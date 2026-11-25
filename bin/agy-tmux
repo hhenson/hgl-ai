@@ -1,0 +1,36 @@
+#!/bin/bash
+# agy-tmux [CONVERSATION_ID] [WORKDIR]
+# Run an Antigravity CLI session inside tmux so it can be detached and reattached
+# cleanly over SSH without relying on cloud Remote Control tunnels.
+#
+#   agy-tmux                    attach to tmux session "agy-hgl" (or start `agy -c`)
+#   agy-tmux <conversation-id>  start/attach resuming a specific conversation ID
+
+set -euo pipefail
+
+NAME="${AGY_TMUX_SESSION:-agy-hgl}"
+CONV_ID="${1:-}"
+DIR="${2:-$HOME}"
+
+attach() {
+  if [ -n "${TMUX:-}" ]; then
+    tmux switch-client -t "$NAME"
+  else
+    exec tmux attach -t "$NAME"
+  fi
+}
+
+if tmux has-session -t "$NAME" 2>/dev/null; then
+  attach
+  exit 0
+fi
+
+if [ -n "$CONV_ID" ]; then
+  cmd="agy --conversation $CONV_ID"
+else
+  cmd="agy --continue"
+fi
+
+tmux new-session -d -s "$NAME" -c "$DIR"
+tmux send-keys -t "$NAME" "$cmd" Enter
+attach

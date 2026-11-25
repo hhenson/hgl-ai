@@ -1,0 +1,32 @@
+#!/bin/bash
+# run-nats-hub : start a persistent NATS JetStream hub using either local `nats-server` or Docker.
+#
+# Environment variables:
+#   NATS_BIND   address to bind (default: 127.0.0.1; set to Tailscale IP for direct LAN/VPN access)
+#   NATS_PORT   client port (default: 4222)
+#   NATS_TOKEN  shared auth token (optional for 127.0.0.1 + SSH port forwarding; recommended on VPN)
+#   NATS_DATA   JetStream storage directory (default: ~/.local/share/hgl-ai/nats)
+
+set -euo pipefail
+
+BIND="${NATS_BIND:-127.0.0.1}"
+PORT="${NATS_PORT:-4222}"
+DATA="${NATS_DATA:-$HOME/.local/share/hgl-ai/nats}"
+mkdir -p "$DATA"
+
+AUTH_ARGS=()
+if [ -n "${NATS_TOKEN:-}" ]; then
+  AUTH_ARGS=(--auth "$NATS_TOKEN")
+fi
+
+if command -v nats-server >/dev/null 2>&1; then
+  exec nats-server -js -sd "$DATA" -a "$BIND" -p "$PORT" "${AUTH_ARGS[@]}"
+elif command -v docker >/dev/null 2>&1; then
+  exec docker run --rm --name hgl-nats-hub \
+    -p "${BIND}:${PORT}:4222" \
+    -v "${DATA}:/data" \
+    nats:2-alpine -js -sd /data "${AUTH_ARGS[@]}"
+else
+  echo "Neither nats-server nor docker found in PATH." >&2
+  exit 1
+fi
