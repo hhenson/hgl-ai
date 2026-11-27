@@ -168,6 +168,8 @@ pub struct Reading {
     pub samples: Vec<MetricsSample>,
     pub rate: RateLimit,
     pub missing: Vec<String>,
+    /// Queue classes with more than one page: repository, label, the cursor after page one.
+    pub more: Vec<(String, &'static str, String)>,
 }
 
 impl Reading {
@@ -210,11 +212,27 @@ pub fn batch_query(n_repos: usize) -> String {
 fragment B on Repository {{
   open: issues(states: OPEN) {{ totalCount }}
   labels(first: 100) {{ nodes {{ name issues(states: OPEN) {{ totalCount }} }} }}
-  queue: issues(states: OPEN, labels: [\"{PRIORITY}\", \"{CLAIMABLE}\"], first: 100, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
-    nodes {{ number title createdAt labels(first: 30) {{ nodes {{ name }} }} }}
-  }}
+  priority: issues(states: OPEN, labels: [\"{PRIORITY}\"], first: 100, orderBy: {{field: CREATED_AT, direction: ASC}}) {{ ...Q }}
+  claimable: issues(states: OPEN, labels: [\"{CLAIMABLE}\"], first: 100, orderBy: {{field: CREATED_AT, direction: ASC}}) {{ ...Q }}
+}}
+fragment Q on IssueConnection {{
+  pageInfo {{ hasNextPage endCursor }}
+  nodes {{ number title createdAt labels(first: 30) {{ nodes {{ name }} }} }}
 }}"
     )
+}
+
+/// The later pages of one repository's issues with `label` (`gh api --paginate`).
+pub fn page_query() -> String {
+    "query Page($owner: String!, $name: String!, $label: String!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    issues(states: OPEN, labels: [$label], first: 100, after: $endCursor, orderBy: {field: CREATED_AT, direction: ASC}) {
+      pageInfo { hasNextPage endCursor }
+      nodes { number title createdAt labels(first: 30) { nodes { name } } }
+    }
+  }
+}"
+    .to_string()
 }
 
 /// The query's variables for the UTC day of `now`.
@@ -285,6 +303,7 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
     };
     let mut samples = Vec::new();
     let mut missing = Vec::new();
+    let mut more = Vec::new();
     let mut queue = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
         let r = data.get(format!("r{i}")).filter(|r| !r.is_null());
@@ -312,12 +331,24 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
             }
         }
         b.open.insert(repo.clone(), open);
-        queue.extend(
-            nodes(r, &["queue"])
-                .iter()
-                .filter_map(candidate)
-                .map(|(number, priority, created, title)| (i, number, priority, created, title)),
-        );
+        for (alias, label) in [("priority", PRIORITY), ("claimable", CLAIMABLE)] {
+            queue.extend(
+                nodes(r, &[alias]).iter().filter_map(candidate).map(
+                    |(number, priority, created, title)| (i, number, priority, created, title),
+                ),
+            );
+            let page = r.get(alias).and_then(|c| c.get("pageInfo"));
+            if page
+                .and_then(|p| p.get("hasNextPage"))
+                .and_then(Value::as_bool)
+                == Some(true)
+                && let Some(cur) = page
+                    .and_then(|p| p.get("endCursor"))
+                    .and_then(Value::as_str)
+            {
+                more.push((repo.clone(), label, cur.to_string()));
+            }
+        }
         samples.push(MetricsSample {
             repo: repo.clone(),
             date: date.clone(),
@@ -331,9 +362,27 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
     if !repos.is_empty() && missing.len() == repos.len() {
         return Err(resp("no repository answered"));
     }
+    b.queue = order(queue, repos);
+    Ok(Reading {
+        backlog: b,
+        samples,
+        rate,
+        missing,
+        more,
+    })
+}
+
+type Candidate = (usize, u64, bool, DateTime<Utc>, String);
+
+/// The claimable queue: `codex-priority` first, then `codex`, each oldest first across
+/// the repositories (ties in configured order, then number); an issue in both classes
+/// once, as priority.
+fn order(mut queue: Vec<Candidate>, repos: &[String]) -> Vec<QueueRow> {
     queue.sort_by_key(|(i, number, priority, created, _)| (!*priority, *created, *i, *number));
-    b.queue = queue
+    let mut seen = std::collections::BTreeSet::new();
+    queue
         .into_iter()
+        .filter(|(i, number, ..)| seen.insert((*i, *number)))
         .map(|(i, number, priority, created, title)| QueueRow {
             repo: repos[i].clone(),
             number,
@@ -341,13 +390,43 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
             created: utc_stamp(created),
             title,
         })
+        .collect()
+}
+
+/// Add the later pages `read` fetched to the queue.
+pub fn add_pages(r: &mut Reading, repos: &[String], pages: &[(String, Vec<Value>)]) {
+    let index = |repo: &str| repos.iter().position(|x| x == repo);
+    let mut queue: Vec<Candidate> = r
+        .backlog
+        .queue
+        .iter()
+        .filter_map(|q| {
+            Some((
+                index(&q.repo)?,
+                q.number,
+                q.priority,
+                table::parse_time(&q.created).or_else(|| hgl_ai_proto::parse_stamp(&q.created))?,
+                q.title.clone(),
+            ))
+        })
         .collect();
-    Ok(Reading {
-        backlog: b,
-        samples,
-        rate,
-        missing,
-    })
+    for (repo, pp) in pages {
+        let Some(i) = index(repo) else { continue };
+        for p in pp {
+            let conn = p.pointer("/data/repository/issues");
+            for n in conn
+                .and_then(|c| c.get("nodes"))
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some((number, priority, created, title)) = candidate(n) {
+                    queue.push((i, number, priority, created, title));
+                }
+            }
+        }
+    }
+    r.backlog.queue = order(queue, repos);
 }
 
 /// Read the backlog of every configured repository from GitHub, as at `now`.
@@ -356,7 +435,20 @@ pub async fn read<G: Gh>(gh: &G, s: &Settings, now: DateTime<Utc>) -> Result<Rea
     let vars = variables(s, now);
     let vars: Vec<(&str, String)> = vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     let pages = exec::graphql(gh, &q, &vars, false).await?;
-    parse_batch(&pages[0], &s.repos, now)
+    let mut r = parse_batch(&pages[0], &s.repos, now)?;
+    // A class with more than a page: the rest, page by page, from after the first.
+    let mut later = Vec::new();
+    for (repo, label, cursor) in r.more.clone() {
+        let vars = [
+            ("owner", s.owner.clone()),
+            ("name", repo.clone()),
+            ("label", label.to_string()),
+            ("endCursor", cursor),
+        ];
+        later.push((repo, exec::graphql(gh, &page_query(), &vars, true).await?));
+    }
+    add_pages(&mut r, &s.repos, &later);
+    Ok(r)
 }
 
 /// Write a reading to the hub: `backlog`, then each repository's sample of the day.
@@ -405,9 +497,15 @@ mod tests {
         );
         assert!(q.contains("rateLimit { cost remaining resetAt limit }"));
         assert!(q.contains("open: issues(states: OPEN) { totalCount }"));
+        // Each class has its own connection: newer priority issues are never crowded
+        // out by a hundred older `codex` ones.
         assert!(q.contains(
-            "queue: issues(states: OPEN, labels: [\"codex-priority\", \"codex\"], first: 100, orderBy: {field: CREATED_AT, direction: ASC})"
+            "priority: issues(states: OPEN, labels: [\"codex-priority\"], first: 100, orderBy: {field: CREATED_AT, direction: ASC}) { ...Q }"
         ));
+        assert!(q.contains(
+            "claimable: issues(states: OPEN, labels: [\"codex\"], first: 100, orderBy: {field: CREATED_AT, direction: ASC}) { ...Q }"
+        ));
+        assert!(q.contains("pageInfo { hasNextPage endCursor }"));
         assert!(!q.trim_start().starts_with("mutation"));
 
         let mut s = settings();
@@ -459,6 +557,48 @@ mod tests {
                 .contains_key(&("alpha".into(), "wontfix".into())),
             "no open issue"
         );
+    }
+
+    /// A class with a second page: the rest comes by `gh api --paginate` from after the
+    /// first page's cursor, and joins the queue in order.
+    #[tokio::test]
+    async fn a_long_queue_is_read_to_the_end() {
+        let mut first = json("backlog-batch.json");
+        let alpha = first.pointer_mut("/data/r0/claimable/pageInfo").unwrap();
+        *alpha = serde_json::json!({ "hasNextPage": true, "endCursor": "Y3Vyc29y" });
+        let page2 = serde_json::json!({ "data": { "repository": { "issues": {
+            "pageInfo": { "hasNextPage": false, "endCursor": null },
+            "nodes": [{ "number": 999, "title": "Late", "createdAt": "2026-03-01T00:00:00Z",
+                        "labels": { "nodes": [{ "name": "codex" }] } }]
+        }}}});
+        let mut s = settings();
+        s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+        let gh = crate::exec::fake::FakeGh::default()
+            .on("--paginate", &page2.to_string())
+            .on("graphql", &first.to_string());
+        let r = read(&gh, &s, chrono::Utc::now()).await.unwrap();
+        assert_eq!(
+            r.more,
+            [("alpha".to_string(), CLAIMABLE, "Y3Vyc29y".to_string())]
+        );
+        let last = r.backlog.queue.last().unwrap();
+        assert_eq!((last.repo.as_str(), last.number), ("alpha", 999));
+        let calls = gh.calls();
+        let page = calls.iter().find(|c| c.contains("--paginate")).unwrap();
+        assert!(
+            page.contains("-f endCursor=Y3Vyc29y") && page.contains("-f label=codex"),
+            "{page}"
+        );
+        let n = r.backlog.queue.len();
+        let mut seen = std::collections::BTreeSet::new();
+        assert!(
+            r.backlog
+                .queue
+                .iter()
+                .all(|q| seen.insert((q.repo.clone(), q.number))),
+            "no duplicates"
+        );
+        assert!(n > 1);
     }
 
     #[test]
