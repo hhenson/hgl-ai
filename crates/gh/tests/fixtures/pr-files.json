@@ -1,0 +1,10 @@
+[
+ {
+  "filename": "crates/x/src/lib.rs",
+  "status": "modified"
+ },
+ {
+  "filename": "docs/x.md",
+  "status": "added"
+ }
+]

@@ -1,0 +1,29 @@
+{
+ "total_count": 4,
+ "check_runs": [
+  {
+   "id": 10,
+   "name": "lint",
+   "status": "completed",
+   "conclusion": "failure"
+  },
+  {
+   "id": 30,
+   "name": "lint",
+   "status": "completed",
+   "conclusion": "success"
+  },
+  {
+   "id": 20,
+   "name": "test (windows-latest)",
+   "status": "completed",
+   "conclusion": "failure"
+  },
+  {
+   "id": 21,
+   "name": "test (ubuntu-latest)",
+   "status": "completed",
+   "conclusion": "success"
+  }
+ ]
+}

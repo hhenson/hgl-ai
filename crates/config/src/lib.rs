@@ -7,6 +7,9 @@ use std::time::Duration;
 use hgl_ai_proto::{Family, Role, Runtime, Seat, Tier};
 use serde::{Deserialize, Serialize};
 
+pub mod github;
+pub use github::{Pin, ReleaseWatch, RepoGate, Tap};
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading {path}: {source}")]
@@ -114,6 +117,76 @@ pub struct Github {
     pub repos: Vec<String>,
     pub branch_prefix: String,
     pub wrapper: String,
+    // GitHub services and gates (crates/gh); see `github.rs` for each key.
+    /// Login of the review bot, without a `[bot]` suffix.
+    #[serde(
+        default = "github::review_bot",
+        skip_serializing_if = "github::is_review_bot"
+    )]
+    pub review_bot: String,
+    /// Seat that gets the coordinator's alerts and sends `landed` notes.
+    #[serde(
+        default = "github::controller",
+        skip_serializing_if = "github::is_controller"
+    )]
+    pub controller: String,
+    /// Sender seat of the coordinator's notes.
+    #[serde(
+        default = "github::coord_seat",
+        skip_serializing_if = "github::is_coord_seat"
+    )]
+    pub coord_seat: String,
+    #[serde(
+        default = "github::coord_interval",
+        skip_serializing_if = "github::is_coord_interval"
+    )]
+    pub coord_interval: String,
+    /// GraphQL allowance at or below which the coordinator writes `hold`.
+    #[serde(
+        default = "github::hold_below",
+        skip_serializing_if = "github::is_hold_below"
+    )]
+    pub hold_below: u64,
+    /// Path prefixes where a move of `main` brings every pull request up to date first.
+    #[serde(
+        default = "github::global_paths",
+        skip_serializing_if = "github::is_global_paths"
+    )]
+    pub global_paths: Vec<String>,
+    /// Regular expressions over changed file names that block a merge.
+    #[serde(
+        default = "github::hygiene_files",
+        skip_serializing_if = "github::is_hygiene_files"
+    )]
+    pub hygiene_files: Vec<String>,
+    /// Regular expressions over added lines that block a merge.
+    #[serde(
+        default = "github::hygiene_lines",
+        skip_serializing_if = "github::is_hygiene_lines"
+    )]
+    pub hygiene_lines: Vec<String>,
+    #[serde(default = "github::gates", skip_serializing_if = "github::is_gates")]
+    pub gate: BTreeMap<String, RepoGate>,
+    #[serde(default = "github::pins", skip_serializing_if = "github::is_pins")]
+    pub pins: Vec<Pin>,
+    /// Title and branch (after `branch_prefix`) of a pin pull request; `{sha8}` is replaced.
+    #[serde(
+        default = "github::pin_title",
+        skip_serializing_if = "github::is_pin_title"
+    )]
+    pub pin_title: String,
+    #[serde(
+        default = "github::pin_branch",
+        skip_serializing_if = "github::is_pin_branch"
+    )]
+    pub pin_branch: String,
+    #[serde(
+        default = "github::release",
+        skip_serializing_if = "github::is_release"
+    )]
+    pub release: ReleaseWatch,
+    #[serde(default = "github::tap", skip_serializing_if = "github::is_tap")]
+    pub tap: Tap,
 }
 
 impl Default for Github {
@@ -131,6 +204,20 @@ impl Default for Github {
             .to_vec(),
             branch_prefix: "codex/".into(),
             wrapper: "hgl-project".into(),
+            review_bot: github::review_bot(),
+            controller: github::controller(),
+            coord_seat: github::coord_seat(),
+            coord_interval: github::coord_interval(),
+            hold_below: github::hold_below(),
+            global_paths: github::global_paths(),
+            hygiene_files: github::hygiene_files(),
+            hygiene_lines: github::hygiene_lines(),
+            gate: github::gates(),
+            pins: github::pins(),
+            pin_title: github::pin_title(),
+            pin_branch: github::pin_branch(),
+            release: github::release(),
+            tap: github::tap(),
         }
     }
 }
@@ -336,7 +423,13 @@ impl Config {
                     .map_err(|e| ConfigError::Invalid(format!("seat {}: {e}", s.name)))?;
             }
         }
-        for d in [&self.limits.stale_after, &self.limits.turn_timeout] {
+        github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
+        for d in [
+            &self.limits.stale_after,
+            &self.limits.turn_timeout,
+            &self.github.coord_interval,
+            &self.github.release.timeout,
+        ] {
             parse_duration(d).ok_or_else(|| ConfigError::Invalid(format!("duration {d:?}")))?;
         }
         Ok(())
@@ -534,5 +627,60 @@ model = "claude-opus-5-5-high"
         assert_eq!(parse_duration("45"), Some(Duration::from_secs(45)));
         assert_eq!(parse_duration("2w"), None);
         assert_eq!(parse_duration(""), None);
+    }
+
+    #[test]
+    fn github_service_keys() {
+        // Defaults fill in, and a saved file does not repeat them.
+        let c: Config = toml::from_str("host = \"h\"\n").unwrap();
+        assert_eq!(c.github, Github::default());
+        assert_eq!(c.github.review_bot, "chatgpt-codex-connector");
+        assert_eq!(c.github.gate["hgl-compiler"].verdicts.len(), 3);
+        let text = toml::to_string_pretty(&c).unwrap();
+        assert!(
+            !text.contains("review_bot") && !text.contains("pins"),
+            "{text}"
+        );
+
+        let t = r#"
+host = "h"
+[github]
+owner = "o"
+repos = ["a", "w"]
+branch_prefix = "codex/"
+wrapper = "w"
+review_bot = "some-bot"
+gate = { a = { verdicts = ["linux"] } }
+pins = [{ path = "a", repo = "a" }, { path = "s", from = "a", submodule = "spec/s" }]
+[github.tap]
+repo = "tap"
+formula = "f"
+source_repo = "a"
+bottle_workflow = "b.yml"
+bottle_tag = "arm64_tahoe"
+anchor = "x"
+"#;
+        let c: Config = toml::from_str(t).unwrap();
+        c.validate().unwrap();
+        assert_eq!(c.github.review_bot, "some-bot");
+        assert_eq!(c.github.pins[1].submodule.as_deref(), Some("spec/s"));
+        assert_eq!(c.github.release, ReleaseWatch::default());
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("config.toml");
+        c.save(&p).unwrap();
+        assert_eq!(Config::load(&p).unwrap(), c);
+
+        let mut bad = c.clone();
+        bad.github.pins[1].from = Some("s".into());
+        assert!(bad.validate().is_err(), "from must name a pin with a repo");
+        bad.github.pins[1] = Pin {
+            path: "s".into(),
+            repo: Some("x".into()),
+            from: Some("a".into()),
+            submodule: None,
+        };
+        assert!(bad.validate().is_err());
+        let unknown = "host = \"h\"\n[github]\nowner=\"o\"\nrepos=[]\nbranch_prefix=\"\"\nwrapper=\"w\"\nbogus=1\n";
+        assert!(toml::from_str::<Config>(unknown).is_err());
     }
 }
