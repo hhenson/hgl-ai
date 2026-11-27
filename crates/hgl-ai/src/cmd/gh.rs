@@ -270,7 +270,7 @@ enum TapCmd {
 fn lift(e: hgl_ai_gh::Error) -> anyhow::Error {
     match e {
         hgl_ai_gh::Error::Bus(b) => b.into(),
-        hgl_ai_gh::Error::Locked(m) => NotReady(m).into(),
+        hgl_ai_gh::Error::Locked(m) | hgl_ai_gh::Error::LeaseLost(m) => NotReady(m).into(),
         other => other.into(),
     }
 }

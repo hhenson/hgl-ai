@@ -118,14 +118,18 @@ async fn wait_for_table(
 /// How often the shared table is read while it says not yet (it costs no GitHub call).
 const TABLE_POLL: Duration = Duration::from_secs(60);
 
-/// Wait while `HGL_STATE/hold` holds (ROLE-17), but not past `deadline`.
-async fn wait_for_hold(bus: &Bus, deadline: Instant) -> Result<()> {
+/// Wait while `HGL_STATE/hold` holds (ROLE-17), but not past `deadline`: `Some(value)`
+/// when the hold is still active at the deadline.
+async fn wait_for_hold(bus: &Bus, deadline: Instant) -> Result<Option<String>> {
     loop {
         let Some(h) = bus.state_get(state::KEY_HOLD).await? else {
-            return Ok(());
+            return Ok(None);
         };
-        if !hold_active(&h.value, chrono::Utc::now()) || Instant::now() >= deadline {
-            return Ok(());
+        if !hold_active(&h.value, chrono::Utc::now()) {
+            return Ok(None);
+        }
+        if Instant::now() >= deadline {
+            return Ok(Some(h.value.trim().to_string()));
         }
         eprintln!("hold until {}: waiting", h.value.trim());
         tokio::time::sleep(
@@ -149,7 +153,7 @@ pub async fn land<G: Gh>(
     hgl_ai_proto::check_head(head)?;
     let who = holder(s, &format!("land {repo}#{number}"));
     let lock = LandLock::acquire(bus, repo, &who, o.lock_wait).await?;
-    let held = land_locked(gh, s, bus, repo, number, head, o).await;
+    let held = land_locked(gh, s, bus, repo, number, head, o, &lock).await;
     lock.release().await;
     let (Landing { outcome, mut after }, what) = held?;
     if outcome.kind != Kind::Merged {
@@ -175,6 +179,7 @@ pub async fn land<G: Gh>(
 
 /// `land` under the landing lock: the gate until it decides, and after a merge the records,
 /// notes and comment; also returns what `main` gained.
+#[allow(clippy::too_many_arguments)]
 async fn land_locked<G: Gh>(
     gh: &G,
     s: &Settings,
@@ -183,6 +188,7 @@ async fn land_locked<G: Gh>(
     number: u64,
     head: &str,
     o: &LandOpts,
+    lock: &LandLock,
 ) -> Result<(Landing, String)> {
     let deadline = Instant::now() + o.timeout;
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
@@ -192,8 +198,38 @@ async fn land_locked<G: Gh>(
     }
     let mut shown = String::new();
     let outcome = loop {
-        wait_for_hold(bus, deadline).await?;
-        let out = match gate::evaluate(gh, s, Some(bus), repo, number, head, &o.gate, true).await {
+        if let Some(until) = wait_for_hold(bus, deadline).await? {
+            // The time is up under the hold: stop, and do not spend the call it defers.
+            let outcome = Outcome {
+                kind: Kind::Hold,
+                line: format!(
+                    "{repo} #{number}: hold still active at the deadline (hold until {until}) HOLD"
+                ),
+                retry: false,
+                merge_commit: None,
+                head: head.to_string(),
+            };
+            return Ok((
+                Landing {
+                    outcome,
+                    after: Vec::new(),
+                },
+                String::new(),
+            ));
+        }
+        let out = match gate::evaluate(
+            gh,
+            s,
+            Some(bus),
+            repo,
+            number,
+            head,
+            &o.gate,
+            true,
+            Some(lock),
+        )
+        .await
+        {
             Ok(out) => out,
             Err(Error::RateLimited(m)) if Instant::now() + o.interval < deadline => {
                 eprintln!("{repo} #{number}: GitHub rate limit ({m}); trying again");
@@ -215,7 +251,7 @@ async fn land_locked<G: Gh>(
         let after = Vec::new();
         return Ok((Landing { outcome, after }, String::new()));
     }
-    let (after, what) = after_merge(gh, s, bus, repo, number, &outcome, o).await?;
+    let (after, what) = after_merge(gh, s, bus, repo, number, &outcome, o, lock).await?;
     Ok((Landing { outcome, after }, what))
 }
 
@@ -234,12 +270,13 @@ pub async fn merge_once<G: Gh>(
     hgl_ai_proto::check_head(head)?;
     let who = holder(s, &format!("merge-if-clean {repo}#{number}"));
     let lock = LandLock::acquire(bus, repo, &who, o.lock_wait).await?;
-    let held = merge_locked(gh, s, bus, repo, number, head, o).await;
+    let held = merge_locked(gh, s, bus, repo, number, head, o, &lock).await;
     lock.release().await;
     held
 }
 
-async fn merge_locked<G: Gh>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn merge_locked<G: Gh>(
     gh: &G,
     s: &Settings,
     bus: &Bus,
@@ -247,15 +284,27 @@ async fn merge_locked<G: Gh>(
     number: u64,
     head: &str,
     o: &LandOpts,
+    lock: &LandLock,
 ) -> Result<Landing> {
-    let outcome = gate::evaluate(gh, s, Some(bus), repo, number, head, &o.gate, true).await?;
+    let outcome = gate::evaluate(
+        gh,
+        s,
+        Some(bus),
+        repo,
+        number,
+        head,
+        &o.gate,
+        true,
+        Some(lock),
+    )
+    .await?;
     if outcome.kind != Kind::Merged {
         return Ok(Landing {
             outcome,
             after: Vec::new(),
         });
     }
-    let (mut after, _) = after_merge(gh, s, bus, repo, number, &outcome, o).await?;
+    let (mut after, _) = after_merge(gh, s, bus, repo, number, &outcome, o, lock).await?;
     if s.pin_sources().contains(&repo) {
         after.push(format!(
             "the {} pins are not raised: run `hgl-ai gh pins sync`",
@@ -266,7 +315,8 @@ async fn merge_locked<G: Gh>(
 }
 
 /// `landed.log`, `main`, the `landed` notes and their comment; also returns what `main` gained.
-async fn after_merge<G: Gh>(
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn after_merge<G: Gh>(
     gh: &G,
     s: &Settings,
     bus: &Bus,
@@ -274,9 +324,10 @@ async fn after_merge<G: Gh>(
     number: u64,
     outcome: &Outcome,
     o: &LandOpts,
+    lock: &LandLock,
 ) -> Result<(Vec<String>, String)> {
     let merge = outcome.merge_commit.clone().unwrap_or_default();
-    let mut after = vec![record(gh, s, bus, repo, number, &merge).await?];
+    let mut after = vec![record(gh, s, bus, repo, number, &merge, Some(lock)).await?];
     let pr = gate::fetch_pr(gh, s, repo, number).await?;
     let what = o.what.clone().unwrap_or_else(|| pr.title.clone());
     let issue = o
@@ -329,7 +380,7 @@ pub async fn plan<G: Gh>(
     head: &str,
     o: &LandOpts,
 ) -> Result<Landing> {
-    let outcome = gate::evaluate(gh, s, None, repo, number, head, &o.gate, false).await?;
+    let outcome = gate::evaluate(gh, s, None, repo, number, head, &o.gate, false, None).await?;
     let mut after = Vec::new();
     if outcome.kind == Kind::WouldMerge {
         let pr = gate::fetch_pr(gh, s, repo, number).await?;
@@ -366,7 +417,8 @@ pub async fn plan<G: Gh>(
     Ok(Landing { outcome, after })
 }
 
-/// Append the landing to `landed.log` and rewrite `main`.
+/// Append the landing to `landed.log` and rewrite `main`. Under the landing lock, the lock
+/// is confirmed ours right before each write; a lost lock stops with what is left undone.
 pub async fn record<G: Gh>(
     gh: &G,
     s: &Settings,
@@ -374,10 +426,31 @@ pub async fn record<G: Gh>(
     repo: &str,
     number: u64,
     merge: &str,
+    lock: Option<&LandLock>,
 ) -> Result<String> {
+    let merged = format!("{repo} #{number} is merged at {}", short(merge));
+    if let Some(l) = lock {
+        l.confirm(&format!(
+            "writing {}: {merged}; {}, {} and the landed notes are not written",
+            state::KEY_LANDED,
+            state::KEY_LANDED,
+            state::KEY_MAIN
+        ))
+        .await?;
+    }
     let line = state::landed_line(&utc_now_stamp(), repo, number, merge);
     store::append_bounded(bus, state::KEY_LANDED, &line, state::LANDED_KEEP).await?;
-    refresh_main(gh, s, bus).await?;
+    let text = main_text(gh, s).await?;
+    if let Some(l) = lock {
+        l.confirm(&format!(
+            "writing {}: {merged} and in {}; {} and the landed notes are not written",
+            state::KEY_MAIN,
+            state::KEY_LANDED,
+            state::KEY_MAIN
+        ))
+        .await?;
+    }
+    store::put_latest(bus, state::KEY_MAIN, &text).await?;
     Ok(format!(
         "recorded {repo} #{number} at {} in {} and {}",
         short(merge),
@@ -408,12 +481,6 @@ pub async fn main_text<G: Gh>(gh: &G, s: &Settings) -> Result<String> {
         &s.wrapper,
         &pinned,
     ))
-}
-
-pub async fn refresh_main<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<()> {
-    let text = main_text(gh, s).await?;
-    store::put_latest(bus, state::KEY_MAIN, &text).await?;
-    Ok(())
 }
 
 /// The author's seats: the trees registry, the branch name, or the `Ready` comment's signer

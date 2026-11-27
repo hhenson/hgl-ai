@@ -46,6 +46,9 @@ pub enum Error {
     /// Another landing holds the repository's landing lock: try again later.
     #[error("{0}")]
     Locked(String),
+    /// The landing lock expired or was taken while held; the landing stopped.
+    #[error("{0}")]
+    LeaseLost(String),
     /// `gh` is missing or not signed in; waiting does not change it.
     #[error("{0}")]
     Auth(String),
