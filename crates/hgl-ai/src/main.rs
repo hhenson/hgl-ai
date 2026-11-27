@@ -6,7 +6,11 @@ mod cmd;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "hgl-ai", version, about = "Coordination tooling for a mixed fleet of coding agents")]
+#[command(
+    name = "hgl-ai",
+    version,
+    about = "Coordination tooling for a mixed fleet of coding agents"
+)]
 struct Cli {
     /// Configuration file (default: $XDG_CONFIG_HOME/hgl-ai/config.toml).
     #[arg(long, global = true, env = "HGL_AI_CONFIG")]
@@ -50,8 +54,19 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    // Logs go to stderr; `HGL_AI_LOG` sets the filter (default: warnings).
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("HGL_AI_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
     let cli = Cli::parse();
-    let ctx = cmd::Ctx { config_path: cli.config, json: cli.json };
+    let ctx = cmd::Ctx {
+        config_path: cli.config,
+        json: cli.json,
+    };
     let res = match cli.command {
         Command::Server(a) => cmd::server::run(&ctx, a).await,
         Command::Client(a) => cmd::client::run(&ctx, a).await,

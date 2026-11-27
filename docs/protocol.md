@@ -24,7 +24,9 @@ Status: proposed. Open decisions are issues in this repository.
   and puts the notes in the turn's prompt. Agents never poll.
 - **PROTO-6 — Interactive seats.** A seat run by a person-facing session (the
   controller) waits with `hgl-ai note wait SEAT`, which blocks until a note
-  arrives, prints it and acknowledges it.
+  arrives, prints it and acknowledges it. A seat is served by a bridge or
+  interactively, never both: `note wait` and `note peek` refuse a seat that a
+  live `HGL_HOSTS` record lists, unless given `--force`.
 
 ```sh
 hgl-ai note send --to claude --issue 980 --kind ready --body-file ready.md

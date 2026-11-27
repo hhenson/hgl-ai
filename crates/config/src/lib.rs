@@ -13,11 +13,20 @@ pub use github::{Pin, ReleaseWatch, RepoGate, Tap};
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("reading {path}: {source}")]
-    Read { path: PathBuf, source: std::io::Error },
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("writing {path}: {source}")]
-    Write { path: PathBuf, source: std::io::Error },
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("parsing {path}: {source}")]
-    Parse { path: PathBuf, source: toml::de::Error },
+    Parse {
+        path: PathBuf,
+        source: toml::de::Error,
+    },
     #[error("invalid configuration: {0}")]
     Invalid(String),
     #[error("no home directory")]
@@ -57,7 +66,10 @@ pub struct Hub {
 
 impl Default for Hub {
     fn default() -> Self {
-        Hub { url: "nats://127.0.0.1:4222".into(), token_file: "~/.config/hgl-ai/hub.token".into() }
+        Hub {
+            url: "nats://127.0.0.1:4222".into(),
+            token_file: "~/.config/hgl-ai/hub.token".into(),
+        }
     }
 }
 
@@ -70,7 +82,10 @@ pub struct Paths {
 
 impl Default for Paths {
     fn default() -> Self {
-        Paths { work_root: "~/hgl-ai/work".into(), data_dir: "~/.local/share/hgl-ai".into() }
+        Paths {
+            work_root: "~/hgl-ai/work".into(),
+            data_dir: "~/.local/share/hgl-ai".into(),
+        }
     }
 }
 
@@ -86,7 +101,12 @@ pub struct Limits {
 
 impl Default for Limits {
     fn default() -> Self {
-        Limits { memcap_gb: 64, min_free_gb: 200, stale_after: "3d".into(), turn_timeout: "2h".into() }
+        Limits {
+            memcap_gb: 64,
+            min_free_gb: 200,
+            stale_after: "3d".into(),
+            turn_timeout: "2h".into(),
+        }
     }
 }
 
@@ -140,9 +160,15 @@ impl Default for Github {
     fn default() -> Self {
         Github {
             owner: "hhenson".into(),
-            repos: ["hgl-compiler", "hgl_spec", "hgl_core", "hgl-project", "homebrew-hgraph"]
-                .map(String::from)
-                .to_vec(),
+            repos: [
+                "hgl-compiler",
+                "hgl_spec",
+                "hgl_core",
+                "hgl-project",
+                "homebrew-hgraph",
+            ]
+            .map(String::from)
+            .to_vec(),
             branch_prefix: "codex/".into(),
             wrapper: "hgl-project".into(),
             review_bot: github::review_bot(),
@@ -183,11 +209,21 @@ impl TierModels {
 }
 
 pub fn default_models() -> BTreeMap<Family, TierModels> {
-    let m = |f: &str, b: &str, s: &str| TierModels { frontier: f.into(), balanced: b.into(), fast: s.into() };
+    let m = |f: &str, b: &str, s: &str| TierModels {
+        frontier: f.into(),
+        balanced: b.into(),
+        fast: s.into(),
+    };
     BTreeMap::from([
-        (Family::Claude, m("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5")),
+        (
+            Family::Claude,
+            m("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"),
+        ),
         (Family::Gpt, m("gpt-6.1-sol", "gpt-6.1-sol", "gpt-6-luna")),
-        (Family::Gemini, m("gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash")),
+        (
+            Family::Gemini,
+            m("gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"),
+        ),
     ])
 }
 
@@ -296,8 +332,14 @@ impl Config {
     }
 
     pub fn load(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read { path: path.into(), source })?;
-        let cfg: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse { path: path.into(), source })?;
+        let text = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
+            path: path.into(),
+            source,
+        })?;
+        let cfg: Config = toml::from_str(&text).map_err(|source| ConfigError::Parse {
+            path: path.into(),
+            source,
+        })?;
         cfg.validate()?;
         Ok(cfg)
     }
@@ -306,7 +348,10 @@ impl Config {
     pub fn save(&self, path: &Path) -> Result<()> {
         self.validate()?;
         let text = toml::to_string_pretty(self).map_err(|e| ConfigError::Invalid(e.to_string()))?;
-        let w = |source| ConfigError::Write { path: path.into(), source };
+        let w = |source| ConfigError::Write {
+            path: path.into(),
+            source,
+        };
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir).map_err(w)?;
         }
@@ -318,10 +363,16 @@ impl Config {
     pub fn validate(&self) -> Result<()> {
         let label_ok = !self.host.is_empty()
             && self.host.len() <= 32
-            && self.host.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            && self
+                .host
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
             && !self.host.starts_with('-');
         if !label_ok {
-            return Err(ConfigError::Invalid(format!("host label {:?}: use [a-z0-9-], at most 32", self.host)));
+            return Err(ConfigError::Invalid(format!(
+                "host label {:?}: use [a-z0-9-], at most 32",
+                self.host
+            )));
         }
         let mut seen = std::collections::BTreeSet::new();
         for s in &self.seats {
@@ -329,10 +380,14 @@ impl Config {
                 return Err(ConfigError::Invalid("a seat cannot be named `all`".into()));
             }
             if !seen.insert(s.name.clone()) {
-                return Err(ConfigError::Invalid(format!("seat {} appears twice", s.name)));
+                return Err(ConfigError::Invalid(format!(
+                    "seat {} appears twice",
+                    s.name
+                )));
             }
             for b in std::iter::once(&s.binding).chain(&s.fallback) {
-                self.resolve(b).map_err(|e| ConfigError::Invalid(format!("seat {}: {e}", s.name)))?;
+                self.resolve(b)
+                    .map_err(|e| ConfigError::Invalid(format!("seat {}: {e}", s.name)))?;
             }
         }
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
@@ -345,10 +400,17 @@ impl Config {
     /// Resolve a binding to one model (docs/design.md §3).
     pub fn resolve(&self, b: &Binding) -> std::result::Result<Resolved, String> {
         let (family, model) = match (&b.model, b.family, b.tier) {
-            (Some(m), f, None) => (f.or_else(|| self.family_of(m)).unwrap_or(native_family(b.runtime)), m.clone()),
+            (Some(m), f, None) => (
+                f.or_else(|| self.family_of(m))
+                    .unwrap_or(native_family(b.runtime)),
+                m.clone(),
+            ),
             (None, f, Some(t)) => {
                 let f = f.unwrap_or(native_family(b.runtime));
-                let tm = self.models.get(&f).ok_or_else(|| format!("no [models.{f}] table"))?;
+                let tm = self
+                    .models
+                    .get(&f)
+                    .ok_or_else(|| format!("no [models.{f}] table"))?;
                 (f, tm.get(t).to_string())
             }
             (Some(_), _, Some(_)) => return Err("give `model` or `tier`, not both".into()),
@@ -357,14 +419,23 @@ impl Config {
         if !runtime_supports(b.runtime, family) {
             return Err(format!("runtime {} cannot run a {family} model", b.runtime));
         }
-        Ok(Resolved { runtime: b.runtime, family, model, effort: b.effort.clone() })
+        Ok(Resolved {
+            runtime: b.runtime,
+            family,
+            model,
+            effort: b.effort.clone(),
+        })
     }
 
     /// The family whose `[models]` table names this slug, if any.
     pub fn family_of(&self, slug: &str) -> Option<Family> {
         self.models
             .iter()
-            .find(|(_, t)| [&t.frontier, &t.balanced, &t.fast].iter().any(|m| slug == m.as_str() || slug.starts_with(&format!("{m}-"))))
+            .find(|(_, t)| {
+                [&t.frontier, &t.balanced, &t.fast]
+                    .iter()
+                    .any(|m| slug == m.as_str() || slug.starts_with(&format!("{m}-")))
+            })
             .map(|(f, _)| *f)
     }
 
@@ -390,7 +461,10 @@ impl Config {
 }
 
 fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME").filter(|h| !h.is_empty()).map(PathBuf::from).ok_or(ConfigError::NoHome)
+    std::env::var_os("HOME")
+        .filter(|h| !h.is_empty())
+        .map(PathBuf::from)
+        .ok_or(ConfigError::NoHome)
 }
 
 /// Expand a leading `~/` (or a lone `~`) to `$HOME`.
@@ -454,9 +528,16 @@ model = "claude-opus-5-5-high"
         let r = c.resolve(&w1.binding).unwrap();
         assert_eq!((r.family, r.model.as_str()), (Family::Gpt, "gpt-6.1-sol"));
         let f = c.resolve(&w1.fallback[0]).unwrap();
-        assert_eq!((f.runtime, f.family, f.model.as_str()), (Runtime::Agy, Family::Claude, "claude-opus-5-5"));
+        assert_eq!(
+            (f.runtime, f.family, f.model.as_str()),
+            (Runtime::Agy, Family::Claude, "claude-opus-5-5")
+        );
         let r1 = c.resolve(&c.seat("r1").unwrap().binding).unwrap();
-        assert_eq!(r1.family, Family::Claude, "slug with an effort suffix maps to its family");
+        assert_eq!(
+            r1.family,
+            Family::Claude,
+            "slug with an effort suffix maps to its family"
+        );
     }
 
     #[test]
@@ -469,8 +550,19 @@ model = "claude-opus-5-5-high"
             model: model.map(String::from),
             effort: None,
         };
-        assert!(c.resolve(&b(Runtime::Codex, Some(Family::Claude), Some(Tier::Fast), None)).is_err());
-        assert!(c.resolve(&b(Runtime::Claude, None, Some(Tier::Fast), Some("x"))).is_err());
+        assert!(
+            c.resolve(&b(
+                Runtime::Codex,
+                Some(Family::Claude),
+                Some(Tier::Fast),
+                None
+            ))
+            .is_err()
+        );
+        assert!(
+            c.resolve(&b(Runtime::Claude, None, Some(Tier::Fast), Some("x")))
+                .is_err()
+        );
         assert!(c.resolve(&b(Runtime::Claude, None, None, None)).is_err());
         c.host = "Bad Host".into();
         assert!(c.validate().is_err());
