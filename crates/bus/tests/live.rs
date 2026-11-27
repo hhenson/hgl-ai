@@ -979,9 +979,25 @@ async fn peeks_spend_no_delivery_and_naks_never_drop() {
     assert_eq!(r.len(), 1);
     assert_eq!(r[0].note.body.trim(), "not for claude");
 
-    // Twenty naks, and the note is still there.
+    // Twenty naks, and the note is still there. An inbox made with the old limit of 5 is
+    // brought to unlimited when it is opened.
     let n = bus.send(&note("claude", "w4", "retry me")).await.unwrap();
+    let old = InboxOptions {
+        max_deliver: 5,
+        ..InboxOptions::default()
+    };
+    drop(bus.inbox_with(&seat("w4"), old).await.unwrap());
     let mut w4 = bus.inbox(&seat("w4")).await.unwrap();
+    let info = hub
+        .raw()
+        .await
+        .get_stream("HGL_NOTES")
+        .await
+        .unwrap()
+        .consumer_info("inbox-w4")
+        .await
+        .unwrap();
+    assert_eq!(info.config.max_deliver, -1);
     let b = w4.fetch(1, LONG).await.unwrap();
     assert_eq!(b[0].seq, all.seq, "the broadcast first");
     b[0].ack().await.unwrap();
