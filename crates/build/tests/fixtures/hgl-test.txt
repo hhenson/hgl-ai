@@ -1,0 +1,17 @@
+error[type/type.mismatch]: `true` must be a compile-time `str` or `i64` pack key
+  ┌─ cases/pack.hgl:12:9
+   │
+12 │     let k = pack[true];
+   │                  ^^^^ expected `str` or `i64`
+cases/units.hgl:4:1: unit `demo.calc` imports itself
+passed   rejection   demo.calc::rejects_cycles
+FAILED   rejection   demo.calc::rejects_bad_key
+    expected rejection type/type.mismatch at cases/pack.hgl:13:9
+    got none
+passed   executable  demo.calc::adds
+FAILED   executable  demo.calc::divides
+    assert failed at cases/calc.hgl:30:5: 1.0 / 0.0 == 0.0
+not run  executable  demo.calc::streams
+    no C++ target in this build
+rejection cases: 1 passed, 1 failed
+executable cases: 1 passed, 1 failed, 1 not run

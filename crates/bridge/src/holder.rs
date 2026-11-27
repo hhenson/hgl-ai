@@ -94,6 +94,9 @@ pub fn dead_own(holder: &str, host: &str, id: &str) -> bool {
     }
     match what {
         "(bridge)" if pid == std::process::id() => true,
+        // A builder takes over only while it holds its label's host lock, so an earlier
+        // lane of this very process is gone too.
+        "(builder)" => pid == std::process::id() || !process_alive(pid),
         "(bridge)" | "(note wait)" | "(note peek)" => {
             pid != std::process::id() && !process_alive(pid)
         }
@@ -170,6 +173,22 @@ mod tests {
         assert_eq!(
             holder("lab1", "aa11bb22", "note wait"),
             format!("lab1 pid {me} (note wait) id aa11bb22")
+        );
+        // A builder's: dead, or an earlier lane of this process; never another host's.
+        assert!(dead_own(
+            &h(dead, "builder", "aa11bb22"),
+            "lab1",
+            "aa11bb22"
+        ));
+        assert!(dead_own(&h(me, "builder", "aa11bb22"), "lab1", "aa11bb22"));
+        assert!(!dead_own(
+            &h(dead, "builder", "cc33dd44"),
+            "lab1",
+            "aa11bb22"
+        ));
+        assert!(
+            !dead_own(&h(1, "builder", "aa11bb22"), "lab1", "aa11bb22"),
+            "pid 1 lives"
         );
     }
 }

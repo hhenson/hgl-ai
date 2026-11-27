@@ -22,6 +22,8 @@ pub struct ClientOpts {
     pub work_root: Option<String>,
     /// Run `loginctl enable-linger` (Linux).
     pub linger: bool,
+    /// Install the builder service (`--no-builder` clears it).
+    pub builder: bool,
 }
 
 /// What `install` could not finish.
@@ -125,6 +127,10 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ClientOpts) -> Result
     let data_dir = env.expand(&cfg.paths.data_dir);
     service::install(sys, &Spec::hgl_ai(Service::Bridge, sys, &data_dir))?;
     done(sys, "service: bridge started");
+    if o.builder {
+        service::install(sys, &Spec::hgl_ai(Service::Builder, sys, &data_dir))?;
+        done(sys, "service: builder started");
+    }
     if let Some(l) = service::linger_line(service::linger(sys, o.linger)?) {
         sys.say(&l);
     }
@@ -142,6 +148,8 @@ pub fn uninstall(sys: &dyn System, purge: bool) -> Result<()> {
     let env = sys.env();
     service::uninstall(sys, Service::Bridge)?;
     sys.say("service: bridge removed");
+    service::uninstall(sys, Service::Builder)?;
+    sys.say("service: builder removed");
     for rt in Runtime::ALL {
         if skill::remove(sys, *rt)? {
             sys.say(&format!(
@@ -207,6 +215,7 @@ mod tests {
             host: "build-1".into(),
             work_root: None,
             linger: false,
+            builder: true,
         }
     }
 
@@ -245,6 +254,24 @@ mod tests {
         assert!(
             f.runs()
                 .contains(&"systemctl --user restart hgl-ai-bridge.service".to_string())
+        );
+        let builder =
+            std::fs::read_to_string(home.join(".config/systemd/user/hgl-ai-builder.service"))
+                .unwrap();
+        assert!(builder.contains("builder run"));
+        let d2 = tempfile::tempdir().unwrap();
+        let f2 = fake(d2.path());
+        let o = ClientOpts {
+            builder: false,
+            ..opts()
+        };
+        install(&f2, &FakeHub::up(), &o).await.unwrap();
+        assert!(
+            !f2.env
+                .home
+                .join(".config/systemd/user/hgl-ai-builder.service")
+                .exists(),
+            "--no-builder"
         );
         let said = f.output();
         assert!(!said.contains("c0ffee"), "the token is never printed");

@@ -5,6 +5,7 @@ use std::time::Duration;
 
 use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_config::Config;
+use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
     KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES,
     STREAM_NOTES, STREAM_OWNER,
@@ -56,6 +57,7 @@ impl Hub for BusHub {
         }
         for b in [
             KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
+            KV_BUILD,
         ] {
             if js.get_key_value(b).await.is_err() {
                 missing.push(b.to_string());
@@ -201,7 +203,8 @@ mod live {
                 KV_ENDED,
                 KV_THREADS,
                 KV_METRICS,
-                KV_CONSOLE
+                KV_CONSOLE,
+                KV_BUILD
             ]
         );
 
@@ -221,6 +224,7 @@ mod live {
         }
         for b in [
             KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
+            KV_BUILD,
         ] {
             js.create_key_value(async_nats::jetstream::kv::Config {
                 bucket: b.into(),

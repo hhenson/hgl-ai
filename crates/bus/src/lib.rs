@@ -61,6 +61,9 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::OnceCell;
 
+mod build;
+pub use build::BUILD_HISTORY;
+
 #[derive(Debug, thiserror::Error)]
 pub enum BusError {
     #[error("hub unreachable at {url}: {reason}")]
@@ -233,6 +236,7 @@ pub struct Bus {
     threads: OnceCell<kv::Store>,
     metrics: OnceCell<kv::Store>,
     console: OnceCell<kv::Store>,
+    build: OnceCell<kv::Store>,
 }
 
 impl Bus {
@@ -308,6 +312,7 @@ impl Bus {
             threads: OnceCell::new(),
             metrics: OnceCell::new(),
             console: OnceCell::new(),
+            build: OnceCell::new(),
         })
     }
 
@@ -477,6 +482,7 @@ impl Bus {
                 1,
                 Duration::ZERO,
             ),
+            build::BUCKET,
         ];
         for (bucket, description, storage, history, max_age) in buckets {
             self.js
@@ -855,10 +861,11 @@ impl Bus {
             .map_err(|e| nats(&format!("deleting host {host}"), e))
     }
 
-    /// Every live host record, ordered by host label.
+    /// Every live host record, ordered by host label (builder records are apart:
+    /// [`Bus::builders`]).
     pub async fn hosts(&self) -> Result<Vec<HostRecord>> {
         let store = self.store(&self.hosts, KV_HOSTS).await?;
-        list_json(store).await
+        list_json_where(store, |k| !build::is_builder_key(k)).await
     }
 
     /// The live host whose bridge serves `seat`, if any. A seat is served by a
@@ -1401,10 +1408,21 @@ async fn put_json<T: Serialize>(store: &kv::Store, key: &str, rec: &T) -> Result
 /// Every live value of a JSON bucket, ordered by key. A value that does not
 /// parse is logged and skipped.
 async fn list_json<T: DeserializeOwned>(store: &kv::Store) -> Result<Vec<T>> {
+    list_json_where(store, |_| true).await
+}
+
+/// [`list_json`] of the keys `keep` accepts.
+async fn list_json_where<T: DeserializeOwned>(
+    store: &kv::Store,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<T>> {
     let mut keys = store.keys().await.map_err(|e| nats("listing keys", e))?;
     let mut names = Vec::new();
     while let Some(k) = keys.next().await {
-        names.push(k.map_err(|e| nats("listing keys", e))?);
+        let k = k.map_err(|e| nats("listing keys", e))?;
+        if keep(&k) {
+            names.push(k);
+        }
     }
     names.sort();
     names.dedup();

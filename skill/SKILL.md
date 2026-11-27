@@ -28,6 +28,10 @@ hgl-ai thread withdraw ID [--reason R]  withdraw an open question
 hgl-ai status post --body-file F        controller: the status report for the owner
 hgl-ai decision add LINE                controller: a judgement a later turn needs
 hgl-ai decision tail [N]                the decision log's newest lines
+hgl-ai build run [REPO] [--steps A,B]   build and test by the repo's recipe; prints a summary
+hgl-ai build run --platform macos|windows [--detach]   the same on a builder of that platform
+hgl-ai build status|wait ID             a detached build
+hgl-ai build log ID STEP --bytes A-B    the part of a step's log the summary points to
 ```
 
 The controller also uses:
@@ -75,7 +79,13 @@ The first body line names runtime and action: `[codex] Ready: hgl-compiler#980 a
 - `ready`, `review`, `receipt`, `sendback`, `approved` carry the exact
   40-character head (`git rev-parse HEAD`). A new commit voids every verdict.
 - `ready` notes and receipts name your model family and model.
-- Every build, test, probe and generated program runs under
+- Build and test with `hgl-ai build run` (each step is capped; exit 0 pass, 1 fail, 3 not
+  run). Read its summary, not the log; open the log by byte range only when the summary
+  is not enough. A long or other-platform build: `--platform P --detach` (a builder runs
+  it, so it outlives your turn), then `build wait ID`.
+  Not run (a missing SDK, tool or recipe) goes to the controller as `blocked`; never work
+  around it. A recipe change is a pull request to the repository's `recipes/`.
+- Every other build, test, probe and generated program runs under
   `hgl-ai cap SIZE --time DUR -- ...`: 32G for one compiler run or program,
   64G for a C++ build or a whole-workspace build or test. A hit cap is a finding;
   never raise it yourself.

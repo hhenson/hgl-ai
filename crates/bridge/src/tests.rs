@@ -1745,6 +1745,34 @@ async fn a_tree_that_cannot_be_prepared_yet_is_tried_again() {
     stop(tx, j).await;
 }
 
+/// hgl-ai#15: a `build` note at an agent seat starts no turn; it is terminated and its
+/// sender told.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_build_note_at_an_agent_seat_is_refused() {
+    let h = harness();
+    h.script("codex", "echo should-not-run");
+    let (tx, j) = h.start(&["w1"]);
+    let mut n = Note::new(seat("w2"), seat("w1"), Kind::Build, "{\"v\":1}");
+    n.repo = Some("demo".into());
+    n.head = Some("a".repeat(40));
+    let b = h.bus.push("w1", n);
+    eventually("terminated", || h.bus.events(b) == [Ev::Term]).await;
+    eventually("the sender told", || {
+        !h.bus.sent_containing("[bridge] Not a builder").is_empty()
+    })
+    .await;
+    let told = &h.bus.sent_containing("[bridge] Not a builder")[0];
+    assert_eq!((told.recipient.as_str(), told.kind), ("w2", Kind::Note));
+    assert!(
+        told.body.contains("hgl-ai build run --platform"),
+        "{}",
+        told.body
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(h.calls("codex").is_empty(), "no turn");
+    stop(tx, j).await;
+}
+
 /// The bot's P1 (hgl-ai PR 1): the hub stops answering (a partition), so no refresh says
 /// the lease is lost while it runs out. The seat stops, its turn and notes with it, once the
 /// lease has gone unrefreshed for half the bucket's `max_age`: before it can expire and

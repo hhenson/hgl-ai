@@ -185,6 +185,7 @@ string_enum!(
     Assign => "assign", Ready => "ready", Blocked => "blocked", Question => "question",
     Answer => "answer", Review => "review", Receipt => "receipt", Sendback => "sendback",
     Approved => "approved", Landed => "landed", Closed => "closed", Done => "done", Note => "note",
+    Build => "build",
     Tick => "tick",
 });
 
@@ -200,7 +201,12 @@ impl Kind {
     pub fn needs_head(self) -> bool {
         matches!(
             self,
-            Kind::Ready | Kind::Review | Kind::Receipt | Kind::Sendback | Kind::Approved
+            Kind::Ready
+                | Kind::Review
+                | Kind::Receipt
+                | Kind::Sendback
+                | Kind::Approved
+                | Kind::Build
         )
     }
     /// Kinds after which the bridge removes the issue's worktrees (PROTO-14).
@@ -596,6 +602,9 @@ pub struct EndedRecord {
 pub fn ended_key(seat: &Seat, task: &TaskKey) -> String {
     format!("{seat}.{}-{}", task.repo, task.issue)
 }
+
+/// Build recipes, jobs, summaries and builder records (docs/build.md).
+pub mod build;
 
 #[cfg(test)]
 mod tests {

@@ -1286,9 +1286,11 @@ name = "hgl-ai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "chrono",
  "clap",
  "hgl-ai-bridge",
+ "hgl-ai-build",
  "hgl-ai-bus",
  "hgl-ai-cap",
  "hgl-ai-config",
@@ -1298,6 +1300,7 @@ dependencies = [
  "hgl-ai-owner",
  "hgl-ai-proto",
  "hgl-ai-tree",
+ "libc",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
@@ -1322,6 +1325,30 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "hgl-ai-build"
+version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "base64 0.22.1",
+ "chrono",
+ "hgl-ai-bridge",
+ "hgl-ai-bus",
+ "hgl-ai-cap",
+ "hgl-ai-config",
+ "hgl-ai-proto",
+ "hgl-ai-tree",
+ "libc",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
  "tracing",
 ]
 

@@ -1,0 +1,35 @@
+# hgl-ai: format, lint, test, as AGENTS.md and the release check run them.
+# Linux and macOS only: the binary does not build on Windows (crates/cap is Unix).
+# Import: hgl-ai build recipe import recipes/hgl-ai.toml
+repo = "hgl-ai"
+env = { CARGO_TERM_COLOR = "never" }
+
+[[step]]
+name = "fmt"
+run = "cargo fmt --all --check"
+platforms = ["linux", "macos"]
+memcap_gb = 4
+time = "10m"
+parser = "lines"
+needs = ["tool:cargo"]
+# `Diff in <file>:<line>:` per unformatted hunk.
+patterns = { error = ['^Diff in (?P<file>.+?):(?P<line>\d+):'] }
+
+[[step]]
+name = "clippy"
+run = "cargo clippy --workspace --all-targets --locked --message-format=json -- -D warnings"
+platforms = ["linux", "macos"]
+memcap_gb = 64
+time = "30m"
+parser = "cargo"
+needs = ["tool:cargo"]
+
+[[step]]
+name = "test"
+# The live tests use nats-server from PATH and skip without it.
+run = "cargo test --workspace --locked --message-format=json"
+platforms = ["linux", "macos"]
+memcap_gb = 64
+time = "40m"
+parser = "cargo"
+needs = ["tool:cargo"]
