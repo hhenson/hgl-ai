@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hgl_ai_config::{Binding, Config, SeatConfig};
-use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskClass, Tier};
+use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskClass, TaskKey, Tier};
 use hgl_ai_tree::testing::{commit, git, remote};
 use hgl_ai_tree::{Git, Layout, Trees};
 use tokio::sync::watch;
@@ -261,6 +261,182 @@ fn note(kind: Kind, to: &str, issue: u64, body: &str) -> Note {
 }
 
 use crate::proc::alive;
+
+/// r1's minor 5 on hgl-ai PR 25: a moved seat recreating its tree on an unclassed
+/// `sendback` keeps the class its `HGL_TREES` record from the other host holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recreated_tree_keeps_the_class_from_its_record() {
+    use hgl_ai_tree::Registry as _;
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let task = TaskKey {
+        repo: "demo".into(),
+        issue: 11,
+    };
+    let rec = |host: &str, review, class| hgl_ai_proto::TreeRecord {
+        host: host.into(),
+        seat: seat("w1"),
+        task: task.clone(),
+        review,
+        path: "elsewhere".into(),
+        branch: None,
+        created_at: hgl_ai_proto::utc_now_stamp(),
+        size_bytes: 0,
+        families: vec![],
+        class,
+    };
+    h.bus
+        .tree_put(&rec("build-0", false, Some(TaskClass::Complex)))
+        .await
+        .unwrap();
+    h.bus
+        .tree_put(&rec("build-3", true, Some(TaskClass::Simple)))
+        .await
+        .unwrap();
+    let (tx, j) = h.start(&["w1"]);
+    let s = h.bus.push(
+        "w1",
+        note(Kind::Sendback, "w1", 11, "[claude] Sendback: demo#11"),
+    );
+    eventually("sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    let dir = h.work().join("w1/demo-11");
+    assert_eq!(
+        hgl_ai_tree::read_task(&dir).unwrap().class,
+        Some(TaskClass::Complex)
+    );
+    assert!(h.calls("codex")[0].stdin.contains("Task class: complex"));
+    stop(tx, j).await;
+}
+
+/// r1's minor 3 on hgl-ai PR 25: a dead letter quotes the note's class, so a resend keeps it.
+#[test]
+fn a_dead_letter_quotes_the_class() {
+    let mut n = note(Kind::Assign, "w1", 3, "[claude] Assign: demo#3");
+    n.class = Some(TaskClass::Standard);
+    let d = crate::describe_note(9, &n);
+    assert!(
+        d.lines().next().unwrap().contains(" class=standard "),
+        "{d}"
+    );
+}
+
+/// A seat with `[seat.class.simple]` on agy/gemini whose agy refuses gemini for quota and
+/// runs every other model; codex (the primary) runs.
+fn class_quota_harness() -> H {
+    let mut h = harness();
+    h.opts.quota_retry = Duration::from_secs(3600);
+    let light = Binding {
+        runtime: Runtime::Agy,
+        family: Some(Family::Gemini),
+        tier: None,
+        model: Some("gemini-4-hydrogen".into()),
+        effort: Some("high".into()),
+    };
+    h.cfg.seats[0].class.insert(TaskClass::Simple, light);
+    h.cfg.validate().unwrap();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    h.script(
+        "agy",
+        &format!(
+            "case \"$*\" in *gemini*) cat '{}'; exit 1;; *) cat '{}';; esac",
+            fixture("agy-quota.synthetic.jsonl"),
+            fixture("agy-ok.jsonl")
+        ),
+    );
+    h
+}
+
+fn reviewer_host(family: Family, model: &str) -> hgl_ai_proto::HostRecord {
+    hgl_ai_proto::HostRecord {
+        host: "build-2".into(),
+        seats: vec![hgl_ai_proto::SeatRecord {
+            seat: seat("r9"),
+            role: Role::Reviewer,
+            runtime: Runtime::Agy,
+            family,
+            model: model.into(),
+        }],
+        memcap_gb: 64,
+        work_root_free_gb: 500,
+        updated_at: hgl_ai_proto::utc_now_stamp(),
+    }
+}
+
+/// r1's blocker on hgl-ai PR 25: a quota refusal on a class binding leaves the seat on its
+/// primary and runs the task there (not on a fallback), naming the binding that was refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_class_binding_refused_for_quota_runs_the_task_on_the_seats_binding() {
+    let h = class_quota_harness();
+    h.bus
+        .put_host(reviewer_host(Family::Claude, "claude-opus-5-5"));
+    let (tx, j) = h.start(&["w1"]);
+    let mut n = note(Kind::Assign, "w1", 5, "[claude] Assign: demo#5 Rename");
+    n.class = Some(TaskClass::Simple);
+    let a = h.bus.push("w1", n);
+    eventually("acked on the primary", || h.bus.events(a) == [Ev::Ack]).await;
+    assert_eq!(h.calls("agy").len(), 1, "the class binding was tried once");
+    let codex = h.calls("codex");
+    assert_eq!(codex.len(), 1, "then the seat's own binding ran it");
+    assert!(
+        codex[0]
+            .stdin
+            .contains("Task class: simple (the seat's own binding runs it).")
+    );
+    let told = h
+        .bus
+        .sent_containing("class binding agy gemini/gemini-4-hydrogen");
+    assert_eq!(told.len(), 1, "{:?}", h.bus.sent());
+    assert!(
+        told[0].body.contains("codex gpt/gpt-6.2-astra"),
+        "{}",
+        told[0].body
+    );
+    assert!(
+        h.bus.sent_containing("moved from").is_empty(),
+        "the seat did not fail over"
+    );
+    // The next simple task in the cool-down goes straight to the seat's binding.
+    let mut n = note(Kind::Assign, "w1", 6, "[claude] Assign: demo#6 Rename too");
+    n.class = Some(TaskClass::Simple);
+    let b = h.bus.push("w1", n);
+    eventually("second acked", || h.bus.events(b) == [Ev::Ack]).await;
+    assert_eq!(h.calls("agy").len(), 1);
+    assert_eq!(h.calls("codex").len(), 2);
+    stop(tx, j).await;
+}
+
+/// r1's blocker, ROLE-11 half: moving the refused task from the class binding's family to
+/// the seat's would leave it no reviewer of another family, so only that task waits; the
+/// seat goes on with other tasks.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_class_quota_move_that_breaks_role_11_holds_only_that_task() {
+    let h = class_quota_harness();
+    // The only live reviewer family is the seat binding's, gpt.
+    h.bus.put_host(reviewer_host(Family::Gpt, "gpt-6.2-astra"));
+    let (tx, j) = h.start(&["w1"]);
+    let mut n = note(Kind::Assign, "w1", 7, "[claude] Assign: demo#7 Rename");
+    n.class = Some(TaskClass::Simple);
+    let a = h.bus.push("w1", n);
+    eventually("told", || {
+        !h.bus.sent_containing("would break ROLE-11").is_empty()
+    })
+    .await;
+    let told = &h.bus.sent_containing("would break ROLE-11")[0];
+    assert!(
+        told.body.contains("agy gemini/gemini-4-hydrogen"),
+        "{}",
+        told.body
+    );
+    assert!(h.calls("codex").is_empty(), "not moved to gpt");
+    assert!(h.bus.events(a).is_empty(), "held, not naked");
+    let b = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 8, "[claude] Assign: demo#8 Other"),
+    );
+    eventually("the seat runs other tasks", || h.bus.events(b) == [Ev::Ack]).await;
+    assert!(h.bus.events(a).is_empty());
+    stop(tx, j).await;
+}
 
 /// docs/roles.md §3: the `assign` note's class picks the seat's binding for it, the tree
 /// records the class, and a `sendback` only moves it up (ROLE-15).

@@ -135,13 +135,17 @@ fn binding(cfg: &Config, b: &Binding) -> String {
     }
 }
 
-/// `w1 implementor codex gpt/gpt-6.1-sol effort high; fallback agy claude/claude-opus-5-5`
+/// `w1 implementor codex gpt/gpt-6.1-sol effort high; fallback agy claude/claude-opus-5-5;
+/// class simple agy gemini/gemini-4-hydrogen`
 fn describe(cfg: &Config, s: &SeatConfig) -> String {
     let mut line = format!("{} {} {}", s.name, s.role, binding(cfg, &s.binding));
     if !s.fallback.is_empty() {
         let f: Vec<String> = s.fallback.iter().map(|b| binding(cfg, b)).collect();
         line.push_str("; fallback ");
         line.push_str(&f.join(", "));
+    }
+    for (c, b) in &s.class {
+        line.push_str(&format!("; class {c} {}", binding(cfg, b)));
     }
     line
 }
@@ -157,6 +161,56 @@ fn json(cfg: &Config, s: &SeatConfig) -> serde_json::Value {
     v["seat"] = s.name.as_str().into();
     v["role"] = s.role.as_str().into();
     v["fallback"] = s.fallback.iter().map(one).collect::<Vec<_>>().into();
+    v["class"] = s
+        .class
+        .iter()
+        .map(|(c, b)| (c.to_string(), one(b)))
+        .collect::<serde_json::Map<_, _>>()
+        .into();
     v["memcap_gb"] = s.memcap_gb.unwrap_or(cfg.limits.memcap_gb).into();
     v
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// r1's major on hgl-ai PR 25: `seat list` shows a seat's class bindings.
+    #[test]
+    fn class_bindings_are_listed() {
+        let b = |runtime, tier, model: Option<&str>, effort: Option<&str>| Binding {
+            runtime,
+            family: None,
+            tier,
+            model: model.map(String::from),
+            effort: effort.map(String::from),
+        };
+        let mut cfg = Config::new("h");
+        cfg.seats.push(SeatConfig {
+            name: hgl_ai_proto::Seat::new("w1").unwrap(),
+            role: hgl_ai_proto::Role::Implementor,
+            binding: b(
+                Runtime::Codex,
+                Some(hgl_ai_proto::Tier::Frontier),
+                None,
+                None,
+            ),
+            fallback: vec![],
+            class: [(
+                hgl_ai_proto::TaskClass::Simple,
+                b(Runtime::Agy, None, Some("gemini-4-hydrogen"), Some("high")),
+            )]
+            .into(),
+            memcap_gb: None,
+            headless: false,
+        });
+        let s = &cfg.seats[0];
+        assert_eq!(
+            describe(&cfg, s),
+            "w1 implementor codex gpt/gpt-6.2-astra; class simple agy gemini/gemini-4-hydrogen effort high"
+        );
+        let j = json(&cfg, s);
+        assert_eq!(j["class"]["simple"]["model"], "gemini-4-hydrogen");
+        assert_eq!(j["class"]["simple"]["runtime"], "agy");
+    }
 }

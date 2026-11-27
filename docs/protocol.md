@@ -187,10 +187,15 @@ before hub users takes one shared token until it moves.
 - **PROTO-21 — Task class.** An `assign` carries the task's class (docs/roles.md §3);
   only `assign` and `sendback` carry one. The bridge records it in the task's
   `task.json` and `HGL_TREES` record. An `assign` sets it; a `sendback` with a class
-  only moves it up, never down (ROLE-15). A seat may bind a class
+  only moves it up, never down (ROLE-15). A tree made anew for a task another host began
+  takes the class from that host's record. An implementor seat may bind a class
   (`[seat.class.<class>]`): while the seat is on its primary binding, a turn of a task of
   that class runs on that binding; a class without one, an unclassed task and a fallback
-  binding keep the seat's binding. The turn's prompt names the class.
+  binding keep the seat's binding. The turn's prompt names the class. A quota refusal on a
+  class binding moves the class, not the seat: when the seat's binding keeps ROLE-11 for the
+  task (judged from the family that ran), the class's turns run on it for
+  `limits.failover_cooldown`; otherwise that task's notes are held and tried again on the
+  class binding, and the seat's other tasks go on.
 - **PROTO-17 — Failover.** A seat may list fallback bindings. A quota refusal
   is known from the CLI's structured output (an error event or result and its
   status), never from text on stderr. On one, the bridge holds the notes and

@@ -269,6 +269,9 @@ pub enum Outcome {
 pub struct TurnOut {
     pub outcome: Outcome,
     pub binding_idx: usize,
+    /// The class whose binding (`[seat.class.<class>]`) ran the turn, with that binding;
+    /// `None` when the seat's binding at `binding_idx` ran it.
+    pub class_binding: Option<(TaskClass, Binding)>,
 }
 
 fn first_line(body: &str) -> String {
@@ -325,20 +328,47 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
+    /// The class of this seat's implementor task in another host's `HGL_TREES` record, the
+    /// newest if several; `None` when the hub has none or cannot be read.
+    async fn class_elsewhere(
+        &self,
+        seat: &hgl_ai_proto::Seat,
+        task: &TaskKey,
+    ) -> Option<TaskClass> {
+        let recs = match self.bus.trees().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(%task, "reading HGL_TREES for the task's class: {e}");
+                return None;
+            }
+        };
+        recs.into_iter()
+            .filter(|r| &r.seat == seat && &r.task == task && !r.review && r.host != self.cfg.host)
+            .filter_map(|r| r.class.map(|c| (r.created_at, c)))
+            .max()
+            .map(|(_, c)| c)
+    }
+
     pub(crate) async fn turn(self: Arc<Self>, job: Job) -> TurnOut {
         let binding_idx = job.binding_idx;
-        let outcome = self.turn_inner(&job).await;
+        let mut class_binding = None;
+        let outcome = self.turn_inner(&job, &mut class_binding).await;
         TurnOut {
             outcome,
             binding_idx,
+            class_binding,
         }
     }
 
-    async fn turn_inner(&self, job: &Job) -> Outcome {
+    async fn turn_inner(
+        &self,
+        job: &Job,
+        class_binding: &mut Option<(TaskClass, Binding)>,
+    ) -> Outcome {
         let seat = &job.seat;
         let name = seat.name().clone();
         // The directory, its tree, and its turn lock.
-        let (dir, held, file) = match &job.target {
+        let (dir, held, file, inherited) = match &job.target {
             Target::Inbox => {
                 let trees = self.trees.clone();
                 let n = name.clone();
@@ -348,7 +378,7 @@ impl<B: BusApi> Bridge<B> {
                     Err(e) => return Outcome::PrepFailed(e.to_string()),
                 };
                 match take_lock(&dir).await {
-                    Ok(l) => (dir, l, None),
+                    Ok(l) => (dir, l, None, None),
                     Err(o) => return o,
                 }
             }
@@ -384,6 +414,9 @@ impl<B: BusApi> Bridge<B> {
                         Err(e) => return Outcome::PrepFailed(e.to_string()),
                     }
                 }
+                // A tree made anew may continue a task begun on another host: its class
+                // is in that host's record (PROTO-21).
+                let mut inherited = None;
                 let file = match &job.create {
                     Some((seq, c)) => {
                         let trees = self.trees.clone();
@@ -396,6 +429,9 @@ impl<B: BusApi> Bridge<B> {
                                     && let Err(e) = self.bus.tree_put(&created.record).await
                                 {
                                     tracing::warn!(key = %created.record.key(), "registering: {e}");
+                                }
+                                if !created.reused && !*review && created.file.class.is_none() {
+                                    inherited = self.class_elsewhere(&name, task).await;
                                 }
                                 created.file
                             }
@@ -416,7 +452,7 @@ impl<B: BusApi> Bridge<B> {
                         Err(o) => return o,
                     },
                 };
-                (dir, held, Some(file))
+                (dir, held, Some(file), inherited)
             }
         };
         match *job.stop.borrow() {
@@ -426,12 +462,19 @@ impl<B: BusApi> Bridge<B> {
         }
         // The task's class (docs/roles.md §3), recorded in its tree; an inbox turn has none.
         let mut file = file;
-        let class = file.as_ref().and_then(|f| task_class(f.class, &job.notes));
-        let (binding, by_class) = turn_binding(&seat.cfg, job.binding_idx, class);
+        let class = file
+            .as_ref()
+            .and_then(|f| task_class(f.class.or(inherited), &job.notes));
+        // A class binding refused for quota sits out its cool-down (PROTO-21).
+        let usable = class.filter(|c| !seat.class_refused(*c, self.opts.failover_cooldown));
+        let (binding, by_class) = turn_binding(&seat.cfg, job.binding_idx, usable);
         let r = match self.cfg.resolve(&binding) {
             Ok(r) => r,
             Err(e) => return Outcome::PrepFailed(format!("seat binding: {e}")),
         };
+        if let (true, Some(c)) = (by_class, usable) {
+            *class_binding = Some((c, binding.clone()));
+        }
         // The task's authors (ROLE-11): every family whose turns run in an implementor
         // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
         if let Some(f) = file.as_mut() {
