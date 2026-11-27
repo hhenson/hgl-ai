@@ -76,6 +76,19 @@ enum Cmd {
     Shell(ShellArgs),
     /// Show, edit, import or export a repository's recipe on the hub.
     Recipe(RecipeArgs),
+    /// The local build verdicts a pull request needs for its head on the present main,
+    /// asking builders for those not judged (BUILD-15), as `gh land` does. Exit 0 all
+    /// pass, 1 one failed or did not run, 3 still building or missing.
+    Gate {
+        repo: String,
+        pr: u64,
+        /// Wait until every verdict is judged or did not run.
+        #[arg(long)]
+        wait: bool,
+        /// With --wait: give up after this long (the builds go on).
+        #[arg(long, value_name = "DUR", value_parser = duration)]
+        timeout: Option<Duration>,
+    },
 }
 
 #[derive(clap::Args)]
@@ -205,6 +218,12 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
         } => log(ctx, &id, step, bytes, log_dir),
         Cmd::Shell(a) => shell(ctx, a).await,
         Cmd::Recipe(a) => recipe(ctx, a).await,
+        Cmd::Gate {
+            repo,
+            pr,
+            wait,
+            timeout,
+        } => gate(ctx, &repo, pr, wait, timeout).await,
     }
 }
 
@@ -669,6 +688,70 @@ async fn wait_remote(
                 );
             }
         }
+    }
+}
+
+async fn gate(
+    ctx: &Ctx,
+    repo: &str,
+    pr: u64,
+    wait: bool,
+    timeout: Option<Duration>,
+) -> anyhow::Result<i32> {
+    use hgl_ai_gh::gate::VerdictState;
+    let (cfg, bus) = connect(ctx).await?;
+    let s = hgl_ai_gh::Settings::from_config(&cfg)?;
+    let gh = super::gh::gh_client(&cfg).await?;
+    let builds = super::gh::gate_builds(&cfg)?;
+    let deadline = timeout.map(|t| Instant::now() + t);
+    let mut shown = String::new();
+    loop {
+        let (head, main, states) = hgl_ai_gh::builds::gate(&gh, &s, &bus, &builds, repo, pr)
+            .await
+            .map_err(super::gh::lift)?;
+        let mut lines = format!(
+            "{repo} #{pr} head {} on main {}\n",
+            &head[..12],
+            &main[..12]
+        );
+        for (n, st) in &states {
+            let l = match st {
+                VerdictState::Pass(v) => format!("{n} pass: {v}"),
+                VerdictState::Fail(v) => format!("{n} FAIL: {v}"),
+                VerdictState::NotRun(w) => format!("{n} NOT RUN: {w}"),
+                VerdictState::Building(w) => format!("{n} building: {w}"),
+                VerdictState::Missing(w) => {
+                    format!("{n} missing: {}", w.as_deref().unwrap_or("none"))
+                }
+            };
+            lines.push_str(&l);
+            lines.push('\n');
+        }
+        if lines != shown {
+            print!("{lines}");
+            shown = lines;
+        }
+        let failed = states
+            .iter()
+            .any(|(_, st)| matches!(st, VerdictState::Fail(_) | VerdictState::NotRun(_)));
+        let open = states
+            .iter()
+            .any(|(_, st)| matches!(st, VerdictState::Building(_)));
+        if failed {
+            return Ok(EXIT_FAIL);
+        }
+        if states
+            .iter()
+            .all(|(_, st)| matches!(st, VerdictState::Pass(_)))
+        {
+            return Ok(EXIT_OK);
+        }
+        if !wait || !open || deadline.is_some_and(|d| Instant::now() >= d) {
+            return Err(
+                NotReady(format!("{repo} #{pr}: local build verdicts not all judged")).into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 

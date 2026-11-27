@@ -286,9 +286,24 @@ async fn dry_run_bus(cfg: &hgl_ai_config::Config) -> Option<Bus> {
     }
 }
 
+/// `gh` with the coordinator's token where configured, checked signed in: every command
+/// that uses it reads GitHub, so say so clearly when `gh` cannot.
+pub(crate) async fn gh_client(cfg: &hgl_ai_config::Config) -> anyhow::Result<GhCli> {
+    let gh = match &cfg.github.token_file {
+        Some(p) => GhCli::default()
+            .with_token_file(&hgl_ai_config::expand(p)?)
+            .map_err(lift)?,
+        None => GhCli::default(),
+    };
+    hgl_ai_gh::exec::check_auth(&gh).await.map_err(lift)?;
+    Ok(gh)
+}
+
 /// The gate builds a landing asks for (BUILD-15), sent as this seat (the controller), else
 /// this host.
-fn gate_builds(cfg: &hgl_ai_config::Config) -> anyhow::Result<std::sync::Arc<GateBuilds>> {
+pub(crate) fn gate_builds(
+    cfg: &hgl_ai_config::Config,
+) -> anyhow::Result<std::sync::Arc<GateBuilds>> {
     let me = std::env::var("HGL_AI_SEAT")
         .ok()
         .filter(|s| !s.is_empty())
@@ -300,7 +315,7 @@ fn gate_builds(cfg: &hgl_ai_config::Config) -> anyhow::Result<std::sync::Arc<Gat
 }
 
 /// A bus error stays a bus error, so an unreachable hub exits 10.
-fn lift(e: hgl_ai_gh::Error) -> anyhow::Error {
+pub(crate) fn lift(e: hgl_ai_gh::Error) -> anyhow::Error {
     match e {
         hgl_ai_gh::Error::Bus(b) => b.into(),
         hgl_ai_gh::Error::Locked(m) | hgl_ai_gh::Error::LeaseLost(m) => NotReady(m).into(),
@@ -330,14 +345,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     }
     let cfg = ctx.load_config()?;
     let s = Settings::from_config(&cfg)?;
-    let gh = match &cfg.github.token_file {
-        Some(p) => GhCli::default()
-            .with_token_file(&hgl_ai_config::expand(p)?)
-            .map_err(lift)?,
-        None => GhCli::default(),
-    };
-    // Every command below reads GitHub: say so clearly when `gh` cannot.
-    hgl_ai_gh::exec::check_auth(&gh).await.map_err(lift)?;
+    let gh = gh_client(&cfg).await?;
     match *args.cmd {
         Cmd::Coord {
             cmd:

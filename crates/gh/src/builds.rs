@@ -231,3 +231,33 @@ pub async fn verdict_state(
         Err(why) => VerdictState::Missing(Some(why)),
     })
 }
+
+/// `hgl-ai build gate`: every local build verdict `repo#pr` needs, for its head on the
+/// present `main`, asking for those neither judged nor being built (as `gh land` does).
+/// Returns the head, `main` and each verdict.
+pub async fn gate<G: crate::exec::Gh>(
+    gh: &G,
+    s: &crate::Settings,
+    bus: &Bus,
+    builds: &GateBuilds,
+    repo: &str,
+    pr: u64,
+) -> Result<(String, String, Vec<(String, VerdictState)>)> {
+    let names = s.gate_rules(repo).verdicts;
+    if names.is_empty() {
+        return Err(Error::Invalid(format!(
+            "{repo} names no local build verdicts ([github.gate.{repo}] verdicts)"
+        )));
+    }
+    let p = crate::gate::fetch_pr(gh, s, repo, pr).await?;
+    if p.merged || p.state != "open" {
+        return Err(Error::Invalid(format!("{repo} #{pr} is not open")));
+    }
+    let main = crate::gate::main_head(gh, s, repo).await?;
+    let mut out = Vec::new();
+    for name in names {
+        let st = verdict_state(Some(bus), Some(builds), repo, pr, &name, &p.head, &main).await?;
+        out.push((name, st));
+    }
+    Ok((p.head, main, out))
+}

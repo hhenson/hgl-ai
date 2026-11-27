@@ -1031,6 +1031,26 @@ async fn gate_builds_write_verdicts_and_a_moved_main_is_built_again() {
         Some(m1.as_str()),
         "it built onto m1"
     );
+    // `build gate` by hand: the pull request's head on GitHub's `main`, every configured
+    // verdict, nothing asked again for a judged pair.
+    let mut st = crate::testutil::settings();
+    st.gates.entry("demo".into()).or_default().verdicts = vec![name.to_string()];
+    let pr = fixture("pr-open.json").replace("1f461fa77bba922fe81383df4c475feb58b7c233", &head);
+    let fake = FakeGh::default().on("pulls/7", &pr).on(
+        "git/ref/heads/main",
+        &format!("{{\"object\":{{\"sha\":\"{m1}\"}}}}"),
+    );
+    let (h0, m0, by_hand) = crate::builds::gate(&fake, &st, &b, &builds, "demo", 7)
+        .await
+        .unwrap();
+    assert_eq!((h0.as_str(), m0.as_str()), (head.as_str(), m1.as_str()));
+    assert_eq!(by_hand, vec![(name.to_string(), first.clone())]);
+    st.gates.get_mut("demo").unwrap().verdicts.clear();
+    assert!(
+        crate::builds::gate(&fake, &st, &b, &builds, "demo", 7)
+            .await
+            .is_err()
+    );
     // Asked once: judged now, it is not asked again.
     assert_eq!(
         verdict_state(Some(&b), Some(&builds), "demo", 7, name, &head, &m1)

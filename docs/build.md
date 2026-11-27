@@ -129,9 +129,17 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   - It writes `HGL_STATE/verdict.<repo>.<pr>.<name>` (`docs/protocol.md` §8): `running`
     once checked out, then `pass`, `fail` (the failing step) or `not-run` (why), with the
     build id and its label, before the final `run.<id>`.
-  - Only a `builder` hub user writes verdicts; seats are refused (hgl-ai#16). `builder
-    run` connects with `[builder] credential`, which must be readable only by the OS user
-    that runs it, not by the agents'. A builder without one reports gate builds not run.
+  - `hgl-ai build gate REPO PR [--wait] [--timeout DUR]` does the same by hand: it prints
+    each verdict for the head on the present `main` and asks for the missing ones. Exit 0
+    all pass, 1 one failed or did not run, 3 still building or missing.
+  - Only a `builder` hub user writes verdicts; seat and coordinator users are refused.
+    `builder run` connects with `[builder] credential`. A builder without one reports
+    gate builds not run.
+  - Limitation: the hub knows a user, not a process. While a builder's OS user is also
+    the agents' (they share a host account today), an agent can read the builder's
+    credential and write a verdict, so keep that file readable only by an OS user no
+    agent runs as. Separate OS accounts, and verdicts signed by the builder's key, are
+    hgl-ai#16. On a hub with one shared token, any client can write a verdict.
 
 ## 2a. Proxy builders
 
