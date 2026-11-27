@@ -86,25 +86,33 @@ Families: `claude` (Claude Code, or Claude models through Antigravity),
 | balanced | `claude-sonnet-5-5` | `gpt-6.2-sol` | `gemini-4-hydrogen` |
 | fast | `claude-haiku-5-5` | `gpt-6-luna` | `gemini-3.8-flash` |
 
-The Gemini column is provisional until `docs/calibration.md` has results.
-`gemini-4-carbon` (close to Claude Fable) is trialled for controller and
-triage. Concrete slugs live in configuration (`[models]`), so a new release
+`gemini-4-carbon` (close to Claude Fable) is used for control, architecture and
+design review. Concrete slugs live in configuration (`[models]`), so a new release
 changes one file.
 
-| Work | Tier, effort | Primary family | Alternate |
-| --- | --- | --- | --- |
-| Controller | frontier, high | claude | gpt |
-| Specification text | frontier, high | claude | gpt |
-| Implementation: analyser, types, generics, runtime semantics | frontier, high | gpt | claude |
-| Implementation: target coverage, diagnostics, docs, tooling | balanced, high | gpt | gemini |
-| Review | frontier, xhigh | any family but the author's | the third family |
-| Triage | balanced, medium | claude | gemini |
-| Bulk mechanical edits (renames, label sweeps) | fast, medium | gemini | gpt |
-| Build agent (proposed): recipes, toolchains, build failures | balanced, high | gpt | claude |
-| Coordinator, bridge; builder, merge queue (proposed) | no model | — | — |
+Assignment agreed with the owner, 2026-11-27 (HPH: "lets use that for now"), from
+`docs/calibration.md`:
 
-- **ROLE-12 — Spread by subscription.** Implementors run mostly on `gpt`, so
-  `claude` and `gemini` keep capacity for control, review and triage.
+| Work | First choice | Second | Not alone |
+| --- | --- | --- | --- |
+| Controller, architecture | Carbon high | Astra 6.2 high | — |
+| Triage | Astra 6.2 high | Carbon high | — |
+| Specification text | Carbon high | Opus high | — |
+| Implementation, runtime and semantics (hgraph, the C++ runtime) | Sol 6.2 xhigh, Astra 6.2 xhigh | Neon xhigh | Opus, Terra, Hydrogen high |
+| Implementation, checker edge cases | Neon xhigh | Astra 6.2 xhigh | Terra |
+| Implementation, cross-cutting refactors (analyser, IR) | Opus high | Astra 6.2 xhigh | Terra |
+| Implementation, tooling (hgl-ai, scripts, CI) | Opus high | Sol 6.2 xhigh | — |
+| Review (gate) | Neon xhigh or Carbon high | Astra 6.2 xhigh (fast) | Opus (lenient verdicts) |
+| Review (design, code, logic) | Carbon high | Neon xhigh | — |
+| Build agent, mechanical | Sol 6.2 high | Hydrogen high | — |
+| Coordinator, bridge, builder, merge queue | no model | — | — |
+
+The gate's reviewer is never of the author's family (ROLE-9). The GitHub review bot is
+a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the gate.
+
+- **ROLE-12 — Spread by subscription.** The table spreads work over the three
+  subscriptions (GPT implements runtime work, Claude refactors and tooling, Gemini
+  reviews and checker work); when one runs out, its rows move to their second choice.
 - **ROLE-13 — Escalate once.** A balanced or fast seat whose work is sent back
   twice for the same finding moves that task to the frontier tier.
 - **ROLE-14 — Record the model.** `ready` notes and receipts name the family

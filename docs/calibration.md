@@ -1,6 +1,6 @@
 # Model calibration
 
-Status: done 2026-11-27. The proposal at the end replaces the provisional tiers in `docs/roles.md` §3 once the owner agrees.
+Status: done 2026-11-27. The proposal at the end is now `docs/roles.md` §3 (agreed 2026-11-27).
 
 ## Contestants
 
