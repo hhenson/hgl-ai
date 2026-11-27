@@ -14,6 +14,8 @@ use hgl_ai_proto::{CONSOLE_PREFIX, Kind, Note, OWNER_PREFIX, Seat};
 
 use crate::{App, Error};
 
+/// How long `run` waits for the hub before serving, to take back kept sign-ins.
+const RESTORE_WAIT: Duration = Duration::from_secs(10);
 /// A failed fold is tried again after this long.
 pub const FOLD_RETRY: Duration = Duration::from_secs(2);
 /// Between attempts to reach the hub.
@@ -67,10 +69,7 @@ pub fn on_new_question(app: &App, t: &Thread) -> Option<Notification> {
 
 /// The hourly notification of the `p2` questions that came in, if any.
 pub fn p2_batch(app: &App) -> Option<Notification> {
-    let pending = std::mem::take(&mut *app.pending_p2.lock().expect("pending"));
-    if !pending.is_empty() {
-        app.auth.persist(crate::auth::Persist::P2(Vec::new()));
-    }
+    let pending = app.pending_p2.lock().expect("pending").clone();
     match pending.len() {
         0 => None,
         1 => Some(Notification {
@@ -93,14 +92,51 @@ pub fn p2_batch(app: &App) -> Option<Notification> {
     }
 }
 
-async fn notify(app: &App, n: Notification) {
+/// The questions of a sent batch leave it (and the hub's copy).
+pub fn p2_sent(app: &App, sent: &[String]) {
+    let mut p = app.pending_p2.lock().expect("pending");
+    p.retain(|(id, _)| !sent.contains(id));
+    app.auth.persist(crate::auth::Persist::P2(p.clone()));
+}
+
+/// Drop from the batch the questions no longer open (answered or withdrawn meanwhile).
+pub async fn p2_prune(app: &App, bus: &Bus) {
+    let ids: Vec<String> = app
+        .pending_p2
+        .lock()
+        .expect("pending")
+        .iter()
+        .map(|(i, _)| i.clone())
+        .collect();
+    let mut gone = Vec::new();
+    for id in ids {
+        if let Ok(t) = owner::show(bus, &id).await
+            && !t.as_ref().is_some_and(Thread::is_open)
+        {
+            gone.push(id);
+        }
+    }
+    if !gone.is_empty() {
+        p2_sent(app, &gone);
+    }
+}
+
+/// Send a notification; whether a channel took it (none configured counts as sent:
+/// there is nowhere else to wait for).
+async fn notify(app: &App, n: Notification) -> bool {
     let Some(nt) = &app.notifier else {
         tracing::info!("no notification channel: {}", n.title);
-        return;
+        return true;
     };
     match nt.send(&n).await {
-        Ok(kind) => tracing::info!(channel = kind, "notified: {}", n.title),
-        Err(e) => tracing::warn!("notifying the owner failed: {e}"),
+        Ok(kind) => {
+            tracing::info!(channel = kind, "notified: {}", n.title);
+            true
+        }
+        Err(e) => {
+            tracing::warn!("notifying the owner failed: {e}");
+            false
+        }
     }
 }
 
@@ -134,7 +170,7 @@ pub async fn fold_batch(
                 if new_question.is_some()
                     && let Some(n) = on_new_question(app, &thread)
                 {
-                    notify(app, n).await;
+                    let _ = notify(app, n).await;
                 }
                 m.ack().await?;
             }
@@ -192,14 +228,36 @@ async fn tick_loop(app: Arc<App>, bus: Arc<Bus>) {
     }
 }
 
-async fn batch_loop(app: Arc<App>) {
+/// One hourly batch: the questions still open, sent; cleared only once a channel took
+/// it, else kept for the next hour. Whether anything was sent.
+pub async fn p2_round(app: &App, bus: Option<&Bus>) -> bool {
+    if let Some(b) = bus {
+        p2_prune(app, b).await;
+    }
+    let ids: Vec<String> = app
+        .pending_p2
+        .lock()
+        .expect("pending")
+        .iter()
+        .map(|(i, _)| i.clone())
+        .collect();
+    let Some(n) = p2_batch(app) else {
+        return false;
+    };
+    if notify(app, n).await {
+        p2_sent(app, &ids);
+        true
+    } else {
+        false
+    }
+}
+
+async fn batch_loop(app: Arc<App>, bus: Arc<Bus>) {
     let mut every = tokio::time::interval(P2_BATCH);
     every.tick().await;
     loop {
         every.tick().await;
-        if let Some(n) = p2_batch(&app) {
-            notify(&app, n).await;
-        }
+        p2_round(&app, Some(&bus)).await;
     }
 }
 
@@ -294,10 +352,12 @@ pub async fn start_background(app: Arc<App>) {
             }
         }
     };
-    restore(&app, &bus).await;
+    if !app.restored.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        restore(&app, &bus).await;
+    }
     tokio::spawn(fold_loop(app.clone(), bus.clone()));
     tokio::spawn(tick_loop(app.clone(), bus.clone()));
-    tokio::spawn(batch_loop(app.clone()));
+    tokio::spawn(batch_loop(app.clone(), bus.clone()));
     tokio::spawn(telemetry_loop(app, bus));
 }
 
@@ -322,6 +382,15 @@ pub async fn run(cfg: hgl_ai_config::Config) -> Result<(), Error> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let app = Arc::new(App::new(cfg)?);
     let addr = app.console.listen_addr().map_err(Error::Config)?;
+    // Sign-ins kept on the hub come back before the first request, when the hub answers
+    // soon; else the background takes them back once it does.
+    if let Ok(Ok(b)) = tokio::time::timeout(RESTORE_WAIT, Bus::connect(&app.cfg)).await {
+        let b = Arc::new(b);
+        app.set_hub(b.clone());
+        restore(&app, &b).await;
+        app.restored
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
     tokio::spawn(start_background(app.clone()));
     let router = crate::router(app.clone());
     match (&app.console.tls_cert, &app.console.tls_key) {
@@ -565,6 +634,30 @@ pub(crate) mod tests {
         }
     }
 
+    /// A batch that no channel took waits for the next hour; a sent one is cleared.
+    #[tokio::test]
+    async fn the_p2_batch_waits_until_a_channel_takes_it() {
+        let d = tempfile::tempdir().unwrap();
+        let mut cfg = hgl_ai_config::Config::new("hub");
+        cfg.paths.data_dir = d.path().display().to_string();
+        cfg.console = Some(hgl_ai_config::Console {
+            url: "https://console.example.com".into(),
+            notify: vec![hgl_ai_config::Notify::Ntfy {
+                url: "http://127.0.0.1:1/nobody".into(),
+                token_file: None,
+            }],
+            ..hgl_ai_config::Console::default()
+        });
+        let down = App::new(cfg).unwrap();
+        on_new_question(&down, &q("q-00000002", Priority::P2));
+        assert!(!p2_round(&down, None).await, "the channel refused");
+        assert!(p2_batch(&down).is_some(), "kept for the next hour");
+        let up = app(d.path());
+        on_new_question(&up, &q("q-00000003", Priority::P2));
+        assert!(p2_round(&up, None).await);
+        assert!(p2_batch(&up).is_none());
+    }
+
     #[test]
     fn notification_policy() {
         let d = tempfile::tempdir().unwrap();
@@ -578,7 +671,9 @@ pub(crate) mod tests {
         assert!(on_new_question(&a, &q("q-00000002", Priority::P2)).is_none());
         let one = p2_batch(&a).unwrap();
         assert_eq!(one.link, "https://console.example.com/t/q-00000002");
-        assert!(p2_batch(&a).is_none(), "the batch empties");
+        assert!(p2_batch(&a).is_some(), "not cleared until sent");
+        p2_sent(&a, &["q-00000002".into()]);
+        assert!(p2_batch(&a).is_none(), "the batch empties once sent");
         on_new_question(&a, &q("q-00000004", Priority::P2));
         on_new_question(&a, &q("q-00000005", Priority::P2));
         let two = p2_batch(&a).unwrap();
@@ -586,6 +681,7 @@ pub(crate) mod tests {
             two.title,
             "2 p2 questions: title q-00000004; title q-00000005"
         );
+        p2_sent(&a, &["q-00000004".into(), "q-00000005".into()]);
         assert_eq!(two.link, "https://console.example.com/questions");
         assert!(!two.title.contains("never sent"));
     }

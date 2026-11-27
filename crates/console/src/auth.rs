@@ -822,17 +822,32 @@ impl Auth {
         ticket: &str,
         cred: &RegisterPublicKeyCredential,
     ) -> Result<Session, AuthError> {
-        let e = self
-            .enrolments
-            .lock()
-            .expect("enrolments")
-            .remove(ticket)
-            .ok_or_else(|| bad("this enrolment expired; sign in with a provider again"))?;
-        let reg = e.reg.ok_or_else(|| bad("the passkey was not started"))?;
+        let expired = || bad("this enrolment expired; sign in with a provider again");
+        let (user, via, reg) = {
+            let mut all = self.enrolments.lock().expect("enrolments");
+            let e = all.get(ticket).ok_or_else(expired)?;
+            if e.started.elapsed() >= PENDING_TTL {
+                all.remove(ticket);
+                return Err(expired());
+            }
+            let reg = e
+                .reg
+                .clone()
+                .ok_or_else(|| bad("the passkey was not started"))?;
+            (e.user.clone(), e.via.clone(), reg)
+        };
+        // A failed ceremony keeps the ticket: the browser may start the passkey again.
         let pk = self
             .webauthn
             .finish_passkey_registration(cred, &reg)
             .map_err(|err| bad(format!("the passkey did not register: {err}")))?;
+        self.enrolments.lock().expect("enrolments").remove(ticket);
+        let e = Enrolment {
+            user,
+            via,
+            reg: None,
+            started: Instant::now(),
+        };
         {
             let mut st = self.store.lock().expect("store");
             let u = st
@@ -1157,6 +1172,36 @@ mod tests {
         let s = b.new_session("owner@example.com".into(), "passkey".into());
         let header = format!("{SESSION_COOKIE}={}", b.sign(SESSION_COOKIE, &s.id));
         assert!(b.session(Some(&header)).is_none(), "removed from users");
+    }
+
+    #[test]
+    fn an_expired_enrolment_registers_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let (_, a) = console(d.path());
+        let t = a.enrol_ticket(
+            "owner@example.com".into(),
+            Identity::Github("hhenson".into()),
+        );
+        a.enrolments.lock().unwrap().get_mut(&t).unwrap().started = Instant::now()
+            .checked_sub(PENDING_TTL + Duration::from_secs(1))
+            .unwrap();
+        let cred: RegisterPublicKeyCredential = serde_json::from_value(serde_json::json!({
+            "id": "AA", "rawId": "AA", "type": "public-key", "extensions": {},
+            "response": { "attestationObject": "AA", "clientDataJSON": "AA" }
+        }))
+        .unwrap();
+        let e = a.register_finish(&t, &cred).unwrap_err().to_string();
+        assert!(e.contains("expired"), "{e}");
+        assert!(a.enrolments.lock().unwrap().get(&t).is_none(), "spent");
+
+        // A failed ceremony keeps a live ticket for another try.
+        let t = a.enrol_ticket(
+            "owner@example.com".into(),
+            Identity::Github("hhenson".into()),
+        );
+        a.register_start(&t).unwrap();
+        assert!(a.register_finish(&t, &cred).is_err());
+        assert!(a.enrolments.lock().unwrap().get(&t).is_some(), "kept");
     }
 
     #[cfg(unix)]

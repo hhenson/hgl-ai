@@ -443,6 +443,7 @@ async fn sessions_and_the_p2_batch_survive_a_restart() {
     assert_eq!(b.get("/telemetry").await.status(), 200, "still signed in");
     let batch = hgl_ai_console::service::p2_batch(&second).unwrap();
     assert_eq!(batch.title, "p2 question: Later");
+    hgl_ai_console::service::p2_sent(&second, &["q-0000000a".into()]);
 
     // Seats cannot read the console's state.
     let seat_bus = Bus::connect_with(&hub.url, Some(hub.creds["hub"].clone()))
@@ -479,5 +480,15 @@ async fn sessions_and_the_p2_batch_survive_a_restart() {
     assert!(
         hgl_ai_console::service::p2_batch(&third).is_none(),
         "the batch was sent"
+    );
+    // A question no longer open (here: not in HGL_THREADS at all) leaves the batch
+    // before it is sent.
+    let mut gone = t.clone();
+    gone.id = "q-0000000b".into();
+    hgl_ai_console::service::on_new_question(&third, &gone);
+    assert!(!hgl_ai_console::service::p2_round(&third, third.hub().map(|b| &**b)).await);
+    assert!(
+        hgl_ai_console::service::p2_batch(&third).is_none(),
+        "pruned"
     );
 }
