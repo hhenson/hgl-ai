@@ -80,19 +80,26 @@ pub fn choose_create(creates: Vec<(u64, Option<Create>)>) -> Option<(u64, Create
     review.or(implement)
 }
 
+/// A task's class and the stream sequence of the note that set it (PROTO-21).
+pub type Classed = (Option<TaskClass>, Option<u64>);
+
 /// The task's class after these notes (docs/roles.md §3), in stream order: an `assign`
 /// sets it (triage may reclass a task by assigning it again); a `sendback` only moves it up
-/// (ROLE-15).
-pub fn task_class(recorded: Option<TaskClass>, notes: &[(u64, u64, Note)]) -> Option<TaskClass> {
+/// (ROLE-15). A note no newer than the one that last set it (an older note delivered again,
+/// in this turn or a later one) changes nothing.
+pub fn task_class(recorded: Classed, notes: &[(u64, u64, Note)]) -> Classed {
     let mut by_seq: Vec<&(u64, u64, Note)> = notes.iter().collect();
     by_seq.sort_by_key(|(seq, _, _)| *seq);
-    by_seq
-        .iter()
-        .fold(recorded, |c, (_, _, n)| match (n.kind, n.class) {
-            (Kind::Assign, Some(new)) => Some(new),
-            (Kind::Sendback, Some(new)) => Some(c.map_or(new, |c| c.max(new))),
-            _ => c,
-        })
+    by_seq.iter().fold(recorded, |(c, at), (seq, _, n)| {
+        if at.is_some_and(|a| *seq <= a) {
+            return (c, at);
+        }
+        match (n.kind, n.class) {
+            (Kind::Assign, Some(new)) => (Some(new), Some(*seq)),
+            (Kind::Sendback, Some(new)) if c.is_none_or(|c| new > c) => (Some(new), Some(*seq)),
+            _ => (c, at),
+        }
+    })
 }
 
 /// The binding a turn runs on, and whether its class chose it: the seat's binding for the
@@ -122,39 +129,48 @@ mod tests {
         use TaskClass::*;
         let a = |seq, c| classed(seq, Kind::Assign, Some(c));
         let sb = |seq, c| classed(seq, Kind::Sendback, c);
-        assert_eq!(task_class(None, &[a(1, Simple)]), Some(Simple));
+        let tc =
+            |rec: Option<TaskClass>, notes: &[(u64, u64, Note)]| task_class((rec, None), notes).0;
+        assert_eq!(tc(None, &[a(1, Simple)]), Some(Simple));
+        assert_eq!(tc(Some(Standard), &[sb(5, None)]), Some(Standard), "kept");
+        assert_eq!(tc(None, &[sb(5, None)]), None, "an unclassed task stays so");
+        assert_eq!(tc(Some(Simple), &[sb(5, Some(Standard))]), Some(Standard));
         assert_eq!(
-            task_class(Some(Standard), &[sb(5, None)]),
-            Some(Standard),
-            "kept"
-        );
-        assert_eq!(
-            task_class(None, &[sb(5, None)]),
-            None,
-            "an unclassed task stays so"
-        );
-        assert_eq!(
-            task_class(Some(Simple), &[sb(5, Some(Standard))]),
-            Some(Standard)
-        );
-        assert_eq!(
-            task_class(Some(Complex), &[sb(5, Some(Simple))]),
+            tc(Some(Complex), &[sb(5, Some(Simple))]),
             Some(Complex),
             "never down"
         );
-        assert_eq!(task_class(None, &[sb(5, Some(Standard))]), Some(Standard));
+        assert_eq!(tc(None, &[sb(5, Some(Standard))]), Some(Standard));
         assert_eq!(
-            task_class(Some(Complex), &[a(9, Simple)]),
+            tc(Some(Complex), &[a(9, Simple)]),
             Some(Simple),
             "a new assign reclasses"
         );
         // Stream order, whatever order the batch arrived in.
         assert_eq!(
-            task_class(None, &[sb(7, Some(Complex)), a(3, Simple)]),
+            tc(None, &[sb(7, Some(Complex)), a(3, Simple)]),
             Some(Complex)
         );
         let note = classed(2, Kind::Question, None);
-        assert_eq!(task_class(Some(Simple), &[note]), Some(Simple));
+        assert_eq!(tc(Some(Simple), &[note]), Some(Simple));
+        // r3's finding 2: the sequence that set it is kept, and older notes change nothing.
+        assert_eq!(
+            task_class((None, None), &[a(3, Simple)]),
+            (Some(Simple), Some(3))
+        );
+        let up = (Some(Complex), Some(5));
+        assert_eq!(task_class(up, &[a(3, Simple)]), up, "an older assign again");
+        assert_eq!(task_class(up, &[a(5, Simple)]), up, "the same note again");
+        assert_eq!(
+            task_class(up, &[a(6, Simple)]),
+            (Some(Simple), Some(6)),
+            "a newer one"
+        );
+        assert_eq!(
+            task_class(up, &[sb(8, Some(Simple))]),
+            up,
+            "a lower sendback"
+        );
         assert_eq!(Simple.up(), Standard);
         assert_eq!(Standard.up(), Complex);
         assert_eq!(Complex.up(), Complex);
@@ -328,25 +344,21 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// The class of this seat's implementor task in another host's `HGL_TREES` record, the
-    /// newest if several; `None` when the hub has none or cannot be read.
-    async fn class_elsewhere(
-        &self,
-        seat: &hgl_ai_proto::Seat,
-        task: &TaskKey,
-    ) -> Option<TaskClass> {
+    /// The task's class in `HGL_TREES`: of its implementor trees on any host and seat (a task
+    /// moves with its seat, or to another seat), the one a note set last, by stream sequence.
+    /// `(None, None)` when the hub has none or cannot be read.
+    async fn class_elsewhere(&self, task: &TaskKey) -> Classed {
         let recs = match self.bus.trees().await {
             Ok(r) => r,
             Err(e) => {
                 tracing::warn!(%task, "reading HGL_TREES for the task's class: {e}");
-                return None;
+                return (None, None);
             }
         };
         recs.into_iter()
-            .filter(|r| &r.seat == seat && &r.task == task && !r.review && r.host != self.cfg.host)
-            .filter_map(|r| r.class.map(|c| (r.created_at, c)))
-            .max()
-            .map(|(_, c)| c)
+            .filter(|r| &r.task == task && !r.review && r.class.is_some())
+            .max_by_key(|r| (r.class_seq, r.created_at.clone()))
+            .map_or((None, None), |r| (r.class, r.class_seq))
     }
 
     pub(crate) async fn turn(self: Arc<Self>, job: Job) -> TurnOut {
@@ -378,7 +390,7 @@ impl<B: BusApi> Bridge<B> {
                     Err(e) => return Outcome::PrepFailed(e.to_string()),
                 };
                 match take_lock(&dir).await {
-                    Ok(l) => (dir, l, None, None),
+                    Ok(l) => (dir, l, None, (None, None)),
                     Err(o) => return o,
                 }
             }
@@ -414,9 +426,9 @@ impl<B: BusApi> Bridge<B> {
                         Err(e) => return Outcome::PrepFailed(e.to_string()),
                     }
                 }
-                // A tree made anew may continue a task begun on another host: its class
-                // is in that host's record (PROTO-21).
-                let mut inherited = None;
+                // A tree made anew may continue a task begun on another host or seat: its
+                // class is in that tree's record (PROTO-21).
+                let mut inherited = (None, None);
                 let file = match &job.create {
                     Some((seq, c)) => {
                         let trees = self.trees.clone();
@@ -425,13 +437,14 @@ impl<B: BusApi> Bridge<B> {
                             .await
                         {
                             Ok(Ok(created)) => {
+                                // Read before this tree's own record replaces the old one.
+                                if !created.reused && !*review && created.file.class.is_none() {
+                                    inherited = self.class_elsewhere(task).await;
+                                }
                                 if !created.reused
                                     && let Err(e) = self.bus.tree_put(&created.record).await
                                 {
                                     tracing::warn!(key = %created.record.key(), "registering: {e}");
-                                }
-                                if !created.reused && !*review && created.file.class.is_none() {
-                                    inherited = self.class_elsewhere(&name, task).await;
                                 }
                                 created.file
                             }
@@ -462,11 +475,31 @@ impl<B: BusApi> Bridge<B> {
         }
         // The task's class (docs/roles.md §3), recorded in its tree; an inbox turn has none.
         let mut file = file;
-        let class = file
-            .as_ref()
-            .and_then(|f| task_class(f.class.or(inherited), &job.notes));
-        // A class binding refused for quota sits out its cool-down (PROTO-21).
-        let usable = class.filter(|c| !seat.class_refused(*c, self.opts.failover_cooldown));
+        let (class, class_seq) = match file.as_ref() {
+            Some(f) if f.class.is_some() => task_class((f.class, f.class_seq), &job.notes),
+            Some(_) => task_class(inherited, &job.notes),
+            None => (None, None),
+        };
+        // A class binding refused for quota sits out its cool-down (PROTO-21), but a task
+        // moves to the seat's binding only when that keeps ROLE-11 for it; one it would
+        // not keep stays on its class binding, where a refusal holds that task alone.
+        let mut usable = class;
+        if let Some(c) = class
+            && job.binding_idx == 0
+            && seat.cfg.class.contains_key(&c)
+            && seat.class_refused(c, self.opts.failover_cooldown)
+        {
+            let why = match self.cfg.resolve(&seat.binding_at(0)) {
+                Ok(to) => self.role9_block(seat, &job.target, None, to.family).await,
+                Err(e) => Some(e),
+            };
+            match why {
+                None => usable = None,
+                Some(why) => {
+                    tracing::info!(seat = %name, target = %job.target, class = %c, "class binding kept: {why}")
+                }
+            }
+        }
         let (binding, by_class) = turn_binding(&seat.cfg, job.binding_idx, usable);
         let r = match self.cfg.resolve(&binding) {
             Ok(r) => r,
@@ -483,10 +516,11 @@ impl<B: BusApi> Bridge<B> {
             if author {
                 f.families.push(r.family);
             }
-            let reclassed = f.class != class;
+            let reclassed = (f.class, f.class_seq) != (class, class_seq);
             if reclassed {
-                tracing::info!(seat = %name, target = %job.target, from = ?f.class, to = ?class, "task class");
+                tracing::info!(seat = %name, target = %job.target, from = ?f.class, to = ?class, ?class_seq, "task class");
                 f.class = class;
+                f.class_seq = class_seq;
             }
             if author || reclassed {
                 match hgl_ai_tree::write_task(&dir, f) {

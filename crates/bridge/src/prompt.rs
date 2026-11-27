@@ -206,6 +206,7 @@ mod tests {
             seq: None,
             families: Vec::new(),
             class: None,
+            class_seq: None,
         }
     }
 

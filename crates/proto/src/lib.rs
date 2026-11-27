@@ -554,6 +554,9 @@ pub struct TreeRecord {
     /// The task's class, as its notes last set it (docs/roles.md §3).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<TaskClass>,
+    /// The stream sequence of the note that last set `class` (PROTO-21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_seq: Option<u64>,
 }
 
 impl TreeRecord {

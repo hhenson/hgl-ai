@@ -115,6 +115,10 @@ pub struct TaskFile {
     /// that carries a higher one (ROLE-15).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class: Option<hgl_ai_proto::TaskClass>,
+    /// The stream sequence of the note that last set `class`: a class note with a lower one
+    /// (an older note delivered again) changes nothing (PROTO-21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_seq: Option<u64>,
 }
 
 impl TaskFile {
@@ -416,6 +420,7 @@ impl Trees {
             seq: None,
             families: Vec::new(),
             class: None,
+            class_seq: None,
         })
     }
 
@@ -500,6 +505,7 @@ impl Trees {
             seq: None,
             families: Vec::new(),
             class: None,
+            class_seq: None,
         })
     }
 
@@ -672,6 +678,7 @@ impl Trees {
                         size_bytes: size,
                         families: Vec::new(),
                         class: None,
+                        class_seq: None,
                     },
                 };
                 out.push(LocalTree { dir, record, file });
@@ -694,6 +701,7 @@ impl Trees {
             size_bytes,
             families: f.families.clone(),
             class: f.class,
+            class_seq: f.class_seq,
         }
     }
 

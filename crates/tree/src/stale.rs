@@ -134,6 +134,7 @@ mod tests {
             size_bytes: 0,
             families: Vec::new(),
             class: None,
+            class_seq: None,
         }
     }
 
