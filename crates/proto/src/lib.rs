@@ -187,7 +187,7 @@ string_enum!(
     Runtime, "runtime", { Claude => "claude", Codex => "codex", Agy => "agy" });
 
 string_enum!(
-    /// Model vendor families (ROLE-9).
+    /// Model vendor families (ROLE-11).
     Family, "family", { Claude => "claude", Gpt => "gpt", Gemini => "gemini" });
 
 string_enum!(
@@ -398,7 +398,7 @@ pub struct TreeRecord {
     pub created_at: String,
     #[serde(default)]
     pub size_bytes: u64,
-    /// Model families whose turns ran in an implementor tree: the task's authors (ROLE-9).
+    /// Model families whose turns ran in an implementor tree: the task's authors (ROLE-11).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub families: Vec<Family>,
 }

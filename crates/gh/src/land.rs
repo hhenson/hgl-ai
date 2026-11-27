@@ -4,7 +4,7 @@
 //! under the lock: `landed.log` and `main` (docs/protocol.md §8), the `landed` notes (to the
 //! author's seat and to `all`; the bridges remove the task's worktrees on them), one GitHub
 //! comment for the note (PROTO-1). Then, without it, the wrapper's pins when the repository
-//! is one they follow (ROLE-10).
+//! is one they follow (ROLE-12).
 //!
 //! Each step is recorded on the hub as it is done ([`crate::progress`]): a retry that finds
 //! the pull request merged finishes the steps an earlier attempt left, rather than report
@@ -123,7 +123,7 @@ async fn wait_for_table(
 /// How often the shared table is read while it says not yet (it costs no GitHub call).
 const TABLE_POLL: Duration = Duration::from_secs(60);
 
-/// Wait while `HGL_STATE/hold` holds (ROLE-17), but not past `deadline`: `Some(value)`
+/// Wait while `HGL_STATE/hold` holds (ROLE-19), but not past `deadline`: `Some(value)`
 /// when the hold is still active at the deadline.
 async fn wait_for_hold(bus: &Bus, deadline: Instant) -> Result<Option<String>> {
     loop {

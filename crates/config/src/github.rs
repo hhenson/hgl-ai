@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 #[serde(deny_unknown_fields)]
 pub struct RepoGate {
     /// A merge needs a clean review receipt (docs/protocol.md PROTO-19) for the exact head,
-    /// from a model family other than the author's (docs/roles.md ROLE-9). Default `true`.
+    /// from a model family other than the author's (docs/roles.md ROLE-11). Default `true`.
     #[serde(default = "yes", skip_serializing_if = "is_yes")]
     pub review_receipt: bool,
     /// Path prefixes added to `github.global_paths` for this repository.

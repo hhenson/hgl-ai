@@ -441,7 +441,7 @@ fn a_stale_index_lock_does_not_stop_the_removal() {
     assert!(lock.exists());
 }
 
-/// Carbon's check 7b: the task moves to another seat of the same host (ROLE-13) while the
+/// Carbon's check 7b: the task moves to another seat of the same host (ROLE-15) while the
 /// first still has its branch checked out: the new seat's tree shares the branch.
 #[test]
 fn a_task_moved_to_another_seat_of_the_host_keeps_its_branch() {

@@ -136,7 +136,7 @@ pub struct Deps {
     pub disk: Arc<dyn DiskProbe>,
 }
 
-/// `assign` gate state (ROLE-16, ROLE-17).
+/// `assign` gate state (ROLE-18, ROLE-19).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Gate {
     Open,
@@ -1034,7 +1034,7 @@ impl<B: BusApi> Bridge<B> {
 
     /// Start the next turn from `pending`: the first group of notes sharing a target that
     /// is not busy. A note of a task whose tree a queued `assign` or `review` makes joins
-    /// that tree's turn. While the gate is closed (ROLE-16, ROLE-17) a note that would make
+    /// that tree's turn. While the gate is closed (ROLE-18, ROLE-19) a note that would make
     /// a new tree stays held in `pending`, kept alive, until it opens: an `assign` under
     /// `drain` or low disk, any new tree (a review, a moved task's tree) under low disk.
     /// Nothing starts during a quota hold.
@@ -1379,7 +1379,7 @@ impl<B: BusApi> Bridge<B> {
     }
 
     /// PROTO-17: move the seat to its next binding after a quota refusal on `used`, skipping
-    /// one whose family would break ROLE-9 for the refused turn's task. Whether it moved
+    /// one whose family would break ROLE-11 for the refused turn's task. Whether it moved
     /// (or another refusal moved it already).
     async fn failover(&self, seat: &Arc<SeatRt>, used: usize, msg: &str, target: &Target) -> bool {
         let cur = self
@@ -1428,7 +1428,7 @@ impl<B: BusApi> Bridge<B> {
                 let to = self.describe(&seat.binding_at(i));
                 tracing::warn!(seat = %seat.name(), %from, %to, "quota refusal; failing over");
                 let body = format!(
-                    "[bridge] Failover: seat {} on {} moved from {from} to {to} after a quota refusal ({msg}). Later turns use {to}, and the seat returns to its primary after {:?}; ROLE-9 applies to the new family.{skipped}",
+                    "[bridge] Failover: seat {} on {} moved from {from} to {to} after a quota refusal ({msg}). Later turns use {to}, and the seat returns to its primary after {:?}; ROLE-11 applies to the new family.{skipped}",
                     seat.name(),
                     self.cfg.host,
                     self.opts.failover_cooldown
@@ -1451,7 +1451,7 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// Why moving the turn of `target` from family `cur` to `to` would break ROLE-9, if it
+    /// Why moving the turn of `target` from family `cur` to `to` would break ROLE-11, if it
     /// would. A review keeps the family the controller gave it (it was chosen to differ from
     /// the author's). An implementor's task must leave a live reviewer family that is none of
     /// its authors'. Unknown (the hub unreadable, no reviewer live): allowed.
@@ -1490,7 +1490,7 @@ impl<B: BusApi> Bridge<B> {
                 .map(|s| s.family)
                 .collect(),
             Err(e) => {
-                tracing::warn!("reading the hosts for ROLE-9: {e}; not checked");
+                tracing::warn!("reading the hosts for ROLE-11: {e}; not checked");
                 return None;
             }
         };

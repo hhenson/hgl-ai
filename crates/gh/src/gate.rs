@@ -9,7 +9,7 @@
 //!   pull request does not touch and in none of the global paths, or (`--triaged`) reviewed
 //!   the head with findings the controller triaged;
 //! - (unless the repository turns it off) a clean review receipt (PROTO-19) for the head asked,
-//!   from a model family none of the task's authors used (ROLE-9), sent to the controller
+//!   from a model family none of the task's authors used (ROLE-11), sent to the controller
 //!   and read from the notes stream on the hub; the authors' families come from the
 //!   implementor trees the bridges registered (`HGL_TREES`);
 //! - where the repository names local build verdicts, each passed for this head on this
@@ -646,7 +646,7 @@ fn moved_in(mine: &FileList, theirs: &FileList, global_paths: &[String]) -> Opti
     (!w.is_empty()).then(|| w.trim_end().to_string())
 }
 
-/// ROLE-9 over what was read: a clean receipt for the head `asked`, sent by the reviewer it
+/// ROLE-11 over what was read: a clean receipt for the head `asked`, sent by the reviewer it
 /// names, from a family none of the authors used. Else why not, and whether waiting may
 /// bring one.
 fn receipt_check<'a>(
@@ -657,21 +657,21 @@ fn receipt_check<'a>(
     let authors = match authors {
         Ok(a) if a.is_empty() => {
             return Err((
-                "ROLE-9: no author family known (no implementor tree of the task records one); a receipt cannot be checked".into(),
+                "ROLE-11: no author family known (no implementor tree of the task records one); a receipt cannot be checked".into(),
                 false,
             ));
         }
         Ok(a) => a,
         Err(e) => {
             return Err((
-                format!("ROLE-9: the authors' families not read ({e})"),
+                format!("ROLE-11: the authors' families not read ({e})"),
                 false,
             ));
         }
     };
     let receipts = match receipts {
         Ok(r) => r,
-        Err(e) => return Err((format!("ROLE-9: receipts not read ({e})"), false)),
+        Err(e) => return Err((format!("ROLE-11: receipts not read ({e})"), false)),
     };
     let at_head: Vec<&SeenReceipt> = receipts
         .iter()
@@ -687,14 +687,14 @@ fn receipt_check<'a>(
     }
     let why = if at_head.iter().any(|r| r.receipt.verdict == Verdict::Clean) {
         format!(
-            "ROLE-9: the clean receipts at the head are from the authors' family ({}); another family must review",
+            "ROLE-11: the clean receipts at the head are from the authors' family ({}); another family must review",
             names(authors)
         )
     } else if !at_head.is_empty() {
-        "ROLE-9: the receipts at the head have findings".to_string()
+        "ROLE-11: the receipts at the head have findings".to_string()
     } else {
         format!(
-            "ROLE-9: no clean review receipt at the head from a family other than the authors' ({})",
+            "ROLE-11: no clean review receipt at the head from a family other than the authors' ({})",
             names(authors)
         )
     };
@@ -1276,7 +1276,7 @@ mod tests {
         );
     }
 
-    /// ROLE-9: a clean receipt for the head asked, from a family none of the authors used.
+    /// ROLE-11: a clean receipt for the head asked, from a family none of the authors used.
     #[test]
     fn a_merge_needs_a_clean_receipt_from_another_family() {
         let r = rules();

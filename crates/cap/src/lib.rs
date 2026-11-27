@@ -1,4 +1,4 @@
-//! Memory and time caps for a command tree (docs/design.md §1, docs/roles.md ROLE-15).
+//! Memory and time caps for a command tree (docs/design.md §1, docs/roles.md ROLE-17).
 //!
 //! Two methods, chosen by [`Method::detect`]:
 //!

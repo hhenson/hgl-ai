@@ -31,7 +31,7 @@ Roles and gates are in `docs/roles.md`; notes and worktrees in `docs/protocol.md
 3. Branch `codex/q<issue>-<short-name>` from `origin/main` (the bridge names it). No
    force-push and no rebase of a pushed branch: bring `main` in with `git merge`.
 4. Do what the issue lists and nothing else. A defect outside it goes in a new,
-   unlabelled issue (ROLE-11).
+   unlabelled issue (ROLE-13).
 5. Run every check `AGENTS.md` names, under `hgl-ai cap`. A change reaching the C++
    target also runs that target's checks, plain and sanitized (under
    `hgl-ai cap --no-address-limit`), against the pinned hgraph SDK. The list of
@@ -55,7 +55,7 @@ findings, and a `done` note.
   same functions of the parser, analyser or emitter. Unrelated tasks run in parallel,
   each with its own worktree, branch and pull request.
 - **WORK-6 — Landing order.** Ready pull requests land one at a time in Ready order,
-  each after its gates on the `main` it merges onto (ROLE-8); ones that merge cleanly
+  each after its gates on the `main` it merges onto (ROLE-10); ones that merge cleanly
   together may land as one batch. When `main` moves, merge it into each open branch it
   now conflicts with and rerun the checks; a pull request that conflicts is not Ready.
 - **WORK-7 — One conflict once.** Two tasks that turn out to touch the same code: finish

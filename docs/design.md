@@ -112,7 +112,7 @@ clone_url = "https://github.com/{owner}/{repo}.git"   # default
 controller = "claude"                  # default; the seat that gets the bridge's and coordinator's notes
 
 [github.gate.hgl-compiler]             # per repository; every key optional
-review_receipt = true                  # default: a clean receipt from another family (ROLE-9)
+review_receipt = true                  # default: a clean receipt from another family (ROLE-11)
 verdicts = ["linux", "mac", "windows"] # local build verdicts the merge needs
 
 [models.claude]

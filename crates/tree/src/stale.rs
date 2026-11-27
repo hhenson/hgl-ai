@@ -18,7 +18,7 @@ impl<F: Fn(&str, u64, bool) -> Option<bool>> IsClosed for F {
     }
 }
 
-/// Never asks; used while the GitHub allowance is on hold (ROLE-17).
+/// Never asks; used while the GitHub allowance is on hold (ROLE-19).
 pub struct Unknown;
 
 impl IsClosed for Unknown {
