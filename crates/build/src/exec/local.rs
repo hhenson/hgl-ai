@@ -39,6 +39,13 @@ impl Local {
 }
 
 impl HostOps for Local {
+    fn lock_clone(&self, clone: &str) -> Result<super::CloneGuard, HostError> {
+        // A file beside the clone: across processes (a builder and `build shell`).
+        let l = crate::lock::FileLock::lock(Path::new(&format!("{clone}.lock")))
+            .map_err(|e| HostError::Failed(format!("locking {clone}: {e}")))?;
+        Ok(Box::new(l))
+    }
+
     fn git(&self, cwd: &str, args: &[&str]) -> Result<Out, HostError> {
         let o = self
             .git

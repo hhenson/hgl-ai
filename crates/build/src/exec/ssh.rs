@@ -675,6 +675,30 @@ pub struct Ssh {
     orphans: Mutex<Vec<u32>>,
     /// Bytes of artifacts one step may bring back.
     artifact_limit: u64,
+    /// Clones on the remote in use by a checkout or removal of this proxy.
+    clones: Arc<(
+        Mutex<std::collections::BTreeSet<String>>,
+        std::sync::Condvar,
+    )>,
+}
+
+/// Holds a remote clone for this proxy; frees it when dropped.
+struct RemoteClone {
+    clones: Arc<(
+        Mutex<std::collections::BTreeSet<String>>,
+        std::sync::Condvar,
+    )>,
+    clone: String,
+}
+
+impl Drop for RemoteClone {
+    fn drop(&mut self) {
+        let (set, cv) = &*self.clones;
+        set.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.clone);
+        cv.notify_all();
+    }
 }
 
 impl Ssh {
@@ -694,6 +718,7 @@ impl Ssh {
             kick: Arc::new(tokio::sync::Notify::new()),
             orphans: Mutex::new(Vec::new()),
             artifact_limit: ARTIFACT_LIMIT,
+            clones: Arc::default(),
         }
     }
 
@@ -858,6 +883,20 @@ impl Ssh {
 }
 
 impl HostOps for Ssh {
+    /// In this proxy's process: it alone builds in the remote's work directory.
+    fn lock_clone(&self, clone: &str) -> Result<super::CloneGuard, HostError> {
+        let (set, cv) = &*self.clones;
+        let mut held = set.lock().unwrap_or_else(|e| e.into_inner());
+        while held.contains(clone) {
+            held = cv.wait(held).unwrap_or_else(|e| e.into_inner());
+        }
+        held.insert(clone.to_string());
+        Ok(Box::new(RemoteClone {
+            clones: self.clones.clone(),
+            clone: clone.to_string(),
+        }))
+    }
+
     fn git(&self, cwd: &str, args: &[&str]) -> Result<Out, HostError> {
         self.exec(&self.dialect.git(cwd, args), GIT_TIMEOUT)
     }

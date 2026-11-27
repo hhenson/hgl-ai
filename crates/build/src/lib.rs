@@ -4,6 +4,7 @@
 
 pub mod driver;
 pub mod exec;
+pub mod lock;
 pub mod parse;
 pub mod recipe;
 pub mod service;

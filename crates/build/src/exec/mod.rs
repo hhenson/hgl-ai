@@ -203,8 +203,14 @@ pub struct Out {
     pub stderr: String,
 }
 
+/// Held while git works on a shared clone; released when dropped.
+pub(crate) type CloneGuard = Box<dyn std::any::Any + Send>;
+
 /// File and git operations on an executor's host, for [`checkout`] and [`remove_job`].
 pub(crate) trait HostOps {
+    /// Exclusive use of the shared clone `clone` (its config, refs and worktrees) for a
+    /// checkout or a removal.
+    fn lock_clone(&self, clone: &str) -> Result<CloneGuard, HostError>;
     fn git(&self, cwd: &str, args: &[&str]) -> Result<Out, HostError>;
     fn exists(&self, path: &str) -> Result<bool, HostError>;
     fn mkdirs(&self, path: &str) -> Result<(), HostError>;
@@ -238,6 +244,9 @@ pub(crate) fn checkout(h: &dyn HostOps, root: &str, c: &Checkout) -> Result<Work
     let clone = format!("{root}/clones/{}", c.repo);
     let job = job_dir(root, &c.id);
     let src = format!("{job}/src");
+    // One checkout or removal at a time on the shared clone: git locks its config and
+    // refs and fails a second writer at once.
+    let _guard = h.lock_clone(&clone)?;
     if !h.exists(&format!("{clone}/HEAD"))? {
         h.mkdirs(&clone)?;
         let o = h.git(&clone, &["init", "--quiet", "--bare"])?;
@@ -245,8 +254,13 @@ pub(crate) fn checkout(h: &dyn HostOps, root: &str, c: &Checkout) -> Result<Work
             return Err(Prep::NotRun(format!("git init: {}", first_line(&o.stderr))));
         }
     }
-    let has_origin = h.git(&clone, &["remote", "get-url", "origin"])?.ok;
-    let set = if has_origin {
+    let origin = h.git(&clone, &["remote", "get-url", "origin"])?;
+    let set = if origin.ok && origin.stdout.trim() == c.url {
+        Out {
+            ok: true,
+            ..Out::default()
+        }
+    } else if origin.ok {
         h.git(&clone, &["remote", "set-url", "origin", &c.url])?
     } else {
         h.git(&clone, &["remote", "add", "origin", &c.url])?
@@ -324,7 +338,7 @@ pub(crate) fn checkout(h: &dyn HostOps, root: &str, c: &Checkout) -> Result<Work
         &["worktree", "add", "--quiet", "--detach", &src, &start],
     )?;
     if !add.ok {
-        let _ = remove_job(h, &ws);
+        let _ = remove_job_locked(h, &ws);
         return Err(Prep::NotRun(format!(
             "git worktree add: {}",
             first_line(&add.stderr)
@@ -341,7 +355,7 @@ pub(crate) fn checkout(h: &dyn HostOps, root: &str, c: &Checkout) -> Result<Work
         let m = h.git(&src, &args)?;
         if !m.ok {
             let _ = h.git(&src, &["merge", "--abort"]);
-            let _ = remove_job(h, &ws);
+            let _ = remove_job_locked(h, &ws);
             return Err(Prep::NotRun(format!(
                 "head {} does not merge onto {}",
                 &c.head[..12],
@@ -355,7 +369,7 @@ pub(crate) fn checkout(h: &dyn HostOps, root: &str, c: &Checkout) -> Result<Work
             &["submodule", "update", "--init", "--recursive", "--quiet"],
         )?;
         if !s.ok {
-            let _ = remove_job(h, &ws);
+            let _ = remove_job_locked(h, &ws);
             return Err(Prep::NotRun(format!(
                 "submodules: {}",
                 first_line(&s.stderr)
@@ -367,6 +381,15 @@ pub(crate) fn checkout(h: &dyn HostOps, root: &str, c: &Checkout) -> Result<Work
 
 /// Remove a job's worktree and directory.
 pub(crate) fn remove_job(h: &dyn HostOps, ws: &Workspace) -> Result<(), HostError> {
+    let _guard = match &ws.clone {
+        Some(c) => Some(h.lock_clone(c)?),
+        None => None,
+    };
+    remove_job_locked(h, ws)
+}
+
+/// [`remove_job`] with the clone already locked (inside [`checkout`]).
+fn remove_job_locked(h: &dyn HostOps, ws: &Workspace) -> Result<(), HostError> {
     let Some(job) = &ws.job else { return Ok(()) };
     if let Some(clone) = &ws.clone
         && h.exists(&format!("{clone}/HEAD"))?
