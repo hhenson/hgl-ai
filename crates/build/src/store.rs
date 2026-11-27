@@ -6,6 +6,7 @@ use std::path::Path;
 use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_proto::build::{
     BuildJob, Summary, VerdictValue, VerdictWord, recipe_key, run_key, verdict_key,
+    verdict_replaces,
 };
 use hgl_ai_proto::{Kind, Note, Seat};
 
@@ -103,35 +104,70 @@ pub async fn run_put(bus: &Bus, s: &Summary) -> Result<(), StoreError> {
 }
 
 /// Write a gate build's verdict (BUILD-15): `HGL_STATE/verdict.<repo>.<pr>.<name>` from
-/// its summary, or `running` while it builds. Nothing for a job that is no gate build, or
-/// a summary that has no value (a judged build that does not know its main).
+/// its summary, or `running` (bounded by `until`) while it builds. Compare-and-set: a value
+/// from a build asked later is never replaced ([`verdict_replaces`]); `Ok(false)` then.
+/// Nothing for a job that is no gate build, or a summary that has no value (a judged
+/// build that does not know its main).
 pub async fn verdict_put(
     bus: &Bus,
     job: &BuildJob,
     s: &Summary,
-    running: bool,
-) -> Result<(), StoreError> {
+    running_until: Option<String>,
+) -> Result<bool, StoreError> {
     let Some(name) = &job.verdict else {
-        return Ok(());
+        return Ok(true);
     };
-    let value = if running {
-        s.base_sha.as_ref().map(|m| VerdictValue {
+    let value = match running_until {
+        Some(until) => s.base_sha.as_ref().map(|m| VerdictValue {
             head: job.head.clone(),
             main: m.clone(),
             word: VerdictWord::Running,
             id: Some(s.id.clone()),
             builder: Some(s.host.clone()),
+            recipe: s.recipe_rev,
+            until: Some(until),
             reason: None,
-        })
-    } else {
-        VerdictValue::of(s)
+        }),
+        None => VerdictValue::of(s),
     };
     let Some(v) = value else {
-        return Ok(());
+        return Ok(true);
     };
-    bus.state_put(&verdict_key(&job.repo, job.issue, name), &v.render())
-        .await?;
-    Ok(())
+    let key = verdict_key(&job.repo, job.issue, name);
+    let text = v.render();
+    for _ in 0..16 {
+        let cur = bus.state_get(&key).await?;
+        let old = cur.as_ref().and_then(|e| VerdictValue::parse(&e.value));
+        if !verdict_replaces(&s.id, old.as_ref()) {
+            return Ok(false);
+        }
+        match bus
+            .state_update(&key, &text, cur.map(|e| e.revision).unwrap_or(0))
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(BusError::Conflict { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(StoreError::Other(format!(
+        "{key} kept changing; not written"
+    )))
+}
+
+/// Whether this connection's hub user may write the local build verdicts (BUILD-15), as
+/// the hub's permissions say, not a credential file (a bare NKey seed names no role): a
+/// probe key `verdict._probe.0.<host>`, no repository's, written and deleted.
+pub async fn may_write_verdicts(bus: &Bus, host: &str) -> Result<bool, StoreError> {
+    let key = format!("verdict._probe.0.{host}");
+    match bus.state_put(&key, "probe").await {
+        Ok(_) => {
+            bus.state_del(&key).await?;
+            Ok(true)
+        }
+        Err(BusError::Denied { .. }) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Delete the oldest runs beyond `keep`. Returns how many went.

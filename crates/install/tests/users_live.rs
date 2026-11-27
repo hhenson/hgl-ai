@@ -499,13 +499,20 @@ async fn only_builders_write_verdicts() {
         .state_put(key, &format!("{h} {h} pass 20261127-120000-aaaaaa lab1"))
         .await
         .unwrap();
-    for who in ["build-1", "hub-coord"] {
+    for who in ["build-1", "hub-coord", "console"] {
         let b = hub.bus(who).await;
         denied(b.state_put(key, &format!("{h} {h} pass forged")).await);
+        denied(
+            b.state_update(key, &format!("{h} {h} pass forged"), 1)
+                .await,
+        );
+        denied(b.state_create("verdict.hgl-compiler.9.linux", "x").await);
         denied(b.state_del(key).await);
         denied(b.state_put("verdict.hgl-compiler.8.mac", "x").await);
-        // The rest of `HGL_STATE` stays a seat's.
-        b.state_put("mode", "normal").await.unwrap();
+        // The rest of `HGL_STATE` stays a seat's (the console writes only its log).
+        if who != "console" {
+            b.state_put("mode", "normal").await.unwrap();
+        }
         assert!(
             b.state_get(key).await.unwrap().is_some(),
             "{who} reads verdicts"
@@ -519,6 +526,34 @@ async fn only_builders_write_verdicts() {
             .unwrap()
             .value
             .ends_with("lab1")
+    );
+    // `builder run` asks the hub, not the file: a bare NKey seed of a builder user may
+    // write verdicts; a seat's or the coordinator's may not (r3 on #56, finding 4).
+    use hgl_ai_build::store::may_write_verdicts;
+    assert!(may_write_verdicts(&builder, "lab1").await.unwrap());
+    let Credential::Nkey { seed, .. } = hub.creds["lab1-builder"].clone() else {
+        unreachable!()
+    };
+    let bare = Credential::Nkey {
+        seed,
+        user: None,
+        role: None,
+    };
+    let bare = Bus::connect_with(&hub.url, Some(bare)).await.unwrap();
+    assert!(may_write_verdicts(&bare, "lab1").await.unwrap());
+    for who in ["build-1", "hub-coord"] {
+        assert!(
+            !may_write_verdicts(&hub.bus(who).await, "lab1")
+                .await
+                .unwrap()
+        );
+    }
+    assert!(
+        admin
+            .state_get("verdict._probe.0.lab1")
+            .await
+            .unwrap()
+            .is_none()
     );
     // A builder sends notes (its receipts) but writes no recipe.
     let n = Note::new(seat("builder-lab1"), seat("controller"), Kind::Note, "x");

@@ -1094,7 +1094,7 @@ async fn gate_builds_write_verdicts_and_a_moved_main_is_built_again() {
         panic!("{first:?}")
     };
     assert!(v.starts_with(&format!("{head} {m1} pass ")), "{v}");
-    assert!(v.ends_with(" lab1"), "{v}");
+    assert!(v.contains(" lab1 r"), "{v}");
     let value = b.state_get(&key).await.unwrap().unwrap().value;
     let id = hgl_ai_proto::build::VerdictValue::parse(&value)
         .unwrap()
@@ -1136,6 +1136,55 @@ async fn gate_builds_write_verdicts_and_a_moved_main_is_built_again() {
             .unwrap(),
         first
     );
+    // r3 on #56, finding 2b: a `running` value whose builder is gone, or that ran past its
+    // bound, never holds the gate: it is asked again of a live builder.
+    for (label, until, why) in [
+        (
+            "ghost",
+            "29991231T000000Z",
+            "builder ghost of 20261127-120000-eeeeee is gone",
+        ),
+        (
+            "lab1",
+            "20000101T000000Z",
+            "20261127-120000-eeeeee on lab1 ran past its bound",
+        ),
+    ] {
+        b.state_put(
+            &key,
+            &format!("{head} {m1} running 20261127-120000-eeeeee {label} r- until={until}"),
+        )
+        .await
+        .unwrap();
+        let again = GateBuilds::new(Seat::new("controller").unwrap(), "controller");
+        match verdict_state(Some(&b), Some(&again), "demo", 7, name, &head, &m1)
+            .await
+            .unwrap()
+        {
+            VerdictState::Building(w) => {
+                assert!(w.starts_with(why) && w.contains("; asked "), "{w}")
+            }
+            other => panic!("a lost build held the gate: {other:?}"),
+        }
+        assert!(matches!(
+            judged(&b, &again, name, &head, &m1).await,
+            VerdictState::Pass(_)
+        ));
+    }
+    // A live one's is waited for.
+    b.state_put(
+        &key,
+        &format!("{head} {m1} running 20261127-120000-ffffff lab1 r- until=29991231T000000Z"),
+    )
+    .await
+    .unwrap();
+    let wait = GateBuilds::new(Seat::new("controller").unwrap(), "controller");
+    assert!(matches!(
+        verdict_state(Some(&b), Some(&wait), "demo", 7, name, &head, &m1)
+            .await
+            .unwrap(),
+        VerdictState::Building(w) if w == "building 20261127-120000-ffffff on lab1"
+    ));
     // `main` moves: the verdict for m1 no longer passes, and is asked again for m2.
     git(&seed, &["checkout", "--quiet", "main"]);
     std::fs::write(seed.join("h.txt"), "h\n").unwrap();
@@ -1169,6 +1218,27 @@ async fn gate_builds_write_verdicts_and_a_moved_main_is_built_again() {
         state::verdict_for(Some(&now), &head, &m2).map(|v| v.0),
         Some(true)
     );
+    // r3 on #56, finding 2a: the key holds a later build's value for another pair (a main
+    // this gate has not seen yet). The build this gate asked ended pass without its verdict
+    // standing: that is no "wrote no verdict" block; it is asked again.
+    let newer = hgl_ai_proto::build::new_build_id();
+    b.state_put(
+        &key,
+        &format!("{head} {} pass {newer} lab1 r1", "c".repeat(40)),
+    )
+    .await
+    .unwrap();
+    match verdict_state(Some(&b), Some(&builds), "demo", 7, name, &head, &m2)
+        .await
+        .unwrap()
+    {
+        VerdictState::Building(w) => assert!(w.contains("without its verdict; asked "), "{w}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        judged(&b, &builds, name, &head, &m2).await,
+        VerdictState::Pass(_)
+    ));
     // A head whose build fails: fail, naming the step.
     let bad = commit_on(&seed, "feature", &m1, "bad.txt", "x\n");
     match judged(&b, &builds, name, &bad, &m2).await {

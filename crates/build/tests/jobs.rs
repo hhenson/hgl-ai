@@ -389,7 +389,13 @@ async fn a_gate_build_writes_its_own_platforms_verdict() {
         .value;
     assert_eq!(
         v,
-        format!("{} {} pass {} lab1", r.heads[1], r.heads[0], ok.id)
+        format!(
+            "{} {} pass {} lab1 r{}",
+            r.heads[1],
+            r.heads[0],
+            ok.id,
+            s.recipe_rev.unwrap()
+        )
     );
     assert!(
         r.bus
@@ -400,6 +406,80 @@ async fn a_gate_build_writes_its_own_platforms_verdict() {
         "no verdict for another platform"
     );
     assert!(store::run_get(&r.bus, &foreign.id).await.unwrap().is_none());
+    r.stop().await;
+}
+
+/// hgl-ai#6 (r3 on #56, finding 2): a gate build asked earlier never replaces the verdict
+/// of one asked later, whichever ends last; `running` is bounded; an id stamped in the
+/// future is refused.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_earlier_gate_build_never_replaces_a_later_ones_verdict() {
+    let Some(r) = Rig::start().await else { return };
+    let mine = hgl_ai_proto::build::Platform::current().unwrap().as_str();
+    let key = format!("verdict.demo.7.{mine}");
+    // The later request (a newer main) runs first.
+    let mut later = gate_job(&r, "20261127-130000-bbbbbb", &r.heads[1], mine);
+    later.base = Some(r.heads[1].clone());
+    send_pr(&r, &later).await;
+    assert_eq!(r.receipt(&later.id).await.status, BuildStatus::Pass);
+    let held = r.bus.state_get(&key).await.unwrap().unwrap().value;
+    assert!(held.contains(&later.id), "{held}");
+    // The earlier request (main before it moved) ends after it: refused.
+    let earlier = gate_job(&r, "20261127-120000-aaaaaa", &r.heads[1], mine);
+    send_pr(&r, &earlier).await;
+    assert_eq!(r.receipt(&earlier.id).await.status, BuildStatus::Pass);
+    assert_eq!(
+        r.bus.state_get(&key).await.unwrap().unwrap().value,
+        held,
+        "the later build's verdict stays"
+    );
+    // A slow gate build shows `running`, bounded by its steps' limits and a margin.
+    let slow = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"sleep 3 && test -f f.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
+    store::recipe_put(&r.bus, slow, None).await.unwrap();
+    let now = gate_job(&r, &hgl_ai_proto::build::new_build_id(), &r.heads[1], mine);
+    send_pr(&r, &now).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let running = loop {
+        let v = r.bus.state_get(&key).await.unwrap().unwrap().value;
+        let p = hgl_ai_proto::build::VerdictValue::parse(&v).unwrap();
+        if p.word == hgl_ai_proto::build::VerdictWord::Running {
+            break p;
+        }
+        assert!(Instant::now() < deadline, "no running verdict: {v}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+    assert_eq!(running.id.as_deref(), Some(now.id.as_str()));
+    let rev = store::recipe_get(&r.bus, "demo", None)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    assert_eq!(running.recipe, Some(rev), "it records the recipe it runs");
+    let until = running.until.clone().unwrap();
+    let in_16m = hgl_ai_proto::utc_stamp(chrono::Utc::now() + chrono::Duration::minutes(16));
+    let in_18m = hgl_ai_proto::utc_stamp(chrono::Utc::now() + chrono::Duration::minutes(18));
+    assert!(
+        until.as_str() > in_16m.as_str() && until.as_str() <= in_18m.as_str(),
+        "{until}"
+    );
+    assert_eq!(r.receipt(&now.id).await.status, BuildStatus::Pass);
+    // An id stamped an hour ahead would hold the key against every real build.
+    let ahead = (chrono::Utc::now() + chrono::Duration::hours(1)).format("%Y%m%d-%H%M%S-cccccc");
+    let future = gate_job(&r, &ahead.to_string(), &r.heads[1], mine);
+    send_pr(&r, &future).await;
+    let ok = r.job("20261127-140000-dddddd", &r.heads[0]);
+    r.send(&ok).await;
+    assert_eq!(r.receipt(&ok.id).await.status, BuildStatus::Pass);
+    assert!(store::run_get(&r.bus, &future.id).await.unwrap().is_none());
+    assert!(
+        !r.bus
+            .state_get(&key)
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .contains("cccccc")
+    );
     r.stop().await;
 }
 
@@ -422,17 +502,13 @@ async fn a_builder_without_a_builder_user_runs_no_gate_build() {
     assert_eq!(s.status, BuildStatus::NotRun);
     assert!(s.reason.unwrap().contains("builder hub user"));
     assert!(s.steps.is_empty(), "nothing built");
-    // This hub (one token) takes the not-run value; it never passes.
-    let v = r
-        .bus
-        .state_get(&format!("verdict.demo.7.{mine}"))
-        .await
-        .unwrap()
-        .unwrap()
-        .value;
+    // It does not try to write a verdict its hub user may not write.
     assert!(
-        v.starts_with(&format!("{} - not-run {}", r.heads[1], j.id)),
-        "{v}"
+        r.bus
+            .state_get(&format!("verdict.demo.7.{mine}"))
+            .await
+            .unwrap()
+            .is_none()
     );
     r.stop().await;
 }

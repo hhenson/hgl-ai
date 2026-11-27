@@ -430,6 +430,12 @@ impl BuildJob {
                     "verdict {v}: a gate build needs a pull request and a base"
                 ));
             }
+            if self.recipe_rev.is_some() {
+                return Err(format!(
+                    "verdict {v}: a gate build runs the current recipe, not revision {}",
+                    self.recipe_rev.unwrap_or_default()
+                ));
+            }
             if self.steps.is_some() || self.keep_going {
                 return Err(format!(
                     "verdict {v}: a gate build runs every step, stopping at the first failure"
@@ -516,9 +522,11 @@ impl VerdictWord {
     }
 }
 
-/// A verdict value: `<head> <main> <word> [<build id> <builder> [<reason>]]`. `main` is the
-/// commit the head was merged onto, `-` where the build stopped before it knew one. Only
-/// `pass` and `fail` for this head on this `main` decide the gate.
+/// A verdict value: `<head> <main> <word> [<build id> <builder> r<recipe>|r- [until=<UTC>]
+/// [<reason>]]`. `main` is the commit the head was merged onto, `-` where the build stopped
+/// before it knew one; `r<recipe>` the recipe revision it ran; `until` (on `running` only)
+/// when a builder that has not finished by then is presumed gone. Only `pass` and `fail` for
+/// this head on this `main` decide the gate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VerdictValue {
     pub head: String,
@@ -526,6 +534,9 @@ pub struct VerdictValue {
     pub word: VerdictWord,
     pub id: Option<String>,
     pub builder: Option<String>,
+    pub recipe: Option<u64>,
+    /// `YYYYMMDDTHHMMSSZ`: the bound of a `running` value.
+    pub until: Option<String>,
     pub reason: Option<String>,
 }
 
@@ -555,6 +566,8 @@ impl VerdictValue {
             word,
             id: Some(s.id.clone()),
             builder: Some(s.host.clone()),
+            recipe: s.recipe_rev,
+            until: None,
             reason,
         })
     }
@@ -563,6 +576,13 @@ impl VerdictValue {
         let mut v = format!("{} {} {}", self.head, self.main, self.word.as_str());
         if let Some(id) = &self.id {
             v.push_str(&format!(" {id} {}", self.builder.as_deref().unwrap_or("-")));
+            match self.recipe {
+                Some(r) => v.push_str(&format!(" r{r}")),
+                None => v.push_str(" r-"),
+            }
+            if let Some(u) = &self.until {
+                v.push_str(&format!(" until={u}"));
+            }
             if let Some(r) = &self.reason {
                 // One line, bounded: the value is a state key's.
                 let r: String = r.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -582,16 +602,31 @@ impl VerdictValue {
         let word = VerdictWord::parse(w.next()?)?;
         let id = w.next().map(String::from);
         let builder = w.next().map(String::from);
-        let reason = w
-            .next()
-            .map(|r| r.trim().to_string())
-            .filter(|r| !r.is_empty());
+        let mut rest = w.next().unwrap_or_default().trim();
+        let mut recipe = None;
+        if let Some((tok, more)) = split_word(rest)
+            && let Some(r) = tok.strip_prefix('r')
+            && (r == "-" || r.parse::<u64>().is_ok())
+        {
+            recipe = r.parse().ok();
+            rest = more;
+        }
+        let mut until = None;
+        if let Some((tok, more)) = split_word(rest)
+            && let Some(u) = tok.strip_prefix("until=")
+        {
+            until = Some(u.to_string());
+            rest = more;
+        }
+        let reason = Some(rest.trim().to_string()).filter(|r| !r.is_empty());
         Some(VerdictValue {
             head,
             main,
             word,
             id,
             builder,
+            recipe,
+            until,
             reason,
         })
     }
@@ -600,6 +635,40 @@ impl VerdictValue {
     pub fn is_for(&self, head: &str, main: &str) -> bool {
         self.head == head && self.main == main
     }
+
+    /// A `running` value past its bound at `now` (`YYYYMMDDTHHMMSSZ`): its builder is
+    /// presumed gone.
+    pub fn expired(&self, now: &str) -> bool {
+        self.word == VerdictWord::Running && self.until.as_deref().is_some_and(|u| u < now)
+    }
+}
+
+/// The first word of `s` and the rest.
+fn split_word(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    if s.is_empty() {
+        return None;
+    }
+    Some(match s.find(char::is_whitespace) {
+        Some(i) => (&s[..i], &s[i..]),
+        None => (s, ""),
+    })
+}
+
+/// Whether a value from build `mine` may replace `old` (BUILD-15): builds are ordered by
+/// their ids, which the requester stamps when it asks, so a build asked later (for a newer
+/// `main` or head) is never overwritten by one asked earlier that ends after it.
+pub fn verdict_replaces(mine: &str, old: Option<&VerdictValue>) -> bool {
+    match old.and_then(|o| o.id.as_deref()) {
+        Some(theirs) => mine >= theirs,
+        None => true,
+    }
+}
+
+/// The UTC time a build id was stamped, as `YYYYMMDDTHHMMSSZ`.
+pub fn build_id_stamp(id: &str) -> Option<String> {
+    check_build_id(id).ok()?;
+    Some(format!("{}T{}Z", &id[..8], &id[9..15]))
 }
 
 /// The inbox of the builder `label`: `builder-<label>`.
@@ -724,6 +793,7 @@ mod tests {
         assert!(bad_gate(&|j| j.verdict = Some("freebsd".into())).contains("platform"));
         assert!(bad_gate(&|j| j.steps = Some(vec!["test".into()])).contains("every step"));
         assert!(bad_gate(&|j| j.keep_going = true).contains("every step"));
+        assert!(bad_gate(&|j| j.recipe_rev = Some(3)).contains("current recipe"));
         let mut no_pr = gate.clone();
         no_pr.issue = 0;
         n.issue = 0;
@@ -754,12 +824,41 @@ mod tests {
             word: VerdictWord::NotRun,
             id: Some("20261127-083000-3fa9c1".into()),
             builder: Some("lab1".into()),
+            recipe: Some(4),
+            until: None,
             reason: Some("head does not\nmerge onto main".into()),
         };
         let text = v.render();
         assert_eq!(
             text,
-            format!("{h} - not-run 20261127-083000-3fa9c1 lab1 head does not merge onto main")
+            format!("{h} - not-run 20261127-083000-3fa9c1 lab1 r4 head does not merge onto main")
+        );
+        assert_eq!(VerdictValue::parse(&text).unwrap().recipe, Some(4));
+        // A running value is bounded.
+        let run = VerdictValue {
+            word: VerdictWord::Running,
+            main: m.clone(),
+            recipe: None,
+            until: Some("20261127T090000Z".into()),
+            reason: None,
+            ..v.clone()
+        };
+        let t = run.render();
+        assert_eq!(
+            t,
+            format!("{h} {m} running 20261127-083000-3fa9c1 lab1 r- until=20261127T090000Z")
+        );
+        let back = VerdictValue::parse(&t).unwrap();
+        assert_eq!(back, run);
+        assert!(back.expired("20261127T090001Z") && !back.expired("20261127T085959Z"));
+        // An earlier build never replaces a later one's value.
+        assert!(verdict_replaces("20261127-083000-3fa9c1", Some(&back)));
+        assert!(verdict_replaces("20261127-090000-000000", Some(&back)));
+        assert!(!verdict_replaces("20261127-082959-ffffff", Some(&back)));
+        assert!(verdict_replaces("20261127-082959-ffffff", None));
+        assert_eq!(
+            build_id_stamp("20261127-083000-3fa9c1").as_deref(),
+            Some("20261127T083000Z")
         );
         let back = VerdictValue::parse(&text).unwrap();
         assert_eq!(

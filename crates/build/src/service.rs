@@ -21,6 +21,11 @@ use crate::driver::{self, Meta, Options};
 use crate::exec::{Cancel, Checkout, Executor, Prep, Probe, Workspace, ssh};
 use crate::store;
 
+/// Added to a gate build's step time limits to bound its `running` verdict.
+const RUNNING_MARGIN: Duration = Duration::from_secs(15 * 60);
+/// How far in the future a gate build's id (its request time) may be: an id orders
+/// verdicts, so one stamped later than now would hold the key against every real build.
+const ID_SKEW: chrono::Duration = chrono::Duration::minutes(5);
 /// How often a lane writes its record and checks its gate.
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(60);
@@ -521,7 +526,7 @@ async fn lane_loop(
                 // Acknowledged only once the result is published; until then the job
                 // stays ours (kept alive), and a crash redelivers it.
                 let published = match &out {
-                    Some(s) => finish(&bus, &lane, &job, s, &cancel).await,
+                    Some(s) => finish(&bus, &lane, &job, s, &cancel, settings.verdicts).await,
                     None => false,
                 };
                 keep.abort();
@@ -751,8 +756,25 @@ async fn run_job(
         if job.verdict.is_some() {
             let mut s = s0.clone();
             s.base_sha = ws.base_sha.clone();
-            if let Err(e) = store::verdict_put(bus, job, &s, true).await {
-                tracing::warn!(builder = %lane.label, "writing the verdict of {}: {e}", job.id);
+            // Bounded: every step's time limit and a margin. A builder not done by then
+            // is presumed gone, and the gate asks another (BUILD-15).
+            let budget: Duration = stored
+                .recipe
+                .plan(lane.exec.platform(), None)
+                .map(|p| p.iter().map(|st| st.time_limit()).sum::<Duration>())
+                .unwrap_or_default()
+                + RUNNING_MARGIN;
+            let until = hgl_ai_proto::utc_stamp(
+                chrono::Utc::now() + chrono::Duration::from_std(budget).unwrap_or_default(),
+            );
+            match store::verdict_put(bus, job, &s, Some(until)).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(builder = %lane.label, "{}: a later gate build holds the verdict", job.id)
+                }
+                Err(e) => {
+                    tracing::warn!(builder = %lane.label, "writing the verdict of {}: {e}", job.id)
+                }
             }
         }
         let opts = Options {
@@ -831,10 +853,16 @@ fn check_verdict(lane: &Lane, job: &BuildJob) -> Result<(), String> {
         return Ok(());
     };
     let p = lane.exec.platform();
-    if verdict_platform(v) == Some(p) {
-        Ok(())
-    } else {
-        Err(format!("verdict {v} is not this builder's platform ({p})"))
+    if verdict_platform(v) != Some(p) {
+        return Err(format!("verdict {v} is not this builder's platform ({p})"));
+    }
+    let latest = hgl_ai_proto::utc_stamp(chrono::Utc::now() + ID_SKEW);
+    match hgl_ai_proto::build::build_id_stamp(&job.id) {
+        Some(t) if t <= latest => Ok(()),
+        _ => Err(format!(
+            "build id {} is stamped in the future; a gate build's id is its request time",
+            job.id
+        )),
     }
 }
 
@@ -903,13 +931,21 @@ fn saved_result(lane: &Lane, id: &str) -> Option<Summary> {
 /// Keep the summary (log directory first, then a gate build's verdict, then the hub) and
 /// send the receipts, retrying what fails until it is all published (`true`) or `cancel`
 /// (`false`: the job is redelivered and its saved result published then).
-async fn finish(bus: &Bus, lane: &Lane, job: &BuildJob, s: &Summary, cancel: &Cancel) -> bool {
+async fn finish(
+    bus: &Bus,
+    lane: &Lane,
+    job: &BuildJob,
+    s: &Summary,
+    cancel: &Cancel,
+    verdicts: bool,
+) -> bool {
     let dir = lane.logs.join(&job.id);
     if let Err(e) = store::write_final(&dir, s) {
         tracing::warn!("writing {}: {e}", dir.display());
     }
     let mut run_kept = false;
-    let mut verdict_kept = job.verdict.is_none();
+    // A hub user that may not write verdicts does not try (the run says why).
+    let mut verdict_kept = job.verdict.is_none() || !verdicts;
     let mut to = vec![job.reply_to.clone()];
     to.extend(job.notify.clone());
     let mut pause = Duration::from_secs(1);
@@ -917,8 +953,12 @@ async fn finish(bus: &Bus, lane: &Lane, job: &BuildJob, s: &Summary, cancel: &Ca
         // The verdict before the final run: a requester that sees the run ended finds its
         // verdict written (or refused).
         if !verdict_kept {
-            match store::verdict_put(bus, job, s, false).await {
-                Ok(()) => verdict_kept = true,
+            match store::verdict_put(bus, job, s, None).await {
+                Ok(true) => verdict_kept = true,
+                Ok(false) => {
+                    tracing::info!("{}: a later gate build holds the verdict", s.id);
+                    verdict_kept = true;
+                }
                 Err(e) if transient(&e) => {
                     tracing::warn!("writing the verdict of {}: {e}; retrying", s.id)
                 }

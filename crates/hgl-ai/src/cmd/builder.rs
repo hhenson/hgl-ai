@@ -49,12 +49,16 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     match args.cmd {
         Cmd::Run => {
             // A `builder` hub user writes verdicts; so does any client of a hub with one
-            // shared token. A seat's user does not (docs/build.md BUILD-15).
-            let may = |c: &hgl_ai_bus::Credential| c.is_token() || c.role() == Some("builder");
-            let verdicts = match &builder_cred {
-                Some(c) => may(c),
-                None => hgl_ai_bus::read_credential(&cfg.token_file()?)?.is_some_and(|c| may(&c)),
+            // shared token. A seat's user does not (docs/build.md BUILD-15). The hub, not
+            // the file, says which: a bare NKey seed names no role.
+            let token = match &builder_cred {
+                Some(c) => c.is_token(),
+                None => {
+                    hgl_ai_bus::read_credential(&cfg.token_file()?)?.is_some_and(|c| c.is_token())
+                }
             };
+            let verdicts =
+                token || hgl_ai_build::store::may_write_verdicts(&bus, &cfg.host).await?;
             if !verdicts {
                 tracing::warn!(
                     "no builder hub user ([builder] credential): gate builds are reported not run"

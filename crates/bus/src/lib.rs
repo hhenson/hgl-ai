@@ -789,16 +789,19 @@ impl Bus {
         }
         check_value_size(key, value.len())?;
         let store = self.store(&self.state, KV_STATE).await?;
-        store
-            .create(key, value.as_bytes().to_vec().into())
-            .await
-            .map_err(|e| match e.kind() {
-                kv::CreateErrorKind::AlreadyExists => BusError::Conflict {
-                    key: key.to_string(),
-                    expected: 0,
-                },
-                _ => nats(&format!("creating state {key}"), e),
-            })
+        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+            store
+                .create(key, value.as_bytes().to_vec().into())
+                .await
+                .map_err(|e| match e.kind() {
+                    kv::CreateErrorKind::AlreadyExists => BusError::Conflict {
+                        key: key.to_string(),
+                        expected: 0,
+                    },
+                    _ => nats(&format!("creating state {key}"), e),
+                })
+        })
+        .await
     }
 
     /// Replace `key` only if it is still at `expected_revision` (compare-and-set);
@@ -824,17 +827,20 @@ impl Bus {
             },
             _ => nats(&format!("writing state {key}"), e),
         };
-        if value.is_empty() {
+        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+            if value.is_empty() {
+                store
+                    .purge_expect_revision(key, Some(expected_revision))
+                    .await
+                    .map_err(conflict)?;
+                return Ok(0);
+            }
             store
-                .purge_expect_revision(key, Some(expected_revision))
+                .update(key, value.as_bytes().to_vec().into(), expected_revision)
                 .await
-                .map_err(conflict)?;
-            return Ok(0);
-        }
-        store
-            .update(key, value.as_bytes().to_vec().into(), expected_revision)
-            .await
-            .map_err(conflict)
+                .map_err(conflict)
+        })
+        .await
     }
 
     /// Append `line` and a newline to `key` (creating it if absent), retrying

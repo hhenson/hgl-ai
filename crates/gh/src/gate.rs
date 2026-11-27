@@ -2127,7 +2127,7 @@ mod tests {
                 merge_until: until,
                 ..Opts::default()
             };
-            let out = evaluate(&gh, s, None, REPO, 7, HEAD, &o, true, None)
+            let out = evaluate(&gh, s, None, REPO, 7, HEAD, &o, true, None, None)
                 .await
                 .unwrap();
             (out, gh)

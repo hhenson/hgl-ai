@@ -10,11 +10,11 @@ use std::sync::Mutex;
 
 use hgl_ai_build::request;
 use hgl_ai_bus::Bus;
-use hgl_ai_proto::Seat;
 use hgl_ai_proto::build::{
-    BUILD_VERSION, BuildJob, BuildStatus, VerdictValue, VerdictWord, new_build_id, reply_seat,
-    verdict_key, verdict_platform,
+    BUILD_VERSION, BuildJob, BuildStatus, BuilderRecord, VerdictValue, VerdictWord, new_build_id,
+    reply_seat, verdict_key, verdict_platform,
 };
+use hgl_ai_proto::{Seat, utc_now_stamp};
 
 use crate::{Error, Result, short};
 
@@ -33,6 +33,10 @@ pub enum VerdictState {
     Missing(Option<String>),
 }
 
+/// How many times one landing asks for one verdict of one head on one `main` (the first,
+/// and again for a builder that went away or a verdict that was not written).
+pub const MAX_ASKS: u32 = 3;
+
 /// A gate build asked for by this landing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Asked {
@@ -40,10 +44,13 @@ struct Asked {
     main: String,
     id: String,
     builder: String,
+    /// Asks for this pair so far.
+    asks: u32,
 }
 
-/// The gate builds one `gh land` or `gh merge-if-clean` has asked for, so each pair of head
-/// and `main` is asked once per verdict.
+/// The gate builds one `gh land`, `gh merge-if-clean` or `build gate` has asked for, so
+/// each pair of head and `main` is asked once per verdict, and again only when its build is
+/// lost (at most [`MAX_ASKS`] in all).
 #[derive(Debug)]
 pub struct GateBuilds {
     /// The seat the jobs come from.
@@ -70,25 +77,37 @@ impl GateBuilds {
             .cloned()
     }
 
-    /// Send a gate build of `head` merged onto `main` to a builder of the verdict's
-    /// platform. `Err` is why none was sent.
+    /// Send a gate build of `head` merged onto `main` to a live builder of the verdict's
+    /// platform, other than `not` (one that went away). `Err` is why none was sent.
+    #[allow(clippy::too_many_arguments)]
     async fn ask(
         &self,
         bus: &Bus,
+        builders: &[BuilderRecord],
         repo: &str,
         pr: u64,
         name: &str,
         head: &str,
         main: &str,
+        not: Option<&str>,
     ) -> Result<std::result::Result<Asked, String>> {
         let Some(platform) = verdict_platform(name) else {
             return Ok(Err(format!(
                 "{name} is not a platform's name; no builder can give it"
             )));
         };
-        let builders = bus.builders().await?;
-        let Some(b) = request::choose(&builders, platform, None) else {
-            return Ok(Err(format!("no {platform} builder is registered")));
+        let key = verdict_key(repo, pr, name);
+        let asks = self
+            .asked(&key)
+            .filter(|a| a.head == head && a.main == main)
+            .map_or(0, |a| a.asks);
+        let live: Vec<BuilderRecord> = builders
+            .iter()
+            .filter(|b| Some(b.label.as_str()) != not)
+            .cloned()
+            .collect();
+        let Some(b) = request::choose(&live, platform, None) else {
+            return Ok(Err(format!("no live {platform} builder is registered")));
         };
         let id = new_build_id();
         let job = BuildJob {
@@ -116,11 +135,12 @@ impl GateBuilds {
             main: main.to_string(),
             id,
             builder: b.label.clone(),
+            asks: asks + 1,
         };
         self.asked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(verdict_key(repo, pr, name), a.clone());
+            .insert(key, a.clone());
         Ok(Ok(a))
     }
 }
@@ -132,8 +152,25 @@ fn store_err(e: hgl_ai_build::store::StoreError) -> Error {
     }
 }
 
+/// Builder `label` serves: its record is on the hub (it expires two minutes after its last
+/// heartbeat) and it is not retired.
+fn alive(builders: &[BuilderRecord], label: &str) -> bool {
+    builders
+        .iter()
+        .any(|b| b.label == label && b.state != "retired")
+}
+
+/// Takes queued jobs: active and reachable.
+fn taking(builders: &[BuilderRecord], label: &str) -> bool {
+    builders
+        .iter()
+        .any(|b| b.label == label && b.state == "active" && b.reachable)
+}
+
 /// The verdict `name` of `repo#pr` for `head` on `main`, from the value on the hub. With
-/// `builds` (the gate acts), a verdict neither judged nor being built is asked for.
+/// `builds` (the gate acts), a verdict neither judged nor being built is asked for, and
+/// asked again (on another live builder) when its build is lost: a builder gone, a
+/// `running` value past its bound, or a build that ended without its verdict.
 #[allow(clippy::too_many_arguments)]
 pub async fn verdict_state(
     bus: Option<&Bus>,
@@ -148,23 +185,22 @@ pub async fn verdict_state(
         return Ok(VerdictState::Missing(None));
     };
     let key = verdict_key(repo, pr, name);
-    let raw = bus.state_get(&key).await?.map(|e| e.value);
-    let value = raw.as_deref().and_then(VerdictValue::parse);
-    let mine = value.as_ref().filter(|v| v.is_for(head, main));
-    if let Some(v) = mine {
-        let raw = raw.as_deref().unwrap_or_default().trim().to_string();
-        match v.word {
-            VerdictWord::Pass => return Ok(VerdictState::Pass(raw)),
-            VerdictWord::Fail => return Ok(VerdictState::Fail(raw)),
-            VerdictWord::Running => {
-                return Ok(VerdictState::Building(format!(
-                    "building {} on {}",
-                    v.id.as_deref().unwrap_or("?"),
-                    v.builder.as_deref().unwrap_or("?")
-                )));
-            }
-            VerdictWord::NotRun => {}
+    let read = |raw: Option<String>| {
+        let v = raw.as_deref().and_then(VerdictValue::parse);
+        (raw.map(|r| r.trim().to_string()), v)
+    };
+    let (raw, value) = read(bus.state_get(&key).await?.map(|e| e.value));
+    let judged = |raw: &Option<String>, v: &Option<VerdictValue>| match v {
+        Some(v) if v.is_for(head, main) && v.word == VerdictWord::Pass => {
+            Some(VerdictState::Pass(raw.clone().unwrap_or_default()))
         }
+        Some(v) if v.is_for(head, main) && v.word == VerdictWord::Fail => {
+            Some(VerdictState::Fail(raw.clone().unwrap_or_default()))
+        }
+        _ => None,
+    };
+    if let Some(j) = judged(&raw, &value) {
+        return Ok(j);
     }
     // What the value says instead, for a line.
     let other = value.as_ref().map(|v| match v.word {
@@ -172,19 +208,59 @@ pub async fn verdict_state(
             "not run: {}",
             v.reason.as_deref().unwrap_or("no reason given")
         ),
+        VerdictWord::Running if v.is_for(head, main) => format!(
+            "building {} on {}",
+            v.id.as_deref().unwrap_or("?"),
+            v.builder.as_deref().unwrap_or("?")
+        ),
         _ if v.head != head => format!("for head {}", short(&v.head)),
         _ => format!("for main {}", short(&v.main)),
     });
     let Some(builds) = builds else {
-        return Ok(VerdictState::Missing(other));
+        let running = value
+            .as_ref()
+            .filter(|v| v.is_for(head, main) && v.word == VerdictWord::Running);
+        return Ok(match running {
+            Some(_) => VerdictState::Building(other.unwrap_or_default()),
+            None => VerdictState::Missing(other),
+        });
     };
-    if let Some(a) = builds.asked(&key)
-        && a.head == head
-        && a.main == main
+    let builders = bus.builders().await?;
+    let now = utc_now_stamp();
+    let asked = builds
+        .asked(&key)
+        .filter(|a| a.head == head && a.main == main);
+    // Why the build of this pair is lost, and the builder that lost it; `None` while it
+    // may still come.
+    let lost: Option<(String, Option<String>)> = if let Some(v) = value
+        .as_ref()
+        .filter(|v| v.is_for(head, main) && v.word == VerdictWord::Running)
     {
-        // Ours: its verdict, else its run.
+        let id = v.id.clone().unwrap_or_default();
+        let label = v.builder.clone().unwrap_or_default();
+        let run = hgl_ai_build::store::run_get(bus, &id)
+            .await
+            .map_err(store_err)?;
+        if v.expired(&now) {
+            // Alive but past its bound: any live builder may take it again, this one too.
+            Some((format!("{id} on {label} ran past its bound"), None))
+        } else if !alive(&builders, &label) {
+            Some((format!("builder {label} of {id} is gone"), Some(label)))
+        } else if run.as_ref().is_some_and(|s| s.status.is_final()) {
+            // It may have just written it: the verdict goes before the final run.
+            let (raw, again) = read(bus.state_get(&key).await?.map(|e| e.value));
+            if let Some(j) = judged(&raw, &again) {
+                return Ok(j);
+            }
+            Some((format!("{id} on {label} ended without its verdict"), None))
+        } else {
+            return Ok(VerdictState::Building(format!("building {id} on {label}")));
+        }
+    } else if let Some(a) = &asked {
+        // Ours, not started or ended: its verdict, else its run.
+        let theirs = value.as_ref().and_then(|v| v.id.clone());
         if let Some(v) = &value
-            && v.id.as_deref() == Some(a.id.as_str())
+            && theirs.as_deref() == Some(a.id.as_str())
             && v.word == VerdictWord::NotRun
         {
             return Ok(VerdictState::NotRun(format!(
@@ -197,39 +273,79 @@ pub async fn verdict_state(
         let run = hgl_ai_build::store::run_get(bus, &a.id)
             .await
             .map_err(store_err)?;
-        if let Some(s) = run.filter(|s| s.status.is_final()) {
-            // The builder writes the verdict before the final run, so read it again: none
-            // now means it could not.
-            let again = bus.state_get(&key).await?.map(|e| e.value);
-            if let Some(raw) = again.as_deref()
-                && let Some(v) = VerdictValue::parse(raw).filter(|v| v.is_for(head, main))
-            {
-                match v.word {
-                    VerdictWord::Pass => return Ok(VerdictState::Pass(raw.trim().into())),
-                    VerdictWord::Fail => return Ok(VerdictState::Fail(raw.trim().into())),
-                    _ => {}
+        match run {
+            Some(s) if s.status.is_final() => {
+                // The builder writes the verdict before the final run, so read it again.
+                let (raw, again) = read(bus.state_get(&key).await?.map(|e| e.value));
+                if let Some(j) = judged(&raw, &again) {
+                    return Ok(j);
+                }
+                match s.status {
+                    BuildStatus::NotRun | BuildStatus::Stopped => {
+                        return Ok(VerdictState::NotRun(format!(
+                            "{} on {}: {}",
+                            a.id,
+                            a.builder,
+                            s.reason.unwrap_or_else(|| "no reason given".into())
+                        )));
+                    }
+                    // A judged build whose verdict is not there: not written, or replaced
+                    // by a build asked later for another pair. Ask again.
+                    st => Some((
+                        format!("{} on {} ended {st} without its verdict", a.id, a.builder),
+                        None,
+                    )),
                 }
             }
-            let why = match s.status {
-                BuildStatus::NotRun | BuildStatus::Stopped => {
-                    s.reason.unwrap_or_else(|| "no reason given".into())
-                }
-                st => format!("it ended {st} but wrote no verdict"),
-            };
-            return Ok(VerdictState::NotRun(format!(
-                "{} on {}: {why}",
-                a.id, a.builder
-            )));
+            // Started (or not yet): wait while its builder serves.
+            Some(s) if s.status == BuildStatus::Running && alive(&builders, &a.builder) => {
+                return Ok(VerdictState::Building(format!(
+                    "asked {} of {}",
+                    a.id, a.builder
+                )));
+            }
+            _ if taking(&builders, &a.builder) => {
+                return Ok(VerdictState::Building(format!(
+                    "asked {} of {}",
+                    a.id, a.builder
+                )));
+            }
+            _ => Some((
+                format!("builder {} of {} is not taking jobs", a.builder, a.id),
+                Some(a.builder.clone()),
+            )),
         }
-        return Ok(VerdictState::Building(format!(
-            "asked {} of {}",
-            a.id, a.builder
+    } else {
+        None
+    };
+    let (why, not) = match lost {
+        Some((why, not)) => (Some(why), not),
+        None => (None, None),
+    };
+    if let Some(a) = &asked
+        && a.asks >= MAX_ASKS
+    {
+        return Ok(VerdictState::NotRun(format!(
+            "asked {} times; {}",
+            a.asks,
+            why.unwrap_or_default()
         )));
     }
-    Ok(match builds.ask(bus, repo, pr, name, head, main).await? {
-        Ok(a) => VerdictState::Building(format!("asked {} of {}", a.id, a.builder)),
-        Err(why) => VerdictState::Missing(Some(why)),
-    })
+    Ok(
+        match builds
+            .ask(bus, &builders, repo, pr, name, head, main, not.as_deref())
+            .await?
+        {
+            Ok(a) => VerdictState::Building(match why {
+                Some(w) => format!("{w}; asked {} of {}", a.id, a.builder),
+                None => format!("asked {} of {}", a.id, a.builder),
+            }),
+            Err(e) => match why {
+                Some(w) => VerdictState::Missing(Some(format!("{w}; {e}"))),
+                None => VerdictState::Missing(Some(e)),
+            },
+        },
+    )
 }
 
 /// `hgl-ai build gate`: every local build verdict `repo#pr` needs, for its head on the

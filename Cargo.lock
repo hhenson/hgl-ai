@@ -1457,6 +1457,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "hgl-ai-build",
  "hgl-ai-bus",
  "hgl-ai-config",
  "hgl-ai-owner",

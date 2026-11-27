@@ -86,8 +86,8 @@ enum Cmd {
         #[arg(long)]
         wait: bool,
         /// With --wait: give up after this long (the builds go on).
-        #[arg(long, value_name = "DUR", value_parser = duration)]
-        timeout: Option<Duration>,
+        #[arg(long, value_name = "DUR", value_parser = duration, default_value = "2h")]
+        timeout: Duration,
     },
 }
 
@@ -696,14 +696,16 @@ async fn gate(
     repo: &str,
     pr: u64,
     wait: bool,
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> anyhow::Result<i32> {
     use hgl_ai_gh::gate::VerdictState;
     let (cfg, bus) = connect(ctx).await?;
     let s = hgl_ai_gh::Settings::from_config(&cfg)?;
     let gh = super::gh::gh_client(&cfg).await?;
     let builds = super::gh::gate_builds(&cfg)?;
-    let deadline = timeout.map(|t| Instant::now() + t);
+    // A lost build (its builder gone, past its bound) is asked again on a live builder by
+    // each round, as `gh land` does.
+    let deadline = Instant::now() + timeout;
     let mut shown = String::new();
     loop {
         let (head, main, states) = hgl_ai_gh::builds::gate(&gh, &s, &bus, &builds, repo, pr)
@@ -746,7 +748,7 @@ async fn gate(
         {
             return Ok(EXIT_OK);
         }
-        if !wait || !open || deadline.is_some_and(|d| Instant::now() >= d) {
+        if !wait || !open || Instant::now() >= deadline {
             return Err(
                 NotReady(format!("{repo} #{pr}: local build verdicts not all judged")).into(),
             );
