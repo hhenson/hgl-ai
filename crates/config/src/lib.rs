@@ -786,6 +786,16 @@ model = "claude-opus-5-5-high"
     }
 
     #[test]
+    fn headless_is_for_a_controller() {
+        let t = "host = \"h\"\n[[seat]]\nname = \"w1\"\nrole = \"implementor\"\nruntime = \"codex\"\ntier = \"fast\"\nheadless = true\n";
+        let c: Config = toml::from_str(t).unwrap();
+        assert!(c.validate().is_err());
+        let c: Config = toml::from_str(&t.replace("implementor", "controller")).unwrap();
+        c.validate().unwrap();
+        assert!(c.seats[0].headless);
+    }
+
+    #[test]
     fn reserved_seat_names() {
         for name in ["all", "owner", "console"] {
             let t = format!(

@@ -109,6 +109,7 @@ repository per day.
 - `backlog`: `# read <UTC>`, `# open <repo> <n>`, `# label <repo> <label> <n>`, then
   rows `REPO NUMBER CLASS CREATED TITLE`: `codex-priority` issues, then `codex`, each
   oldest first; `codex-claimed`, `codex-blocked`, `needs-owner`, `codex-ready` left out.
+  Each class is its own connection, read to its last page.
 - `HGL_METRICS/<repo>.<YYYYMMDD>`: `{repo, date, open, opened, closed, labels,
   taken_at}`, rewritten each backlog round; the day's last write is its sample.
 - A task's stage is its last note's kind: `assign` assigned, `ready` ready, `review` or
@@ -131,12 +132,15 @@ repository per day.
 | `hgl.notes.owner.<seat>` | console | the `answer` or `note` a folded owner event sends |
 
 - Thread ids are `q-` (question) or `c-` (conversation) and 8 hex digits.
-- The console alone writes `HGL_THREADS`: its durable feed `console` folds each event
-  in order, sends the owner's notes first, then writes the record (the stream sequence
-  in it makes a refold a no-op), then appends an answer to `decisions.log`. Until the
-  console has folded an `ask`, `thread show` does not find it.
-- `decisions.log`: `HGL_STATE`, newest 2000 lines; a line per owner answer (from the
-  console) and per `hgl-ai decision add` (`<UTC> <seat>: <text>`).
+- The console alone writes `HGL_THREADS`: its durable feed `console` holds one event in
+  flight and folds them in order; a failed fold stops the feed until that event folds.
+  A fold sends the owner's notes, appends an answer to `decisions.log` (once), then
+  writes the record; each step is idempotent, and the stream sequence in the record
+  makes a refold a no-op. Until the console has folded an `ask`, `thread show` does not
+  find it.
+- `decisions.log`: `HGL_STATE`, newest 2000 lines and at most 768 KiB, trimmed in the
+  same compare-and-set as the append; a line per owner answer (from the console) and per
+  `hgl-ai decision add` (`<UTC> <seat>: <text>`).
 
 ## 5. The headless controller
 

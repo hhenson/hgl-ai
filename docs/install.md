@@ -71,12 +71,14 @@ hgl-ai server user ...`).
 
 | Role | May publish |
 | --- | --- |
-| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, stream changes |
+| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, stream changes |
 | `coord` | a seat's, and `HGL_METRICS` |
 | `console` | `hgl.owner.>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `admin` | everything (`hgl-ai init`, `server install`) |
 
-Every role reads every stream and bucket.
+Every role reads every stream and bucket but `HGL_CONSOLE` (the console's own); seat
+and coordinator users read `HGL_OWNER` through short-lived consumers and may not
+touch the console's durable feed.
 
 ```sh
 hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred
