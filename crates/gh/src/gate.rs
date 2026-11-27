@@ -502,6 +502,8 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
             }
         }
     }
+    // The local build passed and GitHub's checks are not all done (a relaxation may pass it).
+    let mut verdict_wait = false;
     if !rules.verdicts.is_empty() {
         let v = need!(f.verdicts, Need::Verdicts);
         let failed: Vec<&str> = v
@@ -546,7 +548,25 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         }
         line.push_str(&format!(" local-build-pass-on-main-{}", short(main)));
         behind = 0;
-        ms = "CLEAN".into();
+        // The verdicts are in addition to GitHub's checks, not instead of them: every check
+        // has to be done and passed too (the merge bypasses the rulesets that would wait).
+        let open: Vec<&str> = checks
+            .iter()
+            .filter(|c| !c.passed())
+            .map(|c| c.name.as_str())
+            .collect();
+        if open.is_empty() && !checks.is_empty() {
+            ms = "CLEAN".into();
+        } else {
+            if checks.is_empty() {
+                line.push_str(" no-checks-yet");
+            } else {
+                line.push_str(&format!(" checks-not-done: {}", open.join(",")));
+            }
+            // Not merged as `CLEAN`, whatever GitHub says, unless a relaxation passes it.
+            verdict_wait = true;
+            ms = "CHECKS-NOT-DONE".into();
+        }
     }
     if behind != 0 {
         let mine = need!(f.mine, Need::CompareFiles);
@@ -568,7 +588,7 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     // `merge_by_admin` (a ruleset only admins pass, which the merge bypasses) leaves a pull
     // request `BLOCKED` when nothing else holds it: `mergeable` says it would merge.
     let ruleset_only = ms == "BLOCKED" && pr.mergeable == Some(true);
-    if (ms == "UNSTABLE" || ruleset_only) && rules.relax_configured() {
+    if (ms == "UNSTABLE" || ruleset_only || verdict_wait) && rules.relax_configured() {
         let files = need!(f.pr_files, Need::PrFiles);
         let checks = need!(f.checks, Need::Checks);
         let inside = files
@@ -588,7 +608,7 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
             ms = "CLEAN".into();
         }
     }
-    if ms == "BLOCKED" && ruleset_only {
+    if ms == "BLOCKED" && ruleset_only && !verdict_wait {
         // The bypass no longer waits for checks: every one has to be done and passed.
         let checks = need!(f.checks, Need::Checks);
         if !checks.is_empty() && checks.iter().all(CheckRun::passed) {
@@ -1686,13 +1706,54 @@ mod tests {
             "{}",
             o.line
         );
-        // All three pass and nothing failed: merged without waiting and without an update.
-        f.checks = Some(vec![CheckRun {
-            id: 1,
-            name: "lint".into(),
-            status: "queued".into(),
-            conclusion: None,
+        // All three pass and a GitHub check is still queued or running: wait for it (#60).
+        for status in ["queued", "in_progress"] {
+            f.checks = Some(vec![
+                run("lint", "completed", Some("success")),
+                run("test (ubuntu-latest)", status, None),
+            ]);
+            let o = outcome(&f, &r, &Opts::default());
+            assert_eq!((o.kind, o.retry), (Kind::Wait, true), "{}", o.line);
+            assert!(
+                o.line.contains("checks-not-done: test (ubuntu-latest)"),
+                "{}",
+                o.line
+            );
+        }
+        f.checks = Some(vec![]);
+        let o = outcome(&f, &r, &Opts::default());
+        assert!(
+            o.kind == Kind::Wait && o.line.contains("no-checks-yet"),
+            "{}",
+            o.line
+        );
+        // GitHub's own `CLEAN` does not override the wait.
+        let mut clean = f.clone();
+        clean.pr.mergeable_state = "CLEAN".into();
+        clean.checks = Some(vec![run("lint", "queued", None)]);
+        assert_eq!(outcome(&clean, &r, &Opts::default()).kind, Kind::Wait);
+        // Only relaxed paths, the required checks passed: the optional one is not waited on.
+        let mut relaxed = f.clone();
+        relaxed.pr_files = Some(vec![PrFile {
+            name: "runtime/cpp/x.cpp".into(),
+            status: "modified".into(),
         }]);
+        let mut checks: Vec<CheckRun> = ["lint", "test (ubuntu-latest)", "hgraph", "cpp"]
+            .iter()
+            .map(|n| run(n, "completed", Some("success")))
+            .collect();
+        checks.push(run("test (macos-latest)", "in_progress", None));
+        relaxed.checks = Some(checks);
+        assert!(
+            matches!(decide(&relaxed, REPO, HEAD, &r, &Opts::default()), Step::Merge(l) if l.contains("relaxed-paths-only")),
+            "{:?}",
+            decide(&relaxed, REPO, HEAD, &r, &Opts::default())
+        );
+        // Every check done and passed: merged without an update.
+        f.checks = Some(vec![
+            run("lint", "completed", Some("success")),
+            run("docs", "completed", Some("skipped")),
+        ]);
         match decide(&f, REPO, HEAD, &r, &Opts::default()) {
             Step::Merge(l) => assert!(
                 l.ends_with(&format!("local-build-pass-on-main-{}", short(MAIN))),
