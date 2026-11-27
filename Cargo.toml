@@ -5,7 +5,7 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT"
 repository = "https://github.com/hhenson/hgl-ai"
 
@@ -20,6 +20,7 @@ hgl-ai-install = { path = "crates/install" }
 hgl-ai-gh = { path = "crates/gh" }
 hgl-ai-owner = { path = "crates/owner" }
 hgl-ai-notify = { path = "crates/notify" }
+hgl-ai-console = { path = "crates/console" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }

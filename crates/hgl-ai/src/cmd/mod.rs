@@ -5,6 +5,7 @@ pub mod agent;
 pub mod bridge;
 pub mod cap;
 pub mod client;
+pub mod console;
 pub mod doctor;
 pub mod gh;
 pub mod note;

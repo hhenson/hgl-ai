@@ -1,0 +1,36 @@
+[package]
+name = "hgl-ai-console"
+description = "The owner's web console of hgl-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hgl-ai-proto.workspace = true
+hgl-ai-config.workspace = true
+hgl-ai-bus.workspace = true
+hgl-ai-owner.workspace = true
+hgl-ai-gh.workspace = true
+hgl-ai-notify.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+reqwest = { workspace = true, features = ["json", "form", "query"] }
+rustls.workspace = true
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "form", "json", "query", "matched-path"] }
+axum-server = { version = "0.9.2", default-features = false, features = ["tls-rustls-no-provider"] }
+webauthn-rs = "0.6.2"
+hmac = "0.12"
+p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+webauthn-authenticator-rs = { version = "0.6.2", features = ["softpasskey"] }

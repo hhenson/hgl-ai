@@ -195,8 +195,7 @@ pub fn check_public_key(k: &str) -> Result<()> {
 pub fn fingerprint(nkey: &str) -> String {
     use sha2::Digest as _;
     let h = hex::encode(sha2::Sha256::digest(nkey.as_bytes()));
-    h[..16]
-        .as_bytes()
+    h.as_bytes()[..16]
         .chunks(4)
         .map(|c| std::str::from_utf8(c).unwrap_or(""))
         .collect::<Vec<_>>()

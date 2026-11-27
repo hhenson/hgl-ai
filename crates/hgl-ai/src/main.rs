@@ -58,6 +58,8 @@ enum Command {
     Status(cmd::owner::StatusArgs),
     /// The controller's decision log.
     Decision(cmd::owner::DecisionArgs),
+    /// The owner's web console.
+    Console(cmd::console::Args),
 }
 
 #[tokio::main]
@@ -93,6 +95,7 @@ async fn main() {
         Command::Thread(a) => cmd::owner::thread(&ctx, a).await,
         Command::Status(a) => cmd::owner::status(&ctx, a).await,
         Command::Decision(a) => cmd::owner::decision(&ctx, a).await,
+        Command::Console(a) => cmd::console::run(&ctx, a).await,
     };
     let code = match res {
         Ok(code) => code,
