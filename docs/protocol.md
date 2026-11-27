@@ -56,7 +56,8 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
   while a turn runs, `ack` after a clean exit, and `nak` with a 15 s delay on a
   crash, a memory or time limit, or a provider quota refusal.
 - **PROTO-9 — Idempotent sends.** Each note carries a `Nats-Msg-Id` of
-  `<sender>-<created_at>-<sha256(body)[0:12]>`, so a retried send is dropped.
+  `<sender>-<created_at>-<sha256(envelope)[0:12]>` over recipient, kind, repo,
+  issue, head, base and body, so a retried send is dropped and no other note is.
 
 ## 4. Notes
 

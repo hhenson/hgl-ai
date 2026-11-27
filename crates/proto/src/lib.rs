@@ -273,14 +273,36 @@ impl Note {
         Ok(())
     }
 
-    /// `Nats-Msg-Id` for deduplication (PROTO-9).
+    /// `Nats-Msg-Id` for deduplication (PROTO-9): `<sender>-<created_at>-<digest>`, the
+    /// digest over the rest of the envelope, so a retry of this note gets the same id and
+    /// a note to another recipient or task does not.
     pub fn msg_id(&self) -> String {
-        let digest = Sha256::digest(self.body.as_bytes());
+        let mut h = Sha256::new();
+        let issue = self.issue.to_string();
+        for field in [
+            Some(self.recipient.as_str()),
+            Some(self.kind.as_str()),
+            self.repo.as_deref(),
+            Some(issue.as_str()),
+            self.head.as_deref(),
+            self.base.as_deref(),
+            Some(self.body.as_str()),
+        ] {
+            // Tagged and length-prefixed: no two envelopes encode alike.
+            match field {
+                None => h.update([0u8]),
+                Some(s) => {
+                    h.update([1u8]);
+                    h.update((s.len() as u64).to_be_bytes());
+                    h.update(s.as_bytes());
+                }
+            }
+        }
         format!(
             "{}-{}-{}",
             self.sender,
             self.created_at,
-            &hex::encode(digest)[..12]
+            &hex::encode(h.finalize())[..12]
         )
     }
 
@@ -462,6 +484,42 @@ mod tests {
         assert!(id.starts_with("w4-20261127T041100Z-"));
         assert_eq!(id.len(), "w4-20261127T041100Z-".len() + 12);
         assert_eq!(id, n.clone().msg_id());
+    }
+
+    #[test]
+    fn msg_id_names_the_envelope() {
+        let mut n = Note::new(seat("claude"), seat("w1"), Kind::Landed, "[claude] Landed");
+        n.created_at = "20261127T041100Z".into();
+        n.repo = Some("hgl-compiler".into());
+        n.issue = 980;
+        let id = n.msg_id();
+        let mut ids = vec![id.clone()];
+        let variants: [&dyn Fn(&mut Note); 7] = [
+            &|n| n.recipient = Seat::broadcast(),
+            &|n| n.kind = Kind::Closed,
+            &|n| n.repo = Some("hgl_spec".into()),
+            &|n| n.issue = 981,
+            &|n| n.head = Some("8a5c3d264c2edbbdaa61530d810bff276c3eebba".into()),
+            &|n| n.base = Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed".into()),
+            &|n| n.body = "[claude] Landed again\n".into(),
+        ];
+        for change in variants {
+            let mut m = n.clone();
+            change(&mut m);
+            assert!(m.msg_id().starts_with("claude-20261127T041100Z-"));
+            ids.push(m.msg_id());
+        }
+        let mut unique = ids.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "{ids:?}");
+        // No field runs into the next: a repo of "" differs from no repo.
+        let mut a = n.clone();
+        a.repo = Some(String::new());
+        let mut b = n.clone();
+        b.repo = None;
+        assert_ne!(a.msg_id(), b.msg_id());
+        assert_eq!(n.clone().msg_id(), id, "a retry keeps its id");
     }
 
     #[test]

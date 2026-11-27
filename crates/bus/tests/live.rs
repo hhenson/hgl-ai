@@ -270,6 +270,60 @@ async fn duplicate_send_is_reported() {
     assert_eq!(got.len(), 1, "the duplicate was not stored");
 }
 
+/// PROTO-9: one body from one sender in the same second, to two recipients and for two
+/// tasks (what `gh land` sends), is four notes, not one and three duplicates.
+#[tokio::test]
+async fn same_body_to_other_recipients_or_tasks_is_not_a_duplicate() {
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let mut w1 = bus.inbox(&seat("w1")).await.unwrap();
+    let mut w2 = bus.inbox(&seat("w2")).await.unwrap();
+    let landed = |to: &str, issue: u64| {
+        let mut n = Note::new(
+            seat("claude"),
+            Seat::new(to).unwrap(),
+            Kind::Landed,
+            "[claude] Landed: hgl-compiler#981",
+        );
+        n.created_at = "20261127T041100Z".into();
+        n.repo = Some("hgl-compiler".into());
+        n.issue = issue;
+        n.base = Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed".into());
+        n
+    };
+    let sends = [
+        landed("w1", 980),
+        landed("all", 980),
+        landed("all", 981),
+        landed("w2", 981),
+    ];
+    let mut seqs = Vec::new();
+    for n in &sends {
+        let r = bus.send(n).await.unwrap();
+        assert!(!r.duplicate, "{} {}", n.recipient, n.issue);
+        seqs.push(r.seq);
+    }
+    // A retry of the same note is still dropped.
+    let again = bus.send(&sends[0]).await.unwrap();
+    assert!(again.duplicate);
+    assert_eq!(again.seq, seqs[0]);
+
+    for (inbox, want) in [
+        (&mut w1, vec![("w1", 980), ("all", 980), ("all", 981)]),
+        (&mut w2, vec![("all", 980), ("all", 981), ("w2", 981)]),
+    ] {
+        let got = inbox.fetch(10, LONG).await.unwrap();
+        let seen: Vec<(&str, u64)> = got
+            .iter()
+            .map(|d| (d.note.recipient.as_str(), d.note.issue))
+            .collect();
+        assert_eq!(seen, want);
+        for d in &got {
+            d.ack().await.unwrap();
+        }
+    }
+}
+
 #[tokio::test]
 async fn broadcast_reaches_every_inbox() {
     let Some(hub) = Hub::start() else { return };
