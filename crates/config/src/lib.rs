@@ -124,7 +124,8 @@ pub struct Github {
         skip_serializing_if = "github::is_review_bot"
     )]
     pub review_bot: String,
-    /// Seat that gets the coordinator's alerts and sends `landed` notes.
+    /// The controller's seat (ROLE-2): it gets the bridge's and the coordinator's alerts
+    /// and sends `landed` notes.
     #[serde(
         default = "github::controller",
         skip_serializing_if = "github::is_controller"
@@ -471,6 +472,7 @@ impl Config {
                     .map_err(|e| ConfigError::Invalid(format!("seat {}: {e}", s.name)))?;
             }
         }
+        self.controller()?;
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
         for d in [
             &self.limits.stale_after,
@@ -527,6 +529,16 @@ impl Config {
 
     pub fn seat(&self, name: &str) -> Option<&SeatConfig> {
         self.seats.iter().find(|s| s.name.as_str() == name)
+    }
+
+    /// The controller's seat, `[github] controller` (default `claude`).
+    pub fn controller(&self) -> Result<Seat> {
+        let invalid = |why: String| ConfigError::Invalid(format!("github.controller: {why}"));
+        let s = Seat::new(self.github.controller.clone()).map_err(|e| invalid(e.to_string()))?;
+        if s.is_broadcast() {
+            return Err(invalid("not `all`; name one seat".into()));
+        }
+        Ok(s)
     }
 
     pub fn work_root(&self) -> Result<PathBuf> {
@@ -657,6 +669,19 @@ model = "claude-opus-5-5-high"
         assert!(c.resolve(&b(Runtime::Claude, None, None, None)).is_err());
         c.host = "Bad Host".into();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn the_controller_seat() {
+        let mut c = Config::new("h");
+        assert_eq!(c.controller().unwrap().as_str(), "claude", "the default");
+        c.github.controller = "boss".into();
+        assert_eq!(c.controller().unwrap().as_str(), "boss");
+        assert!(c.validate().is_ok());
+        for bad in ["all", "Not A Seat"] {
+            c.github.controller = bad.into();
+            assert!(c.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

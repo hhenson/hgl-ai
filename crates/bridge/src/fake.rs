@@ -22,6 +22,7 @@ const MAX_DELIVER: u64 = 5;
 pub enum Ev {
     Ack,
     Nak(Duration),
+    Term,
     Progress,
 }
 
@@ -393,6 +394,10 @@ impl DeliveryApi for FakeDelivery {
                 bus.enqueue(seat, seq, n, note);
             });
         }
+        Ok(())
+    }
+    async fn term(&self) -> Result<()> {
+        self.record(Ev::Term);
         Ok(())
     }
     async fn in_progress(&self) -> Result<()> {

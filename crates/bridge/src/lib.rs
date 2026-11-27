@@ -26,7 +26,7 @@ use std::time::Duration;
 use hgl_ai_bus::BusError;
 use hgl_ai_config::{Binding, Config, SeatConfig};
 use hgl_ai_proto::{Kind, Role, Runtime, Seat, TaskKey, seat_lock_key};
-use hgl_ai_tree::{IsClosed, Trees};
+use hgl_ai_tree::{Create, IsClosed, Trees};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
@@ -39,9 +39,6 @@ use crate::ended::EndedTasks;
 use crate::lock::FileLock;
 use crate::proc::{Stop, TreeSlot};
 use crate::turn::{Outcome, Target, TurnOut};
-
-/// The controller's seat (ROLE-2).
-pub const CONTROLLER: &str = "claude";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -194,6 +191,9 @@ struct LoopEnd {
 /// A turn in flight in a seat loop.
 struct Running<D> {
     target: Target,
+    /// The stream sequence of the note that made the tree the turn runs in (`task.json`
+    /// `seq`, or this turn's creating note); `None` when unknown.
+    start: Option<u64>,
     deliveries: Arc<Mutex<Vec<Arc<D>>>>,
     stop: watch::Sender<Stop>,
     handle: JoinHandle<TurnOut>,
@@ -505,7 +505,7 @@ impl<B: BusApi> Bridge<B> {
                 },
                 out = join(&mut running) => {
                     let r = running.take().expect("a running turn");
-                    self.finish(seat, r, out, &mut pending, &mut busy).await;
+                    self.finish(seat, r, out, &mut pending, &mut busy, None).await;
                 }
                 _ = tick.tick() => self.keep_alive(&pending, running.as_ref()).await,
                 _ = tokio::time::sleep_until(next_busy.unwrap_or_else(Instant::now)), if next_busy.is_some() && running.is_none() => {
@@ -578,14 +578,21 @@ impl<B: BusApi> Bridge<B> {
         tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, from = %d.note().sender, "note");
         // Every note passes here before it can start a turn.
         if let Some(task) = d.note().task() {
-            match self.ended_before(seat, &task, seq).await {
-                Ok(false) => {}
-                Ok(true) => {
+            match self.known_end(seat, &task, seq).await {
+                Ok(Some(end)) if seq < end => {
                     // Sent before its task ended, delivered after (hgl-ai#2): moot.
                     tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, %task, "a note of an ended task sent before its end; acked");
                     let _ = d.ack().await;
                     return;
                 }
+                Ok(Some(end)) if seq == end && d.note().kind.ends_task() => {
+                    // The end it made is recorded: a redelivery after a lost ack. Whatever
+                    // runs in the task now is a restart, newer than this note.
+                    tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, %task, "an ending note whose end is recorded already; acked");
+                    let _ = d.ack().await;
+                    return;
+                }
+                Ok(_) => {}
                 Err(e) => {
                     // Without the hub's answer the note may be moot: no turn, try again later.
                     tracing::warn!(seat = %seat.name(), seq, %task, "reading {}: {e}; naked", hgl_ai_proto::KV_ENDED);
@@ -601,28 +608,27 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// Whether a note of `task` at stream sequence `seq` was sent before the task ended for
-    /// the seat. The hub's `HGL_ENDED` is the authority, so a seat moved from another host
-    /// knows the ends seen there; the local record is a cache of this host's ends.
-    async fn ended_before(
+    /// The end of `task` for the seat that rules on its note at stream sequence `seq`: this
+    /// host's cache of its own ends when that makes the note moot, else the hub's
+    /// `HGL_ENDED`, the authority, so a seat moved from another host knows the ends seen there.
+    async fn known_end(
         &self,
         seat: &SeatRt,
         task: &TaskKey,
         seq: u64,
-    ) -> std::result::Result<bool, BusError> {
-        if lock(&seat.ended).moot(task, seq) {
-            return Ok(true);
+    ) -> std::result::Result<Option<u64>, BusError> {
+        let cached = lock(&seat.ended).get(task);
+        if cached.is_some_and(|end| seq < end) {
+            return Ok(cached);
         }
-        Ok(self
-            .bus
-            .ended_get(seat.name(), task)
-            .await?
-            .is_some_and(|end| seq < end))
+        self.bus.ended_get(seat.name(), task).await
     }
 
     /// `landed` / `closed` (PROTO-14): stop the task's turn, drop its queued notes, remove
     /// the seat's trees of it, record the end on the hub, send a cleanup receipt; no agent
-    /// turn. The note is acked once the end is recorded, else naked to try again.
+    /// turn. The note is acked once the end is recorded, else naked to try again. A tree
+    /// made for a note sent after this one (a restart of the task; this note redelivered
+    /// before its end was recorded) is not this note's: it and its turn are left alone.
     async fn end_task(
         &self,
         seat: &Arc<SeatRt>,
@@ -641,15 +647,22 @@ impl<B: BusApi> Bridge<B> {
             let _ = d.ack().await;
             return;
         };
+        let end = d.seq();
+        let ends = |start: Option<u64>| start.is_none_or(|s| s < end);
         let mut stopped = false;
+        let mut kept = None;
         if let Some(r) = running.as_mut()
             && r.target.task() == Some(&task)
         {
-            let _ = r.stop.send(Stop::Now);
-            let out = (&mut r.handle).await;
-            let r = running.take().expect("checked");
-            self.finish(seat, r, out, pending, busy).await;
-            stopped = true;
+            if ends(r.start) {
+                let _ = r.stop.send(Stop::Now);
+                let out = (&mut r.handle).await;
+                let r = running.take().expect("checked");
+                self.finish(seat, r, out, pending, busy, Some(end)).await;
+                stopped = true;
+            } else {
+                kept = Some(r.target.clone());
+            }
         }
         // Notes of the task still queued (the seat was busy elsewhere) would recreate its
         // tree and run a turn after the removal: they are moot. Notes sent after this one
@@ -662,11 +675,18 @@ impl<B: BusApi> Bridge<B> {
             tracing::info!(seat = %seat.name(), seq = p.seq(), kind = %p.note().kind, %task, "a queued note of an ended task; acked");
             let _ = p.ack().await;
         }
-        busy.retain(|t, _| t.task() != Some(&task));
-        lock(&seat.busy_told).retain(|t| t.task() != Some(&task));
         let mut removed = Vec::new();
         let mut errors = Vec::new();
+        let mut cleared = Vec::new();
         for review in [false, true] {
+            let target = Target::Tree {
+                task: task.clone(),
+                review,
+            };
+            if kept.as_ref() == Some(&target) {
+                tracing::info!(seat = %seat.name(), seq = end, %target, "the running turn is of a restart after this end; left alone");
+                continue;
+            }
             if let Some(dir) = self
                 .trees
                 .layout()
@@ -674,6 +694,11 @@ impl<B: BusApi> Bridge<B> {
                 .ok()
                 .filter(|p| p.exists())
             {
+                let start = hgl_ai_tree::read_task(&dir).ok().and_then(|f| f.seq);
+                if !ends(start) {
+                    tracing::info!(seat = %seat.name(), seq = end, ?start, %target, "a tree made after this end; left alone");
+                    continue;
+                }
                 // A process that still holds the turn lock is a stray of an earlier turn.
                 let lp = dir.join(lock::TURN_LOCK);
                 if lp.exists()
@@ -696,7 +721,10 @@ impl<B: BusApi> Bridge<B> {
                 Ok(Err(e)) => errors.push(e.to_string()),
                 Err(e) => errors.push(format!("removal panicked: {e}")),
             }
+            cleared.push(target);
         }
+        busy.retain(|t, _| !cleared.contains(t));
+        lock(&seat.busy_told).retain(|t| !cleared.contains(t));
         if let Err(e) = lock(&seat.ended).end(task.clone(), d.seq()) {
             tracing::warn!(seat = %seat.name(), %task, "caching the end of the task: {e}");
         }
@@ -760,14 +788,26 @@ impl<B: BusApi> Bridge<B> {
         let mut rest = Vec::new();
         for ((d, p), h) in pending.drain(..).zip(plans).zip(held) {
             if p.target == target && !h {
+                creates.push((d.seq(), p.create));
                 group.push(d);
-                creates.push(p.create);
             } else {
                 rest.push(d);
             }
         }
         *pending = rest;
         let create = turn::choose_create(creates);
+        // The tree the turn runs in: one kept from before (a review always gets a new one),
+        // or the one its creating note makes.
+        let start = match &target {
+            Target::Inbox => None,
+            Target::Tree { task, review } => {
+                let fresh = matches!(create, Some((_, Create::Review { .. })));
+                match self.trees.existing(seat.name(), task, *review) {
+                    Some(dir) if !fresh => hgl_ai_tree::read_task(&dir).ok().and_then(|f| f.seq),
+                    _ => create.as_ref().map(|(seq, _)| *seq),
+                }
+            }
+        };
         let hold = self.bus.state_get("hold").await.ok().flatten();
         let mode = self.bus.state_get("mode").await.ok().flatten();
         let (binding_idx, _) = seat.current();
@@ -791,6 +831,7 @@ impl<B: BusApi> Bridge<B> {
         let handle = tokio::spawn(self.clone().turn(job));
         Some(Running {
             target,
+            start,
             deliveries: Arc::new(Mutex::new(group)),
             stop: stop_tx,
             handle,
@@ -798,6 +839,8 @@ impl<B: BusApi> Bridge<B> {
         })
     }
 
+    /// Settle the notes of an ended turn by its outcome; `end` is the stream sequence of
+    /// the ending note that stopped it, if one did.
     async fn finish(
         &self,
         seat: &Arc<SeatRt>,
@@ -805,6 +848,7 @@ impl<B: BusApi> Bridge<B> {
         out: std::result::Result<TurnOut, JoinError>,
         pending: &mut Vec<Arc<B::Delivery>>,
         busy: &mut HashMap<Target, Instant>,
+        end: Option<u64>,
     ) {
         let ds: Vec<Arc<B::Delivery>> = lock(&r.deliveries).clone();
         let out = match out {
@@ -832,9 +876,14 @@ impl<B: BusApi> Bridge<B> {
                 }
             }
             Outcome::Stopped => {
-                // Its task ended (`landed`, `closed`); the notes are moot.
+                // Its task ended (`landed`, `closed`): the notes sent before the end are moot;
+                // later ones are newer intent and run again.
                 for d in ds {
-                    let _ = d.ack().await;
+                    if end.is_none_or(|e| d.seq() < e) {
+                        let _ = d.ack().await;
+                    } else {
+                        let _ = d.nak(self.opts.nak_delay).await;
+                    }
                 }
             }
             Outcome::Quota(msg) => {
@@ -848,6 +897,26 @@ impl<B: BusApi> Bridge<B> {
                     self.cfg.host,
                     seat.name(),
                     r.target
+                );
+                self.tell(seat.name(), Kind::Note, r.target.task(), body)
+                    .await;
+            }
+            Outcome::CannotStart(msg) => {
+                // A retry fails alike: drop the notes, rather than nak them until
+                // `max_deliver` does, and say which.
+                for d in &ds {
+                    let _ = d.term().await;
+                }
+                let notes: Vec<String> = ds
+                    .iter()
+                    .map(|d| format!("seq {} {} from {}", d.seq(), d.note().kind, d.note().sender))
+                    .collect();
+                let body = format!(
+                    "[bridge] {}/{}: cannot start a turn in {}: {msg}. A retry would fail alike, so its notes are dropped, not retried: {}. Fix the cause and send them again.",
+                    self.cfg.host,
+                    seat.name(),
+                    r.target,
+                    notes.join("; ")
                 );
                 self.tell(seat.name(), Kind::Note, r.target.task(), body)
                     .await;
@@ -930,10 +999,11 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// Send a note to the controller; failures are logged.
+    /// Send a note to the controller (`[github] controller`); failures are logged.
     async fn tell(&self, from: &Seat, kind: Kind, task: Option<&TaskKey>, body: String) {
-        let Ok(to) = Seat::new(CONTROLLER) else {
-            return;
+        let to = match self.cfg.controller() {
+            Ok(s) => s,
+            Err(e) => return tracing::warn!(kind = %kind, "not sent: {e}"),
         };
         let mut n = hgl_ai_proto::Note::new(from.clone(), to, kind, body);
         if let Some(t) = task {
@@ -941,7 +1011,7 @@ impl<B: BusApi> Bridge<B> {
             n.issue = t.issue;
         }
         if let Err(e) = self.bus.send(&n).await {
-            tracing::warn!(kind = %kind, "sending to {CONTROLLER}: {e}");
+            tracing::warn!(kind = %kind, "sending to {}: {e}", n.recipient);
         }
     }
 }

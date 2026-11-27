@@ -58,13 +58,15 @@ fn implementor_tree_on_a_new_branch() {
     let e = env();
     let c = e
         .trees
-        .create(
+        .create_for(
             &seat("w1"),
             &task(980),
             &implement("[claude] Assign: demo#980 Fix the thing"),
+            42,
         )
         .unwrap();
     assert!(!c.reused);
+    assert_eq!(c.file.seq, Some(42), "the note that made the tree");
     let work = e.root.join("work");
     assert_eq!(c.dir, work.join("w1/demo-980"));
     for sub in ["src/README", "tmp", "build", "task.json"] {
@@ -95,9 +97,10 @@ fn implementor_tree_on_a_new_branch() {
 
     let again = e
         .trees
-        .create(&seat("w1"), &task(980), &implement("other title"))
+        .create_for(&seat("w1"), &task(980), &implement("other title"), 50)
         .unwrap();
     assert!(again.reused);
+    assert_eq!(again.file.seq, Some(42), "a kept tree keeps its own");
     assert_eq!(again.file, c.file);
     assert_eq!(read_task(&c.dir).unwrap(), c.file);
 }

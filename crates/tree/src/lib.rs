@@ -103,6 +103,10 @@ pub struct TaskFile {
     /// Agent session ids by runtime, from the task's previous turns.
     #[serde(default)]
     pub sessions: BTreeMap<String, String>,
+    /// The stream sequence of the note whose turn made the tree (PROTO-14): an ending
+    /// note with a lower one is older than the tree and leaves it alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 impl TaskFile {
@@ -233,6 +237,28 @@ impl Trees {
     /// Create the task's tree (PROTO-12). An implementor tree that exists is kept;
     /// a review tree that exists is an error (the caller removes it first).
     pub fn create(&self, seat: &Seat, task: &TaskKey, what: &Create) -> Result<Created> {
+        self.make(seat, task, what, None)
+    }
+
+    /// [`Trees::create`] for the note at stream sequence `seq`, recorded in a new tree's
+    /// `task.json` ([`TaskFile::seq`]); a kept tree keeps its own.
+    pub fn create_for(
+        &self,
+        seat: &Seat,
+        task: &TaskKey,
+        what: &Create,
+        seq: u64,
+    ) -> Result<Created> {
+        self.make(seat, task, what, Some(seq))
+    }
+
+    fn make(
+        &self,
+        seat: &Seat,
+        task: &TaskKey,
+        what: &Create,
+        seq: Option<u64>,
+    ) -> Result<Created> {
         let review = matches!(what, Create::Review { .. });
         let dir = self.layout.task_dir(seat, task, review)?;
         if dir.join(TASK_FILE).is_file() {
@@ -266,7 +292,7 @@ impl Trees {
                 self.add_review(&clone, &dir, seat, task, head, base.as_deref())
             }
         };
-        let file = match made {
+        let mut file = match made {
             Ok(f) => f,
             Err(e) => {
                 let _ = self.remove_dir(&dir);
@@ -274,6 +300,7 @@ impl Trees {
                 return Err(e);
             }
         };
+        file.seq = seq;
         write_task(&dir, &file)?;
         let record = self.record(&dir, &file, dir_size(&dir));
         Ok(Created {
@@ -373,6 +400,7 @@ impl Trees {
             created_at: hgl_ai_proto::utc_now_stamp(),
             conflicts: Vec::new(),
             sessions: BTreeMap::new(),
+            seq: None,
         })
     }
 
@@ -454,6 +482,7 @@ impl Trees {
             created_at: hgl_ai_proto::utc_now_stamp(),
             conflicts,
             sessions: BTreeMap::new(),
+            seq: None,
         })
     }
 
