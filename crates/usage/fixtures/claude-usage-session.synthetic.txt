@@ -1,0 +1,9 @@
+You are currently using your subscription to power your Claude Code usage
+
+Current session: 35% used · resets 3pm (Asia/Dubai)
+Current week (all models): 20% used · resets Dec 4, 9:59am (Asia/Dubai)
+Current week (Fable): 2% used · resets Dec 4, 10am (Asia/Dubai)
+Current week (Opus): nearly there · resets soon
+
+What's contributing to your usage?
+  80%  Run /hgl-ai on a cheaper model

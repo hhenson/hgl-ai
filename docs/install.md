@@ -71,7 +71,7 @@ hgl-ai server user ...`).
 
 | Role | May publish |
 | --- | --- |
-| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, stream changes |
+| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`, `HGL_USAGE`, `hgl.usage.>`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, stream changes |
 | `coord` | a seat's, and `HGL_METRICS` |
 | `console` | `hgl.owner.>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `admin` | everything (`hgl-ai init`, `server install`) |

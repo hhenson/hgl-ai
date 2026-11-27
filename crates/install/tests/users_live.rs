@@ -159,6 +159,32 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
     );
     seat_bus.hosts().await.unwrap();
     seat_bus.trees().await.unwrap();
+    // Usage records, their history and labels (PROTO-21).
+    let usage = hgl_ai_proto::UsageRecord {
+        runtime: hgl_ai_proto::Runtime::Codex,
+        account: hgl_ai_proto::account_fingerprint("acct"),
+        label: None,
+        host: "build-1".into(),
+        plan: None,
+        observed_at: "20261127T000000Z".into(),
+        collected_at: "20261127T000000Z".into(),
+        source_age_s: 0,
+        buckets: vec![],
+        limit_reached: None,
+        unparsed: vec![],
+    };
+    assert!(matches!(
+        seat_bus.usage_put(&usage).await.unwrap(),
+        hgl_ai_bus::UsagePut::Written { .. }
+    ));
+    seat_bus
+        .usage_label(&usage.account, Some("team"))
+        .await
+        .unwrap();
+    assert_eq!(
+        seat_bus.usage().await.unwrap()[0].label.as_deref(),
+        Some("team")
+    );
     let task = hgl_ai_proto::TaskKey {
         repo: "alpha".into(),
         issue: 7,

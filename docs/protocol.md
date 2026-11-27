@@ -74,6 +74,7 @@ before hub users takes one shared token until it moves.
 | Trees | KV `HGL_TREES` | file storage, history 1 |
 | Locks | KV `HGL_LOCKS` | file storage, history 1, `max_age` 30 min |
 | Ended | KV `HGL_ENDED` | file storage, history 1, `max_age` 15 d |
+| Usage | KV `HGL_USAGE`; stream `HGL_USAGE_LOG`, subjects `hgl.usage.>` | KV file storage, history 1; stream file storage, `max_age` 35 d, dedup window 24 h (§10) |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
   broadcast address. `owner` and `console` are senders, never seats: no seat takes
@@ -288,3 +289,33 @@ Each bridge writes `HGL_HOSTS/<host>` every 30 s:
 ```
 
 `host` is a configured label, never a network name or address.
+
+## 10. Subscription usage
+
+`hgl-ai usage collect` reads each signed-in CLI of the host's agent user, by slash
+command or file, never a prompt (no model turn):
+
+| Runtime | Limits | Account id |
+| --- | --- | --- |
+| `claude` | `claude -p "/usage"`: `Current week\|session (<scope>): N% used · resets <time> (<zone>)` lines; the breakdown after them is ignored | `orgId/email` of `claude auth status` |
+| `codex` | the last `rate_limits` of the newest `~/.codex/sessions/**/rollout-*.jsonl` whose `session_meta` is of the account | `tokens.account_id` of `~/.codex/auth.json` |
+| `agy` | `agy -p "/usage"`: `<bucket>\t<window> Limit Remaining\t<pct>%\t<reset>`; a reset at the epoch is a window not started | the `applyAuthResult: email=` line of its newest log |
+
+- **PROTO-21 — One record per login.** `HGL_USAGE/<runtime>.<account>`, where
+  `<account>` is the first 12 hex digits of the SHA-256 of the account id. No id, email
+  or token is published; the account files are parsed into the id fields alone.
+  A record: `runtime`, `account`, `label`, `host` (the reporter), `plan`,
+  `observed_at` (when the numbers were true: the probe, or Codex's last turn),
+  `collected_at`, `source_age_s`, `buckets` `[{scope, window, used_pct, resets_at}]`
+  (`scope` `all`, a model, `gemini`, `claude+gpt`; `window` `5h`, `week` or
+  `<minutes>m`; remaining is 100 − used), `limit_reached`, and `unparsed`: source lines
+  that did not parse, kept as they were (at most 20). A source that fails skips its
+  runtime; one that does not parse keeps its lines; neither fails the collection.
+  `HGL_USAGE/label.<account>` holds the owner's label (`hgl-ai usage label`).
+- **PROTO-22 — Newest observation wins.** Every host holding a login may report it. A
+  record replaces its key only if its `observed_at` is newer (compare-and-set), so the
+  record stays fresh while any of those hosts is up. Each record that replaces its key
+  is also published to `hgl.usage.<runtime>.<account>` (message id
+  `<key>.<observed_at>`), the history for burn-down. Seat and coordinator users may
+  publish both; a host is to publish only the accounts its registration lists
+  (#36).

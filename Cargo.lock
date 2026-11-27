@@ -1298,6 +1298,7 @@ dependencies = [
  "hgl-ai-owner",
  "hgl-ai-proto",
  "hgl-ai-tree",
+ "hgl-ai-usage",
  "serde_json",
  "thiserror 2.0.21",
  "tokio",
@@ -1499,6 +1500,21 @@ dependencies = [
  "serde_json",
  "tempfile",
  "thiserror 2.0.21",
+ "tracing",
+]
+
+[[package]]
+name = "hgl-ai-usage"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hgl-ai-proto",
+ "jiff 1.0.3",
+ "regex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

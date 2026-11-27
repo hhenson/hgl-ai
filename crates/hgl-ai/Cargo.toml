@@ -23,6 +23,7 @@ hgl-ai-install.workspace = true
 hgl-ai-gh.workspace = true
 hgl-ai-owner.workspace = true
 hgl-ai-console.workspace = true
+hgl-ai-usage.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true

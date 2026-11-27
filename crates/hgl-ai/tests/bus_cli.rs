@@ -164,7 +164,7 @@ fn notes_send_wait_peek() {
     };
     assert_eq!(
         ok(&hub.run(&["init"])),
-        "provisioned HGL_NOTES HGL_OWNER HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS HGL_ENDED HGL_THREADS HGL_METRICS HGL_CONSOLE\n"
+        "provisioned HGL_NOTES HGL_OWNER HGL_USAGE_LOG HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS HGL_ENDED HGL_THREADS HGL_METRICS HGL_CONSOLE HGL_USAGE\n"
     );
     ok(&hub.run(&["init"]));
 
@@ -556,4 +556,127 @@ fn cap_passes_status_and_reports_limits() {
     assert!(err(&usage).contains("invalid size"), "{}", err(&usage));
     let missing = cap(&["64M", "--", "hgl-ai-no-such-command"]);
     assert_eq!(missing.status.code(), Some(127));
+}
+
+/// `usage collect`, `show` and `label` against a live hub, the sources being the captured
+/// fixtures behind stand-in CLIs (PROTO-21, PROTO-22).
+#[test]
+fn usage_collect_show_label() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let Some(hub) = Hub::start("usage") else {
+        return;
+    };
+    ok(&hub.run(&["init"]));
+    let fx = Path::new(env!("CARGO_MANIFEST_DIR")).join("../usage/fixtures");
+    let root = hub.dir.0.join("sources");
+    let bin = root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cli = |name: &str, auth: &str, usage: &str| {
+        let p = bin.join(name);
+        std::fs::write(
+            &p,
+            format!(
+                "#!/bin/sh\ncase \"$1 $2\" in\n  'auth status') cat '{}' ;;\n  '-p /usage') cat '{}' ;;\n  *) exit 2 ;;\nesac\n",
+                fx.join(auth).display(),
+                fx.join(usage).display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    };
+    let claude = cli("claude", "claude-auth.json", "claude-usage.txt");
+    let agy = cli("agy", "claude-auth.json", "agy-usage.txt");
+    let codex = root.join("codex");
+    std::fs::create_dir_all(codex.join("sessions/2026/11/27")).unwrap();
+    std::fs::copy(
+        fx.join("codex-auth.synthetic.json"),
+        codex.join("auth.json"),
+    )
+    .unwrap();
+    std::fs::copy(
+        fx.join("codex-rollout.jsonl"),
+        codex.join("sessions/2026/11/27/rollout-2026-11-27T21-00-34-a.jsonl"),
+    )
+    .unwrap();
+    let agy_home = root.join("agy");
+    std::fs::create_dir_all(agy_home.join("log")).unwrap();
+    std::fs::copy(fx.join("agy-cli.log"), agy_home.join("log/cli-1.log")).unwrap();
+    let run = |args: &[&str]| {
+        hub.cmd(args)
+            .env("HGL_AI_USAGE_CLAUDE", &claude)
+            .env("HGL_AI_USAGE_AGY", &agy)
+            .env("CODEX_HOME", &codex)
+            .env("HGL_AI_USAGE_AGY_HOME", &agy_home)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+
+    assert_eq!(
+        ok(&hub.run(&["usage", "show"])),
+        "no usage records; run `hgl-ai usage collect`\n"
+    );
+    let dry = ok(&run(&[
+        "usage",
+        "collect",
+        "--dry-run",
+        "--runtime",
+        "codex",
+    ]));
+    assert_eq!(dry.lines().count(), 1, "{dry}");
+    assert!(dry.contains("\"runtime\":\"codex\""), "{dry}");
+    assert_eq!(
+        ok(&hub.run(&["usage", "show"])),
+        "no usage records; run `hgl-ai usage collect`\n",
+        "a dry run publishes nothing"
+    );
+
+    let first = ok(&run(&["usage", "collect"]));
+    let lines: Vec<&str> = first.lines().collect();
+    assert_eq!(lines.len(), 3, "{first}");
+    assert!(
+        lines[0].starts_with("claude.") && lines[0].ends_with(": 2 buckets, written"),
+        "{first}"
+    );
+    assert!(lines[1].ends_with(": 1 bucket, written"), "{first}");
+    assert!(lines[2].ends_with(": 4 buckets, written"), "{first}");
+    // The Codex observation is the rollout's own: the same again is stale.
+    let again = ok(&run(&["usage", "--json", "collect", "--runtime", "codex"]));
+    let v: serde_json::Value = serde_json::from_str(again.trim()).unwrap();
+    assert_eq!(v["outcome"], "stale", "{again}");
+    assert_eq!(v["host"], "test-host");
+
+    let table = ok(&hub.run(&["usage", "show"]));
+    let rows: Vec<&str> = table.lines().collect();
+    assert!(rows[0].starts_with("RUNTIME  ACCOUNT"), "{table}");
+    assert_eq!(rows.len(), 1 + 2 + 1 + 4, "{table}");
+    assert!(
+        rows.iter()
+            .any(|r| r.starts_with("codex") && r.contains("promax") && r.contains(" 7% ")),
+        "{table}"
+    );
+    for secret in ["someone@example.com", "acct-fixture", "FIXTURE-NOT-A-TOKEN"] {
+        assert!(!table.contains(secret), "{secret}");
+    }
+
+    let codex_key = lines[1].split(':').next().unwrap();
+    let account = codex_key.strip_prefix("codex.").unwrap();
+    assert_eq!(
+        ok(&hub.run(&["usage", "label", account, "team-gpt"])),
+        format!("{account} labelled team-gpt\n")
+    );
+    let json = ok(&hub.run(&["--json", "usage", "show"]));
+    let codex_rec: serde_json::Value = json
+        .lines()
+        .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap())
+        .find(|v| v["runtime"] == "codex")
+        .unwrap();
+    assert_eq!(codex_rec["label"], "team-gpt");
+    assert!(codex_rec["buckets"][0]["hours_to_reset"].is_number());
+    assert!(!json.contains("someone@example.com"));
+    ok(&hub.run(&["usage", "label", account, ""]));
+    assert!(!ok(&hub.run(&["usage", "show"])).contains("team-gpt"));
+    let bad = hub.run(&["usage", "label", "nothex", "x"]);
+    assert_eq!(bad.status.code(), Some(1), "{}", err(&bad));
 }

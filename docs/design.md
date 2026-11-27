@@ -22,6 +22,7 @@ no GitHub or git library.
 | `gh` | Coordinator service, merge gate, landing, pin sync, release watch, tap release; `backlog` and `HGL_METRICS`. Landing and release watch hold the hub lease `HGL_LOCKS/lock.land.<repo>`, so they exclude each other across hosts. | `proto`, `config`, `bus` |
 | `owner` | Owner channel: thread records, events, the console's fold, status reports, `decisions.log`. | `proto`, `bus` |
 | `notify` | Owner notifications: ntfy, Slack webhook, SMTP; first channel that accepts. | `config` |
+| `usage` | The usage collector: the claude, codex and agy sources, account fingerprints, the `usage show` table (PROTO-21). | `proto` |
 | `console` | The owner's web console: pages, telemetry, passkey and OAuth sign-in, the fold, ticks. | `proto`, `config`, `bus`, `owner`, `gh`, `notify` |
 | `hgl-ai` | The `clap` command line; thin over the crates. | all |
 
@@ -60,6 +61,9 @@ hgl-ai note peek SEAT                     print what the inbox has not acked; sp
 hgl-ai state get|put|del KEY [VALUE|-] [--if-revision N]
 hgl-ai state append KEY LINE|-
 hgl-ai hosts
+hgl-ai usage collect [--runtime R ...] [--dry-run]   one record per signed-in login (PROTO-21)
+hgl-ai usage show                         every login's limits, with hours to reset
+hgl-ai usage label ACCOUNT LABEL          an owner's label for a fingerprint; empty removes it
 
 hgl-ai tree list [--stale] [--local] [--json]   HGL_TREES, or this host's work_root
 hgl-ai tree remove SEAT REPO ISSUE [--review]  what the bridge does on `landed`, by hand

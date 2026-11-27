@@ -32,6 +32,9 @@
 //! - [`Bus::publish_event`], [`Bus::owner_feed`], [`Bus::history`] and the `thread_*` and
 //!   `metrics*` calls carry the owner channel (docs/owner.md §4); [`cred`] reads a hub
 //!   credential: the legacy shared token or a hub user's NKey seed (OWN-5).
+//! - [`Bus::usage_put`] keeps the newest usage record per login in `HGL_USAGE`
+//!   (compare-and-set on `observed_at`) and publishes it to `HGL_USAGE_LOG`;
+//!   [`Bus::usage`] lists them with their labels (PROTO-21, PROTO-22).
 //! - A publish the connection's hub user may not make fails with [`BusError::Denied`].
 //!
 //! Nothing here starts a hub; the operations other than `connect*` and
@@ -40,6 +43,7 @@
 
 pub mod cred;
 mod feed;
+mod usage;
 
 use std::path::Path;
 use std::sync::{Arc, Mutex};
@@ -47,6 +51,7 @@ use std::time::{Duration, Instant};
 
 pub use cred::{Credential, parse_credential, read_credential};
 pub use feed::{Feed, StreamMsg};
+pub use usage::UsagePut;
 
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
 use async_nats::jetstream::{self, AckKind, context::Publish, kv, stream};
@@ -54,8 +59,9 @@ use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
     BROADCAST, CONSOLE_PREFIX, EndedRecord, HostRecord, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS,
-    KV_METRICS, KV_STATE, KV_THREADS, KV_TREES, LockRecord, Note, OWNER_PREFIX, STREAM_NOTES,
-    STREAM_OWNER, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord, ended_key, utc_now_stamp,
+    KV_METRICS, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord, Note, OWNER_PREFIX,
+    STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord,
+    USAGE_PREFIX, ended_key, utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -132,6 +138,8 @@ pub const INBOX_MAX_DELIVER: i64 = -1;
 pub const MAX_NOTE_BYTES: usize = 1 << 20;
 /// Largest value a bucket holds.
 pub const MAX_VALUE_BYTES: usize = 1 << 20;
+/// `HGL_USAGE_LOG` keeps usage records 35 days, the burn-down history (PROTO-21).
+pub const USAGE_MAX_AGE: Duration = Duration::from_secs(35 * 86_400);
 /// Attempts [`Bus::append_line`] makes before giving up with [`BusError::Conflict`].
 const APPEND_ATTEMPTS: u32 = 200;
 
@@ -233,6 +241,7 @@ pub struct Bus {
     threads: OnceCell<kv::Store>,
     metrics: OnceCell<kv::Store>,
     console: OnceCell<kv::Store>,
+    usage: OnceCell<kv::Store>,
 }
 
 impl Bus {
@@ -308,6 +317,7 @@ impl Bus {
             threads: OnceCell::new(),
             metrics: OnceCell::new(),
             console: OnceCell::new(),
+            usage: OnceCell::new(),
         })
     }
 
@@ -420,6 +430,21 @@ impl Bus {
             })
             .await
             .map_err(|e| nats(&format!("provisioning stream {STREAM_OWNER}"), e))?;
+        self.js
+            .create_or_update_stream(stream::Config {
+                name: STREAM_USAGE.to_string(),
+                description: Some("hgl-ai subscription usage history".to_string()),
+                subjects: vec![format!("{USAGE_PREFIX}.>")],
+                retention: stream::RetentionPolicy::Limits,
+                discard: stream::DiscardPolicy::Old,
+                storage: stream::StorageType::File,
+                max_age: USAGE_MAX_AGE,
+                duplicate_window: NOTES_DUPLICATE_WINDOW,
+                max_message_size: (MAX_VALUE_BYTES + (64 << 10)) as i32,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| nats(&format!("provisioning stream {STREAM_USAGE}"), e))?;
         let buckets = [
             (
                 KV_STATE,
@@ -473,6 +498,13 @@ impl Bus {
             (
                 KV_CONSOLE,
                 "hgl-ai console state",
+                stream::StorageType::File,
+                1,
+                Duration::ZERO,
+            ),
+            (
+                KV_USAGE,
+                "hgl-ai subscription usage per login",
                 stream::StorageType::File,
                 1,
                 Duration::ZERO,

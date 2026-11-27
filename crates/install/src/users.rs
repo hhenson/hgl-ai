@@ -14,7 +14,8 @@ use std::str::FromStr;
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS,
-    KV_TREES, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, SUBJECT_PREFIX,
+    KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER,
+    SUBJECT_PREFIX, USAGE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 
@@ -249,7 +250,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     .map(String::from)
     .to_vec();
     let buckets = [
-        KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS,
+        KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_USAGE,
     ];
     let mut streams: Vec<String> = vec![STREAM_NOTES.to_string()];
     streams.extend(buckets.iter().map(|b| kv(b)));
@@ -272,9 +273,11 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         Role::Seat | Role::Coord => {
             allow.push(format!("{SUBJECT_PREFIX}.*"));
             allow.push(format!("{CONSOLE_PREFIX}.>"));
-            for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED] {
+            for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_USAGE] {
                 allow.push(format!("$KV.{b}.>"));
             }
+            // Usage records and their history (PROTO-21).
+            allow.push(format!("{USAGE_PREFIX}.>"));
             if role == Role::Coord {
                 allow.push(format!("$KV.{KV_METRICS}.>"));
             }
@@ -428,6 +431,9 @@ mod tests {
         let coord = permissions(Role::Coord).unwrap();
         assert!(coord.publish_allow.iter().any(|a| a == "$KV.HGL_METRICS.>"));
         assert!(!seat.publish_allow.iter().any(|a| a == "$KV.HGL_METRICS.>"));
+        for s in ["$KV.HGL_USAGE.>", "hgl.usage.>"] {
+            assert!(seat.publish_allow.iter().any(|a| a == s), "{s}");
+        }
         let console = permissions(Role::Console).unwrap();
         for s in ["hgl.owner.>", "hgl.notes.owner.>", "$KV.HGL_THREADS.>"] {
             assert!(console.publish_allow.iter().any(|a| a == s), "{s}");
