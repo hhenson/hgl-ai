@@ -53,7 +53,7 @@ before hub users takes one shared token until it moves.
 | --- | --- | --- |
 | Stream | `HGL_NOTES`, subjects `hgl.notes.>` | file storage, `max_age` 14 d, dedup window 24 h |
 | Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>`, `hgl.notes.all` and `hgl.notes.owner.<seat>`; explicit ack; `ack_wait` 300 s; `max_deliver` 5 |
-| Owner | stream `HGL_OWNER`, KV `HGL_THREADS`, KV `HGL_METRICS` | docs/owner.md §4 |
+| Owner | stream `HGL_OWNER`, KV `HGL_THREADS`, KV `HGL_METRICS`, KV `HGL_CONSOLE` | docs/owner.md §4 |
 | State | KV `HGL_STATE` | file storage, history 5 |
 | Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
 | Trees | KV `HGL_TREES` | file storage, history 1 |

@@ -45,8 +45,8 @@ live telemetry. GitHub stays the record (PROTO-1).
     the subject, never a header or the payload: the bridge accepts sender `owner` only on
     `hgl.notes.owner.<recipient>` and nothing else there; the console folds owner events
     only from `hgl.owner.thread.<id>` and agent events only from `hgl.console.thread.<id>`.
-  - Limit: an agent running as the console's OS user can read the console's credential
-    file. Run seats on other hosts or the console as another user; `doctor` warns.
+  - The server side (hub, coordinator, console) runs as its own OS user, so no agent,
+    which runs as the client user, can read the console's credential; `doctor` checks it.
 - **OWN-6 — Sign-in.** The console listens on a configured address (loopback or a
   tailnet address, never a public interface) over HTTPS, at a stable host name, which
   passkeys need. Users sign in with a passkey (WebAuthn). A user's first sign-in, and
@@ -57,8 +57,9 @@ live telemetry. GitHub stays the record (PROTO-1).
   - HTTPS is the console's own (`tls_cert`, `tls_key`) or a local TLS proxy's in front of
     plain HTTP on loopback (`tailscale serve`); `[console] url` is the origin either way.
   - Sessions: random ids in HMAC-signed cookies (HttpOnly, Secure, SameSite=Strict),
-    `session_ttl` (7 d), held in memory: a restart signs everyone out. A form post needs
-    the console's `Origin` and the session's CSRF token.
+    `session_ttl` (7 d), kept on the hub in `HGL_CONSOLE` (only the console's user reads
+    or writes it; a session is keyed by the SHA-256 of its id), so a restart signs no
+    one out. A form post needs the console's `Origin` and the session's CSRF token.
   - A user is keyed by email: `{ email, handle, github, apple, google }`. Google signs
     in by its verified email and Apple by the email in its `id_token` (a private relay
     address needs `apple`); both default to `email`. GitHub signs in by `github` (a
@@ -77,7 +78,7 @@ live telemetry. GitHub stays the record (PROTO-1).
   accepts is used: a phone push (an ntfy topic) or a Slack incoming webhook, then
   email as the last resort. A notification carries the title, priority and a link to
   the thread, never the context. An email channel without `to` goes to every user's
-  `email`.
+  `email`. The pending `p2` batch is kept in `HGL_CONSOLE` across restarts.
 - **OWN-10 — Handles.** Each user signs the owner's words with a handle of their own
   choosing (`handle`, 1 to 31 letters, digits, spaces or `-_.'`, unique ignoring case
   and repeated spaces; shorter reads better). Every owner event records it; owner notes
@@ -120,6 +121,7 @@ repository per day.
 | Stream | `HGL_OWNER`, subjects `hgl.owner.>`, `hgl.console.>` | status reports, thread events; no age limit; dedup 24 h |
 | KV | `HGL_THREADS` | one record per thread: id, kind, title, issue, priority, state, times, options, suggested, answer, messages |
 | KV | `HGL_METRICS` | daily samples per repository |
+| KV | `HGL_CONSOLE` | the console's sessions and pending `p2` batch; the console's user only |
 
 | Subject | Publisher | Event |
 | --- | --- | --- |

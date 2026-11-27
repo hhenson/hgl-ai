@@ -6,14 +6,35 @@ Status: proposed.
 
 ```sh
 brew install hhenson/hgraph/hgl-ai
-hgl-ai server install --listen <tailnet-address>
+hgl-ai server install --listen <tailnet-address>     # as yourself; root steps via sudo
 ```
 
-`server install`:
+The server side (hub, coordinator, console) runs as its own OS user, `hgl-ai`
+(`_hgl-ai` on macOS; `--server-user`), from system units (`User=`) or launch daemons
+(`UserName`), with its configuration, credentials and data in that user's home,
+`/var/lib/hgl-ai` (`/Library/hgl-ai`; `--server-home`), mode 0700. The client side
+(bridge, agent CLIs, their sign-ins) stays yours. Each step that needs root is shown
+and runs through `sudo` only when you confirm it; `--print-root-steps` prints them as
+a script instead and runs none:
+
+| Step (root) | Linux | macOS |
+| --- | --- | --- |
+| the server user | `useradd --system --user-group --home-dir /var/lib/hgl-ai --shell /usr/sbin/nologin hgl-ai` | `sysadminctl -addUser _hgl-ai -roleAccount -home /Library/hgl-ai -shell /usr/bin/false` |
+| its home | `install -d -o hgl-ai -m 0700 /var/lib/hgl-ai`, `chown hgl-ai:hgl-ai` | `install -d -o _hgl-ai -m 0700 /Library/hgl-ai` |
+| `hgl-ai` it can run, when yours is under your home | `install -m 0755 <yours> /usr/local/bin/hgl-ai` | same |
+| its files, as the server user | `sudo -u hgl-ai env HOME=... hgl-ai server install --same-user --no-services ...` | same |
+| units | `install -m 0644 ... /etc/systemd/system/hgl-ai-{hub,coord,console}.service`, `systemctl daemon-reload`, `enable`, `restart` | `/Library/LaunchDaemons/io.github.hhenson.hgl-ai.*.plist`, `launchctl bootstrap system`, `kickstart` |
+| provisioning, as the server user's admin hub user | `sudo -u hgl-ai env ... HGL_AI_HUB_CREDENTIAL=.../<hub>-admin.cred hgl-ai init` | same |
+| this host's client credential, for you | `install -m 0600 -o <you> /var/lib/hgl-ai/.config/hgl-ai/hub.token ~/.config/hgl-ai/hub.token` | same |
+
+`--same-user` installs the server side as yourself with user services (development
+and tests; `doctor` warns that agents can then read the console's credential).
+
+The server user's step of `server install`:
 
 1. Uses `nats-server` from `PATH`, or installs it (`brew install
-   nats-server` where Homebrew exists, else the pinned release, checksum
-   verified, into `<data_dir>/bin`).
+   nats-server` where Homebrew exists and the install is `--same-user`, else the
+   pinned release, checksum verified, into `<data_dir>/bin`).
 2. Makes the hub users (below): `<host>-admin`, `<host>` (this host's client,
    in `hub.token_file`), `<host>-coord` and `console`, keeping existing keys, and
    writes `<data_dir>/nats.conf` (mode 0600: listen address, JetStream store,
@@ -25,14 +46,28 @@ hgl-ai server install --listen <tailnet-address>
 4. Prints the client commands. A credential is copied to its host by hand or a
    secret manager; no secret is ever printed.
 
-`server start|stop|status` manage the services; `server uninstall` removes
-them and `nats.conf`, keeping the JetStream store unless `--purge`.
+`server start|stop|status` manage the services (`start`, `stop` as root steps);
+`server uninstall` removes them, keeping the server user's home and JetStream store
+unless `--purge`, which also removes the user.
+
+The coordinator reads GitHub with its own token, not yours: make a fine-grained,
+read-only token (Metadata, Contents, Issues, Pull requests, Checks: read) for the
+repositories, and store it as the server user (`[github] token_file`):
+
+```sh
+sudo -u hgl-ai sh -c 'umask 077; cat > /var/lib/hgl-ai/.config/hgl-ai/github.token'
+```
+
+The server user's own commands run with `sudo -u hgl-ai env HOME=/var/lib/hgl-ai
+hgl-ai ...` (`server user add`, `doctor`).
 
 ## Hub users
 
 Every client has its own NKey user (OWN-5). `<data_dir>/hub-users.toml` lists
 names, roles and public keys; a credential (`user`, `role`, `seed`, mode 0600) is
-written once to `~/.config/hgl-ai/hub-users/<name>.cred`.
+written once to `~/.config/hgl-ai/hub-users/<name>.cred` (the server user's home in
+a system install: run `server user` there as `sudo -u hgl-ai env HOME=/var/lib/hgl-ai
+hgl-ai server user ...`).
 
 | Role | May publish |
 | --- | --- |
@@ -50,8 +85,8 @@ hgl-ai server user list
 hgl-ai server user remove build-1                  # the hub refuses it from then on
 ```
 
-`user add` and `remove` rewrite `nats.conf` and restart the hub (clients
-reconnect). On the client: `hgl-ai client install --token-file <the .cred>`. A
+`user add` and `remove` rewrite `nats.conf` and reload the hub (SIGHUP through
+its pid file; connections that stay valid are kept). On the client: `hgl-ai client install --token-file <the .cred>`. A
 credential file may also be a bare NKey seed (`SU...`). `hgl-ai init` needs the
 admin user: `HGL_AI_HUB_CREDENTIAL=~/.config/hgl-ai/hub-users/<hub>-admin.cred hgl-ai init`.
 
@@ -149,8 +184,8 @@ own hub user `console`.
 7. `hgl-ai doctor`, then open `https://<name>/signin`: a provider once, then register a
    passkey; later sign-ins use the passkey. A new device: a provider again.
 
-Seats on the hub host run as the console's user and can read its credential
-(`doctor` warns): run them elsewhere, or the console as another OS user.
+The console's credential and secrets belong to the server user; `doctor`, run as
+you, checks that you (and so your agents) cannot read them.
 
 ## Agents
 

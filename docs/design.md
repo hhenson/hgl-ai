@@ -35,7 +35,9 @@ TLS is `rustls` with `ring` only. Rust 1.89 or later.
 
 ```
 hgl-ai server install [--listen ADDR] [--port 4222] [--store DIR] [--users] [--no-coord]
-                [--no-console] [--console-url URL] [--console-user NAME ...] [--console-listen ADDR]
+                [--no-console] [--console-url URL] [--console-user EMAIL=HANDLE ...]
+                [--console-listen ADDR] [--server-user NAME] [--server-home DIR]
+                [--print-root-steps] [--same-user]
 hgl-ai server start|stop|status|uninstall
 hgl-ai server user add NAME --role seat|coord|console|admin [--nkey PUBKEY] [--rotate]
 hgl-ai server user list|remove NAME
@@ -104,6 +106,7 @@ turn_timeout = "2h"
 
 [github]
 owner = "hhenson"
+# token_file = "~/.config/hgl-ai/github.token"   # the coordinator's own read-only token
 repos = ["hgl-compiler", "hgl_spec", "hgl_core", "hgl-project", "homebrew-hgraph"]
 branch_prefix = "codex/"
 wrapper = "hgl-project"
@@ -138,6 +141,7 @@ port = 4222
 store_dir = "~/.local/share/hgl-ai/nats"
 nats_version = "2.15.3"
 auth = "users"                         # a hub user per client; "token": older single token
+units = "system"                       # the server user's: system units; default "user"
 
 [console]                              # hub host only (docs/owner.md)
 listen = "127.0.0.1:8443"              # loopback or tailnet address, never 0.0.0.0
@@ -224,14 +228,17 @@ Reviewer tasks use `<seat>/<repo>-<pr>-review/` with a detached checkout of
 
 ## 6. Services
 
-`hgl-ai server install` and `client install` write user services:
+`hgl-ai server install` writes system services run as the server user (`hgl-ai`,
+home `/var/lib/hgl-ai`; on macOS `_hgl-ai`, `/Library/hgl-ai`); `client install`
+writes the owner's user service. `server install --same-user` writes user services
+for all four.
 
-| Service | Linux (`systemd --user`) | macOS (`launchd`) |
-| --- | --- | --- |
-| Hub | `hgl-ai-hub.service` running `nats-server -c <data_dir>/nats.conf` | `io.github.hhenson.hgl-ai.hub` |
-| Bridge | `hgl-ai-bridge.service` running `hgl-ai bridge run` | `io.github.hhenson.hgl-ai.bridge` |
-| Coordinator | `hgl-ai-coord.service` running `hgl-ai gh coord run` | `io.github.hhenson.hgl-ai.coord` |
-| Console | `hgl-ai-console.service` running `hgl-ai console run` | `io.github.hhenson.hgl-ai.console` |
+| Service | Runs as | Linux | macOS |
+| --- | --- | --- | --- |
+| Hub | server user | `/etc/systemd/system/hgl-ai-hub.service`: `nats-server -c <data_dir>/nats.conf` | `/Library/LaunchDaemons/io.github.hhenson.hgl-ai.hub.plist` |
+| Coordinator | server user | `hgl-ai-coord.service`: `hgl-ai gh coord run` | `io.github.hhenson.hgl-ai.coord` |
+| Console | server user | `hgl-ai-console.service`: `hgl-ai console run` | `io.github.hhenson.hgl-ai.console` |
+| Bridge | owner | `systemd --user` `hgl-ai-bridge.service`: `hgl-ai bridge run` | LaunchAgent `io.github.hhenson.hgl-ai.bridge` |
 
 Linux services enable lingering (`loginctl enable-linger`) when the user
 allows it, so they survive logout.
