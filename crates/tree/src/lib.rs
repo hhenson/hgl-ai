@@ -119,6 +119,10 @@ pub struct TaskFile {
     /// (an older note delivered again) changes nothing (PROTO-21).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_seq: Option<u64>,
+    /// The stream sequence of the newest `assign` or `sendback` a turn in this tree ran
+    /// (PROTO-21): verdicts go to the task's tree with the newest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_seq: Option<u64>,
 }
 
 impl TaskFile {
@@ -421,6 +425,7 @@ impl Trees {
             families: Vec::new(),
             class: None,
             class_seq: None,
+            handoff_seq: None,
         })
     }
 
@@ -506,6 +511,7 @@ impl Trees {
             families: Vec::new(),
             class: None,
             class_seq: None,
+            handoff_seq: None,
         })
     }
 
@@ -679,6 +685,7 @@ impl Trees {
                         families: Vec::new(),
                         class: None,
                         class_seq: None,
+                        handoff_seq: None,
                         seq: None,
                     },
                 };
@@ -704,6 +711,7 @@ impl Trees {
             class: f.class,
             class_seq: f.class_seq,
             seq: f.seq,
+            handoff_seq: f.handoff_seq,
         }
     }
 
