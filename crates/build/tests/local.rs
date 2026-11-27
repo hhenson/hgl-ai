@@ -76,3 +76,75 @@ fn concurrent_checkouts_share_a_clone() {
     let wt = git(&root.join("builder/clones/demo"), &["worktree", "list"]);
     assert_eq!(wt.lines().count(), 1, "{wt}");
 }
+
+/// Carbon's second review of #12, finding 8: a step sees every SDK the builder has, not
+/// only the ones it needs (an optional prefix, as `recipes/hgraph.toml` reads).
+#[test]
+fn every_configured_sdk_reaches_a_step() {
+    use hgl_ai_build::driver::{self, Meta, Options};
+    use hgl_ai_build::exec::{Cancel, Workspace};
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let ex = Local::new(
+        tmp.path().join("builder"),
+        BTreeMap::from([("hgraph-deps".to_string(), "/opt/hgraph-deps".to_string())]),
+        Git::default(),
+    );
+    let recipe = hgl_ai_build::Recipe::parse(
+        "repo = \"demo\"\n[[step]]\nname = \"configure\"\nrun = 'echo \"deps=${HGL_SDK_HGRAPH_DEPS:-none}\"'\nmemcap_gb = 1\n",
+    )
+    .unwrap();
+    let ws = Workspace {
+        src: src.display().to_string(),
+        build: tmp.path().join("build").display().to_string(),
+        tmp: tmp.path().display().to_string(),
+        job: None,
+        clone: None,
+    };
+    let logs = tmp.path().join("logs");
+    let opts = Options {
+        log_dir: logs.clone(),
+        ..Options::default()
+    };
+    let d = driver::drive(
+        &ex,
+        &ws,
+        &recipe,
+        &Meta::default(),
+        &opts,
+        &Cancel::default(),
+        &mut |_| {},
+    );
+    assert_eq!(d.summary.status.as_str(), "pass");
+    assert_eq!(
+        std::fs::read_to_string(logs.join("configure.log")).unwrap(),
+        "deps=/opt/hgraph-deps\n"
+    );
+}
+
+/// Finding 9: pruning old logs keeps a build that has not ended.
+#[test]
+fn pruning_keeps_unfinished_runs() {
+    let tmp = tempfile::tempdir().unwrap();
+    let logs = tmp.path();
+    for (id, done) in [
+        ("20261127-100000-000000", false),
+        ("20261127-110000-000000", true),
+        ("20261127-120000-000000", true),
+    ] {
+        let d = logs.join(id);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("request.json"), "{}").unwrap();
+        if done {
+            std::fs::write(d.join("summary.json"), "{}").unwrap();
+        }
+    }
+    hgl_ai_build::service::prune_logs(logs, 1);
+    assert!(
+        logs.join("20261127-100000-000000").exists(),
+        "still running"
+    );
+    assert!(!logs.join("20261127-110000-000000").exists());
+    assert!(logs.join("20261127-120000-000000").exists());
+}

@@ -899,6 +899,8 @@ pub fn prune_logs(root: &std::path::Path, keep: usize) {
         .filter(|e| {
             e.file_type().is_ok_and(|t| t.is_dir())
                 && hgl_ai_proto::build::check_build_id(&e.file_name().to_string_lossy()).is_ok()
+                // A build that has not ended (with `concurrency > 1`) keeps its logs.
+                && e.path().join(store::SUMMARY_FILE).is_file()
         })
         .map(|e| e.path())
         .collect();

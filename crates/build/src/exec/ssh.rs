@@ -953,6 +953,10 @@ impl Executor for Ssh {
         self.sdk.get(name).cloned()
     }
 
+    fn sdk_names(&self) -> Vec<String> {
+        self.sdk.keys().cloned().collect()
+    }
+
     fn has_tool(&self, tool: &str) -> Result<bool, HostError> {
         Ok(self.exec(&self.dialect.has_tool(tool), SHORT)?.ok)
     }

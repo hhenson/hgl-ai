@@ -173,6 +173,9 @@ pub trait Executor: Send + Sync {
     fn platform(&self) -> Platform;
     /// The prefix of SDK `name` on the executor's host, if configured.
     fn sdk(&self, name: &str) -> Option<String>;
+    /// Every SDK configured on the executor's host, by name: steps see them all
+    /// (`HGL_SDK_<NAME>`); `needs` only requires one.
+    fn sdk_names(&self) -> Vec<String>;
     fn has_tool(&self, tool: &str) -> Result<bool, HostError>;
     /// Check out `c` in a job directory of its own.
     fn prepare(&self, c: &Checkout) -> Result<Workspace, Prep>;

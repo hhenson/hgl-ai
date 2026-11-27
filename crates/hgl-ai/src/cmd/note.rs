@@ -142,6 +142,12 @@ async fn send(ctx: &Ctx, a: SendArgs) -> anyhow::Result<i32> {
             a.from
         );
     }
+    if hgl_ai_proto::build::is_build_address(&a.from) {
+        bail!(
+            "--from {}: `builder-*` and `r-*` are builders' and builds' addresses, never a sender here",
+            a.from
+        );
+    }
     let mut note = Note::new(a.from, a.to, a.kind, body);
     note.repo = a.repo;
     note.issue = a.issue.unwrap_or(0);

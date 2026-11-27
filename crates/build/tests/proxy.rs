@@ -608,7 +608,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         !jobs.join("20261126-000000-000000").exists(),
         "the leftover is gone"
     );
-    let s = store::parse_receipt(&r).unwrap();
+    let s = store::parse_receipt(&r, "20261127-090000-aaaaaa").unwrap();
     assert_eq!(s.status, BuildStatus::Pass, "{s:?}");
     assert_eq!(
         (s.host.as_str(), s.proxy.as_deref(), s.executor.as_str()),
@@ -664,7 +664,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         );
     }
     let r = r.unwrap();
-    let s = store::parse_receipt(&r).unwrap();
+    let s = store::parse_receipt(&r, "20261127-090000-bbbbbb").unwrap();
     assert_eq!(
         s.status,
         BuildStatus::Pass,
@@ -703,7 +703,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         .await
         .unwrap()
         .expect("a receipt");
-    let got = store::parse_receipt(&r).unwrap();
+    let got = store::parse_receipt(&r, "20261127-090000-dddddd").unwrap();
     assert_eq!(got.reason.as_deref(), Some("saved before the crash"));
     let log = std::fs::read_to_string(w.state.join("log")).unwrap();
     assert!(

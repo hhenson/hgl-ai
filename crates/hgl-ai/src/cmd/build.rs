@@ -328,6 +328,13 @@ fn pid_alive(pid: i32) -> bool {
     pid > 0 && unsafe { libc::kill(pid, 0) } == 0
 }
 
+/// `<run_dir>/pid`, written whole (a reader never sees it half written).
+fn write_pid(run_dir: &Path, pid: u32) -> std::io::Result<()> {
+    let tmp = run_dir.join(format!("pid.{}.tmp", std::process::id()));
+    std::fs::write(&tmp, format!("{pid}\n"))?;
+    std::fs::rename(&tmp, run_dir.join("pid"))
+}
+
 /// Start this same command again in the background, detached, with `--id`.
 fn detach(id: &str, run_dir: &Path, log_root: &Path) -> anyhow::Result<()> {
     use std::os::unix::process::CommandExt;
@@ -360,7 +367,7 @@ fn detach(id: &str, run_dir: &Path, log_root: &Path) -> anyhow::Result<()> {
         });
     }
     let child = c.spawn().context("starting the detached build")?;
-    std::fs::write(run_dir.join("pid"), format!("{}\n", child.id()))?;
+    write_pid(run_dir, child.id())?;
     Ok(())
 }
 
@@ -431,7 +438,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         return Ok(EXIT_OK);
     }
     std::fs::create_dir_all(&run_dir)?;
-    std::fs::write(run_dir.join("pid"), format!("{}\n", std::process::id()))?;
+    write_pid(&run_dir, std::process::id())?;
     let head = git_out(&src, &["rev-parse", "HEAD"]);
     let dirty = git_out(&src, &["status", "--porcelain"]).is_some_and(|s| !s.is_empty());
     let build = a
@@ -589,6 +596,14 @@ async fn run_remote(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
             b.reason.as_deref().unwrap_or("no reason given")
         );
     }
+    // The task's pull request, so a `--notify` receipt resumes the seat's task.
+    let issue = match (
+        a.issue,
+        task_dir().and_then(|t| hgl_ai_tree::read_task(&t).ok()),
+    ) {
+        (0, Some(t)) if t.repo == repo => t.issue,
+        (n, _) => n,
+    };
     let id = new_build_id();
     let reply = reply_seat(&id)?;
     let job = BuildJob {
@@ -597,7 +612,7 @@ async fn run_remote(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         repo: repo.clone(),
         head: head.clone(),
         base: a.base.clone(),
-        issue: a.issue,
+        issue,
         steps: a.steps.clone(),
         recipe_rev: None,
         keep_going: a.keep_going,
@@ -641,7 +656,7 @@ async fn run_remote(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
     n.repo = Some(repo);
     n.head = Some(head);
     n.base = a.base.clone();
-    n.issue = a.issue;
+    n.issue = issue;
     bus.send(&n).await?;
     if a.detach {
         if ctx.json {
@@ -684,8 +699,13 @@ async fn wait_remote(
             return Ok(None);
         }
         let step = left.unwrap_or(Duration::MAX).min(Duration::from_secs(30));
+        // Only the builder's receipt of this build counts; another note on the address
+        // (a stray or a forged one) is passed over, the hub's copy standing in.
         if let Some(n) = bus.reply_wait(&reply, step).await? {
-            return Ok(Some(store::parse_receipt(&n)?));
+            match store::parse_receipt(&n, id) {
+                Ok(s) => return Ok(Some(s)),
+                Err(e) => tracing::warn!("build {id}: {e}; reading the hub's copy"),
+            }
         }
         // The hub's final summary stands in for a receipt not (yet) published. A stopped
         // run is queued again, so it is not final here.
@@ -993,14 +1013,9 @@ async fn shell(ctx: &Ctx, a: ShellArgs) -> anyhow::Result<i32> {
             ws.src
         );
         let mut env = driver::build_env(&c.id, &ws);
-        let names = cfg2
-            .builder
-            .sdk
-            .keys()
-            .chain(cfg2.builder.remote.iter().flat_map(|r| r.sdk.keys()));
-        for n in names {
-            if let Some(p) = exec.sdk(n) {
-                env.push((sdk_var(n), p));
+        for n in exec.sdk_names() {
+            if let Some(p) = exec.sdk(&n) {
+                env.push((sdk_var(&n), p));
             }
         }
         let code = exec.shell(&ws, &env);

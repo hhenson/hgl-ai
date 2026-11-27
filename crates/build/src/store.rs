@@ -217,7 +217,23 @@ pub async fn send_receipt(
 }
 
 /// A build summary from a receipt's body.
-pub fn parse_receipt(n: &Note) -> Result<Summary, StoreError> {
-    serde_json::from_str(n.body.trim())
-        .map_err(|e| StoreError::Other(format!("a build receipt that is not a summary: {e}")))
+/// The summary of build `id` from its receipt: a `receipt` from a builder
+/// (`builder-*`) whose summary is that build's. Anything else on the reply address is not
+/// the build's result.
+pub fn parse_receipt(n: &Note, id: &str) -> Result<Summary, StoreError> {
+    if n.kind != Kind::Receipt || !n.sender.as_str().starts_with("builder-") {
+        return Err(StoreError::Other(format!(
+            "a {} from {} is not a builder's receipt",
+            n.kind, n.sender
+        )));
+    }
+    let s: Summary = serde_json::from_str(n.body.trim())
+        .map_err(|e| StoreError::Other(format!("a build receipt that is not a summary: {e}")))?;
+    if s.id != id {
+        return Err(StoreError::Other(format!(
+            "a receipt of build {}, not {id}",
+            s.id
+        )));
+    }
+    Ok(s)
 }

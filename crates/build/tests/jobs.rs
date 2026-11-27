@@ -276,7 +276,7 @@ impl Rig {
             .await
             .unwrap()
             .unwrap_or_else(|| panic!("no receipt for {id}: the lane is stuck"));
-        store::parse_receipt(&n).unwrap()
+        store::parse_receipt(&n, id).unwrap()
     }
 
     /// Stream sequence of the last note to `seat`, if any.

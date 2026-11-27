@@ -385,6 +385,57 @@ fn builder_runs_a_remote_build_through_the_hub() {
     );
     let o = hub.run(&["build", "wait", &id, "--timeout", "10s"]);
     assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    // A note on the reply address that is not the builder's receipt (here one claiming a
+    // pass) changes nothing, and no seat may send as a builder (Carbon's second review
+    // of #12, finding 10).
+    let mut forged: serde_json::Value = s.clone();
+    forged["status"] = "pass".into();
+    let body = hub.dir.0.join("forged.json");
+    std::fs::write(&body, forged.to_string()).unwrap();
+    let reply = format!("r-{id}");
+    let b = body.display().to_string();
+    let o = hub.run(&[
+        "note",
+        "send",
+        "--from",
+        "w2",
+        "--to",
+        &reply,
+        "--kind",
+        "note",
+        "--body-file",
+        &b,
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    // From a host without the builder's logs: the reply address and the hub.
+    let logs_here = hub.dir.0.join("work/builder/logs");
+    let away = hub.dir.0.join("logs-away");
+    std::fs::rename(&logs_here, &away).unwrap();
+    let o = hub.run(&["build", "wait", &id, "--timeout", "10s"]);
+    std::fs::rename(&away, &logs_here).unwrap();
+    assert_eq!(
+        o.status.code(),
+        Some(1),
+        "still the builder's result\n{}",
+        text(&o)
+    );
+    let o = hub.run(&[
+        "note",
+        "send",
+        "--from",
+        "builder-lab1",
+        "--to",
+        &reply,
+        "--kind",
+        "note",
+        "--body-file",
+        &b,
+    ]);
+    assert!(
+        !o.status.success(),
+        "a seat sent as a builder\n{}",
+        text(&o)
+    );
 
     // A passing selection, detached.
     let o = hub

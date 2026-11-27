@@ -164,6 +164,10 @@ impl Executor for Local {
         })
     }
 
+    fn sdk_names(&self) -> Vec<String> {
+        self.sdk.keys().cloned().collect()
+    }
+
     fn has_tool(&self, tool: &str) -> Result<bool, HostError> {
         Ok(find_on_path(tool).is_some())
     }

@@ -42,7 +42,7 @@ hgl-ai server install [--listen ADDR] [--port 4222] [--store DIR] [--users] [--n
 hgl-ai server start|stop|status|uninstall
 hgl-ai server user add NAME --role seat|coord|console|admin [--nkey PUBKEY] [--rotate]
 hgl-ai server user list|remove NAME
-hgl-ai client install --hub URL --token-file FILE --host LABEL [--work-root DIR]
+hgl-ai client install --hub URL --token-file FILE --host LABEL [--work-root DIR] [--no-builder]
 hgl-ai client uninstall
 hgl-ai init                               provision stream and buckets (idempotent)
 hgl-ai doctor                             check config, hub, CLIs, skills, services, disk

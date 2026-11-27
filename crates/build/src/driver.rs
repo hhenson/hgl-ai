@@ -168,6 +168,11 @@ pub fn drive(
         }
         // Needs.
         let mut env = opts.env.clone();
+        for n in exec.sdk_names() {
+            if let Some(p) = exec.sdk(&n) {
+                env.push((sdk_var(&n), p));
+            }
+        }
         let mut missing = None;
         for need in step.needs() {
             match &need {
