@@ -80,22 +80,44 @@ impl Default for Console {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum User {
-    /// An identity with its owner's handle.
-    Owner(OwnerEntry),
-    /// The older form: an identity without a handle (`doctor` warns).
+    /// A person, keyed by email, with the identities they sign in with.
+    Person(Person),
+    /// An earlier form: `{ id, handle }`; no email (`doctor` fails, naming it).
+    Linked(LinkedEntry),
+    /// The earliest form: a bare identity; no email or handle.
     Plain(String),
+}
+
+/// `{ email = "...", handle = "...", github = "<login>", apple = "...", google = "..." }`
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Person {
+    /// The user's key (lower-cased) and the default address of the email channel.
+    pub email: String,
+    /// The name the user chooses to sign with (OWN-10): 1 to 31 letters, digits, spaces
+    /// or `-_.'`, unique among users ignoring case and repeated spaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
+    /// A GitHub login; without one, a GitHub account whose verified emails include
+    /// `email` signs in as this user.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub github: Option<String>,
+    /// The email Apple gives (it may be a private relay address); default `email`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub apple: Option<String>,
+    /// The Google account email; default `email`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub google: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct OwnerEntry {
+pub struct LinkedEntry {
     pub id: Ids,
-    /// The name the owner chooses to sign with (OWN-10): 1 to 31 letters, digits, spaces
-    /// or `-_.'`, unique among users ignoring case and repeated spaces.
     pub handle: String,
 }
 
-/// One identity or several (one owner signing in with GitHub and Google, say).
+/// One identity or several.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum Ids {
@@ -113,25 +135,53 @@ impl Ids {
 }
 
 impl User {
-    /// `{ id, handle }`
-    pub fn new(id: impl Into<String>, handle: impl Into<String>) -> User {
-        User::Owner(OwnerEntry {
-            id: Ids::One(id.into()),
-            handle: handle.into(),
+    /// `{ email, handle }`: Apple and Google by that email, GitHub by its verified emails.
+    pub fn person(email: impl Into<String>, handle: impl Into<String>) -> User {
+        User::Person(Person {
+            email: email.into(),
+            handle: Some(handle.into()),
+            github: None,
+            apple: None,
+            google: None,
         })
     }
-    fn ids(&self) -> Vec<&str> {
-        match self {
-            User::Owner(o) => o.id.all(),
-            User::Plain(s) => vec![s.as_str()],
-        }
+}
+
+/// One user as the console knows them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Member {
+    /// The user's key: the email, lower-cased; for an entry in an earlier form, its
+    /// first identity (`github:<login>`).
+    pub key: String,
+    pub email: Option<String>,
+    pub handle: Option<String>,
+    pub github: Option<String>,
+    pub apple: Option<String>,
+    pub google: Option<String>,
+}
+
+impl Member {
+    /// How the user signs: the handle, else the key.
+    pub fn signature(&self) -> &str {
+        self.handle.as_deref().unwrap_or(&self.key)
     }
-    pub fn handle(&self) -> Option<&str> {
-        match self {
-            User::Owner(o) => Some(&o.handle),
-            User::Plain(_) => None,
-        }
-    }
+}
+
+/// Why an identity signs in as nobody.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unresolved {
+    NotListed,
+    /// More than one user matches: refused rather than guessed.
+    Ambiguous(Vec<String>),
+}
+
+fn lower(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+fn is_email(s: &str) -> bool {
+    let s = s.trim();
+    matches!(s.split_once('@'), Some((a, b)) if !a.is_empty() && b.contains('.') && !s.contains(char::is_whitespace))
 }
 
 /// A GitHub OAuth app (first sign-in and new-device enrolment).
@@ -353,6 +403,8 @@ pub enum Notify {
         #[serde(default)]
         tls: SmtpTls,
         from: String,
+        /// Recipients; default every user's `email` (OWN-9).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
         to: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user: Option<String>,
@@ -443,19 +495,28 @@ impl Console {
                 .filter(|d| !d.is_zero())
                 .ok_or_else(|| format!("console.{what}: duration {d:?}"))?;
         }
-        let owners = self.owners()?;
-        let mut handles = std::collections::BTreeSet::new();
-        let mut ids = std::collections::BTreeSet::new();
-        for o in &owners {
-            if let Some(h) = &o.handle {
+        let members = self.members()?;
+        let mut seen = std::collections::BTreeMap::new();
+        for m in &members {
+            if let Some(h) = &m.handle {
                 hgl_ai_proto::check_handle(h).map_err(|e| format!("console.users: {e}"))?;
-                if !handles.insert(hgl_ai_proto::handle_key(h)) {
-                    return Err(format!("console.users: handle {h} is taken twice"));
+                if seen
+                    .insert(format!("handle {}", hgl_ai_proto::handle_key(h)), ())
+                    .is_some()
+                {
+                    return Err(format!("console.users: handle {h:?} is taken twice"));
                 }
             }
-            for i in &o.ids {
-                if !ids.insert(i.folded()) {
-                    return Err(format!("console.users: {i} is listed twice"));
+            for (what, v) in [
+                ("user", Some(&m.key)),
+                ("github", m.github.as_ref()),
+                ("apple", m.apple.as_ref()),
+                ("google", m.google.as_ref()),
+            ] {
+                if let Some(v) = v
+                    && seen.insert(format!("{what} {}", lower(v)), ()).is_some()
+                {
+                    return Err(format!("console.users: {what} {v} is listed twice"));
                 }
             }
         }
@@ -474,8 +535,10 @@ impl Console {
                             "console.notify email smtp {smtp:?}: expected host:port"
                         ));
                     }
-                    if to.is_empty() {
-                        return Err("console.notify email: no `to` address".into());
+                    if to.is_empty() && !members.iter().any(|m| m.email.is_some()) {
+                        return Err(
+                            "console.notify email: no `to` address and no user email".into()
+                        );
                     }
                 }
                 _ => {}
@@ -491,64 +554,175 @@ impl Console {
         parse_duration(&self.session_ttl).expect("validated")
     }
 
-    /// The users, parsed.
-    pub fn owners(&self) -> Result<Vec<Owner>, String> {
-        self.users
-            .iter()
-            .map(|u| {
-                let ids = u
-                    .ids()
-                    .into_iter()
-                    .map(Identity::parse)
-                    .collect::<Result<Vec<_>, _>>()
-                    .map_err(|e| format!("console.users: {e}"))?;
-                if ids.is_empty() {
-                    return Err("console.users: an entry with no id".to_string());
+    /// The users, parsed and checked one by one.
+    pub fn members(&self) -> Result<Vec<Member>, String> {
+        let mut out = Vec::new();
+        for u in &self.users {
+            out.push(match u {
+                User::Person(p) => {
+                    if !is_email(&p.email) {
+                        return Err(format!(
+                            "console.users: email {:?} is not an email",
+                            p.email
+                        ));
+                    }
+                    for (what, v) in [("apple", &p.apple), ("google", &p.google)] {
+                        if let Some(v) = v
+                            && !is_email(v)
+                        {
+                            return Err(format!("console.users: {what} {v:?} is not an email"));
+                        }
+                    }
+                    if let Some(g) = &p.github
+                        && (g.trim().is_empty() || g.contains(['@', ':', ' ']))
+                    {
+                        return Err(format!("console.users: github {g:?} is not a login"));
+                    }
+                    let email = lower(&p.email);
+                    Member {
+                        key: email.clone(),
+                        email: Some(email.clone()),
+                        handle: p.handle.clone(),
+                        github: p.github.as_deref().map(lower),
+                        apple: Some(
+                            p.apple
+                                .as_deref()
+                                .map(lower)
+                                .unwrap_or_else(|| email.clone()),
+                        ),
+                        google: Some(p.google.as_deref().map(lower).unwrap_or(email)),
+                    }
                 }
-                Ok(Owner {
-                    ids,
-                    handle: u.handle().map(String::from),
-                })
-            })
+                User::Linked(l) => legacy(&l.id.all(), Some(l.handle.clone()))?,
+                User::Plain(s) => legacy(&[s.as_str()], None)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// The user an identity signs in as. GitHub matches a configured login; failing
+    /// that, a user without one whose `email` is among `github_emails` (the account's
+    /// verified emails). Apple and Google match their links (by default the email). No
+    /// match, or two, is refused.
+    pub fn resolve(&self, id: &Identity, github_emails: &[String]) -> Result<Member, Unresolved> {
+        let members = self.members().map_err(|_| Unresolved::NotListed)?;
+        let pick = |v: Vec<&Member>| match v.len() {
+            0 => Err(Unresolved::NotListed),
+            1 => Ok(v[0].clone()),
+            _ => Err(Unresolved::Ambiguous(
+                v.iter().map(|m| m.key.clone()).collect(),
+            )),
+        };
+        match id {
+            Identity::Github(login) => {
+                let l = lower(login);
+                let by_login: Vec<&Member> = members
+                    .iter()
+                    .filter(|m| m.github.as_deref() == Some(l.as_str()))
+                    .collect();
+                if !by_login.is_empty() {
+                    return pick(by_login);
+                }
+                let verified: Vec<String> = github_emails.iter().map(|e| lower(e)).collect();
+                pick(
+                    members
+                        .iter()
+                        .filter(|m| m.github.is_none())
+                        .filter(|m| m.email.as_ref().is_some_and(|e| verified.contains(e)))
+                        .collect(),
+                )
+            }
+            Identity::Apple(e) => {
+                let e = lower(e);
+                pick(
+                    members
+                        .iter()
+                        .filter(|m| m.apple.as_deref() == Some(e.as_str()))
+                        .collect(),
+                )
+            }
+            Identity::Google(e) => {
+                let e = lower(e);
+                pick(
+                    members
+                        .iter()
+                        .filter(|m| m.google.as_deref() == Some(e.as_str()))
+                        .collect(),
+                )
+            }
+        }
+    }
+
+    /// The user with this key, if still listed.
+    pub fn member(&self, key: &str) -> Option<Member> {
+        self.members().ok()?.into_iter().find(|m| m.key == key)
+    }
+
+    /// Whether a GitHub sign-in needs the account's verified emails: no user has its login.
+    pub fn github_needs_emails(&self, login: &str) -> bool {
+        let l = lower(login);
+        !self
+            .members()
+            .unwrap_or_default()
+            .iter()
+            .any(|m| m.github.as_deref() == Some(l.as_str()))
+    }
+
+    /// Entries in an earlier form, without an email: what `doctor` names.
+    pub fn without_email(&self) -> Vec<String> {
+        self.members()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.email.is_none())
+            .map(|m| m.key)
             .collect()
     }
 
-    /// The user `identity` signs in as, if the allow-list has it. Logins and emails
-    /// compare without regard to case; the provider must match.
-    pub fn owner(&self, identity: &Identity) -> Option<Owner> {
-        let want = identity.folded();
-        self.owners()
-            .ok()?
-            .into_iter()
-            .find(|o| o.ids.iter().any(|i| i.folded() == want))
-    }
-
-    /// Whether `identity` may sign in.
-    pub fn allows(&self, identity: &Identity) -> bool {
-        self.owner(identity).is_some()
-    }
-
-    /// The handle that signs `identity`'s words: its handle, or for an entry in the
-    /// older form without one, the identity itself.
-    pub fn handle_of(&self, identity: &Identity) -> Option<String> {
-        self.owner(identity)?.handle
-    }
-
-    /// Entries in the older form, without a handle.
+    /// Users without a handle.
     pub fn missing_handles(&self) -> Vec<String> {
-        self.users
-            .iter()
-            .filter(|u| u.handle().is_none())
-            .flat_map(|u| u.ids().into_iter().map(String::from))
+        self.members()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|m| m.handle.is_none())
+            .map(|m| m.key)
+            .collect()
+    }
+
+    /// Every user's email: the email channel's default recipients (OWN-9).
+    pub fn emails(&self) -> Vec<String> {
+        self.members()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|m| m.email)
             .collect()
     }
 }
 
-/// One person on the allow-list: their identities and handle.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Owner {
-    pub ids: Vec<Identity>,
-    pub handle: Option<String>,
+/// An entry in an earlier form: its identities, keyed by the first.
+fn legacy(ids: &[&str], handle: Option<String>) -> Result<Member, String> {
+    let mut m = Member {
+        key: String::new(),
+        email: None,
+        handle,
+        github: None,
+        apple: None,
+        google: None,
+    };
+    for raw in ids {
+        let id = Identity::parse(raw).map_err(|e| format!("console.users: {e}"))?;
+        if m.key.is_empty() {
+            m.key = id.to_string().to_lowercase();
+        }
+        match id {
+            Identity::Github(l) => m.github = Some(lower(&l)),
+            Identity::Apple(e) => m.apple = Some(lower(&e)),
+            Identity::Google(e) => m.google = Some(lower(&e)),
+        }
+    }
+    if m.key.is_empty() {
+        return Err("console.users: an entry with no id".into());
+    }
+    Ok(m)
 }
 
 /// Who signed in, as the provider named them. Three kinds, never confused:
@@ -586,15 +760,6 @@ impl Identity {
             )),
         }
     }
-
-    /// For comparison: the kind and the name in lower case.
-    fn folded(&self) -> (u8, String) {
-        match self {
-            Identity::Github(n) => (0, n.to_ascii_lowercase()),
-            Identity::Apple(n) => (1, n.to_ascii_lowercase()),
-            Identity::Google(n) => (2, n.to_ascii_lowercase()),
-        }
-    }
 }
 
 impl std::fmt::Display for Identity {
@@ -611,18 +776,27 @@ impl std::fmt::Display for Identity {
 mod tests {
     use super::*;
 
+    fn person(email: &str, handle: &str, github: Option<&str>, apple: Option<&str>) -> User {
+        User::Person(Person {
+            email: email.into(),
+            handle: Some(handle.into()),
+            github: github.map(String::from),
+            apple: apple.map(String::from),
+            google: None,
+        })
+    }
+
     fn console() -> Console {
         Console {
             url: "https://hub.example.com".into(),
             users: vec![
-                User::new("github:hhenson", "HPH"),
-                User::Owner(OwnerEntry {
-                    id: Ids::Many(vec![
-                        "apple:Owner@Example.com".into(),
-                        "google:owner@example.com".into(),
-                    ]),
-                    handle: "OW".into(),
-                }),
+                person(
+                    "Owner@Example.com",
+                    "This Dude",
+                    Some("hhenson"),
+                    Some("relay@privaterelay.example.com"),
+                ),
+                person("second@example.com", "Two", None, None),
             ],
             ..Console::default()
         }
@@ -657,34 +831,71 @@ mod tests {
     }
 
     #[test]
-    fn allow_list() {
+    fn users_by_email() {
         let c = console();
-        assert!(c.allows(&Identity::Github("HHenson".into())));
-        assert!(c.allows(&Identity::Apple("owner@example.com".into())));
-        assert!(c.allows(&Identity::Google("Owner@example.com".into())));
-        assert!(!c.allows(&Identity::Github("owner@example.com".into())));
-        assert!(!c.allows(&Identity::Apple("hhenson".into())));
-        assert!(!c.allows(&Identity::Github("someone".into())));
+        let key = |id: Identity, emails: &[&str]| {
+            let e: Vec<String> = emails.iter().map(|s| s.to_string()).collect();
+            c.resolve(&id, &e).map(|m| m.key)
+        };
+        // Each provider reaches the same user.
+        let me = Ok("owner@example.com".to_string());
+        assert_eq!(key(Identity::Github("HHenson".into()), &[]), me, "by login");
         assert_eq!(
-            c.handle_of(&Identity::Github("hhenson".into())).as_deref(),
-            Some("HPH")
+            key(Identity::Google("owner@example.com".into()), &[]),
+            me,
+            "google defaults to email"
         );
         assert_eq!(
-            c.handle_of(&Identity::Google("owner@example.com".into()))
-                .as_deref(),
-            Some("OW")
+            key(
+                Identity::Apple("relay@privaterelay.example.com".into()),
+                &[]
+            ),
+            me,
+            "apple relay link"
         );
-        assert!(c.missing_handles().is_empty());
-
-        // Three kinds of identity, never confused.
-        let only_google = Console {
-            users: vec![User::new("google:owner@example.com", "GO")],
+        assert_eq!(
+            key(Identity::Apple("owner@example.com".into()), &[]),
+            Err(Unresolved::NotListed),
+            "apple is linked to the relay address"
+        );
+        // GitHub by a verified email, for a user without a login.
+        assert_eq!(
+            key(Identity::Github("someone".into()), &["SECOND@example.com"]),
+            Ok("second@example.com".to_string())
+        );
+        assert_eq!(
+            key(Identity::Github("someone".into()), &[]),
+            Err(Unresolved::NotListed)
+        );
+        // A login takes precedence; the first user's email does not match by email
+        // because it has a login configured.
+        assert_eq!(
+            key(Identity::Github("someone".into()), &["owner@example.com"]),
+            Err(Unresolved::NotListed)
+        );
+        assert!(c.github_needs_emails("someone") && !c.github_needs_emails("hhenson"));
+        // Two users whose emails one GitHub account has verified: refused.
+        let two = Console {
+            users: vec![
+                person("a@example.com", "A", None, None),
+                person("b@example.com", "B", None, None),
+            ],
             ..console()
         };
-        assert!(!only_google.allows(&Identity::Apple("owner@example.com".into())));
+        assert!(matches!(
+            two.resolve(
+                &Identity::Github("x".into()),
+                &["a@example.com".into(), "b@example.com".into()]
+            ),
+            Err(Unresolved::Ambiguous(_))
+        ));
+        let m = c.member("owner@example.com").unwrap();
+        assert_eq!(m.signature(), "This Dude");
+        assert_eq!(c.emails(), ["owner@example.com", "second@example.com"]);
+        assert!(c.without_email().is_empty() && c.missing_handles().is_empty());
         assert_eq!(
-            Identity::parse("hhenson").unwrap(),
-            Identity::Github("hhenson".into())
+            Identity::Github("hhenson".into()).to_string(),
+            "github:hhenson"
         );
         for bad in [
             "owner@example.com",
@@ -692,20 +903,36 @@ mod tests {
             "apple:nobody",
             "gitlab:x",
             "google:",
-            "apple: a@b.c",
         ] {
             assert!(Identity::parse(bad).is_err(), "{bad}");
         }
+    }
 
-        // The older form still works, without a handle.
+    #[test]
+    fn earlier_forms() {
         let old: Console = toml::from_str(
-            "listen = \"127.0.0.1:1\"\nurl = \"https://a.example.com\"\nusers = [\"hhenson\", \"apple:o@example.com\"]\n",
+            "listen = \"127.0.0.1:1\"\nurl = \"https://a.example.com\"\nusers = [\"hhenson\", { id = \"google:o@example.com\", handle = \"OW\" }]\n",
         )
         .unwrap();
         old.validate().unwrap();
-        assert!(old.allows(&Identity::Github("hhenson".into())));
-        assert_eq!(old.handle_of(&Identity::Github("hhenson".into())), None);
-        assert_eq!(old.missing_handles(), ["hhenson", "apple:o@example.com"]);
+        assert_eq!(
+            old.resolve(&Identity::Github("hhenson".into()), &[])
+                .unwrap()
+                .key,
+            "github:hhenson"
+        );
+        assert_eq!(
+            old.resolve(&Identity::Google("O@example.com".into()), &[])
+                .unwrap()
+                .handle
+                .as_deref(),
+            Some("OW")
+        );
+        assert_eq!(
+            old.without_email(),
+            ["github:hhenson", "google:o@example.com"]
+        );
+        assert_eq!(old.missing_handles(), ["github:hhenson"]);
         let bare_email: Console = toml::from_str(
             "listen = \"127.0.0.1:1\"\nurl = \"https://a.example.com\"\nusers = [\"o@example.com\"]\n",
         )
@@ -714,78 +941,74 @@ mod tests {
     }
 
     #[test]
-    fn handles_are_checked() {
+    fn users_are_checked() {
         let with = |users: Vec<User>| Console { users, ..console() };
+        let p = |e: &str, h: &str| User::person(e, h);
+        assert!(with(vec![p("not-an-email", "A")]).validate().is_err());
         assert!(
-            with(vec![User::new("github:a", "")]).validate().is_err(),
-            "empty"
+            with(vec![p("a@example.com", "")]).validate().is_err(),
+            "empty handle"
         );
         assert!(
-            with(vec![User::new("github:a", "x".repeat(32))])
+            with(vec![p("a@example.com", &"x".repeat(32))])
                 .validate()
                 .is_err(),
             "too long"
         );
         assert!(
-            with(vec![User::new("github:a", "H@P")]).validate().is_err(),
+            with(vec![p("a@example.com", "H@P")]).validate().is_err(),
             "letters, digits, -_.'"
         );
         assert!(
-            with(vec![User::new("github:a", " Dude")])
-                .validate()
-                .is_err(),
+            with(vec![p("a@example.com", " Dude")]).validate().is_err(),
             "a leading space"
         );
-        with(vec![User::new("github:a", "This Dude")])
+        with(vec![p("a@example.com", "This Dude")])
             .validate()
             .unwrap();
         assert!(
             with(vec![
-                User::new("github:a", "This  Dude"),
-                User::new("github:b", "this dude")
+                p("a@example.com", "This  Dude"),
+                p("b@example.com", "this dude")
             ])
             .validate()
             .is_err(),
-            "the same ignoring case and repeated spaces"
+            "handles are the same ignoring case and repeated spaces"
+        );
+        assert!(
+            with(vec![p("A@example.com", "One"), p("a@example.com", "Two")])
+                .validate()
+                .is_err(),
+            "one email, one user"
         );
         assert!(
             with(vec![
-                User::new("github:a", "HPH"),
-                User::new("github:b", "hph")
+                person("a@example.com", "One", Some("hh"), None),
+                person("b@example.com", "Two", Some("HH"), None)
             ])
             .validate()
             .is_err(),
-            "unique"
+            "one GitHub login, one user"
         );
         assert!(
             with(vec![
-                User::new("github:a", "HPH"),
-                User::new("github:A", "XY")
+                p("a@example.com", "One"),
+                person("b@example.com", "Two", None, Some("a@example.com"))
             ])
             .validate()
             .is_err(),
-            "one identity, one user"
+            "an Apple address belongs to one user"
         );
-        with(vec![
-            User::new("github:a", "HPH"),
-            User::new("github:b", "X2"),
-        ])
-        .validate()
-        .unwrap();
-        let t = "listen = \"127.0.0.1:1\"\nurl = \"https://a.example.com\"\nusers = [{ id = \"github:hhenson\", handle = \"HPH\" }, { id = [\"apple:o@example.com\", \"google:o@example.com\"], handle = \"OW\" }]\n";
+        let t = "listen = \"127.0.0.1:1\"\nurl = \"https://a.example.com\"\nusers = [{ email = \"owner@example.com\", handle = \"This Dude\", github = \"hhenson\", apple = \"r@privaterelay.example.com\" }]\n";
         let c: Console = toml::from_str(t).unwrap();
         c.validate().unwrap();
-        assert_eq!(
-            c.handle_of(&Identity::Google("o@example.com".into()))
-                .as_deref(),
-            Some("OW")
-        );
         let back: Console = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
         assert_eq!(back, c);
-        assert!(toml::from_str::<Console>("listen = \"x\"\nurl = \"y\"\nusers = [{ id = \"github:a\", handle = \"AB\", extra = 1 }]\n").is_err());
-        assert_eq!(
-            Identity::Github("hhenson".into()).to_string(),
-            "github:hhenson"
+        assert!(
+            toml::from_str::<Console>(
+                "listen = \"x\"\nurl = \"y\"\nusers = [{ email = \"a@example.com\", extra = 1 }]\n"
+            )
+            .is_err()
         );
     }
 
@@ -794,7 +1017,7 @@ mod tests {
         let t = r#"
 listen = "127.0.0.1:8443"
 url = "https://hub.example.com"
-users = ["hhenson"]
+users = [{ email = "owner@example.com", handle = "This Dude", github = "hhenson" }]
 
 [github]
 client_id = "Iv1.example"
@@ -819,7 +1042,6 @@ webhook_file = "~/.config/hgl-ai/console/slack.url"
 kind = "email"
 smtp = "smtp.example.com:587"
 from = "console@example.com"
-to = ["owner@example.com"]
 "#;
         let c: Console = toml::from_str(t).unwrap();
         c.validate().unwrap();

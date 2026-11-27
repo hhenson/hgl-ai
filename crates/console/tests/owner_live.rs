@@ -214,7 +214,7 @@ async fn ask_answer_converse_and_refuse_forgery() {
     assert_eq!(r.status(), 303, "{}", r.text().await.unwrap());
     let t = owner::show(&seat_bus, &id).await.unwrap().unwrap();
     assert_eq!(t.state, ThreadState::Answered);
-    assert_eq!(t.answer.as_ref().unwrap().user, "github:hhenson");
+    assert_eq!(t.answer.as_ref().unwrap().user, "owner@example.com");
 
     let got = inbox.fetch(10, Duration::from_secs(5)).await.unwrap();
     let ans: Vec<_> = got.iter().filter(|d| d.note.kind == Kind::Answer).collect();
@@ -241,7 +241,7 @@ async fn ask_answer_converse_and_refuse_forgery() {
     let log = owner::decisions_tail(&seat_bus, 5).await.unwrap();
     assert!(
         log.iter()
-            .any(|l| l.contains(&id) && l.contains("This Dude (github:hhenson): accept a")),
+            .any(|l| l.contains(&id) && l.contains("This Dude (owner@example.com): accept a")),
         "{log:?}"
     );
 
@@ -269,8 +269,8 @@ async fn ask_answer_converse_and_refuse_forgery() {
         v: 1,
         id: id2.clone(),
         sender: "owner".into(),
-        user: Some("github:hhenson".into()),
-        handle: Some("HPH".into()),
+        user: Some("owner@example.com".into()),
+        handle: Some("This Dude".into()),
         at: hgl_ai_proto::utc_now_stamp(),
         body: Body::Answer {
             choice: hgl_ai_owner::Choice::Reject,

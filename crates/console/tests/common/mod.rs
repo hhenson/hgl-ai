@@ -13,7 +13,7 @@ use axum::extract::{Form, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use base64::Engine as _;
-use hgl_ai_config::{AppleOAuth, Config, Console, GithubOAuth, GoogleOAuth, Ids, OwnerEntry, User};
+use hgl_ai_config::{AppleOAuth, Config, Console, GithubOAuth, GoogleOAuth, Person, User};
 use hgl_ai_console::App;
 use webauthn_authenticator_rs::WebauthnAuthenticator as _;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -152,6 +152,24 @@ async fn gh_token(Form(f): Form<BTreeMap<String, String>>) -> axum::Json<serde_j
     })
 }
 
+/// The verified emails of the mock accounts.
+async fn gh_emails(h: HeaderMap) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
+    let auth = h
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let login = auth
+        .strip_prefix("Bearer tok-")
+        .ok_or(axum::http::StatusCode::UNAUTHORIZED)?;
+    let e = |email: &str, verified: bool| serde_json::json!({ "email": email, "verified": verified, "primary": false });
+    Ok(axum::Json(serde_json::Value::Array(match login {
+        "second" => vec![e("Second@example.com", true), e("other@example.com", true)],
+        "both" => vec![e("c@example.com", true), e("d@example.com", true)],
+        "unverified" => vec![e("second@example.com", false)],
+        _ => vec![],
+    })))
+}
+
 async fn gh_user(h: HeaderMap) -> Result<axum::Json<serde_json::Value>, axum::http::StatusCode> {
     let auth = h
         .get("authorization")
@@ -206,6 +224,7 @@ impl Providers {
         let app = Router::new()
             .route("/login/oauth/access_token", post(gh_token))
             .route("/user", get(gh_user))
+            .route("/user/emails", get(gh_emails))
             .route("/auth/token", post(apple_token))
             .route("/google/token", post(google_token))
             .route("/keys/{who}", get(jwks))
@@ -276,14 +295,19 @@ impl Harness {
             listen: "127.0.0.1:8443".into(),
             url: ORIGIN.into(),
             users: vec![
-                User::new("github:hhenson", "This Dude"),
-                User::Owner(OwnerEntry {
-                    id: Ids::Many(vec![
-                        "apple:owner@example.com".into(),
-                        "google:owner@example.com".into(),
-                    ]),
-                    handle: "OW".into(),
+                // GitHub by login, Apple through a private relay address, Google by email.
+                User::Person(Person {
+                    email: "Owner@example.com".into(),
+                    handle: Some("This Dude".into()),
+                    github: Some("hhenson".into()),
+                    apple: Some("relay@privaterelay.example.com".into()),
+                    google: None,
                 }),
+                // GitHub by a verified email: no login configured.
+                User::person("second@example.com", "Two"),
+                // Two users one GitHub account has verified emails for.
+                User::person("c@example.com", "Cee"),
+                User::person("d@example.com", "Dee"),
             ],
             github: Some(github),
             apple: Some(apple),

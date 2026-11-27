@@ -10,8 +10,8 @@ use serde::{Deserialize, Serialize};
 pub mod console;
 pub mod github;
 pub use console::{
-    AppleOAuth, Console, GithubOAuth, GoogleOAuth, Identity, Ids, Notify, Owner, OwnerEntry,
-    SmtpTls, User,
+    AppleOAuth, Console, GithubOAuth, GoogleOAuth, Identity, Ids, LinkedEntry, Member, Notify,
+    Person, SmtpTls, Unresolved, User,
 };
 pub use github::{Pin, ReleaseWatch, RepoGate, Tap};
 

@@ -63,13 +63,20 @@ fn b64(data: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(data)
 }
 
-/// A signed-in user.
-#[derive(Debug, Clone)]
+/// A signed-in user: the user's key (their email, `[console] users`), how they signed
+/// in, the form token, and when it ends (UTC seconds).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
     pub id: String,
-    pub identity: Identity,
+    pub user: String,
+    /// `github:<login>`, `apple:<email>`, `google:<email>` or `passkey`.
+    pub via: String,
     pub csrf: String,
-    expires: Instant,
+    pub expires_at: i64,
+}
+
+fn now_secs() -> i64 {
+    chrono::Utc::now().timestamp()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,7 +96,8 @@ struct Flow {
 }
 
 struct Enrolment {
-    identity: Identity,
+    user: String,
+    via: Identity,
     reg: Option<PasskeyRegistration>,
     started: Instant,
 }
@@ -104,7 +112,8 @@ struct StoredPasskey {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct StoredUser {
-    identity: Identity,
+    /// The user's key (email).
+    user: String,
     uuid: Uuid,
     passkeys: Vec<StoredPasskey>,
 }
@@ -250,9 +259,17 @@ impl Auth {
         self.console.google.is_some()
     }
 
-    /// The handle that signs `identity`'s words (OWN-10), if `[console] users` gives one.
-    pub fn handle_of(&self, identity: &Identity) -> Option<String> {
-        self.console.handle_of(identity)
+    /// The handle that signs this user's words (OWN-10), if `[console] users` gives one.
+    pub fn handle_of(&self, user: &str) -> Option<String> {
+        self.console.member(user)?.handle
+    }
+
+    /// `This Dude (owner@example.com)`, or the key alone without a handle.
+    pub fn display(&self, user: &str) -> String {
+        match self.handle_of(user) {
+            Some(h) => format!("{h} ({user})"),
+            None => user.to_string(),
+        }
     }
 
     // ---- cookies ----
@@ -317,12 +334,13 @@ impl Auth {
 
     // ---- sessions ----
 
-    fn new_session(&self, identity: Identity) -> Session {
+    fn new_session(&self, user: String, via: String) -> Session {
         let s = Session {
             id: random_hex(),
-            identity,
+            user,
+            via,
             csrf: random_hex(),
-            expires: Instant::now() + self.console.session_ttl(),
+            expires_at: now_secs() + self.console.session_ttl().as_secs() as i64,
         };
         self.sessions
             .lock()
@@ -342,7 +360,7 @@ impl Auth {
         let id = self.cookie(cookie_header, SESSION_COOKIE)?;
         let mut all = self.sessions.lock().expect("sessions");
         let s = all.get(&id)?.clone();
-        if s.expires <= Instant::now() || !self.console.allows(&s.identity) {
+        if s.expires_at <= now_secs() || self.console.member(&s.user).is_none() {
             all.remove(&id);
             return None;
         }
@@ -370,7 +388,7 @@ impl Auth {
         self.sessions
             .lock()
             .expect("sessions")
-            .retain(|_, s| s.expires > now);
+            .retain(|_, s| s.expires_at > now_secs());
     }
 
     // ---- OAuth ----
@@ -401,9 +419,12 @@ impl Auth {
                     .ok_or_else(|| bad("GitHub sign-in is not configured"))?;
                 let mut u =
                     Url::parse(&g.authorize_url).map_err(|e| AuthError::Setup(e.to_string()))?;
+                // `user:email`: the verified emails a user without a configured login
+                // is found by.
                 u.query_pairs_mut()
                     .append_pair("client_id", &g.client_id)
                     .append_pair("redirect_uri", &redirect)
+                    .append_pair("scope", "user:email")
                     .append_pair("state", &state)
                     .append_pair("allow_signup", "false");
                 u.to_string()
@@ -485,13 +506,13 @@ impl Auth {
         Ok(f)
     }
 
-    /// GitHub's callback: the identity behind `code`, if the allow-list has it.
+    /// GitHub's callback: the user behind `code`, by login or by a verified email.
     pub async fn github_callback(
         &self,
         code: &str,
         state: &str,
         binding: Option<&str>,
-    ) -> Result<Identity, AuthError> {
+    ) -> Result<(String, Identity), AuthError> {
         self.take_flow(Provider::Github, state, binding)?;
         let g = self
             .console
@@ -499,7 +520,7 @@ impl Auth {
             .as_ref()
             .ok_or_else(|| bad("GitHub sign-in is not configured"))?;
         let secret = read_secret(&expand(&g.secret_file))?;
-        let login = github_login(
+        let (login, token) = github_login(
             &self.http,
             g,
             &secret,
@@ -507,8 +528,12 @@ impl Auth {
             &self.redirect_uri(Provider::Github),
         )
         .await?;
-        let id = Identity::Github(login);
-        self.allowed(id)
+        let emails = if self.console.github_needs_emails(&login) {
+            github_emails(&self.http, g, &token).await?
+        } else {
+            Vec::new()
+        };
+        self.allowed(Identity::Github(login), &emails)
     }
 
     /// Apple's callback (a form POST): the account email behind `code`.
@@ -517,7 +542,7 @@ impl Auth {
         code: &str,
         state: &str,
         binding: Option<&str>,
-    ) -> Result<Identity, AuthError> {
+    ) -> Result<(String, Identity), AuthError> {
         let flow = self.take_flow(Provider::Apple, state, binding)?;
         let a = self
             .console
@@ -554,7 +579,7 @@ impl Auth {
                 &flow.nonce,
             )
             .await?;
-        self.allowed(Identity::Apple(email))
+        self.allowed(Identity::Apple(email), &[])
     }
 
     /// Google's callback: the account email behind `code` (OpenID Connect, PKCE).
@@ -563,7 +588,7 @@ impl Auth {
         code: &str,
         state: &str,
         binding: Option<&str>,
-    ) -> Result<Identity, AuthError> {
+    ) -> Result<(String, Identity), AuthError> {
         let flow = self.take_flow(Provider::Google, state, binding)?;
         let g = self
             .console
@@ -598,7 +623,7 @@ impl Auth {
                 &flow.nonce,
             )
             .await?;
-        self.allowed(Identity::Google(email))
+        self.allowed(Identity::Google(email), &[])
     }
 
     /// The verified email of a token reply's `id_token`: its signature against the
@@ -635,24 +660,38 @@ impl Auth {
         .map_err(p)
     }
 
-    fn allowed(&self, id: Identity) -> Result<Identity, AuthError> {
-        if self.console.allows(&id) {
-            Ok(id)
-        } else {
-            tracing::warn!(identity = %id, "refused a sign-in not on [console] users");
-            Err(AuthError::NotAllowed(id.to_string()))
+    /// The user an identity signs in as (`[console] users`); none, or two, is refused.
+    fn allowed(
+        &self,
+        id: Identity,
+        github_emails: &[String],
+    ) -> Result<(String, Identity), AuthError> {
+        match self.console.resolve(&id, github_emails) {
+            Ok(m) => Ok((m.key, id)),
+            Err(hgl_ai_config::Unresolved::NotListed) => {
+                tracing::warn!(identity = %id, "refused a sign-in not on [console] users");
+                Err(AuthError::NotAllowed(id.to_string()))
+            }
+            Err(hgl_ai_config::Unresolved::Ambiguous(users)) => {
+                tracing::warn!(identity = %id, "refused a sign-in that matches {users:?}");
+                Err(AuthError::Bad(format!(
+                    "{id} matches more than one console user; link it in [console] users"
+                )))
+            }
         }
     }
 
     // ---- passkeys ----
 
-    /// After the provider vouched for `identity`: an enrolment ticket (the enrol cookie).
-    pub fn enrol_ticket(&self, identity: Identity) -> String {
+    /// After a provider vouched for `user` (signed in `via`): an enrolment ticket (the
+    /// enrol cookie).
+    pub fn enrol_ticket(&self, user: String, via: Identity) -> String {
         let t = random_hex();
         self.enrolments.lock().expect("enrolments").insert(
             t.clone(),
             Enrolment {
-                identity,
+                user,
+                via,
                 reg: None,
                 started: Instant::now(),
             },
@@ -660,20 +699,20 @@ impl Auth {
         t
     }
 
-    pub fn enrolment_identity(&self, ticket: &str) -> Option<Identity> {
+    fn enrolment_user(&self, ticket: &str) -> Option<String> {
         let e = self.enrolments.lock().expect("enrolments");
         e.get(ticket)
             .filter(|e| e.started.elapsed() < PENDING_TTL)
-            .map(|e| e.identity.clone())
+            .map(|e| e.user.clone())
     }
 
     pub fn register_start(&self, ticket: &str) -> Result<CreationChallengeResponse, AuthError> {
-        let identity = self
-            .enrolment_identity(ticket)
-            .ok_or_else(|| bad("this enrolment expired; sign in with GitHub or Apple again"))?;
+        let user = self
+            .enrolment_user(ticket)
+            .ok_or_else(|| bad("this enrolment expired; sign in with a provider again"))?;
         let (uuid, exclude) = {
             let st = self.store.lock().expect("store");
-            match st.users.iter().find(|u| u.identity == identity) {
+            match st.users.iter().find(|u| u.user == user) {
                 Some(u) => (
                     u.uuid,
                     u.passkeys
@@ -684,10 +723,10 @@ impl Auth {
                 None => (Uuid::from_bytes(random_bytes16()), Vec::new()),
             }
         };
-        let name = identity.to_string();
+        let shown = self.handle_of(&user).unwrap_or_else(|| user.clone());
         let (ccr, reg) = self
             .webauthn
-            .start_passkey_registration(uuid, &name, &name, Some(exclude))
+            .start_passkey_registration(uuid, &user, &shown, Some(exclude))
             .map_err(|e| bad(format!("starting the passkey: {e}")))?;
         let mut all = self.enrolments.lock().expect("enrolments");
         let e = all
@@ -696,15 +735,15 @@ impl Auth {
         e.reg = Some(reg);
         // Keep the user's id for finish.
         drop(all);
-        self.pending_uuid(&identity, uuid);
+        self.pending_uuid(&user, uuid);
         Ok(ccr)
     }
 
-    fn pending_uuid(&self, identity: &Identity, uuid: Uuid) {
+    fn pending_uuid(&self, user: &str, uuid: Uuid) {
         let mut st = self.store.lock().expect("store");
-        if !st.users.iter().any(|u| &u.identity == identity) {
+        if !st.users.iter().any(|u| u.user == user) {
             st.users.push(StoredUser {
-                identity: identity.clone(),
+                user: user.to_string(),
                 uuid,
                 passkeys: Vec::new(),
             });
@@ -722,7 +761,7 @@ impl Auth {
             .lock()
             .expect("enrolments")
             .remove(ticket)
-            .ok_or_else(|| bad("this enrolment expired; sign in with GitHub or Apple again"))?;
+            .ok_or_else(|| bad("this enrolment expired; sign in with a provider again"))?;
         let reg = e.reg.ok_or_else(|| bad("the passkey was not started"))?;
         let pk = self
             .webauthn
@@ -733,7 +772,7 @@ impl Auth {
             let u = st
                 .users
                 .iter_mut()
-                .find(|u| u.identity == e.identity)
+                .find(|u| u.user == e.user)
                 .ok_or_else(|| bad("no such user"))?;
             u.passkeys.push(StoredPasskey {
                 passkey: pk,
@@ -742,8 +781,8 @@ impl Auth {
             });
             self.save(&st)?;
         }
-        tracing::info!(identity = %e.identity, "registered a passkey");
-        Ok(self.new_session(e.identity))
+        tracing::info!(user = %e.user, via = %e.via, "registered a passkey");
+        Ok(self.new_session(e.user, e.via.to_string()))
     }
 
     fn save(&self, st: &Store) -> Result<(), AuthError> {
@@ -757,7 +796,7 @@ impl Auth {
         let st = self.store.lock().expect("store");
         st.users
             .iter()
-            .any(|u| self.console.allows(&u.identity) && !u.passkeys.is_empty())
+            .any(|u| self.console.member(&u.user).is_some() && !u.passkeys.is_empty())
     }
 
     /// A passkey challenge over every allowed user's passkeys, and the login cookie value.
@@ -767,7 +806,7 @@ impl Auth {
             let st = self.store.lock().expect("store");
             st.users
                 .iter()
-                .filter(|u| self.console.allows(&u.identity))
+                .filter(|u| self.console.member(&u.user).is_some())
                 .flat_map(|u| u.passkeys.iter().map(|p| p.passkey.clone()))
                 .collect()
         };
@@ -807,7 +846,7 @@ impl Auth {
             .finish_passkey_authentication(cred, &st)
             .map_err(|e| bad(format!("the passkey was not accepted: {e}")))?;
         let mut store = self.store.lock().expect("store");
-        let identity = {
+        let user = {
             let (u, p) = store
                 .users
                 .iter_mut()
@@ -822,12 +861,14 @@ impl Auth {
             let sp = &mut u.passkeys[p];
             sp.passkey.update_credential(&res);
             sp.last_used = Some(hgl_ai_proto::utc_now_stamp());
-            u.identity.clone()
+            u.user.clone()
         };
-        let identity = self.allowed(identity)?;
+        if self.console.member(&user).is_none() {
+            return Err(AuthError::NotAllowed(user));
+        }
         self.save(&store)?;
         drop(store);
-        Ok(self.new_session(identity))
+        Ok(self.new_session(user, "passkey".into()))
     }
 }
 
@@ -884,7 +925,7 @@ async fn github_login(
     secret: &str,
     code: &str,
     redirect: &str,
-) -> Result<String, AuthError> {
+) -> Result<(String, String), AuthError> {
     let t = token_reply(
         http.post(&g.token_url)
             .header("Accept", "application/json")
@@ -910,7 +951,7 @@ async fn github_login(
     let u: User = http
         .get(format!("{}/user", g.api_url.trim_end_matches('/')))
         .header("Accept", "application/vnd.github+json")
-        .bearer_auth(token)
+        .bearer_auth(&token)
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
@@ -921,7 +962,36 @@ async fn github_login(
     if u.login.is_empty() {
         return Err(AuthError::Provider("GitHub: no login".into()));
     }
-    Ok(u.login)
+    Ok((u.login, token))
+}
+
+/// The GitHub account's verified emails (`GET /user/emails`, scope `user:email`).
+async fn github_emails(
+    http: &reqwest::Client,
+    g: &GithubOAuth,
+    token: &str,
+) -> Result<Vec<String>, AuthError> {
+    #[derive(Deserialize)]
+    struct Email {
+        email: String,
+        #[serde(default)]
+        verified: bool,
+    }
+    let v: Vec<Email> = http
+        .get(format!("{}/user/emails", g.api_url.trim_end_matches('/')))
+        .header("Accept", "application/vnd.github+json")
+        .bearer_auth(token)
+        .send()
+        .await
+        .and_then(reqwest::Response::error_for_status)
+        .map_err(|e| AuthError::Provider(format!("GitHub emails: {}", e.without_url())))?
+        .json()
+        .await
+        .map_err(|e| AuthError::Provider(format!("GitHub emails: {}", e.without_url())))?;
+    Ok(v.into_iter()
+        .filter(|e| e.verified)
+        .map(|e| e.email)
+        .collect())
 }
 
 /// Apple's issuer and the audience of its client secrets.
@@ -961,7 +1031,10 @@ mod tests {
     fn console(dir: &Path) -> (Console, Auth) {
         let c = Console {
             url: "https://console.example.com".into(),
-            users: vec![hgl_ai_config::User::new("github:hhenson", "HPH")],
+            users: vec![hgl_ai_config::User::person(
+                "owner@example.com",
+                "This Dude",
+            )],
             ..Console::default()
         };
         let a = Auth::new(&c, dir).unwrap();
@@ -1008,14 +1081,14 @@ mod tests {
     fn sessions_follow_the_allow_list() {
         let d = tempfile::tempdir().unwrap();
         let (mut c, a) = console(d.path());
-        let s = a.new_session(Identity::Github("hhenson".into()));
+        let s = a.new_session("owner@example.com".into(), "passkey".into());
         let header = format!("{SESSION_COOKIE}={}", a.sign(SESSION_COOKIE, &s.id));
         assert!(a.session(Some(&header)).is_some());
         a.sign_out(&s.id);
         assert!(a.session(Some(&header)).is_none());
         c.users.clear();
         let b = Auth::new(&c, d.path()).unwrap();
-        let s = b.new_session(Identity::Github("hhenson".into()));
+        let s = b.new_session("owner@example.com".into(), "passkey".into());
         let header = format!("{SESSION_COOKIE}={}", b.sign(SESSION_COOKIE, &s.id));
         assert!(b.session(Some(&header)).is_none(), "removed from users");
     }

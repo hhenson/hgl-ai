@@ -65,7 +65,7 @@ impl App {
             None
         } else {
             Some(
-                hgl_ai_notify::Notifier::new(console.notify.clone())
+                hgl_ai_notify::Notifier::new(channels(&console))
                     .map_err(|e| Error::Config(format!("notifications: {e}")))?,
             )
         };
@@ -95,6 +95,24 @@ impl App {
     pub fn thread_link(&self, id: &str) -> String {
         format!("{}/t/{id}", self.auth.origin())
     }
+}
+
+/// The notification channels, an email channel without `to` addressed to every user's
+/// email (OWN-9).
+pub fn channels(c: &Console) -> Vec<hgl_ai_config::Notify> {
+    let emails = c.emails();
+    c.notify
+        .iter()
+        .cloned()
+        .map(|mut n| {
+            if let hgl_ai_config::Notify::Email { to, .. } = &mut n
+                && to.is_empty()
+            {
+                to.clone_from(&emails);
+            }
+            n
+        })
+        .collect()
 }
 
 /// Headers every response carries.

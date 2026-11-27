@@ -170,35 +170,67 @@ fn secret_check(sys: &dyn System, name: &str, shown: &str) -> Check {
 fn console_checks(sys: &dyn System, c: &hgl_ai_config::Console) -> Vec<Check> {
     let mut out = Vec::new();
     let missing = c.missing_handles();
+    let no_email = c.without_email();
+    let members = c.members().unwrap_or_default();
     out.push(if c.users.is_empty() {
         Check::warn(
             "console users",
             "nobody may sign in",
-            "add `{ id = \"github:<login>\", handle = \"<initials>\" }` to [console] users",
+            "add `{ email = \"<email>\", handle = \"<name>\" }` to [console] users",
+        )
+    } else if !no_email.is_empty() {
+        let fixes: Vec<String> = members
+            .iter()
+            .filter(|m| m.email.is_none())
+            .map(|m| {
+                let mut f = format!(
+                    "{{ email = \"<email>\", handle = \"{}\"",
+                    m.handle.as_deref().unwrap_or("<name>")
+                );
+                for (k, v) in [
+                    ("github", &m.github),
+                    ("apple", &m.apple),
+                    ("google", &m.google),
+                ] {
+                    if let Some(v) = v {
+                        f.push_str(&format!(", {k} = \"{v}\""));
+                    }
+                }
+                f.push_str(" }");
+                f
+            })
+            .collect();
+        Check::fail(
+            "console users",
+            format!(
+                "no email for {}: a user is keyed by email",
+                no_email.join(", ")
+            ),
+            format!("write {}", fixes.join(", ")),
         )
     } else if !missing.is_empty() {
         Check::warn(
             "console users",
             format!(
-                "no handle for {}: their words are signed by identity",
+                "no handle for {}: their words are signed by email",
                 missing.join(", ")
             ),
-            "write each as `{ id = \"...\", handle = \"<initials>\" }` (OWN-10)",
+            "add `handle = \"<the name they sign with>\"` (OWN-10)",
         )
     } else {
-        let owners = c.owners().unwrap_or_default();
-        let names: Vec<String> = owners
+        let names: Vec<String> = members
             .iter()
-            .map(|o| {
-                let ids: Vec<String> = o.ids.iter().map(ToString::to_string).collect();
-                format!(
-                    "{} ({})",
-                    o.handle.as_deref().unwrap_or("?"),
-                    ids.join(", ")
-                )
+            .map(|m| {
+                let h = m.handle.as_deref().unwrap_or("?");
+                let note = if h.chars().count() > 12 {
+                    "; a shorter handle reads better"
+                } else {
+                    ""
+                };
+                format!("{h} ({}){note}", m.key)
             })
             .collect();
-        Check::ok("console users", names.join("; "))
+        Check::ok("console users", names.join(", "))
     });
     if c.github.is_none() && c.apple.is_none() && c.google.is_none() {
         out.push(Check::warn(
@@ -668,13 +700,45 @@ mod tests {
         let mut with_old = cfg.clone();
         with_old.console.as_mut().unwrap().users = vec![
             hgl_ai_config::User::Plain("hhenson".into()),
-            hgl_ai_config::User::new("google:o@example.com", "OW"),
+            hgl_ai_config::User::person("o@example.com", "This Dude"),
         ];
         crate::save_config(&f, &f.env, &with_old).unwrap();
         let cs2 = run(&f, &FakeHub::up()).await;
         let users = cs2.iter().find(|c| c.name == "console users").unwrap();
-        assert_eq!(users.level, Level::Warn);
-        assert!(users.detail.contains("no handle for hhenson"), "{users:?}");
+        assert_eq!(users.level, Level::Fail, "an earlier form: no email");
+        assert!(
+            users.detail.contains("no email for github:hhenson"),
+            "{users:?}"
+        );
+        assert!(
+            users
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("{ email = \"<email>\", handle = \"<name>\", github = \"hhenson\" }"),
+            "{users:?}"
+        );
+        with_old.console.as_mut().unwrap().users =
+            vec![hgl_ai_config::User::Person(hgl_ai_config::Person {
+                email: "o@example.com".into(),
+                handle: None,
+                github: None,
+                apple: None,
+                google: None,
+            })];
+        crate::save_config(&f, &f.env, &with_old).unwrap();
+        let cs3 = run(&f, &FakeHub::up()).await;
+        let users = cs3.iter().find(|c| c.name == "console users").unwrap();
+        assert_eq!(users.level, Level::Warn, "no handle");
+        with_old.console.as_mut().unwrap().users = vec![hgl_ai_config::User::person(
+            "o@example.com",
+            "Somebody Rather Long",
+        )];
+        crate::save_config(&f, &f.env, &with_old).unwrap();
+        let cs4 = run(&f, &FakeHub::up()).await;
+        let users = cs4.iter().find(|c| c.name == "console users").unwrap();
+        assert_eq!(users.level, Level::Ok, "a long handle is only noted");
+        assert!(users.detail.contains("shorter handle reads better"));
         crate::save_config(&f, &f.env, &cfg).unwrap();
         assert_eq!(get("console github").level, Level::Fail);
         assert!(

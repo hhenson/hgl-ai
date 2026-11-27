@@ -57,12 +57,9 @@ async fn github_then_passkey_then_sign_out_and_in() {
         ))
         .await;
     assert_eq!(r.status(), 200);
-    assert!(
-        r.text()
-            .await
-            .unwrap()
-            .contains("Signed in as <strong>github:hhenson</strong>")
-    );
+    assert!(r.text().await.unwrap().contains(
+        "Signed in as <strong>This Dude (owner@example.com)</strong> through github:hhenson"
+    ));
     let mut key = SoftPasskey::new(true);
     let r = register(&mut b, &mut key).await;
     assert_eq!(r.status(), 200);
@@ -86,7 +83,9 @@ async fn github_then_passkey_then_sign_out_and_in() {
         .to_string();
     assert!(csp.contains("script-src 'self'") && csp.contains("frame-ancestors 'none'"));
     let page = page.text().await.unwrap();
-    assert!(page.contains("github:hhenson") && page.contains("The hub is not reachable"));
+    assert!(
+        page.contains("This Dude (owner@example.com)") && page.contains("The hub is not reachable")
+    );
 
     // The passkeys file is private and holds no session.
     #[cfg(unix)]
@@ -233,7 +232,7 @@ async fn sign_in_with_apple() {
     assert_eq!(q["scope"], "email");
     assert_eq!(q["client_id"], APPLE_CLIENT);
     // Apple posts back across sites: only the SameSite=None flow cookie comes with it.
-    let code = format!("good:owner@example.com:{}", q["nonce"]);
+    let code = format!("good:relay@privaterelay.example.com:{}", q["nonce"]);
     let r = b
         .post_form(
             "/auth/apple/callback",
@@ -242,7 +241,9 @@ async fn sign_in_with_apple() {
         )
         .await;
     assert_eq!(r.status(), 200);
-    assert!(r.text().await.unwrap().contains("apple:owner@example.com"));
+    assert!(r.text().await.unwrap().contains(
+        "This Dude (owner@example.com)</strong> through apple:relay@privaterelay.example.com"
+    ));
     let mut key = SoftPasskey::new(true);
     assert_eq!(register(&mut b, &mut key).await.status(), 200);
     assert_eq!(b.get("/").await.status(), 200);
@@ -275,7 +276,7 @@ async fn sign_in_with_apple() {
     let r = b.get("/auth/apple").await;
     let loc = webauthn_rs::prelude::Url::parse(r.headers()["location"].to_str().unwrap()).unwrap();
     let qs: std::collections::BTreeMap<String, String> = loc.query_pairs().into_owned().collect();
-    let code = format!("good:owner@example.com:{}:badsig", qs["nonce"]);
+    let code = format!("good:relay@privaterelay.example.com:{}:badsig", qs["nonce"]);
     let r = b
         .post_form(
             "/auth/apple/callback",
@@ -347,7 +348,7 @@ async fn sign_in_with_google() {
     assert_eq!(register(&mut b, &mut key).await.status(), 200);
     let page = b.get("/").await.text().await.unwrap();
     assert!(
-        page.contains("OW (google:owner@example.com)"),
+        page.contains("This Dude (owner@example.com)"),
         "the handle is shown"
     );
 
@@ -383,4 +384,59 @@ async fn sign_in_with_google() {
         ))
         .await;
     assert_eq!(r.status(), 502);
+}
+
+#[tokio::test]
+async fn every_provider_reaches_the_same_user_by_email() {
+    let (_p, _h, base) = setup().await;
+    // GitHub by its login, Apple through the relay link, Google by the email: one user.
+    let mut gh = Browser::new(&base);
+    assert_eq!(github(&mut gh, "good-hhenson").await.status(), 200);
+    let mut key = SoftPasskey::new(true);
+    assert_eq!(register(&mut gh, &mut key).await.status(), 200);
+    let mut go = Browser::new(&base);
+    assert_eq!(google(&mut go, "owner@example.com", "").await.status(), 200);
+    let mut key2 = SoftPasskey::new(true);
+    assert_eq!(register(&mut go, &mut key2).await.status(), 200);
+    for b in [&mut gh, &mut go] {
+        let page = b.get("/telemetry").await.text().await.unwrap();
+        assert!(page.contains("This Dude (owner@example.com)"), "{page}");
+    }
+    // Apple's own address is not this user's Apple link (the relay is).
+    let mut ap = Browser::new(&base);
+    let r = ap.get("/auth/apple").await;
+    let q = query(r.headers()["location"].to_str().unwrap());
+    let code = format!("good:owner@example.com:{}", q["nonce"]);
+    let r = ap
+        .post_form(
+            "/auth/apple/callback",
+            &[("code", &code), ("state", &q["state"])],
+            None,
+        )
+        .await;
+    assert_eq!(r.status(), 403);
+
+    // GitHub by a verified email when the user has no login configured.
+    let mut b = Browser::new(&base);
+    let r = github(&mut b, "good-second").await;
+    assert_eq!(r.status(), 200);
+    assert!(
+        r.text()
+            .await
+            .unwrap()
+            .contains("Two (second@example.com)</strong> through github:second")
+    );
+    // An unverified email is not enough.
+    let mut b = Browser::new(&base);
+    assert_eq!(github(&mut b, "good-unverified").await.status(), 403);
+    // Verified emails of two users: refused, not guessed.
+    let mut b = Browser::new(&base);
+    let r = github(&mut b, "good-both").await;
+    assert_eq!(r.status(), 400);
+    assert!(
+        r.text()
+            .await
+            .unwrap()
+            .contains("more than one console user")
+    );
 }

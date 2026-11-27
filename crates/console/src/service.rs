@@ -323,6 +323,33 @@ mod tests {
     }
 
     #[test]
+    fn email_goes_to_the_users_by_default() {
+        let c = hgl_ai_config::Console {
+            url: "https://console.example.com".into(),
+            users: vec![
+                hgl_ai_config::User::person("a@example.com", "A"),
+                hgl_ai_config::User::person("b@example.com", "B"),
+            ],
+            notify: vec![hgl_ai_config::Notify::Email {
+                smtp: "127.0.0.1:2525".into(),
+                tls: hgl_ai_config::SmtpTls::None,
+                from: "console@example.com".into(),
+                to: vec![],
+                user: None,
+                password_file: None,
+            }],
+            ..hgl_ai_config::Console::default()
+        };
+        c.validate().unwrap();
+        match &crate::channels(&c)[0] {
+            hgl_ai_config::Notify::Email { to, .. } => {
+                assert_eq!(to, &["a@example.com", "b@example.com"])
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
     fn notification_policy() {
         let d = tempfile::tempdir().unwrap();
         let a = app(d.path());

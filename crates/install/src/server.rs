@@ -142,12 +142,19 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
         if let Some(l) = &o.console_listen {
             c.listen = l.clone();
         }
-        // `ID=HANDLE` (OWN-10), or a bare `ID` (no handle yet; doctor warns).
+        // `EMAIL=HANDLE` (OWN-10), or a bare `EMAIL` (no handle yet; doctor warns).
         for u in &o.console_users {
-            let entry = match u.rsplit_once('=') {
-                Some((id, handle)) => hgl_ai_config::User::new(id, handle),
-                None => hgl_ai_config::User::Plain(u.clone()),
+            let (email, handle) = match u.split_once('=') {
+                Some((e, h)) => (e.trim().to_string(), Some(h.trim().to_string())),
+                None => (u.trim().to_string(), None),
             };
+            let entry = hgl_ai_config::User::Person(hgl_ai_config::Person {
+                email,
+                handle,
+                github: None,
+                apple: None,
+                google: None,
+            });
             if !c.users.contains(&entry) {
                 c.users.push(entry);
             }
@@ -924,7 +931,7 @@ mod tests {
         let f = fake(d.path(), Os::Linux);
         let o = ServerOpts {
             console_url: Some("https://hub.example.com".into()),
-            console_users: vec!["github:hhenson=HPH".into()],
+            console_users: vec!["owner@example.com=This Dude".into()],
             ..ServerOpts::default()
         };
         let cfg = install(&f, &FakeHub::up(), &o).await.unwrap();
@@ -933,7 +940,10 @@ mod tests {
             (c.url.as_str(), c.users.as_slice()),
             (
                 "https://hub.example.com",
-                &[hgl_ai_config::User::new("github:hhenson", "HPH")][..]
+                &[hgl_ai_config::User::person(
+                    "owner@example.com",
+                    "This Dude"
+                )][..]
             )
         );
         let home = &f.env.home;

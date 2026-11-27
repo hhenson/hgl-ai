@@ -105,10 +105,7 @@ async fn framed(
     body: &str,
     banner: Option<String>,
 ) -> Response {
-    let user = match app.auth.handle_of(&s.identity) {
-        Some(h) => format!("{h} ({})", s.identity),
-        None => s.identity.to_string(),
-    };
+    let user = app.auth.display(&s.user);
     let nav = Nav {
         user: &user,
         csrf: &s.csrf,
@@ -355,16 +352,8 @@ pub async fn start(State(app): AppState, h: HeaderMap, Form(f): Form<StartForm>)
         return hub_down();
     };
     let issue = Some(f.issue.trim().to_string()).filter(|i| !i.is_empty());
-    let handle = app.auth.handle_of(&s.identity);
-    match owner::start_conversation(
-        bus,
-        &s.identity.to_string(),
-        handle.as_deref(),
-        &f.title,
-        issue,
-        &f.body,
-    )
-    .await
+    let handle = app.auth.handle_of(&s.user);
+    match owner::start_conversation(bus, &s.user, handle.as_deref(), &f.title, issue, &f.body).await
     {
         Ok((id, seq)) => {
             let _ = owner::wait_folded(bus, &id, seq, FOLD_WAIT).await;
@@ -544,8 +533,8 @@ async fn send_owner(app: &App, s: &Session, id: &str, body: Body) -> Response {
             None,
         );
     }
-    let handle = app.auth.handle_of(&s.identity);
-    match owner::owner_event(bus, id, &s.identity.to_string(), handle.as_deref(), body).await {
+    let handle = app.auth.handle_of(&s.user);
+    match owner::owner_event(bus, id, &s.user, handle.as_deref(), body).await {
         Ok(seq) => {
             let after = owner::wait_folded(bus, id, seq, FOLD_WAIT)
                 .await
@@ -772,13 +761,14 @@ fn auth_failure(e: AuthError) -> Response {
 }
 
 /// The page after a provider vouched: register this device's passkey.
-fn enrol_page(app: &App, id: hgl_ai_config::Identity) -> Response {
-    let ticket = app.auth.enrol_ticket(id.clone());
+fn enrol_page(app: &App, (user, via): (String, hgl_ai_config::Identity)) -> Response {
+    let ticket = app.auth.enrol_ticket(user.clone(), via.clone());
     let body = format!(
-        "<p>Signed in as <strong>{}</strong>. Register a passkey for this device; you sign in with it from now on.</p>\
+        "<p>Signed in as <strong>{}</strong> through {}. Register a passkey for this device; you sign in with it from now on.</p>\
          <p><button type=\"button\" id=\"passkey-register\">Register a passkey</button></p>\
          <p id=\"auth-status\" role=\"status\" aria-live=\"polite\"></p>",
-        esc(&id.to_string())
+        esc(&app.auth.display(&user)),
+        esc(&via.to_string())
     );
     let mut r = Html(page("Register a passkey", None, None, &body)).into_response();
     let h = r.headers_mut();
