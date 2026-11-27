@@ -99,7 +99,8 @@ before hub users takes one shared token until it moves.
   - At shutdown or a lost lease, held and running notes are naked (handed back).
 - **PROTO-9 — Idempotent sends.** Each note carries a `Nats-Msg-Id` of
   `<sender>-<created_at>-<sha256(envelope)[0:12]>` over recipient, kind, repo,
-  issue, head, base and body, so a retried send is dropped and no other note is.
+  issue, head, base and body (and `by` and `class` when set), so a retried send is
+  dropped and no other note is.
 
 ## 4. Notes
 
@@ -124,13 +125,13 @@ before hub users takes one shared token until it moves.
 
 | Kind | From → to | Meaning |
 | --- | --- | --- |
-| `assign` | controller or triage → seat | Take this issue. Carries `repo`, `issue`, optional `base`. The bridge creates the worktree first (§5). |
+| `assign` | controller or triage → seat | Take this issue. Carries `repo`, `issue`, optional `base` and `class` (`simple`, `standard` or `complex`; PROTO-21). The bridge creates the worktree first (§5). |
 | `ready` | implementor → controller | Pull request at `head` passes the author's checks. |
 | `blocked` | any → controller | Cannot proceed; states the question or dependency. |
 | `question` / `answer` | any ↔ any | Clarification; no GitHub comment unless it settles something. |
 | `review` | controller → reviewer | Review `repo#issue` at `head`. The bridge creates a review worktree. |
 | `receipt` | reviewer or desk → controller | Gate result at `head` (§7). |
-| `sendback` | controller → implementor | Findings at `head`; fix with new commits. |
+| `sendback` | controller → implementor | Findings at `head`; fix with new commits. An optional `class` moves the task up (ROLE-15). |
 | `approved` | controller → implementor | Sign-off for `head` on a verified `main`. |
 | `landed` | controller → seat, `all` | Merged; carries the merge commit. The bridge removes the issue's worktrees (§5). |
 | `closed` | controller → seat | Closed unmerged or superseded; same removal as `landed`. |
@@ -185,6 +186,19 @@ before hub users takes one shared token until it moves.
 - **PROTO-16 — Binding.** A seat binds a role to a runtime (`claude`, `codex`
   or `agy`) and a model on one host, in that host's configuration. Its record
   in `HGL_HOSTS` advertises role, runtime, model family and memory budget.
+- **PROTO-21 — Task class.** An `assign` carries the task's class (docs/roles.md §3);
+  only `assign` and `sendback` carry one. The class picks the seat, not the model: a seat
+  runs its own binding (and its fallbacks, PROTO-17) whatever the class. The bridge records
+  the class, with the stream sequence of the note that set it, in the task's `task.json`
+  and `HGL_TREES` record, and the turn's prompt names it. An `assign` sets it; a `sendback`
+  with a class only moves it up, never down (ROLE-15); a note no newer than the one that set
+  it (an older note delivered again) changes nothing. A tree made anew for a task begun
+  elsewhere (another host or seat) takes the class of the task's record set last, unless
+  the note that made it carries a class: that note moved the task (`gh sendback --class C
+  --to SEAT`, ROLE-15) and its class is the task's there. Each `HGL_TREES` record carries the
+  stream sequence of the note that made its tree (`seq`): the task's newest implementor tree
+  is its current seat, and `gh approve` and `gh sendback` without `--to` go only there
+  (`landed` and `closed` still reach every seat that has a tree, PROTO-14).
 - **PROTO-17 — Failover.** A seat may list fallback bindings. A quota refusal
   is known from the CLI's structured output (an error event or result and its
   status), never from text on stderr. On one, the bridge holds the notes and

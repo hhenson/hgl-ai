@@ -510,7 +510,7 @@ pub(crate) async fn after_merge<G: Gh>(
     );
     if o.notify && !p.has(progress::NOTES) {
         let seats = if o.seats.is_empty() {
-            author_seats(gh, s, bus, repo, &pr.branch, number, issue).await?
+            author_seats(gh, s, bus, repo, &pr.branch, number, issue, false).await?
         } else {
             o.seats.clone()
         };
@@ -766,6 +766,9 @@ async fn main_of<G: Gh>(gh: &G, s: &Settings, repo: &str) -> Result<Option<Strin
 
 /// The author's seats: the trees registry, the branch name, or the `Ready` comment's signer
 /// (a seat some host advertises).
+/// The seats for `landed` (every implementor tree of the task), or with `current` for a
+/// verdict (only the task's current seat, [`state::current_seats`]).
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn author_seats<G: Gh>(
     gh: &G,
     s: &Settings,
@@ -774,6 +777,7 @@ pub(crate) async fn author_seats<G: Gh>(
     branch: &str,
     number: u64,
     issue: Option<u64>,
+    current: bool,
 ) -> Result<Vec<Seat>> {
     let trees = bus.trees().await?;
     let known: Vec<String> = bus
@@ -791,7 +795,12 @@ pub(crate) async fn author_seats<G: Gh>(
     )
     .await?;
     let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
-    Ok(state::author_seats(
+    let pick = if current {
+        state::current_seats
+    } else {
+        state::author_seats
+    };
+    Ok(pick(
         &trees,
         repo,
         branch,

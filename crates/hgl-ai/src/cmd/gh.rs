@@ -75,6 +75,10 @@ struct VerdictArgs {
     /// A file with the body; `-` reads standard input.
     #[arg(long)]
     body_file: Option<PathBuf>,
+    /// Sendback only: the class the task moves up to after its second sendback for the
+    /// same finding (ROLE-15).
+    #[arg(long, value_name = "CLASS")]
+    class: Option<hgl_ai_proto::TaskClass>,
     /// Send the note only (the comment is already on GitHub).
     #[arg(long)]
     no_comment: bool,
@@ -499,6 +503,7 @@ async fn verdict(
         to: a.to.clone(),
         issue: a.issue,
         body: a.body()?,
+        class: a.class,
         comment: !a.no_comment,
         dry_run: a.dry_run,
     };

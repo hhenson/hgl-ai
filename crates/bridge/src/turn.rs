@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hgl_ai_proto::{Kind, Note, Role, TaskKey};
+use hgl_ai_proto::{Kind, Note, Role, TaskClass, TaskKey};
 use hgl_ai_tree::{Create, TASK_FILE};
 use tokio::sync::watch;
 
@@ -79,9 +79,114 @@ pub fn choose_create(creates: Vec<(u64, Option<Create>)>) -> Option<(u64, Create
     review.or(implement)
 }
 
+/// A task's class and the stream sequence of the note that set it (PROTO-21).
+pub type Classed = (Option<TaskClass>, Option<u64>);
+
+/// The task's class after these notes (docs/roles.md §3), in stream order: an `assign`
+/// sets it (triage may reclass a task by assigning it again); a `sendback` only moves it up
+/// (ROLE-15). A note no newer than the one that last set it (an older note delivered again,
+/// in this turn or a later one) changes nothing. The note at `made_by` made the tree of a
+/// task that moved here (a `sendback --to` this seat): its class sets the class, as an
+/// `assign` would, over the record it moved from.
+pub fn task_class(recorded: Classed, notes: &[(u64, u64, Note)], made_by: Option<u64>) -> Classed {
+    let mut by_seq: Vec<&(u64, u64, Note)> = notes.iter().collect();
+    by_seq.sort_by_key(|(seq, _, _)| *seq);
+    by_seq.iter().fold(recorded, |(c, at), (seq, _, n)| {
+        if at.is_some_and(|a| *seq <= a) {
+            return (c, at);
+        }
+        match (n.kind, n.class) {
+            (_, Some(new)) if made_by == Some(*seq) => (Some(new), Some(*seq)),
+            (Kind::Assign, Some(new)) => (Some(new), Some(*seq)),
+            (Kind::Sendback, Some(new)) if c.is_none_or(|c| new > c) => (Some(new), Some(*seq)),
+            _ => (c, at),
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn classed(seq: u64, kind: Kind, class: Option<TaskClass>) -> (u64, u64, Note) {
+        let s = |x: &str| hgl_ai_proto::Seat::new(x).unwrap();
+        let mut n = Note::new(s("claude"), s("w1"), kind, "x");
+        n.class = class;
+        (seq, 1, n)
+    }
+
+    #[test]
+    fn assign_sets_the_class_and_a_sendback_only_moves_it_up() {
+        use TaskClass::*;
+        let a = |seq, c| classed(seq, Kind::Assign, Some(c));
+        let sb = |seq, c| classed(seq, Kind::Sendback, c);
+        let tc = |rec: Option<TaskClass>, notes: &[(u64, u64, Note)]| {
+            task_class((rec, None), notes, None).0
+        };
+        assert_eq!(tc(None, &[a(1, Simple)]), Some(Simple));
+        assert_eq!(tc(Some(Standard), &[sb(5, None)]), Some(Standard), "kept");
+        assert_eq!(tc(None, &[sb(5, None)]), None, "an unclassed task stays so");
+        assert_eq!(tc(Some(Simple), &[sb(5, Some(Standard))]), Some(Standard));
+        assert_eq!(
+            tc(Some(Complex), &[sb(5, Some(Simple))]),
+            Some(Complex),
+            "never down"
+        );
+        assert_eq!(tc(None, &[sb(5, Some(Standard))]), Some(Standard));
+        assert_eq!(
+            tc(Some(Complex), &[a(9, Simple)]),
+            Some(Simple),
+            "a new assign reclasses"
+        );
+        // Stream order, whatever order the batch arrived in.
+        assert_eq!(
+            tc(None, &[sb(7, Some(Complex)), a(3, Simple)]),
+            Some(Complex)
+        );
+        let note = classed(2, Kind::Question, None);
+        assert_eq!(tc(Some(Simple), &[note]), Some(Simple));
+        // r3's finding 2: the sequence that set it is kept, and older notes change nothing.
+        assert_eq!(
+            task_class((None, None), &[a(3, Simple)], None),
+            (Some(Simple), Some(3))
+        );
+        let up = (Some(Complex), Some(5));
+        assert_eq!(
+            task_class(up, &[a(3, Simple)], None),
+            up,
+            "an older assign again"
+        );
+        assert_eq!(
+            task_class(up, &[a(5, Simple)], None),
+            up,
+            "the same note again"
+        );
+        assert_eq!(
+            task_class(up, &[a(6, Simple)], None),
+            (Some(Simple), Some(6)),
+            "a newer one"
+        );
+        assert_eq!(
+            task_class(up, &[sb(8, Some(Simple))], None),
+            up,
+            "a lower sendback"
+        );
+        // The sendback that made the tree of a task moved here sets its class.
+        let moved = (Some(Complex), Some(5));
+        assert_eq!(
+            task_class(moved, &[sb(7, Some(Standard))], Some(7)),
+            (Some(Standard), Some(7))
+        );
+        assert_eq!(task_class(moved, &[sb(7, Some(Standard))], None), moved);
+        assert_eq!(
+            task_class(moved, &[sb(7, None)], Some(7)),
+            moved,
+            "no class, no change"
+        );
+        assert_eq!(Simple.up(), Standard);
+        assert_eq!(Standard.up(), Complex);
+        assert_eq!(Complex.up(), Complex);
+    }
 
     fn review(h: char) -> Option<Create> {
         Some(Create::Review {
@@ -214,6 +319,23 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
+    /// The task's class in `HGL_TREES`: of its implementor trees on any host and seat (a task
+    /// moves with its seat, or to another seat), the one a note set last, by stream sequence.
+    /// `(None, None)` when the hub has none or cannot be read.
+    async fn class_elsewhere(&self, task: &TaskKey) -> Classed {
+        let recs = match self.bus.trees().await {
+            Ok(r) => r,
+            Err(e) => {
+                tracing::warn!(%task, "reading HGL_TREES for the task's class: {e}");
+                return (None, None);
+            }
+        };
+        recs.into_iter()
+            .filter(|r| &r.task == task && !r.review && r.class.is_some())
+            .max_by_key(|r| (r.class_seq, r.created_at.clone()))
+            .map_or((None, None), |r| (r.class, r.class_seq))
+    }
+
     pub(crate) async fn turn(self: Arc<Self>, job: Job) -> TurnOut {
         let binding_idx = job.binding_idx;
         let outcome = self.turn_inner(&job).await;
@@ -227,7 +349,7 @@ impl<B: BusApi> Bridge<B> {
         let seat = &job.seat;
         let name = seat.name().clone();
         // The directory, its tree, and its turn lock.
-        let (dir, held, file) = match &job.target {
+        let (dir, held, file, inherited) = match &job.target {
             Target::Inbox => {
                 let trees = self.trees.clone();
                 let n = name.clone();
@@ -237,7 +359,7 @@ impl<B: BusApi> Bridge<B> {
                     Err(e) => return Outcome::PrepFailed(e.to_string()),
                 };
                 match take_lock(&dir).await {
-                    Ok(l) => (dir, l, None),
+                    Ok(l) => (dir, l, None, None),
                     Err(o) => return o,
                 }
             }
@@ -273,6 +395,10 @@ impl<B: BusApi> Bridge<B> {
                         Err(e) => return Outcome::PrepFailed(e.to_string()),
                     }
                 }
+                // A tree made anew may continue a task begun on another host or seat: its
+                // class is in that tree's record (PROTO-21).
+                // With the sequence of the note that made the tree.
+                let mut inherited: Option<(Classed, u64)> = None;
                 let file = match &job.create {
                     Some((seq, c)) => {
                         let trees = self.trees.clone();
@@ -281,6 +407,10 @@ impl<B: BusApi> Bridge<B> {
                             .await
                         {
                             Ok(Ok(created)) => {
+                                // Read before this tree's own record replaces the old one.
+                                if !created.reused && !*review && created.file.class.is_none() {
+                                    inherited = Some((self.class_elsewhere(task).await, seq));
+                                }
                                 if !created.reused
                                     && let Err(e) = self.bus.tree_put(&created.record).await
                                 {
@@ -305,7 +435,7 @@ impl<B: BusApi> Bridge<B> {
                         Err(o) => return o,
                     },
                 };
-                (dir, held, Some(file))
+                (dir, held, Some(file), inherited)
             }
         };
         match *job.stop.borrow() {
@@ -313,6 +443,17 @@ impl<B: BusApi> Bridge<B> {
             Stop::Graceful(_) => return Outcome::Shutdown,
             Stop::None => {}
         }
+        // The task's class (docs/roles.md §3), recorded in its tree; an inbox turn has none.
+        let mut file = file;
+        let (class, class_seq) = match file.as_ref() {
+            Some(f) if f.class.is_some() => task_class((f.class, f.class_seq), &job.notes, None),
+            Some(f) => match inherited {
+                Some((from, made_by)) => task_class(from, &job.notes, Some(made_by)),
+                None => task_class((f.class, f.class_seq), &job.notes, None),
+            },
+            None => (None, None),
+        };
+        // The class picks the seat, not the model (PROTO-21): the seat's binding runs it.
         let binding = seat.binding_at(job.binding_idx);
         let r = match self.cfg.resolve(&binding) {
             Ok(r) => r,
@@ -320,23 +461,34 @@ impl<B: BusApi> Bridge<B> {
         };
         // The task's authors (ROLE-11): every family whose turns run in an implementor
         // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
-        let mut file = file;
-        if let (Some(f), Target::Tree { review: false, .. }) = (file.as_mut(), &job.target)
-            && !f.families.contains(&r.family)
-        {
-            f.families.push(r.family);
-            match hgl_ai_tree::write_task(&dir, f) {
-                Ok(()) => {
-                    let d = dir.clone();
-                    let size = tokio::task::spawn_blocking(move || hgl_ai_tree::dir_size(&d))
-                        .await
-                        .unwrap_or(0);
-                    let rec = self.trees.record(&dir, f, size);
-                    if let Err(e) = self.bus.tree_put(&rec).await {
-                        tracing::warn!(key = %rec.key(), "registering the task's families: {e}");
+        if let Some(f) = file.as_mut() {
+            let author = !matches!(job.target, Target::Tree { review: true, .. })
+                && !f.families.contains(&r.family);
+            if author {
+                f.families.push(r.family);
+            }
+            let reclassed = (f.class, f.class_seq) != (class, class_seq);
+            if reclassed {
+                tracing::info!(seat = %name, target = %job.target, from = ?f.class, to = ?class, ?class_seq, "task class");
+                f.class = class;
+                f.class_seq = class_seq;
+            }
+            if author || reclassed {
+                match hgl_ai_tree::write_task(&dir, f) {
+                    Ok(()) => {
+                        let d = dir.clone();
+                        let size = tokio::task::spawn_blocking(move || hgl_ai_tree::dir_size(&d))
+                            .await
+                            .unwrap_or(0);
+                        let rec = self.trees.record(&dir, f, size);
+                        if let Err(e) = self.bus.tree_put(&rec).await {
+                            tracing::warn!(key = %rec.key(), "registering the task's families and class: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        return Outcome::PrepFailed(format!("recording the family and class: {e}"));
                     }
                 }
-                Err(e) => return Outcome::PrepFailed(format!("recording the family: {e}")),
             }
         }
         let (cwd, writable) = match &job.target {
@@ -364,6 +516,7 @@ impl<B: BusApi> Bridge<B> {
                 runtime: r.runtime,
                 family: r.family,
                 model: &r.model,
+                class,
                 task: file.as_ref(),
                 hold: job.hold.as_deref(),
                 mode: job.mode.as_deref(),

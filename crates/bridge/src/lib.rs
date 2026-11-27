@@ -1599,6 +1599,9 @@ fn describe_note(seq: u64, n: &Note) -> String {
     if let Some(x) = &n.base {
         h.push_str(&format!(" base={x}"));
     }
+    if let Some(x) = n.class {
+        h.push_str(&format!(" class={x}"));
+    }
     format!("{h} at {}\n{}", n.created_at, n.body)
 }
 

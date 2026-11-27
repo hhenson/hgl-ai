@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hgl_ai_config::{Binding, Config, SeatConfig};
-use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, Tier};
+use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskClass, TaskKey, Tier};
 use hgl_ai_tree::testing::{commit, git, remote};
 use hgl_ai_tree::{Git, Layout, Trees};
 use tokio::sync::watch;
@@ -259,6 +259,310 @@ fn note(kind: Kind, to: &str, issue: u64, body: &str) -> Note {
 }
 
 use crate::proc::alive;
+
+/// r1's minor 5 and r3's finding 3 on hgl-ai PR 25: a tree made anew for a task begun
+/// elsewhere (another host, another seat) takes the class of the record its notes set last,
+/// by stream sequence, not by tree creation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recreated_tree_keeps_the_class_from_its_record() {
+    use hgl_ai_tree::Registry as _;
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let task = TaskKey {
+        repo: "demo".into(),
+        issue: 11,
+    };
+    let rec =
+        |host: &str, who: &str, review, created: &str, class, class_seq| hgl_ai_proto::TreeRecord {
+            host: host.into(),
+            seat: seat(who),
+            task: task.clone(),
+            review,
+            path: "elsewhere".into(),
+            branch: None,
+            created_at: created.into(),
+            size_bytes: 0,
+            families: vec![],
+            class,
+            class_seq,
+            seq: None,
+        };
+    // The task was moved from w2, where a sendback made it complex (seq 50), to w1 on
+    // another host, where a later-made tree still says simple from its assign (seq 10).
+    let older = "20261127T100000Z";
+    let newer = "20261127T110000Z";
+    for r in [
+        rec(
+            "build-0",
+            "w2",
+            false,
+            older,
+            Some(TaskClass::Complex),
+            Some(50),
+        ),
+        rec(
+            "build-2",
+            "w1",
+            false,
+            newer,
+            Some(TaskClass::Simple),
+            Some(10),
+        ),
+        rec(
+            "build-3",
+            "r1",
+            true,
+            newer,
+            Some(TaskClass::Simple),
+            Some(60),
+        ),
+    ] {
+        h.bus.tree_put(&r).await.unwrap();
+    }
+    let (tx, j) = h.start(&["w1"]);
+    let s = h.bus.push(
+        "w1",
+        note(Kind::Sendback, "w1", 11, "[claude] Sendback: demo#11"),
+    );
+    eventually("sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    let dir = h.work().join("w1/demo-11");
+    assert_eq!(
+        hgl_ai_tree::read_task(&dir).unwrap().class,
+        Some(TaskClass::Complex)
+    );
+    assert!(h.calls("codex")[0].stdin.contains("Task class: complex"));
+    stop(tx, j).await;
+}
+
+/// r3's blocker on hgl-ai PR 25 (ROLE-15 in one step): `gh sendback --class C --to w2`
+/// moves the task to w2. Its bridge makes w2's tree on the PR branch at class C, from the
+/// sendback alone, while w1 is offline; w1 gets no note. The new tree's record is the newer
+/// one, so verdicts without `--to` reach only w2 (PROTO-21).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_sendback_to_another_seat_moves_the_task_there_at_its_class() {
+    let mut h = harness();
+    let mut w2 = h.cfg.seats[0].clone();
+    w2.name = seat("w2");
+    h.cfg.seats.push(w2);
+    h.cfg.validate().unwrap();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let mut n = note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it");
+    n.class = Some(TaskClass::Simple);
+    let a = h.bus.push("w1", n);
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    // w1 pushes its branch (the pull request's), then goes offline.
+    let src1 = h.work().join("w1/demo-41/src");
+    let branch = hgl_ai_tree::read_task(&h.work().join("w1/demo-41"))
+        .unwrap()
+        .branch
+        .unwrap();
+    let head = commit(&h.git, &src1, "w.txt", "work\n", "w1's work");
+    h.git
+        .run(
+            &src1,
+            [
+                "push",
+                "--quiet",
+                "origin",
+                &format!("HEAD:refs/heads/{branch}"),
+            ],
+        )
+        .unwrap();
+    stop(tx, j).await;
+    let sent_before = h.bus.sent().len();
+
+    let (tx, j) = h.start(&["w2"]);
+    let mut sb = note(
+        Kind::Sendback,
+        "w2",
+        41,
+        "[claude] Sent back: demo#41 at 1f461fa7",
+    );
+    sb.class = Some(TaskClass::Standard);
+    let s = h.bus.push("w2", sb);
+    eventually("sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    let dir2 = h.work().join("w2/demo-41");
+    let f = hgl_ai_tree::read_task(&dir2).unwrap();
+    assert_eq!((f.class, f.class_seq), (Some(TaskClass::Standard), Some(s)));
+    assert_eq!(f.branch.as_deref(), Some(branch.as_str()), "the PR branch");
+    assert_eq!(
+        h.git
+            .run(&dir2.join("src"), ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim(),
+        head
+    );
+    assert!(
+        h.calls("codex")[1]
+            .stdin
+            .contains("\nTask class: standard.\n")
+    );
+    assert!(
+        h.bus.sent()[sent_before..]
+            .iter()
+            .all(|n| n.recipient.as_str() != "w1"),
+        "w1 gets no note"
+    );
+    let trees = h.bus.trees();
+    assert_eq!(trees["build-1.w1.demo-41"].seq, Some(a));
+    assert_eq!(
+        trees["build-1.w2.demo-41"].seq,
+        Some(s),
+        "w2's tree is the newer"
+    );
+    assert_eq!(trees["build-1.w2.demo-41"].class, Some(TaskClass::Standard));
+    stop(tx, j).await;
+}
+
+/// r1's minor 3 on hgl-ai PR 25: a dead letter quotes the note's class, so a resend keeps it.
+#[test]
+fn a_dead_letter_quotes_the_class() {
+    let mut n = note(Kind::Assign, "w1", 3, "[claude] Assign: demo#3");
+    n.class = Some(TaskClass::Standard);
+    let d = crate::describe_note(9, &n);
+    assert!(
+        d.lines().next().unwrap().contains(" class=standard "),
+        "{d}"
+    );
+}
+
+/// r3's finding 2 and the review bot's thread on hgl-ai PR 25: an older `assign` delivered
+/// again after a newer `sendback` moved the class up does not move it back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_older_class_note_delivered_again_changes_nothing() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let dir = h.work().join("w1/demo-23");
+    let mut n = note(Kind::Assign, "w1", 23, "[claude] Assign: demo#23");
+    n.class = Some(TaskClass::Simple);
+    let a = h.bus.push("w1", n.clone());
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    let mut up = note(Kind::Sendback, "w1", 23, "[claude] Sendback: demo#23");
+    up.class = Some(TaskClass::Complex);
+    let s = h.bus.push("w1", up);
+    eventually("sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    assert_eq!(
+        hgl_ai_tree::read_task(&dir).unwrap().class,
+        Some(TaskClass::Complex)
+    );
+    // The assign again, at its own (older) stream sequence.
+    h.bus.redeliver("w1", a, n);
+    eventually("redelivery acked", || h.bus.events(a) == [Ev::Ack, Ev::Ack]).await;
+    assert_eq!(
+        hgl_ai_tree::read_task(&dir).unwrap().class,
+        Some(TaskClass::Complex)
+    );
+    assert_eq!(
+        h.bus.trees()["build-1.w1.demo-23"].class,
+        Some(TaskClass::Complex)
+    );
+    stop(tx, j).await;
+}
+
+/// PROTO-21 (the controller's decision on hgl-ai PR 25): the class picks the seat, not the
+/// model. The seat's own binding runs a task whatever its class; the tree records the
+/// class, the prompt names it, and a `sendback` only moves it up (ROLE-15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_seats_binding_runs_every_class_and_the_tree_records_it() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let dir = h.work().join("w1/demo-980");
+    let recorded = || {
+        (
+            hgl_ai_tree::read_task(&dir).unwrap().class,
+            h.bus.trees()["build-1.w1.demo-980"].class,
+        )
+    };
+    let model = |i: usize| {
+        let c = &h.calls("codex")[i];
+        let at = c.args.iter().position(|a| a == "-m").unwrap();
+        c.args[at + 1].clone()
+    };
+
+    let mut n = note(
+        Kind::Assign,
+        "w1",
+        980,
+        "[claude] Assign: demo#980 Rename it",
+    );
+    n.class = Some(TaskClass::Simple);
+    let a = h.bus.push("w1", n);
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    assert_eq!(
+        model(0),
+        "gpt-6.2-astra",
+        "the seat's binding, not a lighter one"
+    );
+    assert!(
+        h.calls("codex")[0]
+            .stdin
+            .contains("\nTask class: simple.\n")
+    );
+    let simple = Some(TaskClass::Simple);
+    assert_eq!(recorded(), (simple, simple));
+
+    // A sendback without a class keeps it.
+    let s = h.bus.push(
+        "w1",
+        note(Kind::Sendback, "w1", 980, "[claude] Sendback: once"),
+    );
+    eventually("first sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    assert_eq!(recorded(), (simple, simple));
+
+    // The second for the same finding moves it up; the binding stays the seat's.
+    let mut n = note(Kind::Sendback, "w1", 980, "[claude] Sendback: again");
+    n.class = Some(TaskClass::Complex);
+    let s = h.bus.push("w1", n);
+    eventually("second sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    assert_eq!(model(2), "gpt-6.2-astra");
+    assert!(
+        h.calls("codex")[2]
+            .stdin
+            .contains("\nTask class: complex.\n")
+    );
+    let complex = Some(TaskClass::Complex);
+    assert_eq!(recorded(), (complex, complex));
+
+    // A sendback never moves a class down.
+    let mut n = note(Kind::Sendback, "w1", 980, "[claude] Sendback: lower");
+    n.class = Some(TaskClass::Simple);
+    let s = h.bus.push("w1", n);
+    eventually("third sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    assert_eq!(recorded(), (complex, complex));
+    stop(tx, j).await;
+}
+
+/// The class leaves quota failover as on main (PROTO-17): a classed task refused on the
+/// primary moves the seat to its fallback, and its class goes with the task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_classed_task_fails_over_as_any_other() {
+    let h = harness();
+    h.script(
+        "codex",
+        &format!("cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")),
+    );
+    h.script("agy", &format!("cat '{}'", fixture("agy-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let mut n = note(Kind::Assign, "w1", 31, "[claude] Assign: demo#31 Rename");
+    n.class = Some(TaskClass::Simple);
+    let a = h.bus.push("w1", n);
+    eventually("acked once moved", || h.bus.events(a) == [Ev::Ack]).await;
+    assert_eq!(
+        h.bus
+            .sent_containing("moved from codex gpt/gpt-6.2-astra to agy claude/claude-opus-5-5")
+            .len(),
+        1
+    );
+    let agy = h.calls("agy");
+    let i = agy[0].args.iter().position(|a| a == "--model").unwrap();
+    assert_eq!(agy[0].args[i + 1], "claude-opus-5-5");
+    let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-31")).unwrap();
+    assert_eq!(f.class, Some(TaskClass::Simple));
+    stop(tx, j).await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn assign_then_sendback_resumes_then_landed_cleans_up() {

@@ -8,7 +8,7 @@ use anyhow::{Context as _, bail};
 use hgl_ai_bridge::holder;
 use hgl_ai_bridge::lock::{self, FileLock};
 use hgl_ai_bus::{Bus, BusError, Delivery, Lease, MAX_NOTE_BYTES, StreamNote};
-use hgl_ai_proto::{Kind, Note, Seat, seat_lock_key};
+use hgl_ai_proto::{Kind, Note, Seat, TaskClass, seat_lock_key};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -64,6 +64,10 @@ struct SendArgs {
     /// Base for `assign`; merge commit for `landed`.
     #[arg(long, value_name = "B")]
     base: Option<String>,
+    /// Task class for `assign` (simple, standard, complex; docs/roles.md §3), or the class
+    /// a `sendback` moves the task up to (ROLE-15).
+    #[arg(long, value_name = "CLASS")]
+    class: Option<TaskClass>,
     /// Markdown body.
     #[arg(long, value_name = "TEXT")]
     body: Option<String>,
@@ -153,6 +157,7 @@ async fn send(ctx: &Ctx, a: SendArgs) -> anyhow::Result<i32> {
     note.issue = a.issue.unwrap_or(0);
     note.head = a.head;
     note.base = a.base;
+    note.class = a.class;
     note.validate()?;
     let bus = Bus::connect(&ctx.load_config()?).await?;
     let r = bus.send(&note).await?;
@@ -489,7 +494,7 @@ fn print_delivery(
 }
 
 /// `--- seq=N from=S kind=K repo#issue head=SHA at STAMP`, with `to=all` for a
-/// broadcast, `base=` when set and `delivered=N` on a redelivery.
+/// broadcast, `base=` and `class=` when set and `delivered=N` on a redelivery.
 fn header(d: &Delivery, seat: &Seat) -> String {
     let n = &d.note;
     let mut h = format!("--- seq={} from={}", d.seq, n.sender);
@@ -508,6 +513,9 @@ fn header(d: &Delivery, seat: &Seat) -> String {
     }
     if let Some(x) = &n.base {
         h.push_str(&format!(" base={x}"));
+    }
+    if let Some(x) = n.class {
+        h.push_str(&format!(" class={x}"));
     }
     if d.delivered > 1 {
         h.push_str(&format!(" delivered={}", d.delivered));
@@ -542,6 +550,16 @@ mod tests {
         assert_eq!(
             header(&d, &seat("w1")),
             "--- seq=13 from=claude to=all kind=note delivered=2 at 20261127T041100Z"
+        );
+        let mut a = Note::new(seat("triage"), seat("w1"), Kind::Assign, "[claude] Assign");
+        a.created_at = "20261127T041100Z".into();
+        a.repo = Some("hgl-ai".into());
+        a.issue = 17;
+        a.class = Some(TaskClass::Simple);
+        let d = Delivery::detached(14, 1, a);
+        assert_eq!(
+            header(&d, &seat("w1")),
+            "--- seq=14 from=triage kind=assign hgl-ai#17 class=simple at 20261127T041100Z"
         );
     }
 
