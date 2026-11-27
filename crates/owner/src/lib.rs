@@ -329,6 +329,25 @@ pub async fn decision_once(bus: &Bus, line: &str) -> Result<()> {
     append_decision(bus, line, true).await
 }
 
+/// The log's bytes kept at most: well inside the bucket's value limit.
+pub const DECISIONS_MAX_BYTES: usize = 768 << 10;
+
+/// `text` with `line` appended, then its newest lines only: at most [`DECISIONS_KEEP`]
+/// of them and [`DECISIONS_MAX_BYTES`] in all.
+fn appended(text: &str, line: &str) -> String {
+    let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines.push(line);
+    let mut skip = lines.len().saturating_sub(DECISIONS_KEEP);
+    let mut size: usize = lines[skip..].iter().map(|l| l.len() + 1).sum();
+    while size > DECISIONS_MAX_BYTES && skip + 1 < lines.len() {
+        size -= lines[skip].len() + 1;
+        skip += 1;
+    }
+    let mut value = lines[skip..].join("\n");
+    value.push('\n');
+    value
+}
+
 async fn append_decision(bus: &Bus, line: &str, once: bool) -> Result<()> {
     let line = line.replace(['\n', '\r'], " ");
     let line = line.trim();
@@ -338,11 +357,7 @@ async fn append_decision(bus: &Bus, line: &str, once: bool) -> Result<()> {
         if once && text.lines().any(|l| l == line) {
             return Ok(());
         }
-        let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-        lines.push(line);
-        let skip = lines.len().saturating_sub(DECISIONS_KEEP);
-        let mut value = lines[skip..].join("\n");
-        value.push('\n');
+        let value = appended(&text, line);
         match bus.state_update(KEY_DECISIONS, &value, rev).await {
             Err(BusError::Conflict { .. }) => {
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -376,6 +391,22 @@ pub async fn decisions_tail(bus: &Bus, n: usize) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_stays_bounded() {
+        let mut text = String::new();
+        for i in 0..2100 {
+            text = appended(&text, &format!("{i} short"));
+        }
+        assert_eq!(text.lines().count(), DECISIONS_KEEP);
+        assert!(text.starts_with("100 short\n") && text.ends_with("2099 short\n"));
+        let long = "x".repeat(4000);
+        for _ in 0..400 {
+            text = appended(&text, &long);
+        }
+        assert!(text.len() <= DECISIONS_MAX_BYTES, "{}", text.len());
+        assert!(text.ends_with(&format!("{long}\n")));
+    }
 
     #[test]
     fn urgency_order() {
