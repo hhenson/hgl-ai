@@ -25,9 +25,12 @@ pub struct TurnInput<'a> {
     pub writable: &'a [PathBuf],
 }
 
-/// The agent command line of a headless turn; the caller adds environment and the cap.
+/// The agent command line of a headless turn. The prompt goes on stdin
+/// ([`CmdSpec::input`]), never in an argument: Linux caps one argument at 128 KiB, and a
+/// note may be up to 1 MiB. The caller adds environment and the cap.
 pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
     let mut a: Vec<OsString> = Vec::new();
+    let mut input = t.prompt.as_bytes().to_vec();
     let s = |a: &mut Vec<OsString>, v: &[&str]| a.extend(v.iter().map(OsString::from));
     let models = model_args(t.resolved);
     let models: Vec<&str> = models.iter().map(String::as_str).collect();
@@ -39,15 +42,10 @@ pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
     };
     match t.resolved.runtime {
         Runtime::Claude => {
+            // `-p` without a prompt argument reads the prompt from stdin.
             s(
                 &mut a,
-                &[
-                    "-p",
-                    t.prompt,
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                ],
+                &["-p", "--output-format", "stream-json", "--verbose"],
             );
             s(&mut a, &models);
             if let Some(id) = t.resume {
@@ -95,10 +93,22 @@ pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
                     a.push(t.cwd.into());
                 }
             }
-            a.push(t.prompt.into());
+            // `-`: the prompt from stdin.
+            a.push("-".into());
         }
         Runtime::Agy => {
-            s(&mut a, &["-p", t.prompt, "--output-format", "stream-json"]);
+            // `-p` takes the prompt as its value and reads no stdin; with
+            // `--input-format stream-json` agy runs headless, one turn per stdin line.
+            s(
+                &mut a,
+                &[
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                ],
+            );
+            input = agy_input(t.prompt);
             s(&mut a, &models);
             if let Some(id) = t.resume {
                 s(&mut a, &["--conversation", id]);
@@ -112,7 +122,19 @@ pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
         args: a,
         env: Vec::new(),
         cwd: t.cwd.to_path_buf(),
+        input,
     }
+}
+
+/// agy's `stream-json` input: one user message holding the prompt, on one line.
+fn agy_input(prompt: &str) -> Vec<u8> {
+    let msg = serde_json::json!({
+        "event": "user",
+        "message": {"role": "user", "content": prompt},
+    });
+    let mut line = msg.to_string().into_bytes();
+    line.push(b'\n');
+    line
 }
 
 fn toml_str(s: &str) -> String {
@@ -429,11 +451,11 @@ mod tests {
             writable: &w,
         };
         let c = command(Path::new("claude"), &t);
+        assert_eq!(c.input, b"PROMPT");
         assert_eq!(
             strs(&c),
             [
                 "-p",
-                "PROMPT",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -472,8 +494,10 @@ mod tests {
             cwd: Path::new("/w/w1/r-1/src"),
             writable: &w,
         };
+        let c = command(Path::new("codex"), &t);
+        assert_eq!(c.input, b"PROMPT");
         assert_eq!(
-            strs(&command(Path::new("codex"), &t)),
+            strs(&c),
             [
                 "exec",
                 "--json",
@@ -490,7 +514,7 @@ mod tests {
                 "--skip-git-repo-check",
                 "-C",
                 "/w/w1/r-1/src",
-                "PROMPT",
+                "-",
             ]
         );
         let plain = resolved(Runtime::Codex, Family::Gpt, "gpt-6.1-sol", None);
@@ -515,7 +539,7 @@ mod tests {
                 "sandbox_workspace_write.writable_roots=[\"/w/w1/r-1\"]",
                 "--skip-git-repo-check",
                 "T1",
-                "PROMPT",
+                "-",
             ]
         );
     }
@@ -529,18 +553,28 @@ mod tests {
             "gemini-4-carbon",
             Some("high"),
         );
+        let prompt = "PROMPT line 1\n\"quoted\" \\ é\n";
         let t = TurnInput {
-            prompt: "PROMPT",
+            prompt,
             resolved: &r,
             resume: Some("C1"),
             cwd: Path::new("/x"),
             writable: &w,
         };
+        let c = command(Path::new("agy"), &t);
+        let line = std::str::from_utf8(&c.input).unwrap();
+        assert!(
+            line.ends_with('\n') && line.lines().count() == 1,
+            "{line:?}"
+        );
+        let v: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["event"], "user");
+        assert_eq!(v["message"]["content"], prompt);
         assert_eq!(
-            strs(&command(Path::new("agy"), &t)),
+            strs(&c),
             [
-                "-p",
-                "PROMPT",
+                "--input-format",
+                "stream-json",
                 "--output-format",
                 "stream-json",
                 "--model",
@@ -562,6 +596,7 @@ mod tests {
         };
         let a = strs(&command(Path::new("agy"), &t));
         assert_eq!(a[4..6], ["--model", "claude-opus-5-5-high"]);
+        assert!(!a.iter().any(|x| x.contains("PROMPT")), "never an argument");
         assert!(!a.contains(&"--effort".to_string()));
     }
 }

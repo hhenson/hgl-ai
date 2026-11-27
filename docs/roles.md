@@ -18,10 +18,11 @@ Status: proposed. Open decisions are issues in this repository.
 
 - **ROLE-1 — Owner.** Decides language and specification questions, release
   tags, priorities, and the fleet's budget and mode.
-- **ROLE-2 — Controller** (seat `claude`, whatever runtime holds it). The only
-  role that approves, merges and updates wrapper pins. Judges receipts, adds a
-  few probes of its own, sends back or approves, lands one change at a time
-  against the current `main`, and updates `main` and `landed.log`.
+- **ROLE-2 — Controller** (seat `claude`, or `[github] controller`; whatever
+  runtime holds it). The only role that approves, merges and updates wrapper
+  pins. Judges receipts, adds a few probes of its own, sends back or approves,
+  lands one change at a time against the current `main`, and updates `main`
+  and `landed.log`.
 - **ROLE-3 — Triage** (seat `triage`). Owns intake: labels and slices new
   issues, folds duplicates, keeps the claimable backlog ordered, and batches
   questions for the owner into one labelled list. Writes no code. Workers

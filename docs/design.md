@@ -14,7 +14,7 @@ no GitHub or git library.
 | --- | --- | --- |
 | `proto` | Note, kinds, receipts, host, tree and lock records, name and key validation, message ids. No I/O. | — |
 | `config` | `config.toml` schema, defaults, path expansion, load and save. | `proto` |
-| `bus` | NATS connection, provisioning, send, inbox fetch, ack/nak/in-progress, KV, leases. | `proto`, `config` |
+| `bus` | NATS connection, provisioning, send, inbox fetch, ack/nak/term/in-progress, KV, leases. | `proto`, `config` |
 | `cap` | Memory and time caps for a command tree (`systemd-run --user --scope` on Linux, `setrlimit` and a resident-memory watchdog elsewhere; macOS does not enforce `RLIMIT_AS`, so there the watchdog alone limits memory). | — |
 | `tree` | Worktree layout, create, register, salvage, remove, stale listing. | `proto`, `config`, `bus` |
 | `bridge` | Seat loops, runtime adapters, prompt building, heartbeats, failover, cleanup on `landed`. | all above |
@@ -93,6 +93,7 @@ repos = ["hgl-compiler", "hgl_spec", "hgl_core", "hgl-project", "homebrew-hgraph
 branch_prefix = "codex/"
 wrapper = "hgl-project"
 clone_url = "https://github.com/{owner}/{repo}.git"   # default
+controller = "claude"                  # default; the seat that gets the bridge's and coordinator's notes
 
 [models.claude]
 frontier = "claude-opus-5-5"
@@ -131,10 +132,15 @@ A model's family comes from the `[models.<family>]` table that names it; an
 
 | Runtime | Turn | Resume | Model and effort |
 | --- | --- | --- | --- |
-| `claude` | `claude -p PROMPT --output-format stream-json --verbose` | `--resume ID` from the last turn's `session_id` | `--model`, `--effort` |
-| `codex` | `codex exec --json PROMPT` | `codex exec resume ID --json PROMPT` | `-m`, `-c model_reasoning_effort=E` |
-| `agy` | `agy -p PROMPT --output-format stream-json` | `--conversation ID` | `--model SLUG-EFFORT`, `--effort` |
+| `claude` | `claude -p --output-format stream-json --verbose` | `--resume ID` from the last turn's `session_id` | `--model`, `--effort` |
+| `codex` | `codex exec --json -` | `codex exec resume --json ID -` | `-m`, `-c model_reasoning_effort=E` |
+| `agy` | `agy --input-format stream-json --output-format stream-json` | `--conversation ID` | `--model SLUG-EFFORT`, `--effort` |
 
+- The prompt goes on stdin, never in an argument (Linux caps one at 128 KiB; a
+  note may be 1 MiB). `claude -p` and `codex exec -` read it as text; `agy`
+  reads one line `{"event":"user","message":{"role":"user","content":PROMPT}}`
+  (its `-p` takes the prompt as a value and reads no stdin). Each turn's prompt
+  is kept in the task directory's `prompts/`.
 - A seat keeps one session per task, so context carries across that task's
   turns and is dropped when the task ends. Reviewers always start fresh.
 - The bridge runs each turn under `cap` with the seat's limit, in the task's
@@ -151,9 +157,10 @@ A model's family comes from the `[models.<family>]` table that names it; an
     src/        git worktree of the seat's clone, branch <branch_prefix><issue>-<slug>
     build/      CARGO_TARGET_DIR, CMake build trees
     tmp/        TMPDIR
-    task.json   seat, repo, issue, head, branch, created, session ids
-    turn.lock   flock held for a turn; empty, it is the agent's stdin
+    task.json   seat, repo, issue, head, branch, created, session ids, seq of the note that made it
+    turn.lock   flock held for a turn; the agent's stdin, holding the turn's input
     log/        the last turns' stdout and stderr
+    prompts/    the last turns' prompts, <UTC>-<runtime>.md beside their logs
   clones/<repo>/  one bare-ish clone per repository and host, shared by seats
   salvage/<seat>-<repo>-<issue>-<UTC>.patch
 ```

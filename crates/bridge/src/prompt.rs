@@ -5,12 +5,15 @@ use std::fmt::Write as _;
 use hgl_ai_proto::{Family, Note, Role, Runtime, Seat};
 use hgl_ai_tree::TaskFile;
 
-/// Upper bound of the whole prompt; it travels as one argument (Linux caps one at 128 KiB).
-pub const MAX_PROMPT: usize = 100 * 1024;
+/// Upper bound of the whole prompt, which goes on the agent's stdin: one note at the bus's
+/// limit fits whole beside the preamble; the notes of a batch share it.
+pub const MAX_PROMPT: usize = hgl_ai_bus::MAX_NOTE_BYTES + (64 << 10);
 
 pub struct Context<'a> {
     pub host: &'a str,
     pub seat: &'a Seat,
+    /// The controller's seat (`[github] controller`), named so replies reach it.
+    pub controller: Option<&'a Seat>,
     pub role: Role,
     pub runtime: Runtime,
     pub family: Family,
@@ -63,6 +66,9 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
         None => {
             let _ = writeln!(s, "No task: this turn runs in the seat's inbox directory.");
         }
+    }
+    if let Some(c) = c.controller {
+        let _ = writeln!(s, "The controller is seat `{c}`.");
     }
     s.push_str(
         "The `hgl-ai` skill describes the commands. Reply with `hgl-ai note send`.\n\
@@ -163,6 +169,7 @@ mod tests {
                 vec![]
             },
             sessions: BTreeMap::new(),
+            seq: None,
         }
     }
 
@@ -170,6 +177,7 @@ mod tests {
         Context {
             host: "build-1",
             seat: s,
+            controller: None,
             role: Role::Implementor,
             runtime: Runtime::Codex,
             family: Family::Gpt,
@@ -195,12 +203,15 @@ mod tests {
         n.created_at = "20261127T041100Z".into();
         let q = Note::new(seat("r1"), seat("w1"), Kind::Question, "Why?");
         let mut c = ctx(Some(&t), &s);
+        let boss = seat("boss");
+        c.controller = Some(&boss);
         c.hold = Some("20261127T050000Z\n");
         c.mode = Some("drain");
         let p = build(&c, &[(42, 1, &n), (43, 2, &q)]);
         for needle in [
             "You are seat `w1` (implementor) on host `build-1`, running codex with gpt model `gpt-6.1-sol`.",
             "Task: hgl-compiler#980 on branch `codex/980-fix` from origin/main",
+            "The controller is seat `boss`.",
             "`hgl-ai note send`",
             "Do not remove worktrees",
             "$HGL_AI_TASK_DIR",
@@ -232,9 +243,19 @@ mod tests {
     }
 
     #[test]
-    fn huge_bodies_are_truncated() {
+    fn a_note_at_the_bus_limit_is_whole_and_larger_bodies_are_truncated() {
         let s = seat("w1");
-        let n = Note::new(seat("claude"), seat("w1"), Kind::Note, "é".repeat(200_000));
+        let body = "é".repeat(hgl_ai_bus::MAX_NOTE_BYTES / 2);
+        let n = Note::new(seat("claude"), seat("w1"), Kind::Note, body.clone());
+        let p = build(&ctx(None, &s), &[(1, 1, &n)]);
+        assert!(p.contains(&format!("---\n{body}\n")));
+        assert!(!p.contains("[... truncated by the bridge"));
+        let n = Note::new(
+            seat("claude"),
+            seat("w1"),
+            Kind::Note,
+            "é".repeat(MAX_PROMPT),
+        );
         let p = build(&ctx(None, &s), &[(1, 1, &n)]);
         assert!(p.len() <= MAX_PROMPT + 200, "{}", p.len());
         assert!(p.contains("[... truncated by the bridge"));

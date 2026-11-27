@@ -62,7 +62,10 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
   to it can change (§6) without peers noticing.
 - **PROTO-8 — Ack after the turn.** The bridge sends `in_progress` every 60 s
   while a turn runs, `ack` after a clean exit, and `nak` with a 15 s delay on a
-  crash, a memory or time limit, or a provider quota refusal.
+  crash, a memory or time limit, or a provider quota refusal. A turn that can
+  never start (the CLI is missing, or the command line is over the system's
+  limit) is not retried: the bridge sends `term` and tells the controller which
+  notes it dropped.
 - **PROTO-9 — Idempotent sends.** Each note carries a `Nats-Msg-Id` of
   `<sender>-<created_at>-<sha256(envelope)[0:12]>` over recipient, kind, repo,
   issue, head, base and body, so a retried send is dropped and no other note is.
@@ -121,7 +124,12 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
   acknowledging the note it records the end in `HGL_ENDED` (§8); a note of that
   task to that seat with a lower stream sequence is then moot, on any host, and
   is acknowledged without a turn. A note of a task is naked while `HGL_ENDED`
-  cannot be read, an ending note while its end cannot be recorded.
+  cannot be read, an ending note while its end cannot be recorded. An ending
+  note whose end `HGL_ENDED` already holds (a redelivery) is acknowledged
+  without action. An ending note acts only on a tree made for a note with a
+  lower sequence than its own (`task.json` records it) and on that tree's turn;
+  a tree made for a later note is a restart of the task and is left alone. Of
+  the notes of a turn it stops, the later ones are naked, not acknowledged.
 - **PROTO-15 — Leftovers are visible.** `hgl-ai tree list --stale` lists
   trees whose issue is closed or that are older than `stale_after` (default
   3 days). The bridge posts that list and the disk use of `work_root` to the

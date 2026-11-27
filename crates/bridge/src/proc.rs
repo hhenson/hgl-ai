@@ -1,8 +1,9 @@
 //! Running one turn's command under the cap (`hgl-ai-cap`).
 //!
-//! The agent's stdin is the turn lock's open file (the lock file is empty), so the lock
-//! stays held while the agent lives, even if the bridge itself died: a second turn in
-//! that directory cannot start. Stdout is read line by line under a hard per-line bound.
+//! The agent's stdin is the turn lock's open file, holding the command's input (the
+//! prompt), so the lock stays held while the agent lives, even if the bridge itself died:
+//! a second turn in that directory cannot start. Stdout is read line by line under a hard
+//! per-line bound.
 //! Whatever ends the turn (exit, time or memory limit, stop, shutdown, a panic in the
 //! bridge) the cap's [`Stopper`] ends the tree, and [`run`] then kills any leftover and
 //! returns only once none is left, so a note is never naked while an agent of the turn
@@ -34,6 +35,9 @@ pub struct CmdSpec {
     pub args: Vec<OsString>,
     pub env: Vec<(OsString, OsString)>,
     pub cwd: PathBuf,
+    /// What the command reads on stdin: written into the turn lock when there is one
+    /// (its open file is the stdin), else through a pipe.
+    pub input: Vec<u8>,
 }
 
 /// A request to stop a running turn.
@@ -57,7 +61,11 @@ pub enum Ended {
     Stopped,
     /// Still running when the shutdown grace ran out.
     ShutdownKilled,
+    /// Not started this time; a retry may start it.
     SpawnFailed(String),
+    /// Can never start as given: the program is missing or not executable, or the command
+    /// line is over the system's limit (`E2BIG`). A retry fails alike.
+    CannotStart(String),
 }
 
 impl Ended {
@@ -121,15 +129,27 @@ pub async fn run(
     mut out_log: Option<std::fs::File>,
     err_log: Option<std::fs::File>,
 ) -> Run {
+    if let Some(why) = missing_program(spec) {
+        return not_started(Ended::CannotStart(why));
+    }
     let mut cmd = std::process::Command::new(&spec.program);
     cmd.args(&spec.args).current_dir(&spec.cwd);
     for (k, v) in &spec.env {
         cmd.env(k, v);
     }
     cmd.env(MARKER, marker);
-    let stdin = match lock.map(FileLock::share) {
-        Some(Ok(f)) => Stdio::from(f),
-        _ => Stdio::null(),
+    let (stdin, piped) = match lock {
+        Some(l) => match l.input(&spec.input) {
+            Ok(f) => (Stdio::from(f), false),
+            Err(e) => {
+                return not_started(Ended::SpawnFailed(format!(
+                    "writing the input into {}: {e}",
+                    l.path().display()
+                )));
+            }
+        },
+        None if spec.input.is_empty() => (Stdio::null(), false),
+        None => (Stdio::piped(), true),
     };
     let cap = CapSpec::new(limits.mem_bytes)
         .with_time(limits.timeout)
@@ -150,14 +170,25 @@ pub async fn run(
     let mut child = match c.spawn() {
         Ok(c) => c,
         Err(e) => {
-            return Run {
-                ended: Ended::SpawnFailed(format!("{}: {e}", spec.program.display())),
-                stderr_tail: String::new(),
-                long_lines: 0,
-                reaped: true,
-            };
+            let msg = format!("{}: {e}", spec.program.display());
+            // The program was found, so `ENOENT` with the directory present is its
+            // interpreter (or the cap's `systemd-run`) missing.
+            let never = e.raw_os_error() == Some(libc::E2BIG)
+                || (e.kind() == std::io::ErrorKind::NotFound && spec.cwd.is_dir());
+            return not_started(if never {
+                Ended::CannotStart(msg)
+            } else {
+                Ended::SpawnFailed(msg)
+            });
         }
     };
+    if piped && let Some(mut w) = child.take_stdin() {
+        let input = spec.input.clone();
+        // Ends with the command at the latest (`EPIPE`), if it never reads its stdin.
+        tokio::task::spawn_blocking(move || {
+            let _ = w.write_all(&input);
+        });
+    }
     let root = child.id();
     let scoped = child.method() == Method::Scope;
     let stopper = child.stopper();
@@ -269,6 +300,49 @@ pub async fn run(
         long_lines,
         reaped,
     }
+}
+
+fn not_started(ended: Ended) -> Run {
+    Run {
+        ended,
+        stderr_tail: String::new(),
+        long_lines: 0,
+        reaped: true,
+    }
+}
+
+/// Why `spec.program` cannot run: no such executable (on `PATH` for a bare name; a path
+/// is taken from the command's directory). `None` when it is there, or `PATH` is unset.
+fn missing_program(spec: &CmdSpec) -> Option<String> {
+    let p = &spec.program;
+    let bare = p.parent().is_none_or(|d| d.as_os_str().is_empty());
+    let found = if bare {
+        let path = spec
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .or_else(|| std::env::var_os("PATH"))?;
+        std::env::split_paths(&path).any(|d| executable(&d.join(p)))
+    } else {
+        executable(&spec.cwd.join(p))
+    };
+    (!found).then(|| {
+        let on = if bare { " on PATH" } else { "" };
+        format!("{}: no such executable{on}", p.display())
+    })
+}
+
+#[cfg(unix)]
+fn executable(p: &std::path::Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn executable(p: &std::path::Path) -> bool {
+    p.is_file()
 }
 
 fn publish(slot: Option<&TreeSlot>, t: &TreeId) {
@@ -537,6 +611,7 @@ mod tests {
             args: vec!["-c".into(), script.into()],
             env: vec![],
             cwd: cwd.to_path_buf(),
+            input: vec![],
         }
     }
 
@@ -798,27 +873,68 @@ mod tests {
         assert!(!alive(pid));
     }
 
-    #[tokio::test]
-    async fn spawn_failure() {
-        let d = tempfile::tempdir().unwrap();
-        let spec = CmdSpec {
-            program: "/nonexistent/agent".into(),
-            args: vec![],
-            env: vec![],
-            cwd: d.path().into(),
-        };
-        let r = run(
-            &spec,
-            limits(1000, Method::Rlimit),
+    async fn run_plain(spec: &CmdSpec, lock: Option<&FileLock>) -> Run {
+        run(
+            spec,
+            limits(10_000, Method::Rlimit),
             no_stop(),
-            None,
+            lock,
             "t8",
             None,
             |_| {},
             None,
             None,
         )
-        .await;
+        .await
+    }
+
+    #[tokio::test]
+    async fn spawn_failures_that_a_retry_cannot_fix() {
+        let d = tempfile::tempdir().unwrap();
+        for program in ["/nonexistent/agent", "hgl-ai-no-such-agent"] {
+            let spec = CmdSpec {
+                program: program.into(),
+                ..sh("true", d.path())
+            };
+            let r = run_plain(&spec, None).await;
+            assert!(
+                matches!(&r.ended, Ended::CannotStart(m) if m.contains("no such executable")),
+                "{:?}",
+                r.ended
+            );
+        }
+        // One argument over the system's limit (Linux: 128 KiB; macOS: 1 MiB in all).
+        let mut spec = sh("true", d.path());
+        spec.args.push("x".repeat(4 << 20).into());
+        let r = run_plain(&spec, None).await;
+        assert!(
+            matches!(&r.ended, Ended::CannotStart(m) if m.contains("too long")),
+            "{:?}",
+            r.ended
+        );
+        // A missing directory may be made again: retried.
+        let r = run_plain(&sh("true", &d.path().join("gone")), None).await;
         assert!(matches!(r.ended, Ended::SpawnFailed(_)), "{:?}", r.ended);
+    }
+
+    #[tokio::test]
+    async fn the_input_arrives_on_stdin_through_the_turn_lock_or_a_pipe() {
+        let d = tempfile::tempdir().unwrap();
+        let input: Vec<u8> = (0..300_000u32)
+            .flat_map(|i| format!("{i} \"é\"\n").into_bytes())
+            .collect();
+        let lp = d.path().join("turn.lock");
+        let lock = FileLock::turn(&lp).unwrap().unwrap();
+        for (lock, out) in [(Some(&lock), "via-lock"), (None, "via-pipe")] {
+            let mut spec = sh(&format!("cat > {out}"), d.path());
+            spec.input = input.clone();
+            let r = run_plain(&spec, lock).await;
+            assert!(r.ended.success(), "{:?}", r.ended);
+            assert!(std::fs::read(d.path().join(out)).unwrap() == input, "{out}");
+        }
+        assert!(
+            std::fs::read(&lp).unwrap() == input,
+            "the lock holds the input"
+        );
     }
 }

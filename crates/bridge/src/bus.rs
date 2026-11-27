@@ -71,6 +71,8 @@ pub trait DeliveryApi: Send + Sync + 'static {
     fn delivered(&self) -> u64;
     fn ack(&self) -> impl Future<Output = Result<()>> + Send;
     fn nak(&self, delay: Duration) -> impl Future<Output = Result<()>> + Send;
+    /// Stop redelivery without acknowledging: a note that can never be handled.
+    fn term(&self) -> impl Future<Output = Result<()>> + Send;
     fn in_progress(&self) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -148,6 +150,9 @@ impl DeliveryApi for hgl_ai_bus::Delivery {
     }
     async fn nak(&self, delay: Duration) -> Result<()> {
         hgl_ai_bus::Delivery::nak(self, delay).await
+    }
+    async fn term(&self) -> Result<()> {
+        hgl_ai_bus::Delivery::term(self).await
     }
     async fn in_progress(&self) -> Result<()> {
         hgl_ai_bus::Delivery::in_progress(self).await
