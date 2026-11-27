@@ -33,4 +33,6 @@ p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+hgl-ai-install.workspace = true
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "pem", "ring"] }
 webauthn-authenticator-rs = { version = "0.6.2", features = ["softpasskey"] }

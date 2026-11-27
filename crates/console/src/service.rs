@@ -291,6 +291,62 @@ pub async fn run(cfg: hgl_ai_config::Config) -> Result<(), Error> {
 mod tests {
     use super::*;
 
+    fn app(dir: &std::path::Path) -> App {
+        let mut cfg = hgl_ai_config::Config::new("hub");
+        cfg.paths.data_dir = dir.display().to_string();
+        cfg.console = Some(hgl_ai_config::Console {
+            url: "https://console.example.com".into(),
+            ..hgl_ai_config::Console::default()
+        });
+        App::new(cfg).unwrap()
+    }
+
+    fn q(id: &str, p: Priority) -> Thread {
+        Thread {
+            id: id.into(),
+            kind: hgl_ai_owner::ThreadKind::Question,
+            title: format!("title {id}"),
+            issue: None,
+            priority: Some(p),
+            state: hgl_ai_owner::ThreadState::Open,
+            seat: "claude".into(),
+            created_at: "20261127T000000Z".into(),
+            updated_at: "20261127T000000Z".into(),
+            context: "never sent".into(),
+            question: "q".into(),
+            options: vec![],
+            suggested: None,
+            answer: None,
+            messages: vec![],
+            seq: 1,
+        }
+    }
+
+    #[test]
+    fn notification_policy() {
+        let d = tempfile::tempdir().unwrap();
+        let a = app(d.path());
+        let n = on_new_question(&a, &q("q-00000001", Priority::P1)).unwrap();
+        assert_eq!(n.title, "p1 question: title q-00000001");
+        assert_eq!(n.link, "https://console.example.com/t/q-00000001");
+        assert!(matches!(n.priority, NPriority::Urgent));
+        assert!(on_new_question(&a, &q("q-00000003", Priority::P3)).is_none());
+        assert!(p2_batch(&a).is_none(), "p3 waits for nobody");
+        assert!(on_new_question(&a, &q("q-00000002", Priority::P2)).is_none());
+        let one = p2_batch(&a).unwrap();
+        assert_eq!(one.link, "https://console.example.com/t/q-00000002");
+        assert!(p2_batch(&a).is_none(), "the batch empties");
+        on_new_question(&a, &q("q-00000004", Priority::P2));
+        on_new_question(&a, &q("q-00000005", Priority::P2));
+        let two = p2_batch(&a).unwrap();
+        assert_eq!(
+            two.title,
+            "2 p2 questions: title q-00000004; title q-00000005"
+        );
+        assert_eq!(two.link, "https://console.example.com/questions");
+        assert!(!two.title.contains("never sent"));
+    }
+
     #[test]
     fn ticks_align() {
         let now = Utc.with_ymd_and_hms(2026, 11, 27, 3, 15, 0).unwrap();
