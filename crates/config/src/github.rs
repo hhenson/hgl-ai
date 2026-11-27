@@ -142,7 +142,7 @@ fn strings(v: &[&str]) -> Vec<String> {
 
 default_fns! {
     review_bot, is_review_bot: String = "chatgpt-codex-connector".into();
-    controller, is_controller: String = "claude".into();
+    controller, is_controller: String = "controller".into();
     coord_seat, is_coord_seat: String = "coord".into();
     coord_interval, is_coord_interval: String = "5m".into();
     hold_below, is_hold_below: u64 = 100;

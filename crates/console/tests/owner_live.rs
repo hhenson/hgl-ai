@@ -154,6 +154,7 @@ async fn ask_answer_converse_and_refuse_forgery() {
         token_file: None,
     }];
     h.cfg.hub.url = hub.url.clone();
+    h.cfg.github.controller = "claude".into();
     let app = Arc::new(App::new(h.cfg.clone()).unwrap());
     app.set_hub(Arc::new(console_bus));
     tokio::spawn(hgl_ai_console::service::start_background(app.clone()));

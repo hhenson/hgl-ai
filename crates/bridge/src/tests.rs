@@ -53,6 +53,7 @@ fn harness() -> H {
     let git = git(&root);
     let (_bare, seed) = remote(&git, &root, "demo");
     let mut cfg = Config::new("build-1");
+    cfg.github.controller = "claude".into();
     cfg.paths.work_root = root.join("work").display().to_string();
     cfg.paths.data_dir = root.join("data").display().to_string();
     cfg.github.clone_url = format!("{}/{{repo}}.git", root.display());

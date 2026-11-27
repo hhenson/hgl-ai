@@ -125,7 +125,7 @@ async fn a_round_writes_the_table_alerts_and_hold() {
     store::put_latest(&b, state::KEY_PRS, &fixture("coord-prev.prs"))
         .await
         .unwrap();
-    let controller = Seat::new("claude").unwrap();
+    let controller = Seat::new("controller").unwrap();
     let mut inbox = b.inbox(&controller).await.unwrap();
 
     let gh = FakeGh::default()
@@ -629,7 +629,7 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
 
     // The stream is back; a new run (a restarted service) sends them.
     b.provision().await.unwrap();
-    let controller = Seat::new("claude").unwrap();
+    let controller = Seat::new("controller").unwrap();
     let mut inbox = b.inbox(&controller).await.unwrap();
     coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new())
         .await
@@ -685,7 +685,7 @@ async fn authored_and_reviewed(b: &Bus) {
         seq: None,
     };
     b.tree_put(&tree).await.unwrap();
-    let controller = Seat::new("claude").unwrap();
+    let controller = Seat::new("controller").unwrap();
     let note = |kind: Kind, from: &str, pr: u64, body: &str| {
         let mut n =
             hgl_ai_proto::Note::new(Seat::new(from).unwrap(), controller.clone(), kind, body);

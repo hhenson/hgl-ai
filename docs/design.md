@@ -130,7 +130,7 @@ repos = ["hgl-compiler", "hgl_spec", "hgl_core", "hgl-project", "homebrew-hgraph
 branch_prefix = "codex/"
 wrapper = "hgl-project"
 clone_url = "https://github.com/{owner}/{repo}.git"   # default
-controller = "claude"                  # default; the seat that gets the bridge's and coordinator's notes
+controller = "controller"              # default; the seat that gets the bridge's and coordinator's notes
 
 [github.gate.hgl-compiler]             # per repository; every key optional
 review_receipt = true                  # default: a clean receipt from another family (ROLE-11)
