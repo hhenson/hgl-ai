@@ -101,7 +101,10 @@ jobs:
             target/
           key: cargo-test-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: cargo-test-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-
+      # The tests that go over a memory cap on purpose run here, not in a plain local run.
       - run: cargo test --workspace --locked
+        env:
+          HGL_AI_OOM_TESTS: "1"
       - if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
         run: cargo clean --workspace
       - if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'

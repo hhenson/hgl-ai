@@ -57,14 +57,15 @@ pub struct Plan {
     pub create: Option<Create>,
 }
 
-/// Of a group's creates: the last review (latest head), else the first implement.
-pub fn choose_create(creates: Vec<Option<Create>>) -> Option<Create> {
+/// Of a group's creates, by the stream sequence of the note asking: the last review
+/// (latest head), else the first implement.
+pub fn choose_create(creates: Vec<(u64, Option<Create>)>) -> Option<(u64, Create)> {
     let (mut review, mut implement) = (None, None);
-    for c in creates.into_iter().flatten() {
+    for (seq, c) in creates {
         match c {
-            Create::Review { .. } => review = Some(c),
-            Create::Implement { .. } if implement.is_none() => implement = Some(c),
-            Create::Implement { .. } => {}
+            Some(c @ Create::Review { .. }) => review = Some((seq, c)),
+            Some(c @ Create::Implement { .. }) if implement.is_none() => implement = Some((seq, c)),
+            _ => {}
         }
     }
     review.or(implement)
@@ -73,7 +74,8 @@ pub fn choose_create(creates: Vec<Option<Create>>) -> Option<Create> {
 pub struct Job {
     pub seat: Arc<SeatRt>,
     pub target: Target,
-    pub create: Option<Create>,
+    /// The tree to create, with the stream sequence of the note asking for it.
+    pub create: Option<(u64, Create)>,
     /// (seq, delivery count, note)
     pub notes: Vec<(u64, u64, Note)>,
     pub hold: Option<String>,
@@ -94,6 +96,8 @@ pub enum Outcome {
     /// Another process holds the turn lock (who, as far as known).
     Busy(String),
     PrepFailed(String),
+    /// The agent can never start as given (`proc::Ended::CannotStart`).
+    CannotStart(String),
 }
 
 #[derive(Debug)]
@@ -196,7 +200,7 @@ impl<B: BusApi> Bridge<B> {
                     }
                 }
                 if *review
-                    && matches!(job.create, Some(Create::Review { .. }))
+                    && matches!(job.create, Some((_, Create::Review { .. })))
                     && dir.join(TASK_FILE).exists()
                 {
                     // Each review starts from a fresh tree and session.
@@ -216,10 +220,12 @@ impl<B: BusApi> Bridge<B> {
                     }
                 }
                 let file = match &job.create {
-                    Some(c) => {
+                    Some((seq, c)) => {
                         let trees = self.trees.clone();
-                        let (s, t, c) = (name.clone(), task.clone(), c.clone());
-                        match tokio::task::spawn_blocking(move || trees.create(&s, &t, &c)).await {
+                        let (s, t, c, seq) = (name.clone(), task.clone(), c.clone(), *seq);
+                        match tokio::task::spawn_blocking(move || trees.create_for(&s, &t, &c, seq))
+                            .await
+                        {
                             Ok(Ok(created)) => {
                                 if !created.reused
                                     && let Err(e) = self.bus.tree_put(&created.record).await
@@ -258,6 +264,27 @@ impl<B: BusApi> Bridge<B> {
             Ok(r) => r,
             Err(e) => return Outcome::PrepFailed(format!("seat binding: {e}")),
         };
+        // The task's authors (ROLE-9): every family whose turns run in an implementor
+        // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
+        let mut file = file;
+        if let (Some(f), Target::Tree { review: false, .. }) = (file.as_mut(), &job.target)
+            && !f.families.contains(&r.family)
+        {
+            f.families.push(r.family);
+            match hgl_ai_tree::write_task(&dir, f) {
+                Ok(()) => {
+                    let d = dir.clone();
+                    let size = tokio::task::spawn_blocking(move || hgl_ai_tree::dir_size(&d))
+                        .await
+                        .unwrap_or(0);
+                    let rec = self.trees.record(&dir, f, size);
+                    if let Err(e) = self.bus.tree_put(&rec).await {
+                        tracing::warn!(key = %rec.key(), "registering the task's families: {e}");
+                    }
+                }
+                Err(e) => return Outcome::PrepFailed(format!("recording the family: {e}")),
+            }
+        }
         let (cwd, writable) = match &job.target {
             Target::Inbox => (dir.clone(), vec![dir.clone()]),
             Target::Tree { task, .. } => {
@@ -273,10 +300,12 @@ impl<B: BusApi> Bridge<B> {
             .and_then(|f| f.sessions.get(r.runtime.as_str()))
             .cloned();
         let items: Vec<prompt::Item> = job.notes.iter().map(|(s, d, n)| (*s, *d, n)).collect();
+        let controller = self.cfg.controller().ok();
         let text = prompt::build(
             &prompt::Context {
                 host: &self.cfg.host,
                 seat: &name,
+                controller: controller.as_ref(),
                 role: seat.cfg.role,
                 runtime: r.runtime,
                 family: r.family,
@@ -310,8 +339,11 @@ impl<B: BusApi> Bridge<B> {
         ];
         spec.env.extend(env.into_iter().map(|(k, v)| (k.into(), v)));
         let mem_gb = seat.cfg.memcap_gb.unwrap_or(self.cfg.limits.memcap_gb);
-        let (out_log, err_log) =
-            open_logs(&dir.join("log"), r.runtime.as_str(), self.opts.keep_logs);
+        let stem = format!("{}-{}", hgl_ai_proto::utc_now_stamp(), r.runtime);
+        let (out_log, err_log) = open_logs(&dir.join("log"), &stem, self.opts.keep_logs);
+        if let Err(e) = record_prompt(&dir.join("prompts"), &stem, &text, self.opts.keep_logs) {
+            tracing::warn!(dir = %dir.display(), "recording the prompt: {e}");
+        }
         tracing::info!(seat = %name, target = %job.target, runtime = %r.runtime, model = %r.model, resume = resume.is_some(), "turn starting");
         let mut parser = Parser::new(r.runtime);
         let limits = Limits {
@@ -355,6 +387,7 @@ impl<B: BusApi> Bridge<B> {
             Ended::TimedOut => Outcome::Failed(format!("time limit {:?}", self.opts.turn_timeout)),
             Ended::MemoryCap => Outcome::Failed(format!("memory cap {mem_gb} GiB reached")),
             Ended::SpawnFailed(e) => Outcome::Failed(e),
+            Ended::CannotStart(e) => Outcome::CannotStart(e),
             Ended::Exited(_) if parsed.success(exited_ok) => Outcome::Clean,
             Ended::Exited(_) if parsed.quota => Outcome::Quota(if err.is_empty() {
                 "quota refusal".into()
@@ -407,26 +440,37 @@ fn save_session(dir: &Path, runtime: &str, id: &str) -> hgl_ai_tree::Result<()> 
     Ok(())
 }
 
-/// `<dir>/<UTC>-<runtime>.out|.err`, keeping the newest `keep` turns.
+/// `<dir>/<stem>.out|.err` (`<UTC>-<runtime>`), keeping the newest `keep` turns.
 fn open_logs(
     dir: &Path,
-    runtime: &str,
+    stem: &str,
     keep: usize,
 ) -> (Option<std::fs::File>, Option<std::fs::File>) {
     if std::fs::create_dir_all(dir).is_err() {
         return (None, None);
     }
+    prune(dir, keep.saturating_sub(1) * 2);
+    let open = |ext: &str| std::fs::File::create(dir.join(format!("{stem}.{ext}"))).ok();
+    (open("out"), open("err"))
+}
+
+/// The turn's whole prompt in `<dir>/<stem>.md`, beside its logs; the newest `keep` kept.
+fn record_prompt(dir: &Path, stem: &str, prompt: &str, keep: usize) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    prune(dir, keep.saturating_sub(1));
+    std::fs::write(dir.join(format!("{stem}.md")), prompt)
+}
+
+/// Remove the oldest files of `dir` (by name) until `keep` are left.
+fn prune(dir: &Path, keep: usize) {
     if let Ok(rd) = std::fs::read_dir(dir) {
         let mut names: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
         names.sort();
-        let excess = names.len().saturating_sub(keep.saturating_sub(1) * 2);
+        let excess = names.len().saturating_sub(keep);
         for p in names.into_iter().take(excess) {
             let _ = std::fs::remove_file(p);
         }
     }
-    let stem = format!("{}-{runtime}", hgl_ai_proto::utc_now_stamp());
-    let open = |ext: &str| std::fs::File::create(dir.join(format!("{stem}.{ext}"))).ok();
-    (open("out"), open("err"))
 }
 
 /// Who holds a turn lock: the live holders where they can be found, else the pid the
@@ -438,6 +482,7 @@ fn holders(p: &Path) -> String {
         if let Ok(m) = std::fs::metadata(p) {
             let pids = proc::members(&TreeId {
                 lock: Some((m.dev(), m.ino())),
+                lock_path: Some(p.to_path_buf()),
                 ..TreeId::default()
             });
             if !pids.is_empty() {
@@ -461,6 +506,7 @@ pub async fn reap_lock_holders(path: &Path, grace: Duration) -> bool {
         };
         let t = TreeId {
             lock: Some((m.dev(), m.ino())),
+            lock_path: Some(path.to_path_buf()),
             ..TreeId::default()
         };
         tracing::warn!(lock = %path.display(), holders = ?proc::members(&t), "killing the holders of a turn lock");

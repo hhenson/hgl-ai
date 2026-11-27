@@ -20,6 +20,8 @@ pub trait BusApi: Registry + Send + Sync + 'static {
     fn host_del(&self, host: &str) -> impl Future<Output = Result<()>> + Send;
     /// The live host whose bridge serves `seat` (PROTO-6).
     fn bridge_host(&self, seat: &Seat) -> impl Future<Output = Result<Option<String>>> + Send;
+    /// The live host records (`HGL_HOSTS`).
+    fn hosts(&self) -> impl Future<Output = Result<Vec<HostRecord>>> + Send;
     /// Take the lease `name` in `HGL_LOCKS` (create-if-absent; `BusError::Held` when held).
     fn lock_acquire(
         &self,
@@ -71,6 +73,8 @@ pub trait DeliveryApi: Send + Sync + 'static {
     fn delivered(&self) -> u64;
     fn ack(&self) -> impl Future<Output = Result<()>> + Send;
     fn nak(&self, delay: Duration) -> impl Future<Output = Result<()>> + Send;
+    /// Stop redelivery without acknowledging: a note that can never be handled.
+    fn term(&self) -> impl Future<Output = Result<()>> + Send;
     fn in_progress(&self) -> impl Future<Output = Result<()>> + Send;
 }
 
@@ -98,6 +102,9 @@ impl BusApi for hgl_ai_bus::Bus {
     }
     async fn bridge_host(&self, seat: &Seat) -> Result<Option<String>> {
         hgl_ai_bus::Bus::bridge_host(self, seat).await
+    }
+    async fn hosts(&self) -> Result<Vec<HostRecord>> {
+        hgl_ai_bus::Bus::hosts(self).await
     }
     async fn lock_acquire(&self, name: &str, holder: &str) -> Result<Self::Lease> {
         hgl_ai_bus::Bus::lock_acquire(self, name, holder).await
@@ -148,6 +155,9 @@ impl DeliveryApi for hgl_ai_bus::Delivery {
     }
     async fn nak(&self, delay: Duration) -> Result<()> {
         hgl_ai_bus::Delivery::nak(self, delay).await
+    }
+    async fn term(&self) -> Result<()> {
+        hgl_ai_bus::Delivery::term(self).await
     }
     async fn in_progress(&self) -> Result<()> {
         hgl_ai_bus::Delivery::in_progress(self).await

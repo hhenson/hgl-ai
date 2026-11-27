@@ -15,13 +15,14 @@ use tokio::sync::Notify;
 use crate::bus::{BusApi, DeliveryApi, InboxApi, LeaseApi};
 use crate::disk::DiskProbe;
 
-/// JetStream's `max_deliver` of an inbox (docs/protocol.md §3).
-const MAX_DELIVER: u64 = 5;
+/// JetStream's `max_deliver` of an inbox (docs/protocol.md §3): unlimited.
+const MAX_DELIVER: u64 = u64::MAX;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Ev {
     Ack,
     Nak(Duration),
+    Term,
     Progress,
 }
 
@@ -225,6 +226,14 @@ impl BusApi for FakeBus {
             .find(|h| h.seats.iter().any(|s| &s.seat == seat))
             .map(|h| h.host.clone()))
     }
+    async fn hosts(&self) -> Result<Vec<HostRecord>> {
+        let hosts = g(&self.0.hosts);
+        let mut latest: BTreeMap<String, HostRecord> = BTreeMap::new();
+        for h in hosts.iter() {
+            latest.insert(h.host.clone(), h.clone());
+        }
+        Ok(latest.into_values().collect())
+    }
     async fn lock_acquire(&self, name: &str, holder: &str) -> Result<FakeLease> {
         let mut leases = g(&self.0.leases);
         if let Some((h, _)) = leases.get(name) {
@@ -393,6 +402,10 @@ impl DeliveryApi for FakeDelivery {
                 bus.enqueue(seat, seq, n, note);
             });
         }
+        Ok(())
+    }
+    async fn term(&self) -> Result<()> {
+        self.record(Ev::Term);
         Ok(())
     }
     async fn in_progress(&self) -> Result<()> {

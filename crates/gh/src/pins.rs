@@ -14,7 +14,7 @@ use hgl_ai_config::Pin;
 use serde_json::{Value, json};
 
 use crate::exec::{self, Gh};
-use crate::gate::{self, Kind, Outcome};
+use crate::gate::{self, Outcome};
 use crate::land::{self, LandOpts};
 use crate::{Error, Result, Settings, invalid, short};
 
@@ -315,13 +315,7 @@ pub async fn sync<G: Gh>(
                 .and_then(Value::as_str)
                 .ok_or_else(|| invalid("no commit sha"))?
                 .to_string();
-            exec::write_json(
-                gh,
-                "POST",
-                &format!("repos/{w}/git/refs"),
-                &json!({"ref": format!("refs/heads/{branch}"), "sha": sha}),
-            )
-            .await?;
+            point_branch(gh, &w, &branch, &sha).await?;
             let pr = exec::write_json(
                 gh,
                 "POST",
@@ -338,6 +332,12 @@ pub async fn sync<G: Gh>(
         }
     };
     let lo = LandOpts {
+        // Made by the tool, not an agent: no author family for a review receipt to differ
+        // from (ROLE-9); the review bot and the checks still gate it.
+        gate: gate::Opts {
+            tool_made: true,
+            ..gate::Opts::default()
+        },
         timeout: o.timeout,
         interval: o.interval,
         comment: false,
@@ -347,11 +347,38 @@ pub async fn sync<G: Gh>(
         ..LandOpts::default()
     };
     let l = land::land(gh, s, bus, &s.wrapper, number, &head, &lo).await?;
-    Ok(if l.outcome.kind == Kind::Merged {
+    Ok(if l.outcome.kind.landed() {
         Synced::Landed(l.outcome)
     } else {
         Synced::NotLanded(l.outcome)
     })
+}
+
+/// Point `refs/heads/<branch>` of `w` at `sha`: a branch left by an earlier attempt (or one
+/// whose pull request was closed) is moved there, forced; else it is made.
+async fn point_branch<G: Gh>(gh: &G, w: &str, branch: &str, sha: &str) -> Result<()> {
+    match exec::get(gh, &format!("repos/{w}/git/ref/heads/{branch}")).await {
+        Ok(_) => {
+            exec::write_json(
+                gh,
+                "PATCH",
+                &format!("repos/{w}/git/refs/heads/{branch}"),
+                &json!({"sha": sha, "force": true}),
+            )
+            .await?;
+        }
+        Err(e) if exec::is_not_found(&e) => {
+            exec::write_json(
+                gh,
+                "POST",
+                &format!("repos/{w}/git/refs"),
+                &json!({"ref": format!("refs/heads/{branch}"), "sha": sha}),
+            )
+            .await?;
+        }
+        Err(e) => return Err(e),
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -424,6 +451,45 @@ mod tests {
             t["tree"][1],
             json!({"path": "hgl_spec", "mode": "160000", "type": "commit", "sha": sha('5')})
         );
+    }
+
+    #[tokio::test]
+    async fn a_branch_left_behind_is_moved_not_made_again() {
+        let w = "hhenson/hgl-project";
+        let b = "codex/pins-compiler-cccccccc";
+        // Left by an earlier attempt: forced to the new commit, no `POST git/refs` (HTTP 422).
+        let gh = FakeGh::default()
+            .on(
+                &format!("{w}/git/ref/heads/{b}"),
+                &format!(
+                    "{{\"ref\":\"refs/heads/{b}\",\"object\":{{\"sha\":\"{}\"}}}}",
+                    sha('1')
+                ),
+            )
+            .on("-X PATCH", "{}");
+        point_branch(&gh, w, b, &sha('2')).await.unwrap();
+        let calls = gh.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("-X PATCH") && c.contains(&format!("git/refs/heads/{b}"))),
+            "{calls:?}"
+        );
+        assert!(!calls.iter().any(|c| c.contains("-X POST")), "{calls:?}");
+        // Not there: made.
+        let gh = FakeGh::default()
+            .fail("git/ref/heads/", "gh: Not Found (HTTP 404)")
+            .on("-X POST", "{}");
+        point_branch(&gh, w, b, &sha('2')).await.unwrap();
+        assert!(
+            gh.calls()
+                .iter()
+                .any(|c| c.contains("-X POST") && c.contains("git/refs"))
+        );
+        // Any other failure stops it.
+        let gh = FakeGh::default().fail("git/ref/heads/", "gh: Server Error (HTTP 502)");
+        assert!(point_branch(&gh, w, b, &sha('2')).await.is_err());
+        assert_eq!(gh.calls().len(), 1);
     }
 
     #[tokio::test]

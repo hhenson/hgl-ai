@@ -30,7 +30,8 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// The gate for new `assign` notes, telling the controller when it changes.
+    /// The gate for notes that make a new tree (ROLE-16, ROLE-17), telling the controller
+    /// when it changes.
     pub(crate) async fn gate_check(&self) -> Gate {
         let mode = self.bus.state_get("mode").await.ok().flatten();
         let free = self.free_gb();
@@ -53,10 +54,10 @@ impl<B: BusApi> Bridge<B> {
                     "[bridge] {host}: mode is drain; not taking `assign` notes (held until it opens)."
                 ),
                 Gate::LowDisk => format!(
-                    "[bridge] {host}: work_root has {} GB free, below min_free_gb {min}; not taking `assign` notes (held until it opens).",
+                    "[bridge] {host}: work_root has {} GB free, below min_free_gb {min}; making no new tree (`assign`, `review`, a moved task's tree; held until it opens).",
                     free.unwrap_or(0)
                 ),
-                Gate::Open => format!("[bridge] {host}: taking `assign` notes again."),
+                Gate::Open => format!("[bridge] {host}: taking new work again."),
             };
             tracing::info!(?g, "assign gate changed");
             self.tell(&self.host_seat(), Kind::Note, None, body).await;

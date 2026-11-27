@@ -1,6 +1,6 @@
 # Model calibration
 
-Status: running. Results replace the provisional tiers in `docs/roles.md` §3.
+Status: done 2026-11-27. The proposal at the end replaces the provisional tiers in `docs/roles.md` §3 once the owner agrees.
 
 ## Contestants
 
@@ -33,7 +33,7 @@ Status: running. Results replace the provisional tiers in `docs/roles.md` §3.
 
 ## Scoring
 
-Scored by the controller, then independently by a controller trial (Carbon), blind to contestant ids.
+Scored by the controller from hidden tests and cross-validation (the blind Carbon scoring was not run).
 
 | Axis | Points | Evidence |
 | --- | --- | --- |
@@ -56,4 +56,82 @@ Also recorded: wall time, turns and tokens where the runtime reports them.
 
 ## Results
 
-Pending.
+One run per contestant and task, so differences of a few points are noise; the patterns below
+held across tasks. Wall times shared one loaded machine; the GPT runs started later, under a
+lighter load.
+
+### Coding
+
+| Contestant | t1: min, union cases (of 32) | t2: min, hidden 8 + probes (of 4) | t3: min, hidden (of 4) |
+| --- | --- | --- | --- |
+| sol-xhigh | 15, **31** (moved a submodule pin to an unpushed commit; edited a Python test) | 12, 8+2 | 15, 4 |
+| astra-xhigh | 15, 27 | 17, 8+2 | 24, 4 |
+| astra-high | 24, 27 (edited a Python test) | 11, 8+2 | 23, 4 |
+| neon-xhigh | 36, 28 | 42, 8+**4** | 54, 3 |
+| neon-high | 30, 19 | 28, 8+**4** | 34, 4 |
+| hydrogen-xhigh | 27, 27 | 34, 8+3 | 60, 3 |
+| hydrogen-high | 15, 19 | 21, 8+2 | 37, 4 |
+| opus-high | 13, 19 | 25, 8+2 | 40, 4 |
+| opus-xhigh | 23, 19 | 30, 8+2 | 48, 4 |
+| agyopus-high | — | 22, 8+2 | — |
+| sol-high | 13, 22 | 12, 8+2 | 14, 4 |
+| terra-xhigh | 12, 15 | 12, 8+2 | 15, 3 |
+| terra-high | 18, 11 | 8, 8+1 | 18, 3 |
+
+- t1 (hgraph#1918): each fix ran every contestant's new cases (33, cross-validation; one case
+  asserting combiner visit order excluded); the unfixed base passes 1. Most fixes are partial: they
+  differ on growth across a re-point, empty or invalid collections, and a re-pointed zero.
+- t2 (hgl-compiler#591): all thirteen pass the 8 hidden cases and the workspace suite (~1950 tests).
+  The 4 probes are real defects that the seeded review found in one fix and nearly all shared:
+  an `any` candidate beside list candidates, a list written in braces, a `var` parameter reported
+  twice, and a lifted default whose C++ does not compile. Only Neon handled all four.
+- t3 (structural `Eq`): all pass the workspace suite; the four at 3 of 4 compare a constant's
+  spelling, which UNIT-13 forbids and no existing test catches.
+- Effort: xhigh helped Sol, Neon and Hydrogen on t1 and not Opus; it cost Neon and Hydrogen the
+  spelling rule on t3.
+- Harness: Opus through Antigravity matched Opus through Claude Code on t2.
+
+### Reviewing
+
+Seeded review (t2 fix with three planted defects, `calib/seeded`):
+
+| Reviewer | min | Planted found | Also |
+| --- | --- | --- | --- |
+| astra-xhigh | 7 | 3 | — |
+| sol-xhigh | 9 | 3 | — |
+| opus-xhigh | 10 | 3 | false author report; stale rule-table notes |
+| hydrogen-xhigh | 11 | 3 | false author report |
+| neon-xhigh | 14 | 3 | false report; **a real defect** (lifted default, C++ fails) |
+| carbon-high | 20 | 3 | false report; **three real defects** (`any` widening, braces, double `var` report) |
+| terra-xhigh | 3 | 2 | reviewing its own model's work; not independent |
+
+Cross-review of four t1 fixes with known defects (14 reviews):
+
+- Every reviewer except Opus gave the right verdict (`findings`) on every fix it reviewed, and named
+  the main defect (unsampled links on growth; empty and switched re-points; the zero).
+- **Opus xhigh returned `clean` on all three fixes it reviewed**, each with known defects, rating
+  them minor, including the submodule pin to an unpushed commit that Neon rated a blocker.
+- GPT reviewers (Astra, Sol, Terra) were fastest (6–10 min) with the right verdict; Neon and
+  Hydrogen took 20–55 min and went deepest.
+
+### Controller trials
+
+On the triage of all open issues and the assessment of the architecture review, Carbon, Opus and
+Astra 6.2 agreed on the substance; Carbon was the most thorough, Astra the most empirical and
+concise, Opus the most practical (it wrote and tested a patch). Carbon's later review of hgl-ai
+itself found 30 findings across two pull requests, several of them security issues the GPT line
+review missed.
+
+## Proposal for `docs/roles.md` §3
+
+| Work | First choice | Second | Not alone |
+| --- | --- | --- | --- |
+| Controller, architecture | Carbon high | Astra 6.2 high | — |
+| Triage | Astra 6.2 high | Carbon high | — |
+| Implementation, runtime and semantics | Sol 6.2 xhigh, Astra 6.2 xhigh | Neon xhigh | Terra, Hydrogen high |
+| Implementation, checker edge cases | Neon xhigh | Astra 6.2 xhigh | Terra |
+| Review (gate) | Neon xhigh or Carbon high | Astra 6.2 xhigh (fast) | Opus (lenient verdicts) |
+| Review (design, code, logic) | Carbon high | Neon xhigh | — |
+| Build agent, mechanical | Sol 6.2 high | Hydrogen high | — |
+
+Opus remains useful for practical engineering and patches, but not as the only reviewer of a gate.

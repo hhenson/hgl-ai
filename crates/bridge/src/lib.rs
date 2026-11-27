@@ -11,6 +11,8 @@ pub mod adapter;
 pub mod bus;
 pub mod disk;
 mod ended;
+mod failures;
+pub mod holder;
 pub mod lock;
 pub mod proc;
 pub mod prompt;
@@ -25,8 +27,8 @@ use std::time::Duration;
 
 use hgl_ai_bus::BusError;
 use hgl_ai_config::{Binding, Config, SeatConfig};
-use hgl_ai_proto::{Kind, Role, Runtime, Seat, TaskKey, seat_lock_key};
-use hgl_ai_tree::{IsClosed, Trees};
+use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskKey, seat_lock_key};
+use hgl_ai_tree::{Create, IsClosed, Trees};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
@@ -36,12 +38,10 @@ pub use disk::{DiskProbe, Statvfs};
 pub use hgl_ai_cap::Method as CapMethod;
 
 use crate::ended::EndedTasks;
+use crate::failures::Failures;
 use crate::lock::FileLock;
 use crate::proc::{Stop, TreeSlot};
 use crate::turn::{Outcome, Target, TurnOut};
-
-/// The controller's seat (ROLE-2).
-pub const CONTROLLER: &str = "claude";
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -62,8 +62,18 @@ pub type Result<T> = std::result::Result<T, BridgeError>;
 pub struct Options {
     pub fetch_max: usize,
     pub fetch_wait: Duration,
-    /// PROTO-8.
+    /// PROTO-8: the delay of a nak after a real failure (a crash, a memory or time limit).
     pub nak_delay: Duration,
+    /// Real failures of a note before it is dead-lettered to the controller (PROTO-8).
+    pub max_failures: u32,
+    /// First retry of a tree that could not be prepared; it doubles, to 16 times this.
+    pub prep_retry: Duration,
+    /// Retry of a seat refused for quota with no binding left to move to.
+    pub quota_retry: Duration,
+    /// Retry of a note whose end the hub could not answer or record (`HGL_ENDED`).
+    pub hub_retry: Duration,
+    /// How long a seat stays on a fallback binding before it tries its primary again.
+    pub failover_cooldown: Duration,
     /// Retry of a task whose turn lock another process holds.
     pub busy_retry: Duration,
     /// Also how often held `assign` notes are looked at again.
@@ -91,6 +101,11 @@ impl Options {
             fetch_max: 8,
             fetch_wait: Duration::from_secs(30),
             nak_delay: Duration::from_secs(15),
+            max_failures: 5,
+            prep_retry: Duration::from_secs(60),
+            quota_retry: Duration::from_secs(600),
+            hub_retry: Duration::from_secs(15),
+            failover_cooldown: cfg.failover_cooldown(),
             busy_retry: Duration::from_secs(30),
             in_progress_every: Duration::from_secs(60),
             heartbeat_every: Duration::from_secs(30),
@@ -135,6 +150,8 @@ pub struct Bridge<B: BusApi> {
     served: Mutex<BTreeMap<Seat, Arc<SeatRt>>>,
     /// The seat leases held (PROTO-6), refreshed with the heartbeat.
     leases: tokio::sync::Mutex<BTreeMap<Seat, HeldLease<B::Lease>>>,
+    /// This host's id in lease holder strings ([`holder`]).
+    host_id: String,
 }
 
 /// Turns started by this process, for [`Bridge::next_marker`]: counted per process, not per
@@ -153,20 +170,32 @@ struct SeatRt {
     binding: Mutex<usize>,
     exhausted_told: AtomicBool,
     busy_told: Mutex<HashSet<Target>>,
+    /// Targets whose failed preparation the controller was told of (once until it works).
+    prep_told: Mutex<HashSet<Target>>,
     /// Raised when a refresh finds the seat lease no longer ours.
     lost: watch::Sender<bool>,
     ended: Mutex<EndedTasks>,
+    failures: Mutex<Failures>,
+    /// No turn starts before this: a quota refusal with no binding left (PROTO-17).
+    quota_until: Mutex<Option<Instant>>,
+    /// When the seat last moved to a fallback binding; it returns to the primary after the
+    /// cool-down.
+    failed_over_at: Mutex<Option<Instant>>,
 }
 
 impl SeatRt {
-    fn new(cfg: SeatConfig, ended: EndedTasks) -> Self {
+    fn new(cfg: SeatConfig, ended: EndedTasks, failures: Failures) -> Self {
         SeatRt {
             cfg,
             binding: Mutex::new(0),
             exhausted_told: AtomicBool::new(false),
             busy_told: Mutex::default(),
+            prep_told: Mutex::default(),
             lost: watch::Sender::new(false),
             ended: Mutex::new(ended),
+            failures: Mutex::new(failures),
+            quota_until: Mutex::new(None),
+            failed_over_at: Mutex::new(None),
         }
     }
     fn name(&self) -> &Seat {
@@ -191,9 +220,39 @@ struct LoopEnd {
     lost: Option<bool>,
 }
 
+/// What a seat loop holds between deliveries.
+struct SeatState<D> {
+    /// Notes waiting for a turn: queued behind another target, held by a gate, a quota
+    /// refusal or a failed preparation (kept alive with `in_progress`, PROTO-8).
+    pending: Vec<Arc<D>>,
+    running: Option<Running<D>>,
+    /// Targets not started before the time: a turn lock held elsewhere, a tree that could
+    /// not be prepared.
+    busy: HashMap<Target, Instant>,
+    /// Notes whose end the hub could not answer or record, looked at again then.
+    deferred: Vec<(Arc<D>, Instant)>,
+    /// Failed preparations in a row, per target: the retry backs off.
+    prep_failures: HashMap<Target, u32>,
+}
+
+impl<D> SeatState<D> {
+    fn new() -> Self {
+        SeatState {
+            pending: Vec::new(),
+            running: None,
+            busy: HashMap::new(),
+            deferred: Vec::new(),
+            prep_failures: HashMap::new(),
+        }
+    }
+}
+
 /// A turn in flight in a seat loop.
 struct Running<D> {
     target: Target,
+    /// The stream sequence of the note that made the tree the turn runs in (`task.json`
+    /// `seq`, or this turn's creating note); `None` when unknown.
+    start: Option<u64>,
     deliveries: Arc<Mutex<Vec<Arc<D>>>>,
     stop: watch::Sender<Stop>,
     handle: JoinHandle<TurnOut>,
@@ -206,7 +265,15 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 
 impl<B: BusApi> Bridge<B> {
     pub fn new(cfg: Config, bus: B, trees: Trees, deps: Deps, opts: Options) -> Arc<Self> {
+        let host_id = match cfg.data_dir() {
+            Ok(d) => holder::host_id(&d),
+            Err(e) => {
+                tracing::warn!("no data directory for the host id: {e}");
+                format!("{:016x}", std::process::id())
+            }
+        };
         Arc::new(Bridge {
+            host_id,
             cfg,
             bus,
             trees: Arc::new(trees),
@@ -262,17 +329,24 @@ impl<B: BusApi> Bridge<B> {
             ));
         }
         tracing::info!(host = %self.cfg.host, seats = ?seats.iter().map(|s| s.name.to_string()).collect::<Vec<_>>(), "bridge starting");
+        if self.opts.cap_method.unwrap_or_else(CapMethod::detect) == CapMethod::Scope {
+            // Turn slices a bridge of this host left when it died.
+            let gone = tokio::task::spawn_blocking(hgl_ai_cap::remove_stale_turn_slices)
+                .await
+                .unwrap_or_default();
+            if !gone.is_empty() {
+                tracing::warn!(slices = ?gone, "removed turn slices of bridges that are gone");
+            }
+        }
         let data = self.cfg.data_dir()?;
         let mut set = tokio::task::JoinSet::new();
         for s in seats {
-            let ended = EndedTasks::load(
-                data.join("bridge")
-                    .join("ended")
-                    .join(format!("{}.json", s.name)),
-            );
+            let file = format!("{}.json", s.name);
+            let ended = EndedTasks::load(data.join("bridge").join("ended").join(&file));
+            let failures = Failures::load(data.join("bridge").join("failures").join(&file));
             set.spawn(
                 self.clone()
-                    .seat_main(Arc::new(SeatRt::new(s, ended)), shutdown.clone()),
+                    .seat_main(Arc::new(SeatRt::new(s, ended, failures)), shutdown.clone()),
             );
         }
         set.spawn(self.clone().heartbeat_loop(shutdown.clone()));
@@ -348,7 +422,7 @@ impl<B: BusApi> Bridge<B> {
         shutdown: &mut watch::Receiver<bool>,
     ) -> Option<FileLock> {
         let key = seat_lock_key(seat.name());
-        let holder = format!("{} pid {} (bridge)", self.cfg.host, std::process::id());
+        let holder = holder::holder(&self.cfg.host, &self.host_id, "bridge");
         let mut told: Option<String> = None;
         loop {
             if *shutdown.borrow() {
@@ -401,36 +475,18 @@ impl<B: BusApi> Bridge<B> {
     }
 
     /// Take the seat lease, under the seat lock. A lease that names a holder of this host
-    /// whose process is gone (a crashed bridge or `note wait`; or this process, after a
-    /// refresh whose answer was lost) is taken over at once rather than left to expire.
+    /// (its label and id, [`holder`]) whose process is gone (a crashed bridge or `note wait`;
+    /// or this process, after a refresh whose answer was lost) is taken over at once rather
+    /// than left to expire.
     async fn acquire_seat_lease(&self, key: &str, holder: &str) -> hgl_ai_bus::Result<B::Lease> {
         match self.bus.lock_acquire(key, holder).await {
-            Err(BusError::Held { holder: h, .. }) if self.dead_own_holder(&h) => {
+            Err(BusError::Held { holder: h, .. })
+                if holder::dead_own(&h, &self.cfg.host, &self.host_id) =>
+            {
                 tracing::warn!(lease = key, stale = %h, "taking over the seat lease of a holder of this host that is gone");
                 self.bus.lock_take_over(key, holder, &h).await
             }
             r => r,
-        }
-    }
-
-    /// `<host> pid <pid> (bridge|note wait|note peek)` of this host, with `pid` a dead
-    /// process (or, for a bridge, this one).
-    fn dead_own_holder(&self, holder: &str) -> bool {
-        let Some((pid, what)) = holder
-            .strip_prefix(&format!("{} pid ", self.cfg.host))
-            .and_then(|r| r.split_once(' '))
-        else {
-            return false;
-        };
-        let Ok(pid) = pid.parse::<u32>() else {
-            return false;
-        };
-        match what {
-            "(bridge)" if pid == std::process::id() => true,
-            "(bridge)" | "(note wait)" | "(note peek)" => {
-                pid != std::process::id() && !proc_alive(pid)
-            }
-            _ => false,
         }
     }
 
@@ -466,60 +522,80 @@ impl<B: BusApi> Bridge<B> {
         let mut end = LoopEnd { lost: None };
         let (tx, mut rx) = mpsc::channel::<B::Delivery>(64);
         let fetcher = tokio::spawn(self.clone().fetch_loop(seat.name().clone(), tx));
-        let mut pending: Vec<Arc<B::Delivery>> = Vec::new();
-        let mut running: Option<Running<B::Delivery>> = None;
-        let mut busy: HashMap<Target, Instant> = HashMap::new();
+        let mut st: SeatState<B::Delivery> = SeatState::new();
         let mut stopping = false;
         let every = self.opts.in_progress_every;
         let mut tick = tokio::time::interval_at(Instant::now() + every, every);
         loop {
-            if !stopping && running.is_none() {
-                running = self.start_next(seat, &mut pending, &busy).await;
+            if !stopping && st.running.is_none() {
+                st.running = self.start_next(seat, &mut st).await;
             }
-            if stopping && running.is_none() {
+            if stopping && st.running.is_none() {
                 break;
             }
-            let next_busy = busy.values().min().copied();
+            // When an idle seat may start something it holds: a target no longer busy, the
+            // end of a quota hold.
+            let wake = if st.running.is_none() && !st.pending.is_empty() {
+                let quota = *lock(&seat.quota_until);
+                st.busy.values().copied().chain(quota).min()
+            } else {
+                None
+            };
+            let due = st.deferred.iter().map(|(_, t)| *t).min();
             tokio::select! {
                 _ = down(&mut shutdown), if !stopping => {
                     stopping = true;
                     fetcher.abort();
-                    stop_turn(&running, Stop::Graceful(self.opts.shutdown_grace));
+                    stop_turn(&st.running, Stop::Graceful(self.opts.shutdown_grace));
                 }
                 _ = down(&mut lost), if !stopping => {
                     // Another bridge may serve the seat now: start nothing more, stop the
                     // running turn at once, hand every note back.
                     stopping = true;
                     fetcher.abort();
-                    end.lost = Some(running.is_some());
-                    stop_turn(&running, Stop::Graceful(Duration::ZERO));
+                    end.lost = Some(st.running.is_some());
+                    stop_turn(&st.running, Stop::Graceful(Duration::ZERO));
                 }
                 d = rx.recv(), if !stopping => match d {
-                    Some(d) => self.on_delivery(seat, Arc::new(d), &mut pending, &mut running, &mut busy).await,
+                    Some(d) => self.on_delivery(seat, Arc::new(d), &mut st).await,
                     None => {
                         // The fetcher failed: stop as at shutdown.
                         tracing::error!(seat = %seat.name(), "the inbox fetcher ended; stopping the seat");
                         stopping = true;
-                        stop_turn(&running, Stop::Graceful(self.opts.shutdown_grace));
+                        stop_turn(&st.running, Stop::Graceful(self.opts.shutdown_grace));
                     }
                 },
-                out = join(&mut running) => {
-                    let r = running.take().expect("a running turn");
-                    self.finish(seat, r, out, &mut pending, &mut busy).await;
+                out = join(&mut st.running) => {
+                    let r = st.running.take().expect("a running turn");
+                    self.finish(seat, r, out, &mut st, None).await;
                 }
-                _ = tick.tick() => self.keep_alive(&pending, running.as_ref()).await,
-                _ = tokio::time::sleep_until(next_busy.unwrap_or_else(Instant::now)), if next_busy.is_some() && running.is_none() => {
+                _ = tick.tick() => self.keep_alive(&st).await,
+                _ = tokio::time::sleep_until(wake.unwrap_or_else(Instant::now)), if wake.is_some() => {
                     let now = Instant::now();
-                    busy.retain(|_, until| *until > now);
+                    st.busy.retain(|_, until| *until > now);
+                }
+                _ = tokio::time::sleep_until(due.unwrap_or_else(Instant::now)), if due.is_some() && !stopping => {
+                    let now = Instant::now();
+                    let (ready, later): (Vec<_>, Vec<_>) = std::mem::take(&mut st.deferred)
+                        .into_iter()
+                        .partition(|(_, at)| *at <= now);
+                    st.deferred = later;
+                    for (d, _) in ready {
+                        self.on_delivery(seat, d, &mut st).await;
+                    }
                 }
             }
         }
         fetcher.abort();
         let _ = fetcher.await;
         while let Ok(d) = rx.try_recv() {
-            pending.push(Arc::new(d));
+            st.pending.push(Arc::new(d));
         }
-        for d in pending {
+        let held = st
+            .pending
+            .drain(..)
+            .chain(st.deferred.drain(..).map(|(d, _)| d));
+        for d in held {
             let _ = d.nak(self.opts.nak_delay).await;
         }
         end
@@ -558,17 +634,19 @@ impl<B: BusApi> Bridge<B> {
         &self,
         seat: &Arc<SeatRt>,
         d: Arc<B::Delivery>,
-        pending: &mut Vec<Arc<B::Delivery>>,
-        running: &mut Option<Running<B::Delivery>>,
-        busy: &mut HashMap<Target, Instant>,
+        st: &mut SeatState<B::Delivery>,
     ) {
         let seq = d.seq();
         // A redelivery of a note already held: keep the newest handle, run it once.
-        if let Some(p) = pending.iter_mut().find(|p| p.seq() == seq) {
+        if let Some(p) = st.pending.iter_mut().find(|p| p.seq() == seq) {
             *p = d;
             return;
         }
-        if let Some(r) = running.as_ref() {
+        if let Some((p, _)) = st.deferred.iter_mut().find(|(p, _)| p.seq() == seq) {
+            *p = d;
+            return;
+        }
+        if let Some(r) = st.running.as_ref() {
             let mut ds = lock(&r.deliveries);
             if ds.iter().any(|x| x.seq() == seq) {
                 ds.push(d);
@@ -578,58 +656,64 @@ impl<B: BusApi> Bridge<B> {
         tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, from = %d.note().sender, "note");
         // Every note passes here before it can start a turn.
         if let Some(task) = d.note().task() {
-            match self.ended_before(seat, &task, seq).await {
-                Ok(false) => {}
-                Ok(true) => {
+            match self.known_end(seat, &task, seq).await {
+                Ok(Some(end)) if seq < end => {
                     // Sent before its task ended, delivered after (hgl-ai#2): moot.
                     tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, %task, "a note of an ended task sent before its end; acked");
                     let _ = d.ack().await;
+                    lock(&seat.failures).clear(seq);
                     return;
                 }
+                Ok(Some(end)) if seq == end && d.note().kind.ends_task() => {
+                    // The end it made is recorded: a redelivery after a lost ack. Whatever
+                    // runs in the task now is a restart, newer than this note.
+                    tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, %task, "an ending note whose end is recorded already; acked");
+                    let _ = d.ack().await;
+                    return;
+                }
+                Ok(_) => {}
                 Err(e) => {
-                    // Without the hub's answer the note may be moot: no turn, try again later.
-                    tracing::warn!(seat = %seat.name(), seq, %task, "reading {}: {e}; naked", hgl_ai_proto::KV_ENDED);
-                    let _ = d.nak(self.opts.nak_delay).await;
+                    // Without the hub's answer the note may be moot: no turn; held, kept
+                    // alive, and looked at again (no delivery spent, PROTO-8).
+                    tracing::warn!(seat = %seat.name(), seq, %task, "reading {}: {e}; held, looked at again in {:?}", hgl_ai_proto::KV_ENDED, self.opts.hub_retry);
+                    st.deferred.push((d, Instant::now() + self.opts.hub_retry));
                     return;
                 }
             }
         }
         if d.note().kind.ends_task() {
-            self.end_task(seat, d, pending, running, busy).await;
+            self.end_task(seat, d, st).await;
         } else {
-            pending.push(d);
+            st.pending.push(d);
         }
     }
 
-    /// Whether a note of `task` at stream sequence `seq` was sent before the task ended for
-    /// the seat. The hub's `HGL_ENDED` is the authority, so a seat moved from another host
-    /// knows the ends seen there; the local record is a cache of this host's ends.
-    async fn ended_before(
+    /// The end of `task` for the seat that rules on its note at stream sequence `seq`: this
+    /// host's cache of its own ends when that makes the note moot, else the hub's
+    /// `HGL_ENDED`, the authority, so a seat moved from another host knows the ends seen there.
+    async fn known_end(
         &self,
         seat: &SeatRt,
         task: &TaskKey,
         seq: u64,
-    ) -> std::result::Result<bool, BusError> {
-        if lock(&seat.ended).moot(task, seq) {
-            return Ok(true);
+    ) -> std::result::Result<Option<u64>, BusError> {
+        let cached = lock(&seat.ended).get(task);
+        if cached.is_some_and(|end| seq < end) {
+            return Ok(cached);
         }
-        Ok(self
-            .bus
-            .ended_get(seat.name(), task)
-            .await?
-            .is_some_and(|end| seq < end))
+        self.bus.ended_get(seat.name(), task).await
     }
 
     /// `landed` / `closed` (PROTO-14): stop the task's turn, drop its queued notes, remove
     /// the seat's trees of it, record the end on the hub, send a cleanup receipt; no agent
-    /// turn. The note is acked once the end is recorded, else naked to try again.
+    /// turn. The note is acked once the end is recorded, else held and done again later. A
+    /// tree made for a note sent after this one (a restart of the task; this note redelivered
+    /// before its end was recorded) is not this note's: it and its turn are left alone.
     async fn end_task(
         &self,
         seat: &Arc<SeatRt>,
         d: Arc<B::Delivery>,
-        pending: &mut Vec<Arc<B::Delivery>>,
-        running: &mut Option<Running<B::Delivery>>,
-        busy: &mut HashMap<Target, Instant>,
+        st: &mut SeatState<B::Delivery>,
     ) {
         let note = d.note().clone();
         let Some(task) = note.task() else {
@@ -641,32 +725,47 @@ impl<B: BusApi> Bridge<B> {
             let _ = d.ack().await;
             return;
         };
+        let end = d.seq();
+        let ends = |start: Option<u64>| start.is_none_or(|s| s < end);
         let mut stopped = false;
-        if let Some(r) = running.as_mut()
+        let mut kept = None;
+        if let Some(r) = st.running.as_mut()
             && r.target.task() == Some(&task)
         {
-            let _ = r.stop.send(Stop::Now);
-            let out = (&mut r.handle).await;
-            let r = running.take().expect("checked");
-            self.finish(seat, r, out, pending, busy).await;
-            stopped = true;
+            if ends(r.start) {
+                let _ = r.stop.send(Stop::Now);
+                let out = (&mut r.handle).await;
+                let r = st.running.take().expect("checked");
+                self.finish(seat, r, out, st, Some(end)).await;
+                stopped = true;
+            } else {
+                kept = Some(r.target.clone());
+            }
         }
         // Notes of the task still queued (the seat was busy elsewhere) would recreate its
         // tree and run a turn after the removal: they are moot. Notes sent after this one
         // (a later seq) are newer intent and stay.
-        let (moot, rest): (Vec<_>, Vec<_>) = std::mem::take(pending)
+        let (moot, rest): (Vec<_>, Vec<_>) = std::mem::take(&mut st.pending)
             .into_iter()
             .partition(|p| p.seq() < d.seq() && p.note().task().as_ref() == Some(&task));
-        *pending = rest;
+        st.pending = rest;
         for p in moot {
             tracing::info!(seat = %seat.name(), seq = p.seq(), kind = %p.note().kind, %task, "a queued note of an ended task; acked");
             let _ = p.ack().await;
+            lock(&seat.failures).clear(p.seq());
         }
-        busy.retain(|t, _| t.task() != Some(&task));
-        lock(&seat.busy_told).retain(|t| t.task() != Some(&task));
         let mut removed = Vec::new();
         let mut errors = Vec::new();
+        let mut cleared = Vec::new();
         for review in [false, true] {
+            let target = Target::Tree {
+                task: task.clone(),
+                review,
+            };
+            if kept.as_ref() == Some(&target) {
+                tracing::info!(seat = %seat.name(), seq = end, %target, "the running turn is of a restart after this end; left alone");
+                continue;
+            }
             if let Some(dir) = self
                 .trees
                 .layout()
@@ -674,6 +773,11 @@ impl<B: BusApi> Bridge<B> {
                 .ok()
                 .filter(|p| p.exists())
             {
+                let start = hgl_ai_tree::read_task(&dir).ok().and_then(|f| f.seq);
+                if !ends(start) {
+                    tracing::info!(seat = %seat.name(), seq = end, ?start, %target, "a tree made after this end; left alone");
+                    continue;
+                }
                 // A process that still holds the turn lock is a stray of an earlier turn.
                 let lp = dir.join(lock::TURN_LOCK);
                 if lp.exists()
@@ -696,7 +800,12 @@ impl<B: BusApi> Bridge<B> {
                 Ok(Err(e)) => errors.push(e.to_string()),
                 Err(e) => errors.push(format!("removal panicked: {e}")),
             }
+            cleared.push(target);
         }
+        st.busy.retain(|t, _| !cleared.contains(t));
+        st.prep_failures.retain(|t, _| !cleared.contains(t));
+        lock(&seat.busy_told).retain(|t| !cleared.contains(t));
+        lock(&seat.prep_told).retain(|t| !cleared.contains(t));
         if let Err(e) = lock(&seat.ended).end(task.clone(), d.seq()) {
             tracing::warn!(seat = %seat.name(), %task, "caching the end of the task: {e}");
         }
@@ -717,57 +826,114 @@ impl<B: BusApi> Bridge<B> {
         match recorded {
             Ok(()) => {
                 let _ = d.ack().await;
+                lock(&seat.failures).clear(d.seq());
             }
             Err(e) => {
-                // Redelivered, the note finds nothing left to remove and records the end.
-                tracing::warn!(seat = %seat.name(), %task, "recording the end in {}: {e}; naked", hgl_ai_proto::KV_ENDED);
-                let _ = d.nak(self.opts.nak_delay).await;
+                // Done again later, the note finds nothing left to remove and records the end.
+                tracing::warn!(seat = %seat.name(), %task, "recording the end in {}: {e}; held, done again in {:?}", hgl_ai_proto::KV_ENDED, self.opts.hub_retry);
+                st.deferred.push((d, Instant::now() + self.opts.hub_retry));
             }
         }
     }
 
     /// Start the next turn from `pending`: the first group of notes sharing a target that
-    /// is not busy. While the `assign` gate is closed (ROLE-16, ROLE-17), an `assign` that
-    /// would start a new task stays held in `pending`, kept alive, until the gate opens.
+    /// is not busy. A note of a task whose tree a queued `assign` or `review` makes joins
+    /// that tree's turn. While the gate is closed (ROLE-16, ROLE-17) a note that would make
+    /// a new tree stays held in `pending`, kept alive, until it opens: an `assign` under
+    /// `drain` or low disk, any new tree (a review, a moved task's tree) under low disk.
+    /// Nothing starts during a quota hold.
     async fn start_next(
         self: &Arc<Self>,
         seat: &Arc<SeatRt>,
-        pending: &mut Vec<Arc<B::Delivery>>,
-        busy: &HashMap<Target, Instant>,
+        st: &mut SeatState<B::Delivery>,
     ) -> Option<Running<B::Delivery>> {
+        if st.pending.is_empty() {
+            return None;
+        }
         let now = Instant::now();
-        let plans: Vec<turn::Plan> = pending.iter().map(|d| self.plan(seat, d.note())).collect();
+        self.back_to_primary(seat).await;
+        if lock(&seat.quota_until).is_some_and(|t| t > now) {
+            return None;
+        }
+        let mut plans: Vec<turn::Plan> = st
+            .pending
+            .iter()
+            .map(|d| self.plan(seat, d.note()))
+            .collect();
+        // A note for no tree yet, of a task whose tree a queued note makes: into that turn.
+        let makers: Vec<(TaskKey, Target)> = plans
+            .iter()
+            .filter(|p| p.create.is_some())
+            .filter_map(|p| Some((p.target.task()?.clone(), p.target.clone())))
+            .collect();
+        for (d, p) in st.pending.iter().zip(plans.iter_mut()) {
+            if p.target == Target::Inbox
+                && let Some(t) = d.note().task()
+                && let Some((_, target)) = makers.iter().find(|(k, _)| *k == t)
+            {
+                p.target = target.clone();
+            }
+        }
         let mut gate = None;
         let mut held = Vec::with_capacity(plans.len());
-        for (d, p) in pending.iter().zip(&plans) {
-            let new_task = matches!(&p.target, Target::Tree { task, review: false } if self.trees.existing(seat.name(), task, false).is_none());
-            let gated = if d.note().kind == Kind::Assign && new_task {
+        for (d, p) in st.pending.iter().zip(&plans) {
+            let new_tree = match &p.target {
+                Target::Tree { task, review } => {
+                    p.create.is_some() && self.trees.existing(seat.name(), task, *review).is_none()
+                }
+                Target::Inbox => false,
+            };
+            let gated = if new_tree {
                 let g = match gate {
                     Some(g) => g,
                     None => *gate.insert(self.gate_check().await),
                 };
-                g != Gate::Open
+                (d.note().kind == Kind::Assign && g != Gate::Open) || g == Gate::LowDisk
             } else {
                 false
             };
             held.push(gated);
         }
+        // A note that joins a held maker's tree is held with it.
+        let held_targets: HashSet<Target> = plans
+            .iter()
+            .zip(&held)
+            .filter(|(p, h)| **h && p.create.is_some())
+            .map(|(p, _)| p.target.clone())
+            .collect();
+        for (p, h) in plans.iter().zip(held.iter_mut()) {
+            if !*h && p.create.is_none() && held_targets.contains(&p.target) {
+                *h = true;
+            }
+        }
         let idx = (0..plans.len())
-            .find(|&i| !held[i] && busy.get(&plans[i].target).is_none_or(|u| *u <= now))?;
+            .find(|&i| !held[i] && st.busy.get(&plans[i].target).is_none_or(|u| *u <= now))?;
         let target = plans[idx].target.clone();
         let mut group = Vec::new();
         let mut creates = Vec::new();
         let mut rest = Vec::new();
-        for ((d, p), h) in pending.drain(..).zip(plans).zip(held) {
+        for ((d, p), h) in st.pending.drain(..).zip(plans).zip(held) {
             if p.target == target && !h {
+                creates.push((d.seq(), p.create));
                 group.push(d);
-                creates.push(p.create);
             } else {
                 rest.push(d);
             }
         }
-        *pending = rest;
+        st.pending = rest;
         let create = turn::choose_create(creates);
+        // The tree the turn runs in: one kept from before (a review always gets a new one),
+        // or the one its creating note makes.
+        let start = match &target {
+            Target::Inbox => None,
+            Target::Tree { task, review } => {
+                let fresh = matches!(create, Some((_, Create::Review { .. })));
+                match self.trees.existing(seat.name(), task, *review) {
+                    Some(dir) if !fresh => hgl_ai_tree::read_task(&dir).ok().and_then(|f| f.seq),
+                    _ => create.as_ref().map(|(seq, _)| *seq),
+                }
+            }
+        };
         let hold = self.bus.state_get("hold").await.ok().flatten();
         let mode = self.bus.state_get("mode").await.ok().flatten();
         let (binding_idx, _) = seat.current();
@@ -791,6 +957,7 @@ impl<B: BusApi> Bridge<B> {
         let handle = tokio::spawn(self.clone().turn(job));
         Some(Running {
             target,
+            start,
             deliveries: Arc::new(Mutex::new(group)),
             stop: stop_tx,
             handle,
@@ -798,25 +965,31 @@ impl<B: BusApi> Bridge<B> {
         })
     }
 
+    /// Settle the notes of an ended turn by its outcome; `end` is the stream sequence of
+    /// the ending note that stopped it, if one did. A real failure is counted and naked (or
+    /// dead-lettered); an administrative hold keeps the notes in `pending`, alive, and spends
+    /// no delivery (PROTO-8).
     async fn finish(
         &self,
         seat: &Arc<SeatRt>,
         r: Running<B::Delivery>,
         out: std::result::Result<TurnOut, JoinError>,
-        pending: &mut Vec<Arc<B::Delivery>>,
-        busy: &mut HashMap<Target, Instant>,
+        st: &mut SeatState<B::Delivery>,
+        end: Option<u64>,
     ) {
         let ds: Vec<Arc<B::Delivery>> = lock(&r.deliveries).clone();
         let out = match out {
             Ok(o) => o,
             Err(e) => {
-                // The turn task panicked or was cancelled: kill its tree, then nak.
+                // The turn task panicked or was cancelled: kill its tree, then count it.
                 let tree = lock(&r.slot).clone();
                 if let Some(t) = tree {
                     proc::reap(&t, self.opts.kill_grace, Duration::from_secs(10)).await;
                 }
                 tracing::error!(seat = %seat.name(), "turn task failed: {e}");
-                return nak_all(&ds, self.opts.nak_delay).await;
+                return self
+                    .failed(seat, &ds, &format!("the turn task failed: {e}"))
+                    .await;
             }
         };
         let seqs: Vec<u64> = ds.iter().map(|d| d.seq()).collect();
@@ -824,39 +997,84 @@ impl<B: BusApi> Bridge<B> {
         if !matches!(out.outcome, Outcome::Busy(_)) {
             lock(&seat.busy_told).remove(&r.target);
         }
+        if !matches!(out.outcome, Outcome::PrepFailed(_)) {
+            st.prep_failures.remove(&r.target);
+            lock(&seat.prep_told).remove(&r.target);
+        }
         match out.outcome {
             Outcome::Clean => {
                 seat.exhausted_told.store(false, Ordering::Relaxed);
-                for d in ds {
+                for d in &ds {
                     let _ = d.ack().await;
                 }
+                let mut f = lock(&seat.failures);
+                seqs.iter().for_each(|s| f.clear(*s));
             }
             Outcome::Stopped => {
-                // Its task ended (`landed`, `closed`); the notes are moot.
+                // Its task ended (`landed`, `closed`): the notes sent before the end are moot;
+                // later ones are newer intent and run again.
                 for d in ds {
-                    let _ = d.ack().await;
+                    if end.is_none_or(|e| d.seq() < e) {
+                        let _ = d.ack().await;
+                        lock(&seat.failures).clear(d.seq());
+                    } else {
+                        let _ = d.nak(self.opts.nak_delay).await;
+                    }
                 }
             }
             Outcome::Quota(msg) => {
-                nak_all(&ds, self.opts.nak_delay).await;
-                self.failover(seat, out.binding_idx, &msg).await;
+                // Held, not naked: a quota refusal is no failure of the notes.
+                if !self.failover(seat, out.binding_idx, &msg, &r.target).await {
+                    *lock(&seat.quota_until) = Some(Instant::now() + self.opts.quota_retry);
+                }
+                st.pending.splice(0..0, newest(ds));
             }
             Outcome::PrepFailed(msg) => {
-                nak_all(&ds, self.opts.nak_delay).await;
+                // It may heal (the network, the hub, a fetch): held and tried again, backing off.
+                let n = st.prep_failures.entry(r.target.clone()).or_insert(0);
+                *n += 1;
+                let wait = self.opts.prep_retry * (1u32 << (*n - 1).min(4));
+                st.busy.insert(r.target.clone(), Instant::now() + wait);
+                st.pending.splice(0..0, newest(ds));
+                if lock(&seat.prep_told).insert(r.target.clone()) {
+                    let body = format!(
+                        "[bridge] {}/{}: could not prepare {} for a turn: {msg}. Its notes are held and tried again (backing off to {:?}); a `closed` note for the task drops them.",
+                        self.cfg.host,
+                        seat.name(),
+                        r.target,
+                        self.opts.prep_retry * 16
+                    );
+                    self.tell(seat.name(), Kind::Note, r.target.task(), body)
+                        .await;
+                }
+            }
+            Outcome::CannotStart(msg) => {
+                // A retry fails alike: drop the notes at once and say which.
+                for d in &ds {
+                    let _ = d.term().await;
+                    lock(&seat.failures).clear(d.seq());
+                }
+                let notes: Vec<String> = ds
+                    .iter()
+                    .map(|d| format!("seq {} {} from {}", d.seq(), d.note().kind, d.note().sender))
+                    .collect();
                 let body = format!(
-                    "[bridge] {}/{}: could not prepare {} for a turn: {msg}; notes naked.",
+                    "[bridge] {}/{}: cannot start a turn in {}: {msg}. A retry would fail alike, so its notes are dropped, not retried: {}. Fix the cause and send them again.",
                     self.cfg.host,
                     seat.name(),
-                    r.target
+                    r.target,
+                    notes.join("; ")
                 );
                 self.tell(seat.name(), Kind::Note, r.target.task(), body)
                     .await;
             }
-            Outcome::Failed(_) | Outcome::Shutdown => nak_all(&ds, self.opts.nak_delay).await,
+            Outcome::Failed(msg) => self.failed(seat, &ds, &msg).await,
+            Outcome::Shutdown => nak_all(&ds, self.opts.nak_delay).await,
             Outcome::Busy(who) => {
                 // Another process holds the task's turn lock: wait, do not start a second turn.
-                busy.insert(r.target.clone(), Instant::now() + self.opts.busy_retry);
-                pending.splice(0..0, ds);
+                st.busy
+                    .insert(r.target.clone(), Instant::now() + self.opts.busy_retry);
+                st.pending.splice(0..0, newest(ds));
                 if lock(&seat.busy_told).insert(r.target.clone()) {
                     let body = format!(
                         "[bridge] {}/{}: another process ({who}) still holds the turn lock of {}; its notes wait.",
@@ -871,39 +1089,219 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// PROTO-17: move the seat to its next binding after a quota refusal on `used`.
-    async fn failover(&self, seat: &Arc<SeatRt>, used: usize, msg: &str) {
-        let moved = {
+    /// A real failure of a turn (PROTO-8): count it for each of its notes; nak a note below
+    /// [`Options::max_failures`], dead-letter one that reached it.
+    async fn failed(&self, seat: &Arc<SeatRt>, ds: &[Arc<B::Delivery>], why: &str) {
+        let mut done: Vec<u64> = Vec::new();
+        for d in newest(ds.to_vec()) {
+            let n = lock(&seat.failures).record(d.seq(), why);
+            if n < self.opts.max_failures {
+                continue;
+            }
+            done.push(d.seq());
+            self.dead_letter(seat, &d, n, why).await;
+        }
+        for d in ds {
+            if !done.contains(&d.seq()) {
+                let _ = d.nak(self.opts.nak_delay).await;
+            }
+        }
+    }
+
+    /// Terminate a note that failed `n` times and send it, with the reason, to the
+    /// controller as a `note`.
+    async fn dead_letter(&self, seat: &Arc<SeatRt>, d: &Arc<B::Delivery>, n: u32, why: &str) {
+        let note = d.note();
+        let seq = d.seq();
+        let _ = d.term().await;
+        lock(&seat.failures).clear(seq);
+        tracing::error!(seat = %seat.name(), seq, kind = %note.kind, failures = n, "dead letter: {why}");
+        if note.kind == Kind::Note && note.body.starts_with(DEAD_LETTER) {
+            // Never a dead letter of a dead letter.
+            return;
+        }
+        let task = note
+            .task()
+            .map(|t| format!(", {}#{}", t.repo, t.issue))
+            .unwrap_or_default();
+        let why: String = why.chars().take(500).collect();
+        let head = format!(
+            "{DEAD_LETTER} {}/{}: note seq {seq} ({} from {}{task}) failed {n} times and is dropped, not retried. Last failure: {why}. Fix the cause and send it again. The note:\n\n",
+            self.cfg.host,
+            seat.name(),
+            note.kind,
+            note.sender
+        );
+        // Room for the envelope and JSON escaping within the bus's note limit.
+        let room = hgl_ai_bus::MAX_NOTE_BYTES / 2 - head.len();
+        let mut quoted = describe_note(seq, note);
+        if quoted.len() > room {
+            let mut cut = room;
+            while !quoted.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            quoted.truncate(cut);
+            quoted.push_str("\n(cut off)\n");
+        }
+        let task = note.task();
+        self.tell(seat.name(), Kind::Note, task.as_ref(), head + &quoted)
+            .await;
+    }
+
+    /// The seat's binding after the cool-down: back to its primary (PROTO-17).
+    async fn back_to_primary(&self, seat: &Arc<SeatRt>) {
+        let since = *lock(&seat.failed_over_at);
+        let Some(since) = since else { return };
+        if since.elapsed() < self.opts.failover_cooldown {
+            return;
+        }
+        let from = {
             let mut b = lock(&seat.binding);
-            if *b != used {
+            *lock(&seat.failed_over_at) = None;
+            if *b == 0 {
                 return;
             }
-            if used < seat.cfg.fallback.len() {
-                *b = used + 1;
-                true
-            } else {
-                false
-            }
+            std::mem::replace(&mut *b, 0)
         };
+        *lock(&seat.quota_until) = None;
+        seat.exhausted_told.store(false, Ordering::Relaxed);
+        let from = self.describe(&seat.binding_at(from));
+        let to = self.describe(&seat.binding_at(0));
+        tracing::info!(seat = %seat.name(), %from, %to, "cool-down over; back to the primary binding");
+        let body = format!(
+            "[bridge] Seat {} on {} returns from {from} to its primary {to} after the {:?} cool-down.",
+            seat.name(),
+            self.cfg.host,
+            self.opts.failover_cooldown
+        );
+        self.tell(seat.name(), Kind::Note, None, body).await;
+    }
+
+    /// PROTO-17: move the seat to its next binding after a quota refusal on `used`, skipping
+    /// one whose family would break ROLE-9 for the refused turn's task. Whether it moved
+    /// (or another refusal moved it already).
+    async fn failover(&self, seat: &Arc<SeatRt>, used: usize, msg: &str, target: &Target) -> bool {
+        let cur = self
+            .cfg
+            .resolve(&seat.binding_at(used))
+            .ok()
+            .map(|r| r.family);
+        let mut skipped = Vec::new();
+        let mut to = None;
+        for i in used + 1..=seat.cfg.fallback.len() {
+            let b = seat.binding_at(i);
+            let family = match self.cfg.resolve(&b) {
+                Ok(r) => r.family,
+                Err(e) => {
+                    skipped.push(format!("{} ({e})", b.runtime));
+                    continue;
+                }
+            };
+            match self.role9_block(seat, target, cur, family).await {
+                None => {
+                    to = Some(i);
+                    break;
+                }
+                Some(why) => skipped.push(format!("{} ({why})", self.describe(&b))),
+            }
+        }
+        {
+            let mut b = lock(&seat.binding);
+            if *b != used {
+                return true;
+            }
+            if let Some(i) = to {
+                *b = i;
+                *lock(&seat.failed_over_at) = Some(Instant::now());
+            }
+        }
         let from = self.describe(&seat.binding_at(used));
         let msg: String = msg.chars().take(200).collect();
-        if moved {
-            let to = self.describe(&seat.binding_at(used + 1));
-            tracing::warn!(seat = %seat.name(), %from, %to, "quota refusal; failing over");
-            let body = format!(
-                "[bridge] Failover: seat {} on {} moved from {from} to {to} after a quota refusal ({msg}). Later turns use {to}; ROLE-9 applies to the new family.",
-                seat.name(),
-                self.cfg.host
-            );
-            self.tell(seat.name(), Kind::Note, None, body).await;
-        } else if !seat.exhausted_told.swap(true, Ordering::Relaxed) {
-            let body = format!(
-                "[bridge] Quota: seat {} on {} was refused on {from} ({msg}) and has no fallback left; its notes are naked and retried.",
-                seat.name(),
-                self.cfg.host
-            );
-            self.tell(seat.name(), Kind::Note, None, body).await;
+        let skipped = if skipped.is_empty() {
+            String::new()
+        } else {
+            format!(" Skipped: {}.", skipped.join("; "))
+        };
+        match to {
+            Some(i) => {
+                let to = self.describe(&seat.binding_at(i));
+                tracing::warn!(seat = %seat.name(), %from, %to, "quota refusal; failing over");
+                let body = format!(
+                    "[bridge] Failover: seat {} on {} moved from {from} to {to} after a quota refusal ({msg}). Later turns use {to}, and the seat returns to its primary after {:?}; ROLE-9 applies to the new family.{skipped}",
+                    seat.name(),
+                    self.cfg.host,
+                    self.opts.failover_cooldown
+                );
+                self.tell(seat.name(), Kind::Note, None, body).await;
+                true
+            }
+            None => {
+                if !seat.exhausted_told.swap(true, Ordering::Relaxed) {
+                    let body = format!(
+                        "[bridge] Quota: seat {} on {} was refused on {from} ({msg}) and has no fallback left to move to.{skipped} Its notes are held and tried again every {:?}.",
+                        seat.name(),
+                        self.cfg.host,
+                        self.opts.quota_retry
+                    );
+                    self.tell(seat.name(), Kind::Note, None, body).await;
+                }
+                false
+            }
         }
+    }
+
+    /// Why moving the turn of `target` from family `cur` to `to` would break ROLE-9, if it
+    /// would. A review keeps the family the controller gave it (it was chosen to differ from
+    /// the author's). An implementor's task must leave a live reviewer family that is none of
+    /// its authors'. Unknown (the hub unreadable, no reviewer live): allowed.
+    async fn role9_block(
+        &self,
+        seat: &SeatRt,
+        target: &Target,
+        cur: Option<Family>,
+        to: Family,
+    ) -> Option<String> {
+        if Some(to) == cur {
+            return None;
+        }
+        let Target::Tree { task, review } = target else {
+            return None;
+        };
+        if *review {
+            return Some(format!(
+                "a review keeps its family ({}), which differs from the author's",
+                cur.map(|f| f.to_string())
+                    .unwrap_or_else(|| "unknown".into())
+            ));
+        }
+        let mut authors: HashSet<Family> = cur.into_iter().collect();
+        if let Some(dir) = self.trees.existing(seat.name(), task, false)
+            && let Ok(f) = hgl_ai_tree::read_task(&dir)
+        {
+            authors.extend(f.families);
+        }
+        authors.insert(to);
+        let reviewers: HashSet<Family> = match self.bus.hosts().await {
+            Ok(hosts) => hosts
+                .iter()
+                .flat_map(|h| h.seats.iter())
+                .filter(|s| s.role == Role::Reviewer)
+                .map(|s| s.family)
+                .collect(),
+            Err(e) => {
+                tracing::warn!("reading the hosts for ROLE-9: {e}; not checked");
+                return None;
+            }
+        };
+        if reviewers.is_empty() || reviewers.iter().any(|f| !authors.contains(f)) {
+            return None;
+        }
+        let mut names: Vec<String> = reviewers.iter().map(|f| f.to_string()).collect();
+        names.sort();
+        Some(format!(
+            "every live reviewer family ({}) would then be among the task's authors",
+            names.join(", ")
+        ))
     }
 
     /// `runtime family/model`.
@@ -914,13 +1312,10 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    async fn keep_alive(
-        &self,
-        pending: &[Arc<B::Delivery>],
-        running: Option<&Running<B::Delivery>>,
-    ) {
-        let mut all: Vec<Arc<B::Delivery>> = pending.to_vec();
-        if let Some(r) = running {
+    async fn keep_alive(&self, st: &SeatState<B::Delivery>) {
+        let mut all: Vec<Arc<B::Delivery>> = st.pending.to_vec();
+        all.extend(st.deferred.iter().map(|(d, _)| d.clone()));
+        if let Some(r) = &st.running {
             all.extend(lock(&r.deliveries).iter().cloned());
         }
         for d in all {
@@ -930,10 +1325,11 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// Send a note to the controller; failures are logged.
+    /// Send a note to the controller (`[github] controller`); failures are logged.
     async fn tell(&self, from: &Seat, kind: Kind, task: Option<&TaskKey>, body: String) {
-        let Ok(to) = Seat::new(CONTROLLER) else {
-            return;
+        let to = match self.cfg.controller() {
+            Ok(s) => s,
+            Err(e) => return tracing::warn!(kind = %kind, "not sent: {e}"),
         };
         let mut n = hgl_ai_proto::Note::new(from.clone(), to, kind, body);
         if let Some(t) = task {
@@ -941,25 +1337,42 @@ impl<B: BusApi> Bridge<B> {
             n.issue = t.issue;
         }
         if let Err(e) = self.bus.send(&n).await {
-            tracing::warn!(kind = %kind, "sending to {CONTROLLER}: {e}");
+            tracing::warn!(kind = %kind, "sending to {}: {e}", n.recipient);
         }
     }
 }
 
-/// Whether process `pid` exists on this host (`EPERM`: it exists, someone else's).
-#[cfg(unix)]
-fn proc_alive(pid: u32) -> bool {
-    let Ok(p) = libc::pid_t::try_from(pid) else {
-        return false;
-    };
-    // SAFETY: signal 0 checks existence only.
-    let r = unsafe { libc::kill(p, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+/// The first line of a dead letter's body.
+const DEAD_LETTER: &str = "[bridge] Dead letter:";
+
+/// One handle per note, the newest of a redelivered one, in order.
+fn newest<D: DeliveryApi>(ds: Vec<Arc<D>>) -> Vec<Arc<D>> {
+    let mut out: Vec<Arc<D>> = Vec::with_capacity(ds.len());
+    for d in ds {
+        match out.iter_mut().find(|o| o.seq() == d.seq()) {
+            Some(o) => *o = d,
+            None => out.push(d),
+        }
+    }
+    out
 }
 
-#[cfg(not(unix))]
-fn proc_alive(_: u32) -> bool {
-    true
+/// A note as `note wait` prints it: a header line, then the body.
+fn describe_note(seq: u64, n: &Note) -> String {
+    let mut h = format!(
+        "--- seq={seq} from={} to={} kind={}",
+        n.sender, n.recipient, n.kind
+    );
+    if let Some(t) = n.task() {
+        h.push_str(&format!(" {}#{}", t.repo, t.issue));
+    }
+    if let Some(x) = &n.head {
+        h.push_str(&format!(" head={x}"));
+    }
+    if let Some(x) = &n.base {
+        h.push_str(&format!(" base={x}"));
+    }
+    format!("{h} at {}\n{}", n.created_at, n.body)
 }
 
 /// Resolves once `shutdown` is true (the guard of `wait_for` is not held past it).

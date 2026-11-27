@@ -1,6 +1,7 @@
 # Roles and model assignment
 
-Status: proposed. Open decisions are issues in this repository.
+Status: proposed; implemented, except where a rule says it is proposed (`docs/build.md`).
+Open decisions are issues in this repository.
 
 ## 1. Team
 
@@ -18,10 +19,11 @@ Status: proposed. Open decisions are issues in this repository.
 
 - **ROLE-1 — Owner.** Decides language and specification questions, release
   tags, priorities, and the fleet's budget and mode.
-- **ROLE-2 — Controller** (seat `claude`, whatever runtime holds it). The only
-  role that approves, merges and updates wrapper pins. Judges receipts, adds a
-  few probes of its own, sends back or approves, lands one change at a time
-  against the current `main`, and updates `main` and `landed.log`.
+- **ROLE-2 — Controller** (seat `claude`, or `[github] controller`; whatever
+  runtime holds it). The only role that approves, merges and updates wrapper
+  pins. Judges receipts, adds a few probes of its own, sends back or approves,
+  lands one change at a time against the current `main`, and updates `main`
+  and `landed.log`.
 - **ROLE-3 — Triage** (seat `triage`). Owns intake: labels and slices new
   issues, folds duplicates, keeps the claimable backlog ordered, and batches
   questions for the owner into one labelled list. Writes no code. Workers
@@ -39,26 +41,35 @@ Status: proposed. Open decisions are issues in this repository.
     `HGL_STATE/prs`; an immediate `note` when a review bot finding or a failed
     check lands on a `ready` or `approved` pull request.
   - *desk*: runs the fixed regression sets for each `ready` compiler head
-    merged onto `main`, one run at a time, and sends a factual receipt.
+    merged onto `main`, one run at a time, and sends a factual receipt. Not part of
+    this repository.
   - *bridge*: delivers notes, runs agent turns, owns worktrees (protocol §5).
-  - *builder*: runs build recipes for local and remote requests and the merge queue,
-    and returns bounded summaries (`docs/build.md`). The desk's sets are recipe steps.
-  - *merge queue*: builds approved pull requests in batches on every platform and lands
-    them (`docs/build.md` §3).
-- **ROLE-6a — Build agent** (seat `build`). Writes and repairs recipes, provisions
-  toolchains and SDKs, diagnoses failures of the build itself; never changes the code
-  under build.
+  - *builder* (proposed, not implemented): runs build recipes for local and remote
+    requests and the merge queue, and returns bounded summaries (`docs/build.md`).
+  - *merge queue* (proposed, not implemented): builds approved pull requests in
+    batches on every platform and lands them (`docs/build.md` §3).
+- **ROLE-6a — Build agent** (seat `build`; proposed, not implemented). Writes and
+  repairs recipes, provisions toolchains and SDKs, diagnoses failures of the build
+  itself; never changes the code under build.
 
 ## 2. Gates
 
 - **ROLE-7 — Exact head.** Every receipt and verdict binds one 40-character
   head. A new commit voids them.
 - **ROLE-8 — Current main.** A change lands only after its gates ran on the
-  `main` it merges onto. When `main` moves, the next candidate is revalidated.
-- **ROLE-9 — Independence.** A merge needs a clean review receipt whose model
-  family differs from the author's. An agent never reviews work it wrote,
-  paired on or coordinated. When no other family is available, nothing lands:
-  same-family review is never a fallback.
+  `main` it merges onto. When `main` moves, the next candidate is revalidated. A
+  branch the gate brings up to date keeps its parent's review only where `main`
+  moved in files it does not touch and in no global path; otherwise the review
+  bot reviews the new head.
+- **ROLE-9 — Independence.** A merge needs a clean review receipt (PROTO-19) for
+  its exact head whose model family differs from every family that worked on the
+  task (the families the bridges record in its implementor trees, `HGL_TREES`);
+  `gh land` and `gh merge-if-clean` enforce it unless `[github.gate.<repo>]
+  review_receipt = false`. A pull request the tool makes (the wrapper's pins) has
+  no author and needs none. An agent never reviews work it wrote, paired on or
+  coordinated. When no other family is available, nothing lands: same-family
+  review is never a fallback, and failover never moves a task to a family that
+  would leave it none (PROTO-17).
 - **ROLE-10 — Pins follow merges.** A merge in `hgl_spec`, `hgl_core` or
   `hgl-compiler` is followed by the wrapper pin update and a new `main` state.
 - **ROLE-11 — No scope creep.** A defect found on the way that the change does
@@ -89,8 +100,8 @@ changes one file.
 | Review | frontier, xhigh | any family but the author's | the third family |
 | Triage | balanced, medium | claude | gemini |
 | Bulk mechanical edits (renames, label sweeps) | fast, medium | gemini | gpt |
-| Build agent: recipes, toolchains, build failures | balanced, high | gpt | claude |
-| Coordinator, builder, merge queue, bridge | no model | — | — |
+| Build agent (proposed): recipes, toolchains, build failures | balanced, high | gpt | claude |
+| Coordinator, bridge; builder, merge queue (proposed) | no model | — | — |
 
 - **ROLE-12 — Spread by subscription.** Implementors run mostly on `gpt`, so
   `claude` and `gemini` keep capacity for control, review and triage.
@@ -102,12 +113,19 @@ changes one file.
 ## 4. Resources
 
 - **ROLE-15 — Memory and time caps.** Every build, test, probe and generated
-  program runs under `hgl-ai cap SIZE -- CMD` with a time limit: 16 GiB for one
-  compiler run or program, up to 64 GiB for a workspace build or test run.
-  Reaching a cap is a finding, never a reason to raise it. A tree in
-  `/dev/shm` counts as memory and is removed when the run ends.
-- **ROLE-16 — Disk.** The desk stops below 170 GB free. Each bridge stops
-  taking `assign` notes when `work_root` has less than its configured
+  program runs under `hgl-ai cap SIZE -- CMD` with a time limit: 32 GiB for one
+  compiler run or program, 64 GiB for a C++ build or a whole-workspace build or test
+  run (a C++ build at 16 parallel jobs needs 1–4 GiB a job), and 96 GiB for an agent
+  turn's whole tree (HPH, 2026-11-27).
+  Reaching a cap is a finding, never a reason to raise it. Inside a turn a cap's
+  scope joins the turn's slice, so the seat's limit holds over every cap the
+  agent runs. Without systemd the cap also sets a per-process address-space limit;
+  sanitizer runs (ASan, TSan) use `hgl-ai cap --no-address-limit`, which keeps the
+  resident-memory watchdog. A tree in `/dev/shm` counts as memory; whoever makes
+  one removes it when the run ends (the cap does not).
+- **ROLE-16 — Disk.** Free space is in decimal GB (10^9 bytes) everywhere. The
+  desk stops below 170 GB free. Each bridge makes no new tree (`assign`, `review`,
+  a moved task's tree) when `work_root` has less than its configured
   `min_free_gb`, and says so to the controller.
 - **ROLE-17 — Hold and drain.** While `HGL_STATE/hold` exists, defer every
   GitHub call that can wait. In `drain` mode, finish in-flight work only and

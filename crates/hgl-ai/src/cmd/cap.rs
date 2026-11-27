@@ -21,6 +21,11 @@ pub struct Args {
     /// Grace between TERM and KILL.
     #[arg(long, value_name = "DUR", value_parser = duration, default_value = "10s")]
     kill_after: Duration,
+    /// Without systemd: limit the tree by its sampled resident memory only, with no
+    /// per-process address-space limit. For sanitizer builds (ASan, TSan), which reserve
+    /// far more address space than they use.
+    #[arg(long)]
+    no_address_limit: bool,
     /// The command and its arguments.
     #[arg(value_name = "CMD", required = true, allow_hyphen_values = true, value_parser = clap::value_parser!(OsString))]
     command: Vec<OsString>,
@@ -36,6 +41,7 @@ pub async fn run(_ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
         mem_bytes: args.size,
         time: args.time,
         kill_after: args.kill_after,
+        address_limit: !args.no_address_limit,
     };
     let argv = args.command;
     tokio::task::spawn_blocking(move || hgl_ai_cap::run(&spec, &argv))

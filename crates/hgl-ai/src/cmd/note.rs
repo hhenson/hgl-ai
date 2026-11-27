@@ -5,7 +5,9 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use hgl_ai_bus::{Bus, BusError, Delivery, Lease, MAX_NOTE_BYTES};
+use hgl_ai_bridge::holder;
+use hgl_ai_bridge::lock::{self, FileLock};
+use hgl_ai_bus::{Bus, BusError, Delivery, Lease, MAX_NOTE_BYTES, StreamNote};
 use hgl_ai_proto::{Kind, Note, Seat, seat_lock_key};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{oneshot, watch};
@@ -32,8 +34,8 @@ enum Cmd {
     /// Block until notes arrive for SEAT, print them and acknowledge them.
     /// Exit status 3 when --timeout passes with no note.
     Wait(WaitArgs),
-    /// Print pending notes for SEAT and return them unacknowledged
-    /// (each peek counts as a delivery toward the inbox's limit of 5).
+    /// Print the notes SEAT's inbox has not acknowledged, without taking or acknowledging
+    /// them (a peek spends no delivery).
     Peek(PeekArgs),
 }
 
@@ -155,10 +157,11 @@ async fn send(ctx: &Ctx, a: SendArgs) -> anyhow::Result<i32> {
     Ok(EXIT_OK)
 }
 
-/// `wait` (acknowledge after printing) and `peek` (hand back at once, unacknowledged).
-/// Either holds the seat lease `HGL_LOCKS/seat.<seat>` from before the first fetch until it
-/// returns (PROTO-6), so a bridge started meanwhile does not serve the seat; `--force` goes
-/// without it.
+/// `wait` (acknowledge after printing) and `peek` (read the stream; nothing is taken or
+/// acknowledged). Either holds the seat's lock on this host, `<data_dir>/seats/<seat>.lock`,
+/// and the seat lease `HGL_LOCKS/seat.<seat>` from before the first read until it returns
+/// (PROTO-6), so a bridge started meanwhile does not serve the seat; `--force` goes
+/// without both.
 async fn receive(
     ctx: &Ctx,
     seat: &Seat,
@@ -174,15 +177,28 @@ async fn receive(
     let key = seat_lock_key(seat);
     if force {
         eprintln!(
-            "warning: --force: receiving for seat {seat} without its lease {key}; a bridge may \
-             serve the seat at the same time"
+            "warning: --force: receiving for seat {seat} without its lock and lease {key}; a \
+             bridge may serve the seat at the same time"
         );
         return receive_held(ctx, &bus, seat, max, wait, ack, None, &mut sigs).await;
     }
     served_by_bridge(&bus, seat).await?;
+    let path = cfg.seat_lock_path(seat)?;
+    let _flock = match FileLock::try_exclusive(&path)
+        .with_context(|| format!("the seat lock {}", path.display()))?
+    {
+        Some(l) => l,
+        None => bail!(
+            "seat {seat} is served on this host by pid {} (it holds {}); a seat is served by a \
+             bridge or interactively, never both (--force to override)",
+            lock::holder(&path).map_or_else(|| "unknown".to_string(), |p| p.to_string()),
+            path.display()
+        ),
+    };
     let what = if ack { "note wait" } else { "note peek" };
-    let holder = format!("{} pid {} ({what})", cfg.host, std::process::id());
-    let mut lease = SeatLease::take(&bus, seat, &holder).await?;
+    let id = holder::host_id(&cfg.data_dir()?);
+    let me = holder::holder(&cfg.host, &id, what);
+    let mut lease = SeatLease::take(&bus, seat, &me, &cfg.host, &id).await?;
     // Checked again under the lease: a bridge that advertised the seat meanwhile.
     let r = match served_by_bridge(&bus, seat).await {
         Ok(()) => receive_held(ctx, &bus, seat, max, wait, ack, Some(&mut lease), &mut sigs).await,
@@ -214,6 +230,26 @@ async fn receive_held(
     lease: Option<&mut SeatLease>,
     sigs: &mut Interrupts,
 ) -> anyhow::Result<i32> {
+    if !ack {
+        // A peek reads the stream after the inbox's acknowledged floor: no delivery is spent.
+        let got = tokio::select! {
+            r = bus.peek(seat, max.max(1), wait) => r?,
+            _ = lost(lease) => bail!(
+                "the seat lease {} is no longer ours (it expired or another holder took it); \
+                 stopped",
+                seat_lock_key(seat)
+            ),
+            sig = sigs.recv() => return Ok(128 + sig),
+        };
+        if got.is_empty() {
+            return Err(NotReady(format!("no note for {seat}")).into());
+        }
+        let mut out = std::io::stdout().lock();
+        for n in &got {
+            print_peeked(&mut out, n, ctx.json, seat).context("printing a note")?;
+        }
+        return Ok(EXIT_OK);
+    }
     let mut inbox = bus.inbox(seat).await?;
     let got = tokio::select! {
         r = inbox.fetch(max.max(1), wait) => r?,
@@ -241,11 +277,7 @@ async fn receive_held(
             }
             return Err(e.context("printing a note"));
         }
-        if ack {
-            d.ack().await?;
-        } else {
-            d.nak(Duration::ZERO).await?;
-        }
+        d.ack().await?;
     }
     Ok(EXIT_OK)
 }
@@ -259,15 +291,35 @@ struct SeatLease {
 }
 
 impl SeatLease {
-    /// Take `seat.<seat>`; refused, naming the holder, when it is held.
-    async fn take(bus: &Bus, seat: &Seat, holder: &str) -> anyhow::Result<SeatLease> {
+    /// Take `seat.<seat>` as `me`; refused, naming the holder, when it is held. A holder of
+    /// this host (label `host`, id `id`) whose process is gone, such as a `note wait` killed
+    /// with SIGKILL, is taken over at once (PROTO-6): this receive holds the seat's lock here,
+    /// so no live server of this host holds the lease.
+    async fn take(
+        bus: &Bus,
+        seat: &Seat,
+        me: &str,
+        host: &str,
+        id: &str,
+    ) -> anyhow::Result<SeatLease> {
         let key = seat_lock_key(seat);
-        let lease = match bus.lock_acquire(&key, holder).await {
-            Ok(l) => l,
-            Err(BusError::Held { holder, since, .. }) => bail!(
+        let held = |holder: String, since: String| {
+            anyhow::anyhow!(
                 "seat {seat} is held by {holder} (lease {key} since {since}); a seat is served \
                  by a bridge or interactively, never both (--force to override)"
-            ),
+            )
+        };
+        let lease = match bus.lock_acquire(&key, me).await {
+            Ok(l) => l,
+            Err(BusError::Held { holder: h, .. }) if holder::dead_own(&h, host, id) => {
+                eprintln!("taking over the seat lease {key} from {h}, which is gone");
+                match bus.lock_take_over(&key, me, &h).await {
+                    Ok(l) => l,
+                    Err(BusError::Held { holder, since, .. }) => return Err(held(holder, since)),
+                    Err(e) => return Err(e.into()),
+                }
+            }
+            Err(BusError::Held { holder, since, .. }) => return Err(held(holder, since)),
             Err(e) => return Err(e.into()),
         };
         let (lost_tx, lost) = watch::channel(false);
@@ -361,6 +413,21 @@ impl Interrupts {
             n = one(*c, sc) => n,
         }
     }
+}
+
+/// A peeked note, printed as `wait` prints a delivery (no `delivered=`: none was spent).
+fn print_peeked(
+    out: &mut impl Write,
+    n: &StreamNote,
+    json: bool,
+    seat: &Seat,
+) -> anyhow::Result<()> {
+    print_delivery(
+        out,
+        &Delivery::detached(n.seq, 1, n.note.clone()),
+        json,
+        seat,
+    )
 }
 
 fn print_delivery(

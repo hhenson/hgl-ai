@@ -34,6 +34,7 @@ enum Cmd {
     /// Merge a pull request at HEAD if every gate holds (one attempt).
     MergeIfClean(GateArgs),
     /// Land a pull request: the gate until it decides, then `main`, `landed.log`, notes and pins.
+    /// A pull request an earlier attempt merged has the steps it left finished.
     Land(LandArgs),
     /// The wrapper's submodule pins.
     Pins {
@@ -153,6 +154,8 @@ impl GateArgs {
                 triaged: self.triaged,
                 hygiene_read: self.hygiene_read,
                 no_update: self.no_update,
+                closes: self.closes,
+                tool_made: false,
             },
             closes: self.closes,
             what: self.what.clone(),
@@ -266,6 +269,18 @@ enum TapCmd {
     },
 }
 
+/// The hub for a dry run, which only reads it (local build verdicts, review receipts, a
+/// landing's record); without one the gate says what it could not read.
+async fn dry_run_bus(cfg: &hgl_ai_config::Config) -> Option<Bus> {
+    match Bus::connect(cfg).await {
+        Ok(b) => Some(b),
+        Err(e) => {
+            eprintln!("dry run without the hub ({e}): verdicts and receipts are not read");
+            None
+        }
+    }
+}
+
 /// A bus error stays a bus error, so an unreachable hub exits 10.
 fn lift(e: hgl_ai_gh::Error) -> anyhow::Error {
     match e {
@@ -335,7 +350,8 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
         Cmd::MergeIfClean(a) => {
             let o = a.opts();
             let l = if a.dry_run {
-                land::plan(&ReadOnly(gh), &s, &a.repo, a.pr, &a.head, &o).await
+                let bus = dry_run_bus(&cfg).await;
+                land::plan(&ReadOnly(gh), &s, bus.as_ref(), &a.repo, a.pr, &a.head, &o).await
             } else {
                 let bus = Bus::connect(&cfg).await?;
                 land::merge_once(&gh, &s, &bus, &a.repo, a.pr, &a.head, &o).await
@@ -352,7 +368,8 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
             o.lock_wait = a.gate.lock_wait.unwrap_or(LandOpts::default().lock_wait);
             let g = &a.gate;
             let l = if g.dry_run {
-                land::plan(&ReadOnly(gh), &s, &g.repo, g.pr, &g.head, &o).await
+                let bus = dry_run_bus(&cfg).await;
+                land::plan(&ReadOnly(gh), &s, bus.as_ref(), &g.repo, g.pr, &g.head, &o).await
             } else {
                 let bus = Bus::connect(&cfg).await?;
                 land::land(&gh, &s, &bus, &g.repo, g.pr, &g.head, &o).await

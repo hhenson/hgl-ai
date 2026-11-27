@@ -25,9 +25,12 @@ pub struct TurnInput<'a> {
     pub writable: &'a [PathBuf],
 }
 
-/// The agent command line of a headless turn; the caller adds environment and the cap.
+/// The agent command line of a headless turn. The prompt goes on stdin
+/// ([`CmdSpec::input`]), never in an argument: Linux caps one argument at 128 KiB, and a
+/// note may be up to 1 MiB. The caller adds environment and the cap.
 pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
     let mut a: Vec<OsString> = Vec::new();
+    let mut input = t.prompt.as_bytes().to_vec();
     let s = |a: &mut Vec<OsString>, v: &[&str]| a.extend(v.iter().map(OsString::from));
     let models = model_args(t.resolved);
     let models: Vec<&str> = models.iter().map(String::as_str).collect();
@@ -39,15 +42,10 @@ pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
     };
     match t.resolved.runtime {
         Runtime::Claude => {
+            // `-p` without a prompt argument reads the prompt from stdin.
             s(
                 &mut a,
-                &[
-                    "-p",
-                    t.prompt,
-                    "--output-format",
-                    "stream-json",
-                    "--verbose",
-                ],
+                &["-p", "--output-format", "stream-json", "--verbose"],
             );
             s(&mut a, &models);
             if let Some(id) = t.resume {
@@ -95,10 +93,22 @@ pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
                     a.push(t.cwd.into());
                 }
             }
-            a.push(t.prompt.into());
+            // `-`: the prompt from stdin.
+            a.push("-".into());
         }
         Runtime::Agy => {
-            s(&mut a, &["-p", t.prompt, "--output-format", "stream-json"]);
+            // `-p` takes the prompt as its value and reads no stdin; with
+            // `--input-format stream-json` agy runs headless, one turn per stdin line.
+            s(
+                &mut a,
+                &[
+                    "--input-format",
+                    "stream-json",
+                    "--output-format",
+                    "stream-json",
+                ],
+            );
+            input = agy_input(t.prompt);
             s(&mut a, &models);
             if let Some(id) = t.resume {
                 s(&mut a, &["--conversation", id]);
@@ -112,7 +122,19 @@ pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
         args: a,
         env: Vec::new(),
         cwd: t.cwd.to_path_buf(),
+        input,
     }
+}
+
+/// agy's `stream-json` input: one user message holding the prompt, on one line.
+fn agy_input(prompt: &str) -> Vec<u8> {
+    let msg = serde_json::json!({
+        "event": "user",
+        "message": {"role": "user", "content": prompt},
+    });
+    let mut line = msg.to_string().into_bytes();
+    line.push(b'\n');
+    line
 }
 
 fn toml_str(s: &str) -> String {
@@ -256,13 +278,13 @@ impl Parser {
         self.p.error = Some(msg);
     }
 
-    /// The verdict once the process ended (`exited_ok`: exit status 0).
-    pub fn finish(mut self, exited_ok: bool, stderr_tail: &str) -> Parsed {
+    /// The verdict once the process ended (`exited_ok`: exit status 0). A quota refusal is
+    /// known only from the runtime's structured output: an error event or result and its
+    /// status, never from free text on stderr, where a panic at `lib.rs:429` or a word in
+    /// a log line would pass for one.
+    pub fn finish(mut self, exited_ok: bool, _stderr_tail: &str) -> Parsed {
         let success = exited_ok && self.p.result_ok == Some(true);
         if !success {
-            if is_quota(stderr_tail) {
-                self.quota_hint = true;
-            }
             self.p.quota = self.quota_hint;
         }
         self.p
@@ -279,21 +301,23 @@ fn str_at<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(Value::as_str)
 }
 
-/// Quota and rate-limit wording of the three CLIs and their providers.
+/// Quota and rate-limit wording of the three CLIs and their providers, matched in the
+/// message of a structured error only (an error event or an error result). No bare status
+/// code or single word: those occur in ordinary errors.
 pub fn is_quota(text: &str) -> bool {
     const PATTERNS: [&str; 12] = [
         "usage limit",
         "rate limit",
         "rate_limit",
-        "quota",
+        "quota exceeded",
+        "exceeded your current quota",
+        "insufficient_quota",
         "resource_exhausted",
         "resource exhausted",
         "too many requests",
         "hit your limit",
-        "limit reached",
         "out of credits",
         "credit balance is too low",
-        "429",
     ];
     let t = text.to_lowercase();
     PATTERNS.iter().any(|p| t.contains(p))
@@ -304,6 +328,7 @@ mod tests {
     //! Fixtures: `*-ok.jsonl` are real captures of one `reply with OK` turn of each CLI
     //! (claude 2.1.332, codex-cli 0.155.1, agy 1.5.18), trimmed, ids and paths replaced.
     //! `*.synthetic.jsonl` are hand-written in the same shapes; no real refusal was triggered.
+    //! `*-crash.synthetic.jsonl` are ordinary failures that mention 429 or quota.
     use super::*;
     use hgl_ai_proto::Family;
 
@@ -313,6 +338,9 @@ mod tests {
     const CLAUDE_QUOTA: &str = include_str!("../fixtures/claude-quota.synthetic.jsonl");
     const CODEX_QUOTA: &str = include_str!("../fixtures/codex-quota.synthetic.jsonl");
     const AGY_QUOTA: &str = include_str!("../fixtures/agy-quota.synthetic.jsonl");
+    const CODEX_CRASH: &str = include_str!("../fixtures/codex-crash.synthetic.jsonl");
+    const CLAUDE_CRASH: &str = include_str!("../fixtures/claude-crash.synthetic.jsonl");
+    const AGY_CRASH: &str = include_str!("../fixtures/agy-crash.synthetic.jsonl");
 
     fn parse(rt: Runtime, text: &str, exited_ok: bool, stderr: &str) -> Parsed {
         let mut p = Parser::new(rt);
@@ -374,9 +402,9 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#
         );
         assert!(!parse(Runtime::Claude, &warned, true, "").quota);
-        // Quota wording only on stderr, nothing structured.
+        // Quota wording only on stderr, nothing structured: not a refusal.
         assert!(
-            parse(
+            !parse(
                 Runtime::Codex,
                 "",
                 false,
@@ -384,6 +412,32 @@ mod tests {
             )
             .quota
         );
+    }
+
+    /// Carbon's false positives (hgl-ai PR 1): "429" or "quota" in ordinary failures.
+    #[test]
+    fn ordinary_failures_that_mention_429_or_quota_are_not_quota() {
+        for (rt, text) in [
+            (Runtime::Codex, CODEX_CRASH),
+            (Runtime::Claude, CLAUDE_CRASH),
+            (Runtime::Agy, AGY_CRASH),
+        ] {
+            let p = parse(
+                rt,
+                text,
+                false,
+                "thread 'main' panicked at src/lib.rs:429:5\nquota.rs: test failed; commit 8a5c429f",
+            );
+            assert!(!p.quota, "{rt}: {p:?}");
+            assert!(p.error.is_some(), "{rt}");
+        }
+        assert!(!is_quota("commit 8a5c429f failed"));
+        assert!(!is_quota("thread 'main' panicked at src/lib.rs:429:5"));
+        assert!(!is_quota("disk quota.rs check failed"));
+        assert!(is_quota("RESOURCE_EXHAUSTED: Quota exceeded for model"));
+        assert!(is_quota(
+            "You exceeded your current quota, please check your plan"
+        ));
     }
 
     #[test]
@@ -429,11 +483,11 @@ mod tests {
             writable: &w,
         };
         let c = command(Path::new("claude"), &t);
+        assert_eq!(c.input, b"PROMPT");
         assert_eq!(
             strs(&c),
             [
                 "-p",
-                "PROMPT",
                 "--output-format",
                 "stream-json",
                 "--verbose",
@@ -472,8 +526,10 @@ mod tests {
             cwd: Path::new("/w/w1/r-1/src"),
             writable: &w,
         };
+        let c = command(Path::new("codex"), &t);
+        assert_eq!(c.input, b"PROMPT");
         assert_eq!(
-            strs(&command(Path::new("codex"), &t)),
+            strs(&c),
             [
                 "exec",
                 "--json",
@@ -490,7 +546,7 @@ mod tests {
                 "--skip-git-repo-check",
                 "-C",
                 "/w/w1/r-1/src",
-                "PROMPT",
+                "-",
             ]
         );
         let plain = resolved(Runtime::Codex, Family::Gpt, "gpt-6.1-sol", None);
@@ -515,7 +571,7 @@ mod tests {
                 "sandbox_workspace_write.writable_roots=[\"/w/w1/r-1\"]",
                 "--skip-git-repo-check",
                 "T1",
-                "PROMPT",
+                "-",
             ]
         );
     }
@@ -529,18 +585,28 @@ mod tests {
             "gemini-4-carbon",
             Some("high"),
         );
+        let prompt = "PROMPT line 1\n\"quoted\" \\ é\n";
         let t = TurnInput {
-            prompt: "PROMPT",
+            prompt,
             resolved: &r,
             resume: Some("C1"),
             cwd: Path::new("/x"),
             writable: &w,
         };
+        let c = command(Path::new("agy"), &t);
+        let line = std::str::from_utf8(&c.input).unwrap();
+        assert!(
+            line.ends_with('\n') && line.lines().count() == 1,
+            "{line:?}"
+        );
+        let v: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["event"], "user");
+        assert_eq!(v["message"]["content"], prompt);
         assert_eq!(
-            strs(&command(Path::new("agy"), &t)),
+            strs(&c),
             [
-                "-p",
-                "PROMPT",
+                "--input-format",
+                "stream-json",
                 "--output-format",
                 "stream-json",
                 "--model",
@@ -562,6 +628,7 @@ mod tests {
         };
         let a = strs(&command(Path::new("agy"), &t));
         assert_eq!(a[4..6], ["--model", "claude-opus-5-5-high"]);
+        assert!(!a.iter().any(|x| x.contains("PROMPT")), "never an argument");
         assert!(!a.contains(&"--effort".to_string()));
     }
 }

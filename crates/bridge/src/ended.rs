@@ -80,9 +80,10 @@ impl EndedTasks {
         self.map.retain(|_, (_, at)| now - *at <= keep);
     }
 
-    /// Whether a note of `task` at stream sequence `seq` was sent before the task ended.
-    pub fn moot(&self, task: &TaskKey, seq: u64) -> bool {
-        self.map.get(task).is_some_and(|(end, _)| seq < *end)
+    /// The stream sequence of the note that ended `task`, if recorded here. A note of the
+    /// task with a lower one was sent before the end.
+    pub fn get(&self, task: &TaskKey) -> Option<u64> {
+        self.map.get(task).map(|(end, _)| *end)
     }
 
     /// Record that `task` ended with the note at `seq`, and save.
@@ -140,6 +141,16 @@ mod tests {
         TaskKey {
             repo: "demo".into(),
             issue: n,
+        }
+    }
+
+    trait Moot {
+        fn moot(&self, task: &TaskKey, seq: u64) -> bool;
+    }
+
+    impl Moot for EndedTasks {
+        fn moot(&self, task: &TaskKey, seq: u64) -> bool {
+            self.get(task).is_some_and(|end| seq < end)
         }
     }
 

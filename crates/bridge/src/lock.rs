@@ -1,9 +1,9 @@
 //! Exclusive `flock(2)` locks on files.
 //!
-//! - Turn lock `<task_dir>/turn.lock` ([`FileLock::turn`]): held for a turn. The file
-//!   stays empty and its open file is the agent's stdin, so the lock stays held while
-//!   any process of the turn keeps it, even if the bridge itself died; a second turn in
-//!   that directory cannot start.
+//! - Turn lock `<task_dir>/turn.lock` ([`FileLock::turn`]): held for a turn. Its open
+//!   file is the agent's stdin, holding the turn's input ([`FileLock::input`]), so the
+//!   lock stays held while any process of the turn keeps it, even if the bridge itself
+//!   died; a second turn in that directory cannot start.
 //! - Seat lock `<data_dir>/seats/<seat>.lock` ([`FileLock::try_exclusive`]): held by
 //!   whoever serves the seat on this host, the bridge or an interactive session
 //!   (PROTO-6), never both. It records the holder's pid.
@@ -45,7 +45,8 @@ impl FileLock {
         }))
     }
 
-    /// A turn lock: the file is created empty and opened read-only, and stays empty.
+    /// A turn lock: the file is created if missing and opened read-only; taking the lock
+    /// empties it (the previous turn's input).
     pub fn turn(path: &Path) -> std::io::Result<Option<FileLock>> {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
@@ -83,6 +84,28 @@ impl FileLock {
     /// A second descriptor of the same open file (and so of the lock), for a child.
     pub fn share(&self) -> std::io::Result<File> {
         self.file.try_clone()
+    }
+
+    /// Make `input` the content of the lock file, and return a descriptor of the lock that
+    /// reads it from the start: a child's stdin that keeps the lock held.
+    pub fn input(&self, input: &[u8]) -> std::io::Result<File> {
+        let mut w = OpenOptions::new().write(true).open(&self.path)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let m = w.metadata()?;
+            if self.id() != Some((m.dev(), m.ino())) {
+                return Err(std::io::Error::other(format!(
+                    "{} is no longer the locked file",
+                    self.path.display()
+                )));
+            }
+        }
+        w.set_len(0)?;
+        w.write_all(input)?;
+        let mut f = self.file.try_clone()?;
+        f.rewind()?;
+        Ok(f)
     }
 
     pub fn path(&self) -> &Path {
@@ -153,16 +176,21 @@ mod tests {
         assert_eq!(
             std::fs::metadata(&t).unwrap().len(),
             0,
-            "a turn lock stays empty: it is the agent's stdin"
+            "taking a turn lock empties it"
         );
         assert!(a.id().is_some());
+        let mut stdin = a.input(b"the prompt\n").unwrap();
+        let mut got = String::new();
+        stdin.read_to_string(&mut got).unwrap();
+        assert_eq!(got, "the prompt\n", "the descriptor reads the input");
         let shared = a.share().unwrap();
         drop(a);
         assert!(
             FileLock::turn(&t).unwrap().is_none(),
-            "the shared descriptor still holds it"
+            "the shared descriptors still hold it"
         );
-        drop(shared);
+        drop((shared, stdin));
         assert!(FileLock::turn_patiently(&t).await.unwrap().is_some());
+        assert_eq!(std::fs::metadata(&t).unwrap().len(), 0, "emptied again");
     }
 }

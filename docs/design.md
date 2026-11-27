@@ -1,6 +1,6 @@
 # Design
 
-Status: proposed. The contract between the crates of this repository.
+Status: proposed; implemented. The contract between the crates of this repository.
 
 ## 1. One binary
 
@@ -14,8 +14,8 @@ no GitHub or git library.
 | --- | --- | --- |
 | `proto` | Note, kinds, receipts, host, tree and lock records, name and key validation, message ids. No I/O. | — |
 | `config` | `config.toml` schema, defaults, path expansion, load and save. | `proto` |
-| `bus` | NATS connection, provisioning, send, inbox fetch, ack/nak/in-progress, KV, leases. | `proto`, `config` |
-| `cap` | Memory and time caps for a command tree (`systemd-run --user --scope` on Linux, `setrlimit` and a resident-memory watchdog elsewhere; macOS does not enforce `RLIMIT_AS`, so there the watchdog alone limits memory). | — |
+| `bus` | NATS connection, provisioning, send, inbox fetch, ack/nak/term/in-progress, KV, leases. | `proto`, `config` |
+| `cap` | Memory and time caps for a command tree (`systemd-run --user --scope` on Linux, `setrlimit` and a resident-memory watchdog elsewhere; macOS does not enforce `RLIMIT_AS`, so there the watchdog alone limits memory). A bridge turn gets a transient slice of its own, `app-hgl_ai_turn_<id>.slice` with the seat's `MemoryMax`, named in `HGL_AI_SLICE`; a cap inside the turn puts its scope there. The command leads a process group, which is signalled too. Tests that go over a cap on purpose run only with `HGL_AI_OOM_TESTS=1` (CI sets it). | — |
 | `tree` | Worktree layout, create, register, salvage, remove, stale listing. | `proto`, `config`, `bus` |
 | `bridge` | Seat loops, runtime adapters, prompt building, heartbeats, failover, cleanup on `landed`. | all above |
 | `install` | Hub and client installers, user services, `nats-server` provisioning, skill installation, agent launch. | `config`, `bus` |
@@ -40,27 +40,29 @@ hgl-ai seat add NAME --role ROLE --runtime claude|codex|agy (--tier T [--family 
                 [--effort E] [--fallback RUNTIME:FAMILY:TIER[:EFFORT] ...]
 hgl-ai seat list|remove NAME
 hgl-ai agent start SEAT                   interactive session in tmux `hgl-SEAT`
-hgl-ai agent attach SEAT
+hgl-ai agent attach|stop SEAT
 
 hgl-ai bridge run [--seat NAME ...]       the daemon (the user service runs this)
 
 hgl-ai note send --to SEAT --kind KIND [--repo R] [--issue N] [--head SHA] (--body TEXT | --body-file F)
-hgl-ai note wait SEAT [--timeout DUR]     block, print, ack; holds the seat lease
-hgl-ai note peek SEAT                     print without ack; holds the seat lease
-hgl-ai state get|put|del KEY [VALUE|-]
+hgl-ai note wait SEAT [--timeout DUR]     block, print, ack; holds the seat lock and lease
+hgl-ai note peek SEAT                     print what the inbox has not acked; spends no delivery
+hgl-ai state get|put|del KEY [VALUE|-] [--if-revision N]
+hgl-ai state append KEY LINE|-
 hgl-ai hosts
 
 hgl-ai tree list [--stale] [--local] [--json]   HGL_TREES, or this host's work_root
 hgl-ai tree remove SEAT REPO ISSUE [--review]  what the bridge does on `landed`, by hand
 
-hgl-ai cap SIZE [--time DUR] -- CMD ...   memory and time cap for a command tree
+hgl-ai cap SIZE [--time DUR] [--no-address-limit] -- CMD ...   memory and time cap for a command tree
 
-hgl-ai gh coord run                       coordinator service loop
-hgl-ai gh merge-if-clean REPO PR HEAD
-hgl-ai gh land REPO PR HEAD
+hgl-ai gh coord run [--once] [--dry-run]  coordinator service loop
+hgl-ai gh approve|sendback REPO PR HEAD (--body T | --body-file F)
+hgl-ai gh merge-if-clean REPO PR HEAD     one gate attempt under the landing lock
+hgl-ai gh land REPO PR HEAD               the gate until it decides, then the steps after the merge
 hgl-ai gh pins sync
 hgl-ai gh release watch SHA
-hgl-ai gh tap release VERSION
+hgl-ai gh tap release VERSION | tap formula --version V --checksums DIR
 
 hgl-ai build run [REPO] [--steps A,B] [--platform P [--builder L] [--base REF]] [--keep-going]
                 [--detach] [--notify SEAT] [--dir D] [--log-dir D] [--recipe FILE]
@@ -74,8 +76,9 @@ hgl-ai builder list
 hgl-ai builder drain|retire|resume LABEL
 ```
 
-Exit status: 0 success, 1 failure, 2 usage, 3 not ready (a gate is not
-satisfied; the message says which), 10 hub unreachable.
+Every `gh` command takes `--dry-run`. Exit status: 0 success, 1 failure, 2 usage,
+3 not ready (a gate is not satisfied, or `PARTIAL`: merged with a step after the
+merge not done; the message says which), 10 hub unreachable.
 
 ## 3. Configuration
 
@@ -94,10 +97,11 @@ work_root = "~/hgl-ai/work"            # every task directory lives here
 data_dir = "~/.local/share/hgl-ai"     # bridge state, server store, logs
 
 [limits]
-memcap_gb = 64                         # cap of one agent turn's command tree
-min_free_gb = 200                      # stop taking `assign` below this
+memcap_gb = 96                         # GiB: cap of one agent turn's command tree (its slice)
+min_free_gb = 200                      # decimal GB free under work_root; no new tree below it
 stale_after = "3d"
 turn_timeout = "2h"
+failover_cooldown = "1h"               # back to the primary binding after a failover
 
 [github]
 owner = "hhenson"
@@ -105,6 +109,11 @@ repos = ["hgl-compiler", "hgl_spec", "hgl_core", "hgl-project", "homebrew-hgraph
 branch_prefix = "codex/"
 wrapper = "hgl-project"
 clone_url = "https://github.com/{owner}/{repo}.git"   # default
+controller = "claude"                  # default; the seat that gets the bridge's and coordinator's notes
+
+[github.gate.hgl-compiler]             # per repository; every key optional
+review_receipt = true                  # default: a clean receipt from another family (ROLE-9)
+verdicts = ["linux", "mac", "windows"] # local build verdicts the merge needs
 
 [models.claude]
 frontier = "claude-opus-5-5"
@@ -154,29 +163,41 @@ A model's family comes from the `[models.<family>]` table that names it; an
 
 | Runtime | Turn | Resume | Model and effort |
 | --- | --- | --- | --- |
-| `claude` | `claude -p PROMPT --output-format stream-json --verbose` | `--resume ID` from the last turn's `session_id` | `--model`, `--effort` |
-| `codex` | `codex exec --json PROMPT` | `codex exec resume ID --json PROMPT` | `-m`, `-c model_reasoning_effort=E` |
-| `agy` | `agy -p PROMPT --output-format stream-json` | `--conversation ID` | `--model SLUG-EFFORT`, `--effort` |
+| `claude` | `claude -p --output-format stream-json --verbose` | `--resume ID` from the last turn's `session_id` | `--model`, `--effort` |
+| `codex` | `codex exec --json -` | `codex exec resume --json ID -` | `-m`, `-c model_reasoning_effort=E` |
+| `agy` | `agy --input-format stream-json --output-format stream-json` | `--conversation ID` | `--model SLUG-EFFORT`, `--effort` |
 
+- The prompt goes on stdin, never in an argument (Linux caps one at 128 KiB; a
+  note may be 1 MiB). `claude -p` and `codex exec -` read it as text; `agy`
+  reads one line `{"event":"user","message":{"role":"user","content":PROMPT}}`
+  (its `-p` takes the prompt as a value and reads no stdin). Each turn's prompt
+  is kept in the task directory's `prompts/`.
 - A seat keeps one session per task, so context carries across that task's
   turns and is dropped when the task ends. Reviewers always start fresh.
-- The bridge runs each turn under `cap` with the seat's limit, in the task's
-  worktree, with permissions bypassed only inside that worktree's sandbox as
-  the runtime allows. A turn that exceeds `turn_timeout` is stopped and naked.
-- A quota refusal is recognised from the runtime's structured output and
-  exit status; the patterns live in the adapter, with tests.
+- The bridge runs each turn under `cap` with the seat's limit, in its own slice,
+  in the task's worktree. `codex` runs in its `workspace-write` sandbox over the
+  task directory and the clone; `claude` (`--permission-mode bypassPermissions`,
+  `--add-dir`) and `agy` (`--dangerously-skip-permissions`) run with the user's
+  own permissions. A turn that exceeds `turn_timeout` is stopped and counted as a
+  failure (PROTO-8).
+- A quota refusal is recognised only from the runtime's structured output (error
+  events and results and their status), never from stderr; the patterns live in
+  the adapter, with fixtures of refusals and of ordinary failures that mention
+  `429` or quota.
 
 ## 5. Worktree layout
 
 ```
 <work_root>/
   <seat>/<repo>-<issue>/
-    src/        git worktree of the seat's clone, branch <branch_prefix><issue>-<slug>
+    src/        git worktree of the seat's clone, branch <branch_prefix>q<issue>-<slug>
     build/      CARGO_TARGET_DIR, CMake build trees
     tmp/        TMPDIR
-    task.json   seat, repo, issue, head, branch, created, session ids
-    turn.lock   flock held for a turn; empty, it is the agent's stdin
+    task.json   seat, repo, issue, head, branch, created, session ids, seq of the note that made it,
+                families of the turns that ran (implementor trees)
+    turn.lock   flock held for a turn; the agent's stdin, holding the turn's input
     log/        the last turns' stdout and stderr
+    prompts/    the last turns' prompts, <UTC>-<runtime>.md beside their logs
   clones/<repo>/  one bare-ish clone per repository and host, shared by seats
   salvage/<seat>-<repo>-<issue>-<UTC>.patch
 ```

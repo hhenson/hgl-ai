@@ -546,6 +546,7 @@ async fn hosts_and_trees_round_trip() {
         branch: (!review).then(|| format!("codex/{issue}-x")),
         created_at: "20261127T083000Z".into(),
         size_bytes: 42,
+        families: Vec::new(),
     };
     let a = tree("w1", 992, false);
     let b = tree("r1", 992, true);
@@ -931,4 +932,105 @@ async fn a_refreshed_lease_outlives_max_age_and_an_abandoned_one_expires() {
         Err(BusError::Held { holder, .. }) if holder == "build-2 pid 2"
     ));
     assert!(taken.release().await.unwrap());
+}
+
+/// `peek` reads what the inbox has not acknowledged without a delivery, so any number of
+/// peeks leave the note to the inbox (hgl-ai#5); naks never drop a note (max_deliver is
+/// unlimited; the bridge dead-letters, PROTO-8).
+#[tokio::test]
+async fn peeks_spend_no_delivery_and_naks_never_drop() {
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let claude = seat("claude");
+    let first = bus.send(&note("w1", "claude", "one")).await.unwrap();
+    bus.send(&note("w1", "w2", "not for claude")).await.unwrap();
+    let all = bus
+        .send(&Note::new(seat("w1"), Seat::broadcast(), Kind::Note, "all"))
+        .await
+        .unwrap();
+    // No inbox yet: everything for the seat.
+    for _ in 0..8 {
+        let p = bus.peek(&claude, 10, SHORT).await.unwrap();
+        let seqs: Vec<u64> = p.iter().map(|n| n.seq).collect();
+        assert_eq!(seqs, [first.seq, all.seq]);
+        assert_eq!(p[0].note.body.trim(), "one");
+    }
+    let mut inbox = bus.inbox(&claude).await.unwrap();
+    let got = inbox.fetch(10, LONG).await.unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].delivered, 1, "peeks spent no delivery");
+    got[0].ack().await.unwrap();
+    // After the floor: only the unacknowledged one; `max` and an empty wait.
+    let p = bus.peek(&claude, 10, SHORT).await.unwrap();
+    assert_eq!(p.iter().map(|n| n.seq).collect::<Vec<_>>(), [all.seq]);
+    assert_eq!(bus.peek(&claude, 0, SHORT).await.unwrap(), []);
+    got[1].ack().await.unwrap();
+    let t = Instant::now();
+    assert!(bus.peek(&claude, 10, SHORT).await.unwrap().is_empty());
+    assert!(
+        t.elapsed() >= Duration::from_millis(250),
+        "waited for a note"
+    );
+    // A whole subject's history from a sequence, with a cap.
+    let r = bus
+        .read_notes(&[seat("w2")], 1, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(r.len(), 1);
+    assert_eq!(r[0].note.body.trim(), "not for claude");
+
+    // Twenty naks, and the note is still there. An inbox made with the old limit of 5 is
+    // brought to unlimited when it is opened.
+    let n = bus.send(&note("claude", "w4", "retry me")).await.unwrap();
+    let old = InboxOptions {
+        max_deliver: 5,
+        ..InboxOptions::default()
+    };
+    drop(bus.inbox_with(&seat("w4"), old).await.unwrap());
+    let mut w4 = bus.inbox(&seat("w4")).await.unwrap();
+    let info = hub
+        .raw()
+        .await
+        .get_stream("HGL_NOTES")
+        .await
+        .unwrap()
+        .consumer_info("inbox-w4")
+        .await
+        .unwrap();
+    assert_eq!(info.config.max_deliver, -1);
+    let b = w4.fetch(1, LONG).await.unwrap();
+    assert_eq!(b[0].seq, all.seq, "the broadcast first");
+    b[0].ack().await.unwrap();
+    for i in 1..=20u64 {
+        let d = w4.fetch(1, LONG).await.unwrap();
+        assert_eq!((d[0].seq, d[0].delivered), (n.seq, i));
+        d[0].nak(Duration::ZERO).await.unwrap();
+    }
+    let d = w4.fetch(1, LONG).await.unwrap();
+    assert_eq!(d[0].delivered, 21);
+    d[0].ack().await.unwrap();
+}
+
+/// A whole-history read goes on past a message it cannot read: each page names the last
+/// sequence read, a skipped one included.
+#[tokio::test]
+async fn pages_go_on_past_a_malformed_message() {
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let js = hub.raw().await;
+    let bad = js
+        .publish("hgl.notes.claude", "not json".into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    let good = bus.send(&note("w1", "claude", "good")).await.unwrap();
+    let c = [seat("claude")];
+    let (notes, last) = bus.read_page(&c, 1, 1).await.unwrap();
+    assert!(notes.is_empty());
+    assert_eq!(last, Some(bad.sequence));
+    let (notes, last) = bus.read_page(&c, bad.sequence + 1, 1).await.unwrap();
+    assert_eq!((notes.len(), last), (1, Some(good.seq)));
+    let (notes, last) = bus.read_page(&c, good.seq + 1, 10).await.unwrap();
+    assert_eq!((notes.len(), last), (0, None));
 }

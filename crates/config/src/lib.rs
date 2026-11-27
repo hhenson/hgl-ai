@@ -96,20 +96,31 @@ impl Default for Paths {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Limits {
+    /// GiB (2^30 bytes) of one agent turn's command tree.
     pub memcap_gb: u64,
+    /// Decimal GB (10^9 bytes) free under `work_root`, as `df -H` shows them; below it no new tree is made.
     pub min_free_gb: u64,
     /// A duration such as `3d`, `12h`, `90m`, `30s`.
     pub stale_after: String,
     pub turn_timeout: String,
+    /// How long a seat stays on a fallback binding after a quota refusal before it tries
+    /// its primary again (PROTO-17).
+    #[serde(default = "default_failover_cooldown")]
+    pub failover_cooldown: String,
+}
+
+pub fn default_failover_cooldown() -> String {
+    "1h".into()
 }
 
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            memcap_gb: 64,
+            memcap_gb: 96,
             min_free_gb: 200,
             stale_after: "3d".into(),
             turn_timeout: "2h".into(),
+            failover_cooldown: default_failover_cooldown(),
         }
     }
 }
@@ -128,7 +139,8 @@ pub struct Github {
         skip_serializing_if = "github::is_review_bot"
     )]
     pub review_bot: String,
-    /// Seat that gets the coordinator's alerts and sends `landed` notes.
+    /// The controller's seat (ROLE-2): it gets the bridge's and the coordinator's alerts
+    /// and sends `landed` notes.
     #[serde(
         default = "github::controller",
         skip_serializing_if = "github::is_controller"
@@ -460,6 +472,12 @@ impl Config {
                 self.host
             )));
         }
+        if self.host == hgl_ai_proto::BROADCAST {
+            // The bridge's notes about the host are sent from its label.
+            return Err(ConfigError::Invalid(
+                "host label `all` is the broadcast address; choose another".into(),
+            ));
+        }
         let mut seen = std::collections::BTreeSet::new();
         for s in &self.seats {
             if s.name.is_broadcast() {
@@ -476,11 +494,13 @@ impl Config {
                     .map_err(|e| ConfigError::Invalid(format!("seat {}: {e}", s.name)))?;
             }
         }
+        self.controller()?;
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
         builder::validate(&self.builder, &self.host).map_err(ConfigError::Invalid)?;
         for d in [
             &self.limits.stale_after,
             &self.limits.turn_timeout,
+            &self.limits.failover_cooldown,
             &self.github.coord_interval,
             &self.github.release.timeout,
         ] {
@@ -535,6 +555,16 @@ impl Config {
         self.seats.iter().find(|s| s.name.as_str() == name)
     }
 
+    /// The controller's seat, `[github] controller` (default `claude`).
+    pub fn controller(&self) -> Result<Seat> {
+        let invalid = |why: String| ConfigError::Invalid(format!("github.controller: {why}"));
+        let s = Seat::new(self.github.controller.clone()).map_err(|e| invalid(e.to_string()))?;
+        if s.is_broadcast() {
+            return Err(invalid("not `all`; name one seat".into()));
+        }
+        Ok(s)
+    }
+
     pub fn work_root(&self) -> Result<PathBuf> {
         expand(&self.paths.work_root)
     }
@@ -554,6 +584,9 @@ impl Config {
     }
     pub fn turn_timeout(&self) -> Duration {
         parse_duration(&self.limits.turn_timeout).expect("validated")
+    }
+    pub fn failover_cooldown(&self) -> Duration {
+        parse_duration(&self.limits.failover_cooldown).expect("validated")
     }
 }
 
@@ -663,6 +696,35 @@ model = "claude-opus-5-5-high"
         assert!(c.resolve(&b(Runtime::Claude, None, None, None)).is_err());
         c.host = "Bad Host".into();
         assert!(c.validate().is_err());
+        // The broadcast address is no host label: the bridge's host notes come from it.
+        assert!(Config::new("all").validate().is_err());
+        assert!(Config::new("lab1").validate().is_ok());
+    }
+
+    #[test]
+    fn the_failover_cool_down() {
+        let c = Config::new("h");
+        assert_eq!(c.failover_cooldown(), Duration::from_secs(3600));
+        // A `[limits]` table written before the key existed still loads.
+        let t = "host = \"h\"\n[limits]\nmemcap_gb = 8\nmin_free_gb = 10\nstale_after = \"3d\"\nturn_timeout = \"2h\"\n";
+        let c: Config = toml::from_str(t).unwrap();
+        assert_eq!(c.limits.failover_cooldown, "1h");
+        let mut bad = Config::new("h");
+        bad.limits.failover_cooldown = "soon".into();
+        assert!(bad.validate().is_err());
+    }
+
+    #[test]
+    fn the_controller_seat() {
+        let mut c = Config::new("h");
+        assert_eq!(c.controller().unwrap().as_str(), "claude", "the default");
+        c.github.controller = "boss".into();
+        assert_eq!(c.controller().unwrap().as_str(), "boss");
+        assert!(c.validate().is_ok());
+        for bad in ["all", "Not A Seat"] {
+            c.github.controller = bad.into();
+            assert!(c.validate().is_err(), "{bad}");
+        }
     }
 
     #[test]

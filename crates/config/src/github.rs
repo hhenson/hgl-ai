@@ -6,10 +6,15 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Gate settings of one repository: `[github.gate.<repo>]`.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+/// Gate settings of one repository: `[github.gate.<repo>]`. A repository not listed has
+/// the defaults ([`RepoGate::default`]): a review receipt is required.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RepoGate {
+    /// A merge needs a clean review receipt (docs/protocol.md PROTO-19) for the exact head,
+    /// from a model family other than the author's (docs/roles.md ROLE-9). Default `true`.
+    #[serde(default = "yes", skip_serializing_if = "is_yes")]
+    pub review_receipt: bool,
     /// Path prefixes added to `github.global_paths` for this repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub global_paths: Vec<String>,
@@ -27,6 +32,27 @@ pub struct RepoGate {
     /// Regular expressions over check names that may still run but must not have failed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relax_optional: Vec<String>,
+}
+
+fn yes() -> bool {
+    true
+}
+
+fn is_yes(v: &bool) -> bool {
+    *v
+}
+
+impl Default for RepoGate {
+    fn default() -> Self {
+        RepoGate {
+            review_receipt: true,
+            global_paths: Vec::new(),
+            verdicts: Vec::new(),
+            relax_paths: Vec::new(),
+            relax_required: Vec::new(),
+            relax_optional: Vec::new(),
+        }
+    }
 }
 
 /// One submodule pin of the wrapper repository: `[[github.pins]]`. Give `repo` (follow that
@@ -136,6 +162,7 @@ default_fns! {
 
 fn default_gates() -> BTreeMap<String, RepoGate> {
     let compiler = RepoGate {
+        review_receipt: true,
         global_paths: strings(&["spec/hgl_spec", "spec/hgl_core"]),
         verdicts: strings(&["linux", "mac", "windows"]),
         relax_paths: strings(&[
@@ -195,4 +222,28 @@ pub fn validate_pins(pins: &[Pin]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_review_receipt_is_required_unless_turned_off() {
+        assert!(RepoGate::default().review_receipt);
+        assert!(gates().values().all(|g| g.review_receipt));
+        let g: RepoGate = toml::from_str("verdicts = [\"linux\"]").unwrap();
+        assert!(
+            g.review_receipt,
+            "an entry that does not name it keeps the default"
+        );
+        let off: RepoGate = toml::from_str("review_receipt = false").unwrap();
+        assert!(!off.review_receipt);
+        assert_eq!(
+            toml::to_string(&off).unwrap().trim(),
+            "review_receipt = false"
+        );
+        assert!(toml::to_string(&g).unwrap().contains("verdicts"));
+        assert!(!toml::to_string(&g).unwrap().contains("review_receipt"));
+    }
 }

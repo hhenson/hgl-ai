@@ -580,6 +580,7 @@ name = "hgl-ai-bridge"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "hex",
  "hgl-ai-bus",
  "hgl-ai-cap",
  "hgl-ai-config",

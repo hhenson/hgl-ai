@@ -1,8 +1,11 @@
 # Builds
 
-Status: proposed; §1, §2 and §2a are implemented (`crates/build`), §3 is not. Building
-and testing is deterministic work: a tool runs it, an agent only writes and repairs the
-instructions and reads the summary.
+Status: proposed. §1, §2 and §2a are implemented (`crates/build`); §3, the merge queue,
+is not: today the controller lands with `hgl-ai gh land` (`docs/protocol.md` §8). The
+current rules are in `docs/protocol.md`, `docs/roles.md` and `docs/design.md`.
+
+Building and testing is deterministic work: a tool runs it, an agent only writes and
+repairs the instructions and reads the summary.
 
 ## 1. Recipes
 

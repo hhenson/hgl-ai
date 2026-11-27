@@ -103,6 +103,14 @@ pub struct TaskFile {
     /// Agent session ids by runtime, from the task's previous turns.
     #[serde(default)]
     pub sessions: BTreeMap<String, String>,
+    /// The stream sequence of the note whose turn made the tree (PROTO-14): an ending
+    /// note with a lower one is older than the tree and leaves it alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
+    /// Model families whose turns ran in this tree (implementor trees): the task's authors,
+    /// which a review's family must differ from (ROLE-9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub families: Vec<hgl_ai_proto::Family>,
 }
 
 impl TaskFile {
@@ -233,6 +241,28 @@ impl Trees {
     /// Create the task's tree (PROTO-12). An implementor tree that exists is kept;
     /// a review tree that exists is an error (the caller removes it first).
     pub fn create(&self, seat: &Seat, task: &TaskKey, what: &Create) -> Result<Created> {
+        self.make(seat, task, what, None)
+    }
+
+    /// [`Trees::create`] for the note at stream sequence `seq`, recorded in a new tree's
+    /// `task.json` ([`TaskFile::seq`]); a kept tree keeps its own.
+    pub fn create_for(
+        &self,
+        seat: &Seat,
+        task: &TaskKey,
+        what: &Create,
+        seq: u64,
+    ) -> Result<Created> {
+        self.make(seat, task, what, Some(seq))
+    }
+
+    fn make(
+        &self,
+        seat: &Seat,
+        task: &TaskKey,
+        what: &Create,
+        seq: Option<u64>,
+    ) -> Result<Created> {
         let review = matches!(what, Create::Review { .. });
         let dir = self.layout.task_dir(seat, task, review)?;
         if dir.join(TASK_FILE).is_file() {
@@ -240,7 +270,9 @@ impl Trees {
                 return Err(TreeError::Exists(dir));
             }
             let file = read_task(&dir)?;
-            let record = self.record(&dir, &file, 0);
+            // A git killed in an earlier turn may have left its lock behind.
+            clear_stale_index_lock(&dir.join("src"));
+            let record = self.record(&dir, &file, dir_size(&dir));
             return Ok(Created {
                 dir,
                 file,
@@ -266,7 +298,7 @@ impl Trees {
                 self.add_review(&clone, &dir, seat, task, head, base.as_deref())
             }
         };
-        let file = match made {
+        let mut file = match made {
             Ok(f) => f,
             Err(e) => {
                 let _ = self.remove_dir(&dir);
@@ -274,6 +306,7 @@ impl Trees {
                 return Err(e);
             }
         };
+        file.seq = seq;
         write_task(&dir, &file)?;
         let record = self.record(&dir, &file, dir_size(&dir));
         Ok(Created {
@@ -295,34 +328,37 @@ impl Trees {
     ) -> Result<TaskFile> {
         let src = dir.join("src");
         let wanted = slug::branch_name(&self.github.branch_prefix, task.issue, title);
-        let prefix = format!("{}{}-", self.github.branch_prefix, task.issue);
+        let starts = slug::branch_starts(&self.github.branch_prefix, task.issue);
+        let ours = |h: &&String| starts.iter().any(|p| h.starts_with(p.as_str()));
+        // The task's branch: on the remote (a sendback, a resumed or moved task), else one
+        // made on this host and not pushed yet, else a new one.
         let heads = self.remote_heads(clone)?;
         let on_remote = if heads.contains(&wanted) {
             Some(wanted.clone())
         } else {
-            heads
-                .iter()
-                .filter(|h| h.starts_with(&prefix))
-                .min()
-                .cloned()
+            heads.iter().filter(ours).min().cloned()
         };
-        let branch = on_remote.clone().unwrap_or(wanted);
-        let local = self.git.check(
-            clone,
-            [
-                "rev-parse",
-                "--verify",
-                "--quiet",
-                &format!("refs/heads/{branch}"),
-            ],
-        )?;
+        let locals = self.local_heads(clone)?;
+        let branch = on_remote.clone().unwrap_or_else(|| {
+            if locals.contains(&wanted) {
+                wanted.clone()
+            } else {
+                locals.iter().filter(ours).min().cloned().unwrap_or(wanted)
+            }
+        });
+        let local = locals.contains(&branch);
         let base_ref = self.resolve_base(clone, base)?;
         let src_os = src.as_os_str();
         if local {
-            self.git.run(
-                clone,
-                ["worktree".as_ref(), "add".as_ref(), src_os, branch.as_ref()],
-            )?;
+            // Another seat of this host may still have the branch checked out (the task
+            // moved to this seat, ROLE-13): share it rather than fail.
+            let mut args: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref(), "add".as_ref()];
+            if let Some(other) = self.checked_out_at(clone, &branch)? {
+                tracing::warn!(%branch, other = %other.display(), "the branch is checked out in another tree of this host; sharing it");
+                args.push("--force".as_ref());
+            }
+            args.extend([src_os, branch.as_ref()]);
+            self.git.run(clone, args)?;
         } else if on_remote.is_some() {
             // A sendback or a resumed task: continue the pushed branch.
             let tracking = format!("origin/{branch}");
@@ -373,6 +409,8 @@ impl Trees {
             created_at: hgl_ai_proto::utc_now_stamp(),
             conflicts: Vec::new(),
             sessions: BTreeMap::new(),
+            seq: None,
+            families: Vec::new(),
         })
     }
 
@@ -454,6 +492,8 @@ impl Trees {
             created_at: hgl_ai_proto::utc_now_stamp(),
             conflicts,
             sessions: BTreeMap::new(),
+            seq: None,
+            families: Vec::new(),
         })
     }
 
@@ -476,7 +516,10 @@ impl Trees {
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut salvage = None;
         if src.join(".git").exists() {
-            salvage = self.salvage(&src, seat, task, file.as_ref())?;
+            // A git killed with the turn may have left its lock; salvage reads through an
+            // index of its own either way.
+            clear_stale_index_lock(&src);
+            salvage = self.salvage(&src, seat, task, file.as_ref(), &dir)?;
             if let Some(clone) = &clone {
                 let args: [&std::ffi::OsStr; 4] = [
                     "worktree".as_ref(),
@@ -513,8 +556,13 @@ impl Trees {
         seat: &Seat,
         task: &TaskKey,
         file: Option<&TaskFile>,
+        dir: &Path,
     ) -> Result<Option<PathBuf>> {
-        let status = self.git.output(src, ["status", "--porcelain"])?;
+        // Read-only on the tree's own index: no optional locks, and the untracked files are
+        // added to a copy of it, so a held or stale `index.lock` cannot stop the salvage.
+        let status = self
+            .git
+            .output(src, ["--no-optional-locks", "status", "--porcelain"])?;
         if !status.ok {
             tracing::warn!(src = %src.display(), "git status failed; nothing salvaged: {}", status.stderr.trim());
             return Ok(None);
@@ -556,8 +604,20 @@ impl Trees {
             patch.push_str(&self.git.run(src, &fp)?);
         }
         if dirty {
-            self.git.run(src, ["add", "--all", "--intent-to-add"])?;
-            patch.push_str(&self.git.run(src, ["diff", "HEAD", "--binary"])?);
+            let index = dir.join("salvage.index");
+            if let Some(own) = git_dir(src)
+                .map(|g| g.join("index"))
+                .filter(|i| i.is_file())
+            {
+                std::fs::copy(&own, &index).map_err(|e| TreeError::io(&own, e))?;
+            }
+            let env = [("GIT_INDEX_FILE", index.as_os_str())];
+            let diffed = self
+                .git
+                .run_env(src, ["add", "--all", "--intent-to-add"], &env)
+                .and_then(|_| self.git.run_env(src, ["diff", "HEAD", "--binary"], &env));
+            let _ = std::fs::remove_file(&index);
+            patch.push_str(&diffed?);
         }
         let dir = self.layout.salvage_dir();
         mkdir(&dir)?;
@@ -604,6 +664,7 @@ impl Trees {
                         branch: None,
                         created_at: mtime_stamp(&dir),
                         size_bytes: size,
+                        families: Vec::new(),
                     },
                 };
                 out.push(LocalTree { dir, record, file });
@@ -624,6 +685,7 @@ impl Trees {
             branch: f.branch.clone(),
             created_at: f.created_at.clone(),
             size_bytes,
+            families: f.families.clone(),
         }
     }
 
@@ -645,6 +707,30 @@ impl Trees {
         // pushed commits do not look unpushed at removal.
         self.git.run(&clone, ["fetch", "--quiet", "origin"])?;
         Ok(clone)
+    }
+
+    /// The clone's local branches.
+    fn local_heads(&self, clone: &Path) -> Result<Vec<String>> {
+        let out = self.git.run(
+            clone,
+            ["for-each-ref", "--format=%(refname:short)", "refs/heads/"],
+        )?;
+        Ok(out.lines().map(str::to_string).collect())
+    }
+
+    /// The worktree of the clone that has `branch` checked out, if any.
+    fn checked_out_at(&self, clone: &Path, branch: &str) -> Result<Option<PathBuf>> {
+        let out = self.git.run(clone, ["worktree", "list", "--porcelain"])?;
+        let want = format!("branch refs/heads/{branch}");
+        let mut at = None;
+        for line in out.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                at = Some(PathBuf::from(p));
+            } else if line == want {
+                return Ok(at.filter(|p| p.exists()));
+            }
+        }
+        Ok(None)
     }
 
     fn remote_heads(&self, clone: &Path) -> Result<Vec<String>> {
@@ -701,6 +787,82 @@ impl Trees {
             Err(_) => return Ok(()),
         }
         std::fs::remove_dir_all(&dir).map_err(|e| TreeError::io(&dir, e))
+    }
+}
+
+/// The git directory of a worktree checkout: what its `.git` file names.
+fn git_dir(src: &Path) -> Option<PathBuf> {
+    let text = std::fs::read_to_string(src.join(".git")).ok()?;
+    let p = PathBuf::from(text.trim().strip_prefix("gitdir:")?.trim());
+    Some(if p.is_absolute() { p } else { src.join(p) })
+}
+
+/// Remove the worktree's `index.lock` when no process has it open: a git killed with its
+/// turn left it, and every later git command in the tree would fail on it.
+pub fn clear_stale_index_lock(src: &Path) -> bool {
+    let Some(lock) = git_dir(src).map(|g| g.join("index.lock")) else {
+        return false;
+    };
+    let Ok(meta) = std::fs::metadata(&lock) else {
+        return false;
+    };
+    if held_open(&lock, &meta) {
+        tracing::info!(lock = %lock.display(), "index.lock is held by a running process; left");
+        return false;
+    }
+    match std::fs::remove_file(&lock) {
+        Ok(()) => {
+            tracing::warn!(lock = %lock.display(), "removed a stale index.lock");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(lock = %lock.display(), "removing a stale index.lock: {e}");
+            false
+        }
+    }
+}
+
+/// Whether some process has `path` open: `/proc` on Linux, `lsof` elsewhere; unknown
+/// counts as held unless the file is older than an hour.
+fn held_open(path: &Path, meta: &std::fs::Metadata) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let id = (meta.dev(), meta.ino());
+        let Ok(procs) = std::fs::read_dir("/proc") else {
+            return true;
+        };
+        for p in procs.flatten() {
+            let Ok(fds) = std::fs::read_dir(p.path().join("fd")) else {
+                continue;
+            };
+            if fds
+                .flatten()
+                .any(|fd| std::fs::metadata(fd.path()).is_ok_and(|m| (m.dev(), m.ino()) == id))
+            {
+                return true;
+            }
+        }
+        let _ = path;
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        match std::process::Command::new("lsof")
+            .arg("-t")
+            .arg("--")
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            Ok(o) => !String::from_utf8_lossy(&o.stdout).trim().is_empty(),
+            Err(_) => meta
+                .modified()
+                .ok()
+                .and_then(|t| t.elapsed().ok())
+                .is_none_or(|age| age < std::time::Duration::from_secs(3600)),
+        }
     }
 }
 

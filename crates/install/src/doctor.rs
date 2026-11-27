@@ -129,7 +129,8 @@ fn seat_uses(cfg: Option<&Config>, rt: Runtime) -> bool {
     })
 }
 
-/// Available space at `p` in GiB, from `df -Pk`.
+/// Available space at `p` in decimal GB (10^9 bytes, the unit of `min_free_gb` and of the
+/// bridge's own check), from `df -Pk`.
 pub fn free_gb(sys: &dyn System, p: &Path) -> Option<u64> {
     let o = sys
         .query(&Cmd::new("df").args(["-Pk"]).arg(p.display().to_string()))
@@ -145,7 +146,7 @@ fn parse_df(out: &str) -> Option<u64> {
     let f: Vec<&str> = line.split_whitespace().collect();
     let cap = f.iter().position(|w| w.ends_with('%'))?;
     let kb: u64 = f.get(cap.checked_sub(1)?)?.parse().ok()?;
-    Some(kb / (1024 * 1024))
+    Some(kb.saturating_mul(1024) / 1_000_000_000)
 }
 
 /// Run every check. Checks that need the configuration are skipped when it
@@ -383,10 +384,16 @@ mod tests {
 
     #[test]
     fn df_parsing() {
-        assert_eq!(parse_df(DF), Some(500));
+        // 524288000 KiB is 536.9 GB: the bridge's unit, so the two agree at the threshold.
+        assert_eq!(parse_df(DF), Some(536));
         assert_eq!(
             parse_df("Filesystem\nmy disk 10 1 2097152 1% /a b\n"),
             Some(2)
+        );
+        // 200.0 to 214.7 GB free: both say at least 200 (Carbon's finding 18).
+        assert_eq!(
+            parse_df("Filesystem\n/dev/x 1 1 195312500 1% /w\n"),
+            Some(200)
         );
         assert_eq!(parse_df("garbage"), None);
     }
@@ -460,7 +467,7 @@ mod tests {
         );
         assert!(
             cs.iter()
-                .any(|c| c.name == "work_root" && c.detail.contains("500 GB free"))
+                .any(|c| c.name == "work_root" && c.detail.contains("536 GB free"))
         );
         assert!(f.runs().is_empty(), "doctor changes nothing");
     }
