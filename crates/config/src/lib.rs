@@ -829,10 +829,10 @@ model = "claude-opus-5-5-high"
             "controller",
             "the default"
         );
-        let loaded: Config = toml::from_str("host = \"h\"\n[github]\n").unwrap();
+        let base = "host = \"h\"\n[github]\nowner = \"o\"\nrepos = []\nbranch_prefix = \"codex/\"\nwrapper = \"w\"\n";
+        let loaded: Config = toml::from_str(base).unwrap();
         assert_eq!(loaded.controller().unwrap().as_str(), "controller");
-        let explicit: Config =
-            toml::from_str("host = \"h\"\n[github]\ncontroller = \"claude\"\n").unwrap();
+        let explicit: Config = toml::from_str(&format!("{base}controller = \"claude\"\n")).unwrap();
         assert_eq!(explicit.controller().unwrap().as_str(), "claude");
         c.github.controller = "boss".into();
         assert_eq!(c.controller().unwrap().as_str(), "boss");
