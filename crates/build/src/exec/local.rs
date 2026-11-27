@@ -319,7 +319,8 @@ fn version(tool: &str) -> Option<String> {
         .map(|l| l.chars().take(120).collect())
 }
 
-/// Free space of the file system holding `p` (or its nearest existing parent), in GiB.
+/// Free space of the file system holding `p` (or its nearest existing parent), in GB
+/// (10^9 bytes, as `doctor` and the bridge count it).
 pub fn free_gb(p: &Path) -> Option<u64> {
     let mut p = p.to_path_buf();
     while !p.exists() {
@@ -333,5 +334,5 @@ pub fn free_gb(p: &Path) -> Option<u64> {
     }
     #[allow(clippy::unnecessary_cast)]
     let bytes = (s.f_bavail as u64).saturating_mul(s.f_frsize as u64);
-    Some(bytes >> 30)
+    Some(bytes / 1_000_000_000)
 }

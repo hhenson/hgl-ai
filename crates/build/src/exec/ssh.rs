@@ -104,7 +104,7 @@ impl Dialect {
                     s.push_str(&format!("$env:{k} = {}\n", self.quote(v)));
                 }
                 s.push_str(&format!(
-                    "Set-Location -LiteralPath {}\n$global:LASTEXITCODE = 0\n{run}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }} else {{ exit 1 }} }}\nexit $LASTEXITCODE",
+                    "Set-Location -LiteralPath {} -ErrorAction Stop\n$global:LASTEXITCODE = 0\n{run}\nif (-not $?) {{ if ($LASTEXITCODE) {{ exit $LASTEXITCODE }} else {{ exit 1 }} }}\nexit $LASTEXITCODE",
                     self.quote(dir)
                 ));
                 s
@@ -1187,7 +1187,7 @@ impl Executor for Ssh {
             .trim()
             .parse::<f64>()
             .ok()
-            .map(|b| (b as u64) >> 30);
+            .map(|b| b as u64 / 1_000_000_000);
         for t in tools {
             let o = self.exec(&self.dialect.version(t), SHORT)?;
             if let Some(l) = o.stdout.lines().map(str::trim).find(|l| !l.is_empty()) {
@@ -1239,7 +1239,7 @@ mod tests {
         ));
         assert!(s.contains("$env:HGL_AI_BUILD_DIR = 'C:/w/jobs/1/build'\n"));
         assert!(s.contains(
-            "Set-Location -LiteralPath 'C:/w/jobs/1/src/.'\n$global:LASTEXITCODE = 0\ncargo test\n"
+            "Set-Location -LiteralPath 'C:/w/jobs/1/src/.' -ErrorAction Stop\n$global:LASTEXITCODE = 0\ncargo test\n"
         ));
         assert!(s.ends_with("exit $LASTEXITCODE"));
         let c = d.command("exit 0").unwrap();

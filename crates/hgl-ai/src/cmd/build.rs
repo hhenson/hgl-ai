@@ -338,7 +338,10 @@ fn detach(id: &str, run_dir: &Path, log_root: &Path) -> anyhow::Result<()> {
         .collect();
     args.push("--id".into());
     args.push(id.into());
-    if !args.iter().any(|a| a == "--log-dir") {
+    if !args
+        .iter()
+        .any(|a| a == "--log-dir" || a.to_string_lossy().starts_with("--log-dir="))
+    {
         args.push("--log-dir".into());
         args.push(log_root.into());
     }

@@ -313,7 +313,7 @@ pub struct BuilderRecord {
     pub state: String,
     pub slots: u32,
     pub busy: u32,
-    /// Free space where its builds run, in GiB, where known.
+    /// Free space where its builds run, in GB (10^9 bytes), where known.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub free_gb: Option<u64>,
     /// Tool name to the first line of its `--version`.
