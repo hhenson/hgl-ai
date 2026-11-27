@@ -69,7 +69,6 @@ fn harness() -> H {
             role: Role::Implementor,
             binding: b(Runtime::Codex, None, Tier::Frontier, Some("high")),
             fallback: vec![b(Runtime::Agy, Some(Family::Claude), Tier::Frontier, None)],
-            class: Default::default(),
             memcap_gb: None,
             headless: false,
         },
@@ -78,7 +77,6 @@ fn harness() -> H {
             role: Role::Reviewer,
             binding: b(Runtime::Claude, None, Tier::Frontier, Some("xhigh")),
             fallback: vec![],
-            class: Default::default(),
             memcap_gb: None,
             headless: false,
         },
@@ -347,175 +345,6 @@ fn a_dead_letter_quotes_the_class() {
     );
 }
 
-/// A seat with `[seat.class.simple]` on agy/gemini whose agy refuses gemini for quota and
-/// runs every other model; codex (the primary) runs.
-fn class_quota_harness() -> H {
-    let mut h = harness();
-    h.opts.quota_retry = Duration::from_secs(3600);
-    let light = Binding {
-        runtime: Runtime::Agy,
-        family: Some(Family::Gemini),
-        tier: None,
-        model: Some("gemini-4-hydrogen".into()),
-        effort: Some("high".into()),
-    };
-    h.cfg.seats[0].class.insert(TaskClass::Simple, light);
-    h.cfg.validate().unwrap();
-    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
-    h.script(
-        "agy",
-        &format!(
-            "case \"$*\" in *gemini*) cat '{}'; exit 1;; *) cat '{}';; esac",
-            fixture("agy-quota.synthetic.jsonl"),
-            fixture("agy-ok.jsonl")
-        ),
-    );
-    h
-}
-
-fn reviewer_host(family: Family, model: &str) -> hgl_ai_proto::HostRecord {
-    hgl_ai_proto::HostRecord {
-        host: "build-2".into(),
-        seats: vec![hgl_ai_proto::SeatRecord {
-            seat: seat("r9"),
-            role: Role::Reviewer,
-            runtime: Runtime::Agy,
-            family,
-            model: model.into(),
-        }],
-        memcap_gb: 64,
-        work_root_free_gb: 500,
-        updated_at: hgl_ai_proto::utc_now_stamp(),
-    }
-}
-
-/// r1's blocker on hgl-ai PR 25: a quota refusal on a class binding leaves the seat on its
-/// primary and runs the task there (not on a fallback), naming the binding that was refused.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_class_binding_refused_for_quota_runs_the_task_on_the_seats_binding() {
-    let h = class_quota_harness();
-    h.bus
-        .put_host(reviewer_host(Family::Claude, "claude-opus-5-5"));
-    let (tx, j) = h.start(&["w1"]);
-    let mut n = note(Kind::Assign, "w1", 5, "[claude] Assign: demo#5 Rename");
-    n.class = Some(TaskClass::Simple);
-    let a = h.bus.push("w1", n);
-    eventually("acked on the primary", || h.bus.events(a) == [Ev::Ack]).await;
-    assert_eq!(h.calls("agy").len(), 1, "the class binding was tried once");
-    let codex = h.calls("codex");
-    assert_eq!(codex.len(), 1, "then the seat's own binding ran it");
-    assert!(
-        codex[0]
-            .stdin
-            .contains("Task class: simple (the seat's own binding runs it).")
-    );
-    let told = h
-        .bus
-        .sent_containing("class binding agy gemini/gemini-4-hydrogen");
-    assert_eq!(told.len(), 1, "{:?}", h.bus.sent());
-    assert!(
-        told[0].body.contains("codex gpt/gpt-6.2-astra"),
-        "{}",
-        told[0].body
-    );
-    assert!(
-        h.bus.sent_containing("moved from").is_empty(),
-        "the seat did not fail over"
-    );
-    // The next simple task in the cool-down goes straight to the seat's binding.
-    let mut n = note(Kind::Assign, "w1", 6, "[claude] Assign: demo#6 Rename too");
-    n.class = Some(TaskClass::Simple);
-    let b = h.bus.push("w1", n);
-    eventually("second acked", || h.bus.events(b) == [Ev::Ack]).await;
-    assert_eq!(h.calls("agy").len(), 1);
-    assert_eq!(h.calls("codex").len(), 2);
-    stop(tx, j).await;
-}
-
-/// r1's blocker, ROLE-11 half: moving the refused task from the class binding's family to
-/// the seat's would leave it no reviewer of another family, so only that task waits; the
-/// seat goes on with other tasks.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_class_quota_move_that_breaks_role_11_holds_only_that_task() {
-    let h = class_quota_harness();
-    // The only live reviewer family is the seat binding's, gpt.
-    h.bus.put_host(reviewer_host(Family::Gpt, "gpt-6.2-astra"));
-    let (tx, j) = h.start(&["w1"]);
-    let mut n = note(Kind::Assign, "w1", 7, "[claude] Assign: demo#7 Rename");
-    n.class = Some(TaskClass::Simple);
-    let a = h.bus.push("w1", n);
-    eventually("told", || {
-        !h.bus.sent_containing("would break ROLE-11").is_empty()
-    })
-    .await;
-    let told = &h.bus.sent_containing("would break ROLE-11")[0];
-    assert!(
-        told.body.contains("agy gemini/gemini-4-hydrogen"),
-        "{}",
-        told.body
-    );
-    assert!(h.calls("codex").is_empty(), "not moved to gpt");
-    assert!(h.bus.events(a).is_empty(), "held, not naked");
-    let b = h.bus.push(
-        "w1",
-        note(Kind::Assign, "w1", 8, "[claude] Assign: demo#8 Other"),
-    );
-    eventually("the seat runs other tasks", || h.bus.events(b) == [Ev::Ack]).await;
-    assert!(h.bus.events(a).is_empty());
-    stop(tx, j).await;
-}
-
-/// r3's finding 1 on hgl-ai PR 25: a class binding sitting out its cool-down sends a task
-/// to the seat's binding only when that keeps ROLE-11 for that task; another task whose
-/// authors make the move unsafe is not moved.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_refused_class_moves_each_task_only_when_role_11_holds_for_it() {
-    let h = class_quota_harness();
-    let mut both = reviewer_host(Family::Claude, "claude-opus-5-5");
-    both.seats.push(hgl_ai_proto::SeatRecord {
-        seat: seat("r8"),
-        role: Role::Reviewer,
-        runtime: Runtime::Codex,
-        family: Family::Gpt,
-        model: "gpt-6.2-astra".into(),
-    });
-    h.bus.put_host(both);
-    let (tx, j) = h.start(&["w1"]);
-    // Task A: an unclassed first turn, then (as after an earlier failover) its only author
-    // is claude.
-    let a = h.bus.push(
-        "w1",
-        note(Kind::Assign, "w1", 21, "[claude] Assign: demo#21 A"),
-    );
-    eventually("A acked", || h.bus.events(a) == [Ev::Ack]).await;
-    let dir_a = h.work().join("w1/demo-21");
-    let mut f = hgl_ai_tree::read_task(&dir_a).unwrap();
-    f.families = vec![Family::Claude];
-    hgl_ai_tree::write_task(&dir_a, &f).unwrap();
-    // Task B: simple; gemini is refused and B moves to gpt (claude stays free for it).
-    let mut n = note(Kind::Assign, "w1", 22, "[claude] Assign: demo#22 B");
-    n.class = Some(TaskClass::Simple);
-    let b = h.bus.push("w1", n);
-    eventually("B acked", || h.bus.events(b) == [Ev::Ack]).await;
-    assert_eq!(h.calls("codex").len(), 2, "B ran on the seat's binding");
-    // A becomes simple: gpt would make both live reviewer families its authors.
-    let mut n = note(Kind::Sendback, "w1", 21, "[claude] Sendback: demo#21");
-    n.class = Some(TaskClass::Simple);
-    let s = h.bus.push("w1", n);
-    eventually("A held", || {
-        h.bus
-            .sent_containing("would break ROLE-11")
-            .iter()
-            .any(|n| n.issue == 21)
-    })
-    .await;
-    assert_eq!(h.calls("codex").len(), 2, "A did not run on gpt");
-    assert!(h.bus.events(s).is_empty(), "held, not naked");
-    let fam = hgl_ai_tree::read_task(&dir_a).unwrap().families;
-    assert!(!fam.contains(&Family::Gpt), "{fam:?}");
-    stop(tx, j).await;
-}
-
 /// r3's finding 2 and the review bot's thread on hgl-ai PR 25: an older `assign` delivered
 /// again after a newer `sendback` moved the class up does not move it back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -550,20 +379,12 @@ async fn an_older_class_note_delivered_again_changes_nothing() {
     stop(tx, j).await;
 }
 
-/// docs/roles.md §3: the `assign` note's class picks the seat's binding for it, the tree
-/// records the class, and a `sendback` only moves it up (ROLE-15).
+/// PROTO-21 (the controller's decision on hgl-ai PR 25): the class picks the seat, not the
+/// model. The seat's own binding runs a task whatever its class; the tree records the
+/// class, the prompt names it, and a `sendback` only moves it up (ROLE-15).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn the_task_class_picks_the_model_and_a_sendback_moves_it_up() {
-    let mut h = harness();
-    let light = Binding {
-        runtime: Runtime::Codex,
-        family: None,
-        tier: Some(Tier::Fast),
-        model: None,
-        effort: Some("high".into()),
-    };
-    h.cfg.seats[0].class.insert(TaskClass::Simple, light);
-    h.cfg.validate().unwrap();
+async fn the_seats_binding_runs_every_class_and_the_tree_records_it() {
+    let h = harness();
     h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
     let (tx, j) = h.start(&["w1"]);
     let dir = h.work().join("w1/demo-980");
@@ -572,6 +393,11 @@ async fn the_task_class_picks_the_model_and_a_sendback_moves_it_up() {
             hgl_ai_tree::read_task(&dir).unwrap().class,
             h.bus.trees()["build-1.w1.demo-980"].class,
         )
+    };
+    let model = |i: usize| {
+        let c = &h.calls("codex")[i];
+        let at = c.args.iter().position(|a| a == "-m").unwrap();
+        c.args[at + 1].clone()
     };
 
     let mut n = note(
@@ -583,12 +409,15 @@ async fn the_task_class_picks_the_model_and_a_sendback_moves_it_up() {
     n.class = Some(TaskClass::Simple);
     let a = h.bus.push("w1", n);
     eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
-    let calls = h.calls("codex");
-    assert_eq!(&calls[0].args[..4], ["exec", "--json", "-m", "gpt-6-luna"]);
+    assert_eq!(
+        model(0),
+        "gpt-6.2-astra",
+        "the seat's binding, not a lighter one"
+    );
     assert!(
-        calls[0]
+        h.calls("codex")[0]
             .stdin
-            .contains("Task class: simple (the seat's binding for it")
+            .contains("\nTask class: simple.\n")
     );
     let simple = Some(TaskClass::Simple);
     assert_eq!(recorded(), (simple, simple));
@@ -599,39 +428,57 @@ async fn the_task_class_picks_the_model_and_a_sendback_moves_it_up() {
         note(Kind::Sendback, "w1", 980, "[claude] Sendback: once"),
     );
     eventually("first sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
-    assert!(h.calls("codex")[1].args.contains(&"gpt-6-luna".to_string()));
     assert_eq!(recorded(), (simple, simple));
 
-    // The second for the same finding moves it up; the seat has no binding for
-    // `standard`, so its own binding runs the task.
+    // The second for the same finding moves it up; the binding stays the seat's.
     let mut n = note(Kind::Sendback, "w1", 980, "[claude] Sendback: again");
-    n.class = Some(TaskClass::Standard);
+    n.class = Some(TaskClass::Complex);
     let s = h.bus.push("w1", n);
     eventually("second sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
-    let c = &h.calls("codex")[2];
+    assert_eq!(model(2), "gpt-6.2-astra");
     assert!(
-        c.args.contains(&"gpt-6.2-astra".to_string()),
-        "{:?}",
-        c.args
+        h.calls("codex")[2]
+            .stdin
+            .contains("\nTask class: complex.\n")
     );
-    assert!(
-        c.stdin
-            .contains("Task class: standard (the seat's own binding runs it).")
-    );
-    let standard = Some(TaskClass::Standard);
-    assert_eq!(recorded(), (standard, standard));
+    let complex = Some(TaskClass::Complex);
+    assert_eq!(recorded(), (complex, complex));
 
     // A sendback never moves a class down.
     let mut n = note(Kind::Sendback, "w1", 980, "[claude] Sendback: lower");
     n.class = Some(TaskClass::Simple);
     let s = h.bus.push("w1", n);
     eventually("third sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
-    assert!(
-        h.calls("codex")[3]
-            .args
-            .contains(&"gpt-6.2-astra".to_string())
+    assert_eq!(recorded(), (complex, complex));
+    stop(tx, j).await;
+}
+
+/// The class leaves quota failover as on main (PROTO-17): a classed task refused on the
+/// primary moves the seat to its fallback, and its class goes with the task.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_classed_task_fails_over_as_any_other() {
+    let h = harness();
+    h.script(
+        "codex",
+        &format!("cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")),
     );
-    assert_eq!(recorded(), (standard, standard));
+    h.script("agy", &format!("cat '{}'", fixture("agy-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let mut n = note(Kind::Assign, "w1", 31, "[claude] Assign: demo#31 Rename");
+    n.class = Some(TaskClass::Simple);
+    let a = h.bus.push("w1", n);
+    eventually("acked once moved", || h.bus.events(a) == [Ev::Ack]).await;
+    assert_eq!(
+        h.bus
+            .sent_containing("moved from codex gpt/gpt-6.2-astra to agy claude/claude-opus-5-5")
+            .len(),
+        1
+    );
+    let agy = h.calls("agy");
+    let i = agy[0].args.iter().position(|a| a == "--model").unwrap();
+    assert_eq!(agy[0].args[i + 1], "claude-opus-5-5");
+    let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-31")).unwrap();
+    assert_eq!(f.class, Some(TaskClass::Simple));
     stop(tx, j).await;
 }
 
@@ -1480,7 +1327,6 @@ fn controllers_are_not_served_unless_named() {
             effort: None,
         },
         fallback: vec![],
-        class: Default::default(),
         memcap_gb: None,
         headless: false,
     });
@@ -1592,7 +1438,6 @@ async fn a_note_at_the_bus_limit_reaches_each_cli_whole_on_stdin() {
             effort: None,
         },
         fallback: vec![],
-        class: Default::default(),
         memcap_gb: None,
         headless: false,
     });

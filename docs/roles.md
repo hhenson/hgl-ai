@@ -27,7 +27,7 @@ Open decisions are issues in this repository.
 - **ROLE-3 — Triage** (seat `triage`). Owns intake: labels and slices new
   issues, folds duplicates, keeps the claimable backlog ordered, and batches
   questions for the owner into one labelled list. Gives every task its class
-  (simple, standard or complex, §3), which picks the model that does it. Writes no
+  (simple, standard or complex, §3), which picks the seat, and so the model, that does it. Writes no
   code. Workers claim only what triage labelled ready.
 - **ROLE-4 — Architect** (seat `architect`). Works with the owner, through the owner
   channel (`docs/owner.md`), to expand features and to engineer refactoring and design
@@ -134,9 +134,10 @@ Triage classes each task when it labels it ready, and the `assign` note carries 
 A task whose work turns out to change behaviour is reclassed by its seat with a `blocked`
 note; triage reassigns it. ROLE-15 moves a class up after two sendbacks.
 
-`hgl-ai note send --kind assign --class C` carries the class. A seat whose host binds a
-class (`[seat.class.<class>]`, PROTO-21) runs that class's tasks on it; any other seat keeps
-its binding, and the bridge still records the class.
+The class picks the seat, not the model (controller, 2026-11-27, hgl-ai#25): triage
+assigns a task (`hgl-ai note send --kind assign --class C`) to a seat whose binding is the
+row for its class. A seat runs its own binding, and its fallbacks, whatever the class; the
+bridge records the class with the task and names it in the prompt (PROTO-21).
 
 The gate's reviewer is never of the author's family (ROLE-11). The GitHub review bot is
 a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the gate.
@@ -147,7 +148,9 @@ a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the g
 - **ROLE-15 — Escalate once.** A task whose work is sent back twice for the same
   finding moves up a class (simple to standard, standard to complex). The controller
   judges "the same finding" and sends that second sendback with the next class
-  (`hgl-ai gh sendback ... --class C`); the bridge never moves a class down.
+  (`hgl-ai gh sendback ... --class C`); the bridge never moves a class down. The
+  controller or triage then reassigns the task to a seat for that class; its class
+  goes with it.
 - **ROLE-16 — Record the model.** `ready` notes and receipts name the family
   and model that did the work, so ROLE-11 can be checked.
 

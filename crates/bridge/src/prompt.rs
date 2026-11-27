@@ -18,9 +18,8 @@ pub struct Context<'a> {
     pub runtime: Runtime,
     pub family: Family,
     pub model: &'a str,
-    /// The task's class (docs/roles.md §3), and whether the seat's binding for it chose
-    /// the model.
-    pub class: Option<(TaskClass, bool)>,
+    /// The task's class (docs/roles.md §3, PROTO-21).
+    pub class: Option<TaskClass>,
     /// The task's `task.json`; `None` for a turn in the seat's inbox directory.
     pub task: Option<&'a TaskFile>,
     /// `HGL_STATE/hold`, when present.
@@ -70,13 +69,8 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
             let _ = writeln!(s, "No task: this turn runs in the seat's inbox directory.");
         }
     }
-    if let Some((class, by_class)) = c.class {
-        let how = if by_class {
-            "the seat's binding for it chose the model"
-        } else {
-            "the seat's own binding runs it"
-        };
-        let _ = writeln!(s, "Task class: {class} ({how}).");
+    if let Some(class) = c.class {
+        let _ = writeln!(s, "Task class: {class}.");
     }
     if let Some(c) = c.controller {
         let _ = writeln!(s, "The controller is seat `{c}`.");
@@ -266,15 +260,10 @@ mod tests {
             "a class only when the task has one"
         );
         n.class = Some(TaskClass::Simple);
-        c.class = Some((TaskClass::Simple, true));
+        c.class = Some(TaskClass::Simple);
         let p = build(&c, &[(42, 1, &n)]);
-        assert!(p.contains("Task class: simple (the seat's binding for it chose the model)."));
+        assert!(p.contains("\nTask class: simple.\n"), "{p}");
         assert!(p.contains("hgl-compiler#980, class simple, created"), "{p}");
-        c.class = Some((TaskClass::Standard, false));
-        assert!(
-            build(&c, &[(42, 1, &n)])
-                .contains("Task class: standard (the seat's own binding runs it).")
-        );
         let plain = build(&ctx(None, &s), &[(1, 1, &q)]);
         assert!(plain.contains("No task"));
         assert!(!plain.contains("State "), "hold and mode only when set");

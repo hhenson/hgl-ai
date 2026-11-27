@@ -358,7 +358,6 @@ fn the_bridge_serves_a_seat_against_a_live_hub() {
             effort: None,
         },
         fallback: vec![],
-        class: Default::default(),
         memcap_gb: Some(4),
         headless: false,
     });
@@ -519,7 +518,6 @@ fn two_bridges_for_one_seat_only_one_serves() {
                 effort: None,
             },
             fallback: vec![],
-            class: Default::default(),
             memcap_gb: Some(4),
             headless: false,
         });
@@ -653,7 +651,6 @@ fn seat_host(root: &Path, hub: &Hub, token: &Path, name: &str, body: &str) -> (P
             effort: None,
         },
         fallback: vec![],
-        class: Default::default(),
         memcap_gb: Some(4),
         headless: false,
     });

@@ -144,11 +144,6 @@ tier = "frontier"                      # or `model = "<slug>"` to pin one
 effort = "high"
 fallback = [{ runtime = "agy", family = "claude", tier = "frontier" }]
 
-[seat.class.simple]                    # optional: the binding for one task class (PROTO-21)
-runtime = "agy"
-model = "gemini-4-hydrogen"
-effort = "high"
-
 [server]                               # hub host only
 listen = "127.0.0.1"
 port = 4222

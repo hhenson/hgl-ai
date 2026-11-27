@@ -6,7 +6,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hgl_ai_config::{Binding, SeatConfig};
 use hgl_ai_proto::{Kind, Note, Role, TaskClass, TaskKey};
 use hgl_ai_tree::{Create, TASK_FILE};
 use tokio::sync::watch;
@@ -102,17 +101,6 @@ pub fn task_class(recorded: Classed, notes: &[(u64, u64, Note)]) -> Classed {
     })
 }
 
-/// The binding a turn runs on, and whether its class chose it: the seat's binding for the
-/// class while the seat is on its primary (`idx` 0); otherwise the seat's binding at `idx`.
-/// A fallback is a quota move (PROTO-17) and keeps its own binding whatever the class.
-pub fn turn_binding(seat: &SeatConfig, idx: usize, class: Option<TaskClass>) -> (Binding, bool) {
-    match class.and_then(|c| seat.class.get(&c)) {
-        Some(b) if idx == 0 => (b.clone(), true),
-        _ if idx == 0 => (seat.binding.clone(), false),
-        _ => (seat.fallback[idx - 1].clone(), false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,40 +162,6 @@ mod tests {
         assert_eq!(Simple.up(), Standard);
         assert_eq!(Standard.up(), Complex);
         assert_eq!(Complex.up(), Complex);
-    }
-
-    #[test]
-    fn a_class_binding_runs_only_on_the_primary() {
-        let b = |model: &str| Binding {
-            runtime: hgl_ai_proto::Runtime::Agy,
-            family: None,
-            tier: None,
-            model: Some(model.into()),
-            effort: None,
-        };
-        let seat = SeatConfig {
-            name: hgl_ai_proto::Seat::new("w1").unwrap(),
-            role: Role::Implementor,
-            binding: b("primary"),
-            fallback: vec![b("fallback")],
-            class: [(TaskClass::Simple, b("light"))].into(),
-            memcap_gb: None,
-            headless: false,
-        };
-        let model = |idx, c| {
-            let (b, by) = turn_binding(&seat, idx, c);
-            (b.model.unwrap(), by)
-        };
-        assert_eq!(model(0, Some(TaskClass::Simple)), ("light".into(), true));
-        assert_eq!(
-            model(0, Some(TaskClass::Standard)),
-            ("primary".into(), false)
-        );
-        assert_eq!(model(0, None), ("primary".into(), false));
-        assert_eq!(
-            model(1, Some(TaskClass::Simple)),
-            ("fallback".into(), false)
-        );
     }
 
     fn review(h: char) -> Option<Create> {
@@ -285,9 +239,6 @@ pub enum Outcome {
 pub struct TurnOut {
     pub outcome: Outcome,
     pub binding_idx: usize,
-    /// The class whose binding (`[seat.class.<class>]`) ran the turn, with that binding;
-    /// `None` when the seat's binding at `binding_idx` ran it.
-    pub class_binding: Option<(TaskClass, Binding)>,
 }
 
 fn first_line(body: &str) -> String {
@@ -363,20 +314,14 @@ impl<B: BusApi> Bridge<B> {
 
     pub(crate) async fn turn(self: Arc<Self>, job: Job) -> TurnOut {
         let binding_idx = job.binding_idx;
-        let mut class_binding = None;
-        let outcome = self.turn_inner(&job, &mut class_binding).await;
+        let outcome = self.turn_inner(&job).await;
         TurnOut {
             outcome,
             binding_idx,
-            class_binding,
         }
     }
 
-    async fn turn_inner(
-        &self,
-        job: &Job,
-        class_binding: &mut Option<(TaskClass, Binding)>,
-    ) -> Outcome {
+    async fn turn_inner(&self, job: &Job) -> Outcome {
         let seat = &job.seat;
         let name = seat.name().clone();
         // The directory, its tree, and its turn lock.
@@ -480,34 +425,12 @@ impl<B: BusApi> Bridge<B> {
             Some(_) => task_class(inherited, &job.notes),
             None => (None, None),
         };
-        // A class binding refused for quota sits out its cool-down (PROTO-21), but a task
-        // moves to the seat's binding only when that keeps ROLE-11 for it; one it would
-        // not keep stays on its class binding, where a refusal holds that task alone.
-        let mut usable = class;
-        if let Some(c) = class
-            && job.binding_idx == 0
-            && seat.cfg.class.contains_key(&c)
-            && seat.class_refused(c, self.opts.failover_cooldown)
-        {
-            let why = match self.cfg.resolve(&seat.binding_at(0)) {
-                Ok(to) => self.role9_block(seat, &job.target, None, to.family).await,
-                Err(e) => Some(e),
-            };
-            match why {
-                None => usable = None,
-                Some(why) => {
-                    tracing::info!(seat = %name, target = %job.target, class = %c, "class binding kept: {why}")
-                }
-            }
-        }
-        let (binding, by_class) = turn_binding(&seat.cfg, job.binding_idx, usable);
+        // The class picks the seat, not the model (PROTO-21): the seat's binding runs it.
+        let binding = seat.binding_at(job.binding_idx);
         let r = match self.cfg.resolve(&binding) {
             Ok(r) => r,
             Err(e) => return Outcome::PrepFailed(format!("seat binding: {e}")),
         };
-        if let (true, Some(c)) = (by_class, usable) {
-            *class_binding = Some((c, binding.clone()));
-        }
         // The task's authors (ROLE-11): every family whose turns run in an implementor
         // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
         if let Some(f) = file.as_mut() {
@@ -565,7 +488,7 @@ impl<B: BusApi> Bridge<B> {
                 runtime: r.runtime,
                 family: r.family,
                 model: &r.model,
-                class: class.map(|c| (c, by_class)),
+                class,
                 task: file.as_ref(),
                 hold: job.hold.as_deref(),
                 mode: job.mode.as_deref(),

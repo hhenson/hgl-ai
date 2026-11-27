@@ -185,19 +185,14 @@ before hub users takes one shared token until it moves.
   or `agy`) and a model on one host, in that host's configuration. Its record
   in `HGL_HOSTS` advertises role, runtime, model family and memory budget.
 - **PROTO-21 — Task class.** An `assign` carries the task's class (docs/roles.md §3);
-  only `assign` and `sendback` carry one. The bridge records it, with the stream sequence
-  of the note that set it, in the task's `task.json` and `HGL_TREES` record. An `assign`
-  sets it; a `sendback` with a class only moves it up, never down (ROLE-15); a note no newer
-  than the one that set it (an older note delivered again) changes nothing. A tree made
-  anew for a task begun elsewhere (another host or seat) takes the class of the task's
-  record set last. An implementor seat may bind a class (`[seat.class.<class>]`): while the
-  seat is on its primary binding, a turn of a task of that class runs on that binding; a
-  class without one, an unclassed task and a fallback binding keep the seat's binding. The
-  turn's prompt names the class. A quota refusal on a class binding moves the class, not
-  the seat: when the seat's binding keeps ROLE-11 for the task (judged from the family that
-  ran), the class's turns run on it for `limits.failover_cooldown`, each task only if the
-  seat's binding keeps ROLE-11 for it too; otherwise that task's notes are held and tried
-  again on the class binding, and the seat's other tasks go on.
+  only `assign` and `sendback` carry one. The class picks the seat, not the model: a seat
+  runs its own binding (and its fallbacks, PROTO-17) whatever the class. The bridge records
+  the class, with the stream sequence of the note that set it, in the task's `task.json`
+  and `HGL_TREES` record, and the turn's prompt names it. An `assign` sets it; a `sendback`
+  with a class only moves it up, never down (ROLE-15); a note no newer than the one that set
+  it (an older note delivered again) changes nothing. A tree made anew for a task begun
+  elsewhere (another host or seat, as when a task moves to a seat for its new class) takes
+  the class of the task's record set last.
 - **PROTO-17 — Failover.** A seat may list fallback bindings. A quota refusal
   is known from the CLI's structured output (an error event or result and its
   status), never from text on stderr. On one, the bridge holds the notes and

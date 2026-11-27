@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use hgl_ai_bus::BusError;
 use hgl_ai_config::{Binding, Config, SeatConfig};
-use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskClass, TaskKey, seat_lock_key};
+use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskKey, seat_lock_key};
 use hgl_ai_tree::{Create, IsClosed, Trees};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
@@ -213,11 +213,6 @@ struct SeatRt {
     /// When the seat last moved to a fallback binding; it returns to the primary after the
     /// cool-down.
     failed_over_at: Mutex<Option<Instant>>,
-    /// Class bindings refused for quota, and when; each sits out the cool-down (PROTO-21).
-    class_refused: Mutex<BTreeMap<TaskClass, Instant>>,
-    /// Targets held because moving them off a refused class binding breaks ROLE-11, the
-    /// controller told (once until a turn of the target runs).
-    class_held_told: Mutex<HashSet<Target>>,
 }
 
 impl SeatRt {
@@ -235,20 +230,6 @@ impl SeatRt {
             failures: Mutex::new(failures),
             quota_until: Mutex::new(None),
             failed_over_at: Mutex::new(None),
-            class_refused: Mutex::default(),
-            class_held_told: Mutex::default(),
-        }
-    }
-    /// Whether the class's binding is sitting out a quota refusal's cool-down.
-    fn class_refused(&self, c: TaskClass, cooldown: Duration) -> bool {
-        let mut m = lock(&self.class_refused);
-        match m.get(&c) {
-            Some(at) if at.elapsed() < cooldown => true,
-            Some(_) => {
-                m.remove(&c);
-                false
-            }
-            None => false,
         }
     }
     fn name(&self) -> &Seat {
@@ -1212,9 +1193,6 @@ impl<B: BusApi> Bridge<B> {
         if !matches!(out.outcome, Outcome::Busy(_)) {
             lock(&seat.busy_told).remove(&r.target);
         }
-        if !matches!(out.outcome, Outcome::Quota(_)) {
-            lock(&seat.class_held_told).remove(&r.target);
-        }
         if !matches!(out.outcome, Outcome::PrepFailed(_)) {
             st.prep_failures.remove(&r.target);
             lock(&seat.prep_told).remove(&r.target);
@@ -1239,15 +1217,6 @@ impl<B: BusApi> Bridge<B> {
                         let _ = d.nak(self.opts.nak_delay).await;
                     }
                 }
-            }
-            Outcome::Quota(msg) if out.class_binding.is_some() => {
-                // A class binding's refusal moves that class, not the seat (PROTO-21).
-                let (c, b) = out.class_binding.expect("matched");
-                if !self.class_quota(seat, c, &b, &msg, &r.target).await {
-                    st.busy
-                        .insert(r.target.clone(), Instant::now() + self.opts.quota_retry);
-                }
-                st.pending.splice(0..0, newest(ds));
             }
             Outcome::Quota(msg) => {
                 // Held, not naked: a quota refusal is no failure of the notes.
@@ -1471,57 +1440,6 @@ impl<B: BusApi> Bridge<B> {
                         self.opts.quota_retry
                     );
                     self.tell(seat.name(), Kind::Note, None, body).await;
-                }
-                false
-            }
-        }
-    }
-
-    /// PROTO-21: a quota refusal on the class binding `b` of class `c`. When the seat's binding
-    /// keeps ROLE-11 for the task (`cur` is the family that ran), the class binding sits out the
-    /// cool-down and the class's turns run on the seat's binding; the seat does not move.
-    /// Otherwise the task waits on its class binding. Whether the class moved.
-    async fn class_quota(
-        &self,
-        seat: &Arc<SeatRt>,
-        c: TaskClass,
-        b: &Binding,
-        msg: &str,
-        target: &Target,
-    ) -> bool {
-        let cur = self.cfg.resolve(b).ok().map(|r| r.family);
-        let (_, to_b) = seat.current();
-        let from = self.describe(b);
-        let to = self.describe(&to_b);
-        let msg: String = msg.chars().take(200).collect();
-        let why = match self.cfg.resolve(&to_b) {
-            Ok(r) => self.role9_block(seat, target, cur, r.family).await,
-            Err(e) => Some(e),
-        };
-        match why {
-            None => {
-                lock(&seat.class_refused).insert(c, Instant::now());
-                tracing::warn!(seat = %seat.name(), class = %c, %from, %to, "quota refusal on a class binding");
-                let body = format!(
-                    "[bridge] Failover: seat {} on {}: the {c} class binding {from} was refused for quota ({msg}). For {:?}, {c} tasks run on the seat's binding {to}; the seat itself does not move. ROLE-11 applies to the new family.",
-                    seat.name(),
-                    self.cfg.host,
-                    self.opts.failover_cooldown
-                );
-                self.tell(seat.name(), Kind::Note, target.task(), body)
-                    .await;
-                true
-            }
-            Some(why) => {
-                if lock(&seat.class_held_told).insert(target.clone()) {
-                    let body = format!(
-                        "[bridge] Quota: seat {} on {}: the {c} class binding {from} was refused for {target} ({msg}); moving it to the seat's binding {to} would break ROLE-11 ({why}). Its notes are held and tried again every {:?}; the seat's other tasks go on.",
-                        seat.name(),
-                        self.cfg.host,
-                        self.opts.quota_retry
-                    );
-                    self.tell(seat.name(), Kind::Note, target.task(), body)
-                        .await;
                 }
                 false
             }

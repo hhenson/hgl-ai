@@ -125,7 +125,7 @@ fn seat_uses(cfg: Option<&Config>, rt: Runtime) -> bool {
     cfg.is_some_and(|c| {
         c.seats
             .iter()
-            .any(|s| s.bindings().any(|b| b.runtime == rt))
+            .any(|s| s.binding.runtime == rt || s.fallback.iter().any(|b| b.runtime == rt))
     })
 }
 
@@ -742,43 +742,6 @@ mod tests {
     use crate::{Os, Output};
 
     const DF: &str = "Filesystem 1024-blocks Used Available Capacity Mounted on\n/dev/x 976762584 100 524288000 47% /home\n";
-
-    /// r1's major on hgl-ai PR 25: a runtime only a class binding uses is still checked.
-    #[test]
-    fn a_runtime_only_a_class_binding_uses_counts() {
-        let mut c = Config::new("h");
-        c.seats.push(hgl_ai_config::SeatConfig {
-            name: hgl_ai_proto::Seat::new("w1").unwrap(),
-            role: hgl_ai_proto::Role::Implementor,
-            binding: hgl_ai_config::Binding {
-                runtime: Runtime::Codex,
-                family: None,
-                tier: Some(hgl_ai_proto::Tier::Frontier),
-                model: None,
-                effort: None,
-            },
-            fallback: vec![],
-            class: [(
-                hgl_ai_proto::TaskClass::Simple,
-                hgl_ai_config::Binding {
-                    runtime: Runtime::Agy,
-                    family: None,
-                    tier: Some(hgl_ai_proto::Tier::Balanced),
-                    model: None,
-                    effort: None,
-                },
-            )]
-            .into(),
-            memcap_gb: None,
-            headless: false,
-        });
-        assert!(seat_uses(Some(&c), Runtime::Codex));
-        assert!(
-            seat_uses(Some(&c), Runtime::Agy),
-            "the class binding's runtime"
-        );
-        assert!(!seat_uses(Some(&c), Runtime::Claude));
-    }
 
     #[test]
     fn df_parsing() {

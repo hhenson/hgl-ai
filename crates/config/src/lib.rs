@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hgl_ai_proto::{Family, Role, Runtime, Seat, TaskClass, Tier};
+use hgl_ai_proto::{Family, Role, Runtime, Seat, Tier};
 use serde::{Deserialize, Serialize};
 
 pub mod console;
@@ -362,11 +362,6 @@ pub struct SeatConfig {
     pub binding: Binding,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<Binding>,
-    /// A binding per task class (`[seat.class.simple]`, docs/roles.md §3): a task of that
-    /// class runs on it while the seat is on its primary binding. A class without one keeps
-    /// the seat's binding.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub class: BTreeMap<TaskClass, Binding>,
     /// Per-seat memory cap; defaults to `limits.memcap_gb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memcap_gb: Option<u64>,
@@ -374,15 +369,6 @@ pub struct SeatConfig {
     /// without it a controller is interactive (PROTO-6). Only for role `controller`.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub headless: bool,
-}
-
-impl SeatConfig {
-    /// Every binding the seat may run on: primary, fallbacks, then class bindings.
-    pub fn bindings(&self) -> impl Iterator<Item = &Binding> {
-        std::iter::once(&self.binding)
-            .chain(&self.fallback)
-            .chain(self.class.values())
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -573,12 +559,6 @@ impl Config {
                     s.name
                 )));
             }
-            if !s.class.is_empty() && s.role != Role::Implementor {
-                return Err(ConfigError::Invalid(format!(
-                    "seat {}: `class` bindings are for implementor seats; only their tasks have a class",
-                    s.name
-                )));
-            }
             if s.headless && s.role != Role::Controller {
                 return Err(ConfigError::Invalid(format!(
                     "seat {}: `headless` is for a controller; the bridge serves every other seat",
@@ -591,7 +571,7 @@ impl Config {
                     s.name
                 )));
             }
-            for b in s.bindings() {
+            for b in std::iter::once(&s.binding).chain(&s.fallback) {
                 self.resolve(b)
                     .map_err(|e| ConfigError::Invalid(format!("seat {}: {e}", s.name)))?;
             }
@@ -782,47 +762,6 @@ model = "claude-opus-5-5-high"
             r1.family,
             Family::Claude,
             "slug with an effort suffix maps to its family"
-        );
-    }
-
-    #[test]
-    fn class_bindings() {
-        // The table after `w1`, which it then belongs to.
-        let on_w1 = |table: &str| {
-            SAMPLE.replacen(
-                "[[seat]]\nname = \"r1\"",
-                &format!("{table}\n[[seat]]\nname = \"r1\""),
-                1,
-            )
-        };
-        let simple = "[seat.class.simple]\nruntime = \"agy\"\nmodel = \"gemini-4-hydrogen\"\neffort = \"high\"\n";
-        let c: Config = toml::from_str(&on_w1(simple)).unwrap();
-        c.validate().unwrap();
-        let w1 = c.seat("w1").unwrap();
-        let r = c.resolve(&w1.class[&TaskClass::Simple]).unwrap();
-        assert_eq!(
-            (r.family, r.model.as_str()),
-            (Family::Gemini, "gemini-4-hydrogen")
-        );
-        assert!(c.seat("r1").unwrap().class.is_empty());
-        let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
-        assert_eq!(back, c, "class bindings survive a rewrite");
-        let bad = on_w1(
-            "[seat.class.complex]\nruntime = \"codex\"\nfamily = \"claude\"\ntier = \"frontier\"\n",
-        );
-        let c: Config = toml::from_str(&bad).unwrap();
-        assert!(
-            c.validate().is_err(),
-            "a class binding is checked like the primary"
-        );
-        let unknown = on_w1("[seat.class.huge]\nruntime = \"agy\"\ntier = \"fast\"\n");
-        assert!(toml::from_str::<Config>(&unknown).is_err());
-        // r1's minor 4 on hgl-ai PR 25: only an implementor's tasks have a class.
-        let c: Config = toml::from_str(&format!("{SAMPLE}\n{simple}")).unwrap();
-        let e = c.validate().unwrap_err().to_string();
-        assert!(
-            e.contains("seat r1: `class` bindings are for implementor seats"),
-            "{e}"
         );
     }
 
