@@ -1,0 +1,43 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/hhenson/hgl-ai"
+
+[workspace.dependencies]
+hgl-ai-proto = { path = "crates/proto" }
+hgl-ai-config = { path = "crates/config" }
+hgl-ai-bus = { path = "crates/bus" }
+hgl-ai-cap = { path = "crates/cap" }
+hgl-ai-tree = { path = "crates/tree" }
+hgl-ai-bridge = { path = "crates/bridge" }
+hgl-ai-install = { path = "crates/install" }
+hgl-ai-gh = { path = "crates/gh" }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tokio = { version = "1", features = ["full"] }
+async-nats = "0.42"
+futures = "0.3"
+clap = { version = "4", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std", "serde"] }
+regex = "1"
+tempfile = "3"
+base64 = "0.22"
+libc = "0.2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

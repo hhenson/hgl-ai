@@ -1,0 +1,19 @@
+{
+ "data": {
+  "repository": {
+   "pullRequest": {
+    "reviewThreads": {
+     "pageInfo": {
+      "hasNextPage": false,
+      "endCursor": "c2"
+     },
+     "nodes": [
+      {
+       "isResolved": false
+      }
+     ]
+    }
+   }
+  }
+ }
+}

@@ -1,0 +1,424 @@
+{
+ "data": {
+  "rateLimit": {
+   "cost": 13,
+   "remaining": 4945,
+   "resetAt": "2026-01-05T12:55:49Z",
+   "limit": 5000
+  },
+  "r0": {
+   "name": "alpha",
+   "pullRequests": {
+    "totalCount": 4,
+    "nodes": [
+     {
+      "number": 12,
+      "isDraft": false,
+      "headRefOid": "2222222222222222222222222222222222222222",
+      "headRefName": "codex/12-x",
+      "baseRefName": "main",
+      "updatedAt": "2026-01-05T11:00:00Z",
+      "url": "https://github.com/o/alpha/pull/12",
+      "reviewThreads": {
+       "totalCount": 1,
+       "nodes": [
+        {
+         "isResolved": true
+        }
+       ]
+      },
+      "early": {
+       "nodes": [
+        {
+         "databaseId": 104,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"2222222222222222222222222222222222222222\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T09:02:00Z",
+         "updatedAt": "2026-01-05T09:02:00Z"
+        }
+       ]
+      },
+      "late": {
+       "nodes": [
+        {
+         "databaseId": 104,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"2222222222222222222222222222222222222222\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T09:02:00Z",
+         "updatedAt": "2026-01-05T09:02:00Z"
+        },
+        {
+         "databaseId": 103,
+         "author": {
+          "login": "octo"
+         },
+         "body": "[claude] Approved at 22222222.",
+         "createdAt": "2026-01-05T09:30:00Z",
+         "updatedAt": "2026-01-05T09:30:00Z"
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "commit": {
+          "oid": "2222222222222222222222222222222222222222"
+         },
+         "state": "COMMENTED",
+         "url": "https://github.com/o/alpha/pull/12#pullrequestreview-9"
+        }
+       ]
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "oid": "2222222222222222222222222222222222222222",
+          "statusCheckRollup": {
+           "state": "FAILURE"
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 11,
+      "isDraft": false,
+      "headRefOid": "1111111111111111111111111111111111111111",
+      "headRefName": "codex/11-x",
+      "baseRefName": "main",
+      "updatedAt": "2026-01-05T11:00:00Z",
+      "url": "https://github.com/o/alpha/pull/11",
+      "reviewThreads": {
+       "totalCount": 3,
+       "nodes": [
+        {
+         "isResolved": false
+        },
+        {
+         "isResolved": false
+        },
+        {
+         "isResolved": true
+        }
+       ]
+      },
+      "early": {
+       "nodes": [
+        {
+         "databaseId": 101,
+         "author": {
+          "login": "octo"
+         },
+         "body": "[codex] (worker 1) Ready: alpha#11 at 11111111\n\nAll checks pass.",
+         "createdAt": "2026-01-05T09:00:00Z",
+         "updatedAt": "2026-01-05T09:00:00Z"
+        },
+        {
+         "databaseId": 102,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"1111111111111111111111111111111111111111\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T09:01:00Z",
+         "updatedAt": "2026-01-05T09:01:00Z"
+        }
+       ]
+      },
+      "late": {
+       "nodes": [
+        {
+         "databaseId": 101,
+         "author": {
+          "login": "octo"
+         },
+         "body": "[codex] (worker 1) Ready: alpha#11 at 11111111\n\nAll checks pass.",
+         "createdAt": "2026-01-05T09:00:00Z",
+         "updatedAt": "2026-01-05T09:00:00Z"
+        },
+        {
+         "databaseId": 102,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"1111111111111111111111111111111111111111\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T09:01:00Z",
+         "updatedAt": "2026-01-05T09:01:00Z"
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": [
+        {
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "commit": {
+          "oid": "1111111111111111111111111111111111111111"
+         },
+         "state": "COMMENTED",
+         "url": "https://github.com/o/alpha/pull/11#pullrequestreview-8"
+        },
+        {
+         "author": {
+          "login": "octo"
+         },
+         "commit": {
+          "oid": "1111111111111111111111111111111111111111"
+         },
+         "state": "COMMENTED",
+         "url": "https://github.com/o/alpha/pull/11#pullrequestreview-7"
+        }
+       ]
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "oid": "1111111111111111111111111111111111111111",
+          "statusCheckRollup": {
+           "state": "SUCCESS"
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 13,
+      "isDraft": false,
+      "headRefOid": "3333333333333333333333333333333333333333",
+      "headRefName": "codex/13-x",
+      "baseRefName": "main",
+      "updatedAt": "2026-01-05T11:00:00Z",
+      "url": "https://github.com/o/alpha/pull/13",
+      "reviewThreads": {
+       "totalCount": 1,
+       "nodes": [
+        {
+         "isResolved": false
+        }
+       ]
+      },
+      "early": {
+       "nodes": [
+        {
+         "databaseId": 105,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"3333333333333333333333333333333333333333\",\"has_any_findings\":true,\"has_unresolved_findings\":true,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T09:03:00Z",
+         "updatedAt": "2026-01-05T09:03:00Z"
+        }
+       ]
+      },
+      "late": {
+       "nodes": [
+        {
+         "databaseId": 105,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"3333333333333333333333333333333333333333\",\"has_any_findings\":true,\"has_unresolved_findings\":true,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T09:03:00Z",
+         "updatedAt": "2026-01-05T09:03:00Z"
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": []
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "oid": "3333333333333333333333333333333333333333",
+          "statusCheckRollup": {
+           "state": "PENDING"
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 14,
+      "isDraft": true,
+      "headRefOid": "4444444444444444444444444444444444444444",
+      "headRefName": "codex/14-x",
+      "baseRefName": "main",
+      "updatedAt": "2026-01-05T11:00:00Z",
+      "url": "https://github.com/o/alpha/pull/14",
+      "reviewThreads": {
+       "totalCount": 0,
+       "nodes": []
+      },
+      "early": {
+       "nodes": []
+      },
+      "late": {
+       "nodes": []
+      },
+      "reviews": {
+       "nodes": []
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "oid": "4444444444444444444444444444444444444444",
+          "statusCheckRollup": null
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "r1": {
+   "name": "beta",
+   "pullRequests": {
+    "totalCount": 2,
+    "nodes": [
+     {
+      "number": 3,
+      "isDraft": false,
+      "headRefOid": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+      "headRefName": "codex/3-x",
+      "baseRefName": "main",
+      "updatedAt": "2026-01-05T11:00:00Z",
+      "url": "https://github.com/o/beta/pull/3",
+      "reviewThreads": {
+       "totalCount": 0,
+       "nodes": []
+      },
+      "early": {
+       "nodes": [
+        {
+         "databaseId": 106,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"9999999999999999999999999999999999999999\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T08:00:00Z",
+         "updatedAt": "2026-01-05T08:00:00Z"
+        },
+        {
+         "databaseId": 107,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "You have reached your Codex usage limits for code reviews. You can see your limits in the Codex usage dashboard.",
+         "createdAt": "2026-01-05T08:05:00Z",
+         "updatedAt": "2026-01-05T08:05:00Z"
+        }
+       ]
+      },
+      "late": {
+       "nodes": [
+        {
+         "databaseId": 106,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"9999999999999999999999999999999999999999\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T08:00:00Z",
+         "updatedAt": "2026-01-05T08:00:00Z"
+        },
+        {
+         "databaseId": 107,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "You have reached your Codex usage limits for code reviews. You can see your limits in the Codex usage dashboard.",
+         "createdAt": "2026-01-05T08:05:00Z",
+         "updatedAt": "2026-01-05T08:05:00Z"
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": []
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "oid": "a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3a3",
+          "statusCheckRollup": {
+           "state": "SUCCESS"
+          }
+         }
+        }
+       ]
+      }
+     },
+     {
+      "number": 5,
+      "isDraft": false,
+      "headRefOid": "b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5",
+      "headRefName": "codex/5-x",
+      "baseRefName": "main",
+      "updatedAt": "2026-01-05T11:00:00Z",
+      "url": "https://github.com/o/beta/pull/5",
+      "reviewThreads": {
+       "totalCount": 0,
+       "nodes": []
+      },
+      "early": {
+       "nodes": [
+        {
+         "databaseId": 108,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T10:00:00Z",
+         "updatedAt": "2026-01-05T10:00:00Z"
+        }
+       ]
+      },
+      "late": {
+       "nodes": [
+        {
+         "databaseId": 108,
+         "author": {
+          "login": "chatgpt-codex-connector"
+         },
+         "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"running\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n",
+         "createdAt": "2026-01-05T10:00:00Z",
+         "updatedAt": "2026-01-05T10:00:00Z"
+        }
+       ]
+      },
+      "reviews": {
+       "nodes": []
+      },
+      "commits": {
+       "nodes": [
+        {
+         "commit": {
+          "oid": "b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5b5",
+          "statusCheckRollup": {
+           "state": "EXPECTED"
+          }
+         }
+        }
+       ]
+      }
+     }
+    ]
+   }
+  },
+  "r2": null
+ }
+}

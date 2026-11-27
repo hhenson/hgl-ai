@@ -1,0 +1,35 @@
+[
+ {
+  "id": 1,
+  "user": {
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "commit_id": "61d600afab000000000000000000000000000001",
+  "state": "COMMENTED",
+  "body": "<!-- codex-review-receipt:v1 -->\n\n### Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `61d600afab`\n",
+  "html_url": "https://github.com/o/r/pull/7#pullrequestreview-1",
+  "submitted_at": "2026-01-01T04:13:25Z"
+ },
+ {
+  "id": 2,
+  "user": {
+   "login": "chatgpt-codex-connector[bot]"
+  },
+  "commit_id": "c94f7b07c7aa000000000000000000000000beef",
+  "state": "COMMENTED",
+  "body": "<!-- codex-review-receipt:v1 -->\n\n### Codex Review\n\nHere are some automated review suggestions for this pull request.\n\n**Reviewed commit:** `c94f7b07c7`\n",
+  "html_url": "https://github.com/o/r/pull/7#pullrequestreview-2",
+  "submitted_at": "2026-01-01T04:13:25Z"
+ },
+ {
+  "id": 3,
+  "user": {
+   "login": "octo"
+  },
+  "commit_id": "c94f7b07c7aa000000000000000000000000beef",
+  "state": "COMMENTED",
+  "body": "",
+  "html_url": "https://github.com/o/r/pull/7#pullrequestreview-3",
+  "submitted_at": "2026-01-01T04:13:25Z"
+ }
+]

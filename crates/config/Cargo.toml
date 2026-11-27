@@ -1,0 +1,16 @@
+[package]
+name = "hgl-ai-config"
+description = "Host configuration of hgl-ai (docs/design.md §3)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hgl-ai-proto.workspace = true
+serde.workspace = true
+toml.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,2 @@
+{"event":"init","conversation_id":"00000000-0000-4000-8000-000000000013","init":{"model":"gemini-4-carbon-high","cwd":"/work/w1/repo-1/src","tools":["run_command"],"permission_mode":"always-proceed"}}
+{"event":"result","result":{"conversation_id":"00000000-0000-4000-8000-000000000013","status":"ERROR","error":"RESOURCE_EXHAUSTED: quota exceeded for the current plan","num_turns":0}}

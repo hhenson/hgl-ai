@@ -1,0 +1,8 @@
+diff --git a/crates/x/src/lib.rs b/crates/x/src/lib.rs
+index 1111111..2222222 100644
+--- a/crates/x/src/lib.rs
++++ b/crates/x/src/lib.rs
+@@ -1,3 +1,4 @@
+ fn a() {}
++fn b() {}
+ fn c() {}

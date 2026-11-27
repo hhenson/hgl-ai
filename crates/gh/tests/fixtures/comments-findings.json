@@ -1,0 +1,35 @@
+[
+ {
+  "id": 10,
+  "user": {
+   "login": "octo",
+   "type": "User"
+  },
+  "body": "@codex review",
+  "created_at": "2026-01-01T03:11:10Z",
+  "updated_at": "2026-01-01T03:11:10Z",
+  "html_url": "https://github.com/o/r/pull/7#issuecomment-10"
+ },
+ {
+  "id": 11,
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"61d600afab000000000000000000000000000001\",\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n<details>\n<summary><strong>Codex Review Summary</strong></summary>\n\nThis comment shows the latest Codex review activity on this pull request.\n</details>\n",
+  "created_at": "2026-01-01T03:11:25Z",
+  "updated_at": "2026-01-01T04:13:30Z",
+  "html_url": "https://github.com/o/r/pull/7#issuecomment-11"
+ },
+ {
+  "id": 12,
+  "user": {
+   "login": "octo",
+   "type": "User"
+  },
+  "body": "[codex] (w2) Ready: o/r#7 at c94f7b07",
+  "created_at": "2026-01-01T04:10:47Z",
+  "updated_at": "2026-01-01T04:10:47Z",
+  "html_url": "https://github.com/o/r/pull/7#issuecomment-12"
+ }
+]
