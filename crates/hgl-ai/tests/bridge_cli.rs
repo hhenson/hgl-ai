@@ -97,7 +97,7 @@ fn seats_are_added_listed_and_removed() {
     assert!(o.status.success(), "{}", err(&o));
     assert_eq!(
         out(&o).trim(),
-        "added w1 implementor codex gpt/gpt-6.1-sol effort high; fallback agy claude/claude-opus-5-5 effort high; restart the bridge service to serve it"
+        "added w1 implementor codex gpt/gpt-6.2-astra effort high; fallback agy claude/claude-opus-5-5 effort high; restart the bridge service to serve it"
     );
     let o = add(&[
         "w1",
@@ -150,7 +150,7 @@ fn seats_are_added_listed_and_removed() {
     let o = hgl(&p, &["--json", "seat", "list"]).output().unwrap();
     let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
     assert_eq!(v[0]["seat"], "w1");
-    assert_eq!(v[0]["model"], "gpt-6.1-sol");
+    assert_eq!(v[0]["model"], "gpt-6.2-astra");
     assert_eq!(v[0]["fallback"][0]["model"], "claude-opus-5-5");
     assert_eq!(v[1]["family"], "claude");
     assert_eq!(Config::load(&p).unwrap().seats.len(), 2);

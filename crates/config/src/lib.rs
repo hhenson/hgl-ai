@@ -269,7 +269,7 @@ pub fn default_models() -> BTreeMap<Family, TierModels> {
             Family::Claude,
             m("claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"),
         ),
-        (Family::Gpt, m("gpt-6.1-sol", "gpt-6.1-sol", "gpt-6-luna")),
+        (Family::Gpt, m("gpt-6.2-astra", "gpt-6.2-sol", "gpt-6-luna")),
         (
             Family::Gemini,
             m("gemini-4-neon", "gemini-4-hydrogen", "gemini-3.8-flash"),
@@ -617,7 +617,7 @@ model = "claude-opus-5-5-high"
         assert_eq!(c.paths, Paths::default());
         let w1 = c.seat("w1").unwrap();
         let r = c.resolve(&w1.binding).unwrap();
-        assert_eq!((r.family, r.model.as_str()), (Family::Gpt, "gpt-6.1-sol"));
+        assert_eq!((r.family, r.model.as_str()), (Family::Gpt, "gpt-6.2-astra"));
         let f = c.resolve(&w1.fallback[0]).unwrap();
         assert_eq!(
             (f.runtime, f.family, f.model.as_str()),

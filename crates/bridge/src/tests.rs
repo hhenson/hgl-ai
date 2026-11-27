@@ -265,7 +265,7 @@ async fn assign_then_sendback_resumes_then_landed_cleans_up() {
     ] {
         assert_eq!(c.env.get(k), Some(&v), "{k}");
     }
-    assert_eq!(&c.args[..4], ["exec", "--json", "-m", "gpt-6.1-sol"]);
+    assert_eq!(&c.args[..4], ["exec", "--json", "-m", "gpt-6.2-astra"]);
     assert!(!c.args.contains(&"resume".to_string()));
     assert!(
         c.args
@@ -360,7 +360,7 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
     .await;
     let moved = h
         .bus
-        .sent_containing("moved from codex gpt/gpt-6.1-sol to agy claude/claude-opus-5-5");
+        .sent_containing("moved from codex gpt/gpt-6.2-astra to agy claude/claude-opus-5-5");
     assert_eq!(moved.len(), 1);
     assert_eq!(
         (moved[0].kind, moved[0].recipient.as_str()),

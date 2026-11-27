@@ -64,8 +64,8 @@ Families: `claude` (Claude Code, or Claude models through Antigravity),
 
 | Tier | claude | gpt | gemini |
 | --- | --- | --- | --- |
-| frontier | `claude-opus-5-5` | `gpt-6.1-sol` | `gemini-4-neon` |
-| balanced | `claude-sonnet-5-5` | `gpt-6.1-sol` at `medium` | `gemini-4-hydrogen` |
+| frontier | `claude-opus-5-5` | `gpt-6.2-astra` | `gemini-4-neon` |
+| balanced | `claude-sonnet-5-5` | `gpt-6.2-sol` | `gemini-4-hydrogen` |
 | fast | `claude-haiku-5-5` | `gpt-6-luna` | `gemini-3.8-flash` |
 
 The Gemini column is provisional until `docs/calibration.md` has results.

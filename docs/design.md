@@ -100,8 +100,8 @@ balanced = "claude-sonnet-5-5"
 fast = "claude-haiku-5-5"
 
 [models.gpt]
-frontier = "gpt-6.1-sol"
-balanced = "gpt-6.1-sol"
+frontier = "gpt-6.2-astra"
+balanced = "gpt-6.2-sol"
 fast = "gpt-6-luna"
 
 [models.gemini]
