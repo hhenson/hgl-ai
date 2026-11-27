@@ -6,8 +6,11 @@
 use hgl_ai_proto::{CONSOLE_PREFIX, Kind, Note, OWNER_PREFIX, Seat};
 use serde::{Deserialize, Serialize};
 
+use hgl_ai_bus::MAX_NOTE_BYTES;
+
 use crate::model::{
-    Answer, Choice, Message, Priority, QOption, Thread, ThreadKind, ThreadState, check_id,
+    Answer, CLIPPED, Choice, Message, Priority, QOption, QUOTE_MAX, Thread, ThreadKind,
+    ThreadState, check_id, clipped, shorten_with,
 };
 
 pub const EVENT_VERSION: u32 = 1;
@@ -184,6 +187,46 @@ pub struct Effects {
     pub decision: Option<String>,
     /// A new question to notify the owner of (OWN-9).
     pub new_question: Option<Priority>,
+    /// The encoded size of a note too large for the bus, which the fold shortened: the
+    /// console refuses such an event (`owner_event`), so only one it never checked has it.
+    pub oversize: Option<usize>,
+}
+
+impl Effects {
+    /// Add `n`, shortened to the bus's limit if it is over it (noted in `oversize`): a
+    /// note that cannot be sent would stop the feed.
+    fn add_note(&mut self, mut n: Note) -> Result<(), Refused> {
+        let size = encoded_len(&n);
+        if size > MAX_NOTE_BYTES {
+            self.oversize = Some(self.oversize.unwrap_or(0).max(size));
+            for _ in 0..8 {
+                let over = encoded_len(&n).saturating_sub(MAX_NOTE_BYTES);
+                if over == 0 {
+                    break;
+                }
+                // Cut in proportion to what the body costs encoded (escapes cost more),
+                // and room for the marker.
+                let raw = n.body.len();
+                let cost = serde_json::to_string(&n.body).map_or(raw, |b| b.len());
+                let cut = ((over + 2 * CLIPPED.len()) as u128 * raw as u128)
+                    .div_ceil(cost.max(1) as u128) as usize;
+                shorten_with(
+                    &mut n.body,
+                    raw.saturating_sub(cut) + CLIPPED.len(),
+                    CLIPPED,
+                );
+            }
+            if encoded_len(&n) > MAX_NOTE_BYTES {
+                return Err(refuse(format!("a note of {size} bytes does not fit")));
+            }
+        }
+        self.notes.push(n);
+        Ok(())
+    }
+}
+
+fn encoded_len(n: &Note) -> usize {
+    serde_json::to_vec(n).map_or(usize::MAX, |v| v.len())
 }
 
 /// Why an event was not folded.
@@ -317,7 +360,7 @@ pub fn fold(
                     older: 0,
                     cut: false,
                 };
-                fx.notes.push(owner_note(
+                fx.add_note(owner_note(
                     &t,
                     controller,
                     Kind::Note,
@@ -330,7 +373,7 @@ pub fn fold(
                         t.id,
                         quote(&t.id)
                     ),
-                )?);
+                )?)?;
                 t
             }
             _ => return Err(refuse(format!("no thread {}", ev.id))),
@@ -432,7 +475,7 @@ pub fn fold(
                 body: format!("Answer: {said}"),
             });
             let to = Seat::new(t.seat.clone()).map_err(|e| refuse(e.to_string()))?;
-            fx.notes.push(owner_note(
+            fx.add_note(owner_note(
                 &t,
                 &to,
                 Kind::Answer,
@@ -442,17 +485,19 @@ pub fn fold(
                     t.id,
                     t.title,
                     t.issue.as_deref().unwrap_or("no issue"),
-                    t.question.trim(),
+                    clipped(t.question.trim(), QUOTE_MAX),
                     quote(&t.id)
                 ),
-            )?);
-            fx.decision = Some(format!(
+            )?)?;
+            let line = format!(
                 "{} {} {} {who} ({}): {said}",
                 ev.at,
                 t.id,
                 t.issue.as_deref().unwrap_or("-"),
                 user()
-            ));
+            )
+            .replace(['\n', '\r'], " ");
+            fx.decision = Some(clipped(&line, crate::DECISION_LINE_MAX).into_owned());
         }
         Body::OwnerMessage { body } => {
             if body.trim().is_empty() {
@@ -471,7 +516,7 @@ pub fn fold(
                     Seat::new(t.seat.clone()).map_err(|e| refuse(e.to_string()))?
                 }
             };
-            fx.notes.push(owner_note(
+            fx.add_note(owner_note(
                 &t,
                 &to,
                 Kind::Note,
@@ -484,7 +529,7 @@ pub fn fold(
                     t.id,
                     quote(&t.id)
                 ),
-            )?);
+            )?)?;
         }
         Body::Close => {
             if t.kind != ThreadKind::Conversation || !t.is_open() {
@@ -774,6 +819,55 @@ mod tests {
         let mut forged = start.clone();
         forged.id = "c-00000002".into();
         assert!(fold(None, &agent_subject("c-00000002"), 9, &forged, &ctl()).is_err());
+    }
+
+    fn encoded(n: &Note) -> usize {
+        serde_json::to_vec(n).unwrap().len()
+    }
+
+    /// The agent's text a note quotes is bounded, so choosing an option always fits; a
+    /// note the owner's words make too large is shortened and reported, never unsendable.
+    #[test]
+    fn derived_notes_fit_the_bus() {
+        let ask = ask_event(ID);
+        let (mut t, _) = fold(None, &ask.subject(), 1, &ask, &ctl()).unwrap();
+        t.question = format!("{}END-OF-QUESTION", "q".repeat(600 << 10));
+        t.options[0].line = format!("{}END-OF-OPTION", "o".repeat(600 << 10));
+        let accept = owner(
+            ID,
+            Body::Answer {
+                choice: Choice::Accept,
+                option: None,
+                text: String::new(),
+                note: String::new(),
+            },
+        );
+        let (_, fx) = fold(Some(&t), &accept.subject(), 2, &accept, &ctl()).unwrap();
+        let n = &fx.notes[0];
+        assert!(fx.oversize.is_none());
+        assert!(encoded(n) <= MAX_NOTE_BYTES && n.body.len() > 2 * QUOTE_MAX);
+        assert!(!n.body.contains("END-OF-") && n.body.contains(CLIPPED));
+        let line = fx.decision.unwrap();
+        assert!(line.len() <= crate::DECISION_LINE_MAX && line.ends_with(CLIPPED));
+
+        // Up to the limit the owner's words go whole; past it the note is cut to fit.
+        let said = |body: String| {
+            let m = owner(ID, Body::OwnerMessage { body });
+            fold(Some(&t), &m.subject(), 2, &m, &ctl()).unwrap().1
+        };
+        let fx = said(format!("{}END", "w".repeat((1 << 20) - 1024)));
+        assert!(fx.oversize.is_none() && fx.notes[0].body.contains("wEND"));
+        for body in ["w".repeat(1 << 20), "\"\u{1}".repeat(400 << 10)] {
+            let fx = said(body);
+            let n = &fx.notes[0];
+            assert!(
+                fx.oversize.is_some_and(|s| s > MAX_NOTE_BYTES),
+                "{:?}",
+                fx.oversize
+            );
+            assert!(encoded(n) <= MAX_NOTE_BYTES && encoded(n) > MAX_NOTE_BYTES - 1024);
+            assert!(n.body.ends_with(CLIPPED));
+        }
     }
 
     /// Two 600 KiB replies and many more: the record stays within its bound; what it

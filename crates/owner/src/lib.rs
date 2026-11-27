@@ -12,7 +12,7 @@ pub mod model;
 
 use std::time::Duration;
 
-use hgl_ai_bus::{Bus, BusError, StreamMsg};
+use hgl_ai_bus::{Bus, BusError, MAX_NOTE_BYTES, StreamMsg};
 use hgl_ai_proto::{STREAM_OWNER, Seat, utc_now_stamp};
 
 pub use event::{Ask, Body, EVENT_VERSION, Effects, Event, Origin, Refused, Status, fold};
@@ -25,6 +25,9 @@ pub use model::{
 pub const KEY_DECISIONS: &str = "decisions.log";
 /// Lines of `decisions.log` kept; the owning issues hold the full text.
 pub const DECISIONS_KEEP: usize = 2000;
+/// A `decisions.log` line at most (bytes): `decision add` refuses a longer one, and an
+/// answer's line is shortened, marked; the thread and the issue hold the whole ruling.
+pub const DECISION_LINE_MAX: usize = 16 << 10;
 /// The console's durable feed over `HGL_OWNER`.
 pub const FEED: &str = "console";
 
@@ -189,17 +192,38 @@ pub async fn show_full(bus: &Bus, id: &str) -> Result<Option<Thread>> {
     if !rec.partial() {
         return Ok(Some(rec));
     }
+    Ok(refold(bus, &rec, u64::MAX).await?.or(Some(rec)))
+}
+
+/// The record `rec` read whole from the stream when folding `ev` on it needs words it
+/// shortened: an answer's note and log line quote the question and the option chosen.
+async fn whole_for(bus: &Bus, rec: &Thread, ev: &Event) -> Result<Option<Thread>> {
+    if !rec.cut || !matches!(ev.body, Body::Answer { .. }) {
+        return Ok(None);
+    }
+    let w = refold(bus, rec, rec.seq)
+        .await?
+        .filter(|w| w.seq == rec.seq);
+    if w.is_none() {
+        tracing::warn!(thread = rec.id, "the stream does not hold the whole thread");
+    }
+    Ok(w)
+}
+
+/// The thread of `rec` folded again from its events in `HGL_OWNER` stored at `upto` or
+/// before, every word kept; `None` if the stream has none of them.
+async fn refold(bus: &Bus, rec: &Thread, upto: u64) -> Result<Option<Thread>> {
     let controller = Seat::new(rec.seat.clone()).map_err(|e| invalid(e.to_string()))?;
     let msgs = bus
         .history(
             STREAM_OWNER,
-            &format!("hgl.*.thread.{id}"),
+            &format!("hgl.*.thread.{}", rec.id),
             chrono::DateTime::UNIX_EPOCH,
             100_000,
         )
         .await?;
     let mut t: Option<Thread> = None;
-    for m in &msgs {
+    for m in msgs.iter().filter(|m| m.seq <= upto) {
         let Ok(ev) = serde_json::from_slice::<Event>(&m.payload) else {
             continue;
         };
@@ -207,14 +231,16 @@ pub async fn show_full(bus: &Bus, id: &str) -> Result<Option<Thread>> {
             t = Some(next);
         }
     }
-    Ok(t.or(Some(rec)))
+    Ok(t)
 }
 
 /// The owner's event in a thread, stamped with the signed-in `user` and their `handle`
-/// (OWN-10): the console's hub user alone may publish it (OWN-5, OWN-6). Returns the
-/// stream sequence.
+/// (OWN-10): the console's hub user alone may publish it (OWN-5, OWN-6). Refused before
+/// it is published if the fold would refuse it, or if a note it makes for `controller`
+/// or the asking seat would pass the bus's limit. Returns the stream sequence.
 pub async fn owner_event(
     bus: &Bus,
+    controller: &Seat,
     id: &str,
     user: &str,
     handle: Option<&str>,
@@ -233,12 +259,29 @@ pub async fn owner_event(
         at: utc_now_stamp(),
         body,
     };
+    let mut base = show(bus, id).await?;
+    if let Some(r) = &base
+        && let Some(w) = whole_for(bus, r, &ev).await?
+    {
+        base = Some(w);
+    }
+    let next = base.as_ref().map_or(1, |t| t.seq + 1);
+    let (_, fx) =
+        fold(base.as_ref(), &ev.subject(), next, &ev, controller).map_err(|r| invalid(r.0))?;
+    if let Some(size) = fx.oversize {
+        return Err(invalid(format!(
+            "too long to deliver: its note would be {size} bytes, over the bus's limit of \
+             {MAX_NOTE_BYTES}; shorten it by {} bytes or more",
+            size - MAX_NOTE_BYTES
+        )));
+    }
     publish(bus, &ev).await
 }
 
 /// Start a conversation (OWN-3); returns its id and the event's sequence.
 pub async fn start_conversation(
     bus: &Bus,
+    controller: &Seat,
     user: &str,
     handle: Option<&str>,
     title: &str,
@@ -253,6 +296,7 @@ pub async fn start_conversation(
     let id = new_id(ThreadKind::Conversation);
     let seq = owner_event(
         bus,
+        controller,
         &id,
         user,
         handle,
@@ -299,8 +343,12 @@ pub async fn apply(bus: &Bus, controller: &Seat, msg: &StreamMsg) -> Result<Appl
     };
     for _ in 0..8 {
         let rec = bus.thread_get::<Thread>(id).await?;
+        let whole = match &rec {
+            Some((r, _)) => whole_for(bus, r, &ev).await?,
+            None => None,
+        };
         let (mut t, fx) = match fold(
-            rec.as_ref().map(|(t, _)| t),
+            whole.as_ref().or(rec.as_ref().map(|(t, _)| t)),
             &msg.subject,
             msg.seq,
             &ev,
@@ -354,6 +402,12 @@ pub async fn wait_folded(bus: &Bus, id: &str, seq: u64, wait: Duration) -> Resul
 /// the same compare-and-set (OWN-8; like `landed.log`), so the value never outgrows the
 /// bucket. Newlines in `line` become spaces.
 pub async fn decision_append(bus: &Bus, line: &str) -> Result<()> {
+    if line.len() > DECISION_LINE_MAX {
+        return Err(invalid(format!(
+            "a decision line is at most {DECISION_LINE_MAX} bytes; this one is {}",
+            line.len()
+        )));
+    }
     append_decision(bus, line, false).await
 }
 

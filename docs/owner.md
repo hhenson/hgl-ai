@@ -143,11 +143,17 @@ repository per day.
   writes the record; each step is idempotent, and the stream sequence in the record
   makes a refold a no-op. A record stays within 256 KiB: the newest 50 messages, long
   texts shortened, a count of what it leaves out; `thread show` and the console read a
-  long thread whole by folding its events again from `HGL_OWNER`. Until the console has folded an `ask`, `thread show` does not
-  find it.
+  long thread whole by folding its events again from `HGL_OWNER`; an answer to a record
+  that shortened its question or options is folded on the thread read whole. Until the
+  console has folded an `ask`, `thread show` does not find it.
+- An owner note quotes at most 256 KiB each of the question and the option chosen. The
+  console refuses an owner event the fold would refuse or whose note would pass a
+  note's 1 MiB limit; the fold cuts such a note it never checked to fit, marked, so the
+  feed does not stop on it.
 - `decisions.log`: `HGL_STATE`, newest 2000 lines and at most 768 KiB, trimmed in the
   same compare-and-set as the append; a line per owner answer (from the console) and per
-  `hgl-ai decision add` (`<UTC> <seat>: <text>`).
+  `hgl-ai decision add` (`<UTC> <seat>: <text>`). A line is at most 16 KiB: `decision
+  add` refuses a longer one; an answer's is shortened, marked.
 
 ## 5. The headless controller
 

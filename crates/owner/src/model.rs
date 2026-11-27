@@ -192,20 +192,41 @@ pub const MESSAGES_KEPT: usize = 50;
 /// A message body, the context or the question in a record, at most (bytes).
 pub const TEXT_MAX: usize = 16 << 10;
 
+/// The agent's text an owner note quotes (the question, the option chosen), at most
+/// (bytes): the owner's own words keep the rest of a note's room.
+pub const QUOTE_MAX: usize = 256 << 10;
+
 const SHORTENED: &str = "\n[... shortened in the record; `hgl-ai thread show` reads it whole]";
+/// The marker of text a note or a log line shortens.
+pub(crate) const CLIPPED: &str = " [... shortened; `hgl-ai thread show` reads it whole]";
 
 /// `s` cut to at most `max` bytes on a character boundary, with a marker; whether cut.
 fn shorten(s: &mut String, max: usize) -> bool {
+    shorten_with(s, max, SHORTENED)
+}
+
+/// [`shorten`] with this `marker`.
+pub(crate) fn shorten_with(s: &mut String, max: usize, marker: &str) -> bool {
     if s.len() <= max {
         return false;
     }
-    let mut end = max.saturating_sub(SHORTENED.len());
+    let mut end = max.saturating_sub(marker.len());
     while !s.is_char_boundary(end) {
         end -= 1;
     }
     s.truncate(end);
-    s.push_str(SHORTENED);
+    s.push_str(marker);
     true
+}
+
+/// `s`, or at most `max` bytes of it marked as shortened.
+pub(crate) fn clipped(s: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    if s.len() <= max {
+        return s.into();
+    }
+    let mut c = s.to_string();
+    shorten_with(&mut c, max, CLIPPED);
+    c.into()
 }
 
 impl Thread {
@@ -330,7 +351,7 @@ impl Thread {
             (Choice::Accept | Choice::Option, Some(l)) => format!(
                 "{} {l}: {}",
                 a.choice,
-                self.option(l).map(|o| o.line.as_str()).unwrap_or("")
+                clipped(self.option(l).map_or("", |o| o.line.as_str()), QUOTE_MAX)
             ),
             (Choice::Other, _) => format!("other: {}", a.text.trim()),
             (c, _) => c.to_string(),

@@ -582,7 +582,12 @@ pub(crate) mod tests {
             .unwrap()
             .port();
         let token = format!("t{}", std::process::id());
+        // The installed hub's payload limit, so a note at the bus's limit goes through.
+        let conf = d.path().join("nats.conf");
+        std::fs::write(&conf, "max_payload: 4MB\n").unwrap();
         let child = std::process::Command::new(bin)
+            .arg("-c")
+            .arg(&conf)
             .args([
                 "-js",
                 "-a",
@@ -702,8 +707,20 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
+        // The console answers only a question it has filed.
+        let filters = vec![format!("{CONSOLE_PREFIX}.>"), format!("{OWNER_PREFIX}.>")];
+        let mut feed = bus.owner_feed(owner::FEED, filters).await.unwrap();
+        for _ in 0..20 {
+            if owner::show(&bus, &id).await.unwrap().is_some() {
+                break;
+            }
+            fold_batch(&a, &bus, &mut feed, Duration::from_millis(500))
+                .await
+                .unwrap();
+        }
         let answer = owner::owner_event(
             &bus,
+            &a.controller,
             &id,
             "owner@example.com",
             Some("This Dude"),
@@ -718,6 +735,7 @@ pub(crate) mod tests {
         .unwrap();
         let later = owner::owner_event(
             &bus,
+            &a.controller,
             &id,
             "owner@example.com",
             Some("This Dude"),
@@ -728,8 +746,6 @@ pub(crate) mod tests {
         .await
         .unwrap();
         a.fold_probe.fail_once(answer);
-        let filters = vec![format!("{CONSOLE_PREFIX}.>"), format!("{OWNER_PREFIX}.>")];
-        let mut feed = bus.owner_feed(owner::FEED, filters).await.unwrap();
         // Fetches go on while the answer waits out its retry: none hands over the message.
         for _ in 0..40 {
             fold_batch(&a, &bus, &mut feed, Duration::from_millis(500))
@@ -772,6 +788,198 @@ pub(crate) mod tests {
             got.iter().map(|d| &d.note.body).collect::<Vec<_>>()
         );
         assert_eq!(owner_notes[0].note.kind, Kind::Answer, "in order");
+    }
+
+    /// Fold until the record of `id` has folded `seq`, a bounded number of rounds.
+    async fn fold_to(a: &App, bus: &Bus, feed: &mut hgl_ai_bus::Feed, id: &str, seq: u64) {
+        for _ in 0..20 {
+            if owner::show(bus, id)
+                .await
+                .unwrap()
+                .is_some_and(|t| t.seq >= seq)
+            {
+                return;
+            }
+            fold_batch(a, bus, feed, Duration::from_millis(500))
+                .await
+                .unwrap();
+        }
+        panic!("{id} never folded event {seq}");
+    }
+
+    async fn feed(bus: &Bus) -> hgl_ai_bus::Feed {
+        let filters = vec![format!("{CONSOLE_PREFIX}.>"), format!("{OWNER_PREFIX}.>")];
+        bus.owner_feed(owner::FEED, filters).await.unwrap()
+    }
+
+    fn question(title: &str, question: String, line: String) -> owner::Ask {
+        owner::Ask {
+            title: title.into(),
+            priority: Priority::P3,
+            issue: Some("alpha#7".into()),
+            context: String::new(),
+            question,
+            options: vec![owner::QOption {
+                label: "a".into(),
+                line,
+            }],
+            suggested: Some("a".into()),
+        }
+    }
+
+    /// The bot's probe: an owner message whose note would pass the bus's limit. The
+    /// console refuses it unpublished; one it never checked folds with its note cut to
+    /// fit, and the feed goes on to the next event.
+    #[tokio::test]
+    async fn an_owner_note_too_large_is_refused_and_never_stops_the_feed() {
+        let Some((_srv, url, token)) = hub() else {
+            eprintln!("skipped: nats-server is not on PATH");
+            return;
+        };
+        let bus = Bus::connect_url(&url, Some(token)).await.unwrap();
+        bus.provision().await.unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let a = app(d.path());
+        let claude = Seat::new("claude").unwrap();
+        let id = owner::ask(
+            &bus,
+            &claude,
+            question("Big", "Which?".into(), "One".into()),
+        )
+        .await
+        .unwrap();
+        let mut feed = feed(&bus).await;
+        fold_to(&a, &bus, &mut feed, &id, 1).await;
+        // The largest message the stream takes as an event: its note is larger.
+        let mut ev = owner::Event {
+            v: owner::EVENT_VERSION,
+            id: id.clone(),
+            sender: hgl_ai_proto::OWNER.into(),
+            user: Some("owner@example.com".into()),
+            handle: Some("This Dude".into()),
+            at: hgl_ai_proto::utc_now_stamp(),
+            body: owner::Body::OwnerMessage {
+                body: String::new(),
+            },
+        };
+        let room = hgl_ai_bus::MAX_NOTE_BYTES - serde_json::to_vec(&ev).unwrap().len();
+        let big = "w".repeat(room);
+        ev.body = owner::Body::OwnerMessage { body: big.clone() };
+        let e = owner::owner_event(
+            &bus,
+            &a.controller,
+            &id,
+            "owner@example.com",
+            Some("This Dude"),
+            ev.body.clone(),
+        )
+        .await
+        .unwrap_err();
+        assert!(e.to_string().starts_with("too long to deliver"), "{e}");
+        let events = bus
+            .history(
+                hgl_ai_proto::STREAM_OWNER,
+                &format!("hgl.*.thread.{id}"),
+                DateTime::UNIX_EPOCH,
+                10,
+            )
+            .await
+            .unwrap();
+        assert_eq!(events.len(), 1, "nothing published");
+        let long = "x".repeat(owner::DECISION_LINE_MAX + 1);
+        assert!(owner::decision_append(&bus, &long).await.is_err());
+        // As an older console might have published it.
+        let payload = serde_json::to_vec(&ev).unwrap();
+        bus.publish_event(&ev.subject(), &payload, &ev.msg_id())
+            .await
+            .unwrap();
+        let after = owner::owner_event(
+            &bus,
+            &a.controller,
+            &id,
+            "owner@example.com",
+            Some("This Dude"),
+            owner::Body::OwnerMessage {
+                body: "After it.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        fold_to(&a, &bus, &mut feed, &id, after).await;
+        let t = owner::show_full(&bus, &id).await.unwrap().unwrap();
+        assert_eq!(t.messages.len(), 2);
+        assert_eq!(t.messages[0].body, big, "the thread keeps every word");
+        let mut inbox = bus.inbox(&claude).await.unwrap();
+        let got = inbox.fetch(10, Duration::from_secs(2)).await.unwrap();
+        let notes: Vec<_> = got.iter().filter(|d| d.note.sender.is_owner()).collect();
+        assert_eq!(notes.len(), 2);
+        let cut = &notes[0].note;
+        assert!(serde_json::to_vec(cut).unwrap().len() <= hgl_ai_bus::MAX_NOTE_BYTES);
+        assert!(cut.body.ends_with("reads it whole]"));
+        assert!(notes[1].note.body.contains("After it."));
+    }
+
+    /// The bot's probe: a question and an option longer than the record keeps. The
+    /// answer's note and its `decisions.log` line quote both whole, from the stream.
+    #[tokio::test]
+    async fn an_answer_quotes_what_the_record_shortened() {
+        let Some((_srv, url, token)) = hub() else {
+            eprintln!("skipped: nats-server is not on PATH");
+            return;
+        };
+        let bus = Bus::connect_url(&url, Some(token)).await.unwrap();
+        bus.provision().await.unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let a = app(d.path());
+        let claude = Seat::new("claude").unwrap();
+        let q = format!("{}END-OF-QUESTION", "q".repeat(20 << 10));
+        let line = format!("{}END-OF-OPTION", "o".repeat(2000));
+        let id = owner::ask(&bus, &claude, question("Long", q.clone(), line.clone()))
+            .await
+            .unwrap();
+        let mut feed = feed(&bus).await;
+        fold_to(&a, &bus, &mut feed, &id, 1).await;
+        let rec = owner::show(&bus, &id).await.unwrap().unwrap();
+        assert!(
+            rec.cut
+                && !rec.question.contains("END-OF-")
+                && !rec.options[0].line.contains("END-OF-")
+        );
+        let answer = owner::owner_event(
+            &bus,
+            &a.controller,
+            &id,
+            "owner@example.com",
+            Some("This Dude"),
+            owner::Body::Answer {
+                choice: owner::Choice::Accept,
+                option: None,
+                text: String::new(),
+                note: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        fold_to(&a, &bus, &mut feed, &id, answer).await;
+        let mut inbox = bus.inbox(&claude).await.unwrap();
+        let got = inbox.fetch(10, Duration::from_secs(2)).await.unwrap();
+        let n = &got
+            .iter()
+            .find(|d| d.note.kind == Kind::Answer)
+            .unwrap()
+            .note;
+        assert!(
+            n.body.contains(&format!("accept a: {line}")),
+            "the option whole"
+        );
+        assert!(n.body.contains(&q), "the question whole");
+        assert!(!n.body.contains("shortened"));
+        let log = owner::decisions_tail(&bus, 5).await.unwrap();
+        let l = log.iter().find(|l| l.contains(&id)).unwrap();
+        assert!(l.contains(&line) && !l.contains("shortened"), "{l}");
+        let t = owner::show(&bus, &id).await.unwrap().unwrap();
+        assert_eq!(t.state, owner::ThreadState::Answered);
+        assert!(t.messages.last().unwrap().body.contains(&line));
     }
 
     fn app(dir: &std::path::Path) -> App {

@@ -355,7 +355,16 @@ pub async fn start(State(app): AppState, h: HeaderMap, Form(f): Form<StartForm>)
     };
     let issue = Some(f.issue.trim().to_string()).filter(|i| !i.is_empty());
     let handle = app.auth.handle_of(&s.user);
-    match owner::start_conversation(bus, &s.user, handle.as_deref(), &f.title, issue, &f.body).await
+    match owner::start_conversation(
+        bus,
+        &app.controller,
+        &s.user,
+        handle.as_deref(),
+        &f.title,
+        issue,
+        &f.body,
+    )
+    .await
     {
         Ok((id, seq)) => {
             let _ = owner::wait_folded(bus, &id, seq, FOLD_WAIT).await;
@@ -537,7 +546,7 @@ async fn send_owner(app: &App, s: &Session, id: &str, body: Body) -> Response {
         );
     }
     let handle = app.auth.handle_of(&s.user);
-    match owner::owner_event(bus, id, &s.user, handle.as_deref(), body).await {
+    match owner::owner_event(bus, &app.controller, id, &s.user, handle.as_deref(), body).await {
         Ok(seq) => {
             let after = owner::wait_folded(bus, id, seq, FOLD_WAIT)
                 .await
