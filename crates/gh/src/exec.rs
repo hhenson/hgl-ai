@@ -337,12 +337,31 @@ pub async fn write<G: Gh>(
 
 /// A request that changes something, with a JSON body.
 pub async fn write_json<G: Gh>(gh: &G, method: &str, path: &str, body: &Value) -> Result<Value> {
-    let args = s(&["api", "-X", method, path, "--input", "-"]);
+    let args = json_args(method, path);
     let t = text_in(gh, args, Some(body.to_string().into_bytes())).await?;
     serde_json::from_str(&t).map_err(|e| Error::Response {
         what: path.into(),
         msg: e.to_string(),
     })
+}
+
+fn json_args(method: &str, path: &str) -> Vec<String> {
+    s(&["api", "-X", method, path, "--input", "-"])
+}
+
+/// [`write_json`], returning the run as it was, a failed one included: for an answer whose
+/// error body carries what the caller needs (a pending request's id). With its arguments
+/// as shown, for [`failure`].
+pub(crate) async fn send_json<G: Gh>(
+    gh: &G,
+    method: &str,
+    path: &str,
+    body: &Value,
+) -> Result<(Output, String)> {
+    let args = json_args(method, path);
+    let shown = args.join(" ");
+    let out = gh.exec(args, Some(body.to_string().into_bytes())).await?;
+    Ok((out, shown))
 }
 
 /// A GraphQL query with string variables. With `paginate`, the query takes `$endCursor`
@@ -409,6 +428,8 @@ pub(crate) mod fake {
         /// (pattern, output, used once)
         pub rules: Mutex<Vec<(String, Output, bool)>>,
         pub calls: Mutex<Vec<String>>,
+        /// (joined arguments, standard input) of each run given one.
+        pub inputs: Mutex<Vec<(String, String)>>,
     }
 
     impl FakeGh {
@@ -468,9 +489,13 @@ pub(crate) mod fake {
     }
 
     impl Gh for FakeGh {
-        async fn exec(&self, args: Vec<String>, _stdin: Option<Vec<u8>>) -> Result<Output> {
+        async fn exec(&self, args: Vec<String>, stdin: Option<Vec<u8>>) -> Result<Output> {
             let joined = args.join(" ");
             self.calls.lock().unwrap().push(joined.clone());
+            if let Some(i) = stdin {
+                let i = String::from_utf8_lossy(&i).into_owned();
+                self.inputs.lock().unwrap().push((joined.clone(), i));
+            }
             let mut rules = self.rules.lock().unwrap();
             match rules
                 .iter()

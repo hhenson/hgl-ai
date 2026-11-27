@@ -213,6 +213,7 @@ async fn land_locked<G: Gh>(
         return Ok(done);
     }
     let deadline = Instant::now() + o.timeout;
+    let gate_opts = merge_bound(bus, &o.gate, deadline).await?;
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
     {
         let after = Vec::new();
@@ -246,7 +247,7 @@ async fn land_locked<G: Gh>(
             repo,
             number,
             head,
-            &o.gate,
+            &gate_opts,
             true,
             Some(lock),
         )
@@ -303,6 +304,22 @@ async fn resume_recorded<G: Gh>(
     eprintln!("{}", outcome.line);
     let (after, what) = after_merge(gh, s, bus, repo, number, &outcome, o, lock, Some(p)).await?;
     Ok(Some((Landing { outcome, after }, what)))
+}
+
+/// The gate's options with the poll of an accepted merge bounded by the landing's
+/// `deadline` and by the landing lock's lease from now, whichever comes first.
+async fn merge_bound(bus: &Bus, gate: &gate::Opts, deadline: Instant) -> Result<gate::Opts> {
+    // A `max_age` of zero is no expiry.
+    let lease = bus.locks_max_age().await?;
+    let until = if lease.is_zero() {
+        deadline
+    } else {
+        deadline.min(Instant::now() + lease)
+    };
+    Ok(gate::Opts {
+        merge_until: Some(tokio::time::Instant::from_std(until)),
+        ..*gate
+    })
 }
 
 /// After the gate decided, under the lock: a merge's steps; a pull request found merged
@@ -409,6 +426,7 @@ pub(crate) async fn merge_locked<G: Gh>(
         match resume_recorded(gh, s, bus, repo, number, o, lock).await? {
             Some(done) => done,
             None => {
+                let gate_opts = merge_bound(bus, &o.gate, Instant::now() + o.timeout).await?;
                 let outcome = gate::evaluate(
                     gh,
                     s,
@@ -416,7 +434,7 @@ pub(crate) async fn merge_locked<G: Gh>(
                     repo,
                     number,
                     head,
-                    &o.gate,
+                    &gate_opts,
                     true,
                     Some(lock),
                 )
