@@ -1,10 +1,20 @@
 //! Exclusive `flock` locks on files: one builder per label on a host, one git
-//! operation at a time on a shared clone. Released when dropped (the file closes).
+//! operation at a time on a shared clone. Released when dropped, by an explicit
+//! `LOCK_UN`: a `flock` belongs to the open file description, and a child forked by
+//! any thread holds a copy of it until `exec`, so closing the file alone does not
+//! release it then.
 
 use std::os::unix::io::AsRawFd;
 use std::path::Path;
 
-pub struct FileLock(#[allow(dead_code)] std::fs::File);
+pub struct FileLock(std::fs::File);
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        // SAFETY: a valid descriptor. Unlocks the description, whoever else holds a copy.
+        unsafe { libc::flock(self.0.as_raw_fd(), libc::LOCK_UN) };
+    }
+}
 
 fn open(path: &Path) -> std::io::Result<std::fs::File> {
     if let Some(d) = path.parent() {
@@ -62,5 +72,22 @@ mod tests {
         drop(a);
         assert!(FileLock::try_lock(&p).unwrap().is_some());
         let _b = FileLock::lock(&p).unwrap();
+    }
+
+    /// A copy of the descriptor (what a child forked by another thread holds until
+    /// `exec`) does not keep the lock past the drop.
+    #[test]
+    fn released_despite_a_copy() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("a.lock");
+        let a = FileLock::try_lock(&p).unwrap().unwrap();
+        // SAFETY: a valid descriptor; the copy is closed below.
+        let copy = unsafe { libc::dup(a.0.as_raw_fd()) };
+        assert!(copy >= 0);
+        drop(a);
+        let taken = FileLock::try_lock(&p).unwrap().is_some();
+        // SAFETY: the copy made above.
+        unsafe { libc::close(copy) };
+        assert!(taken);
     }
 }
