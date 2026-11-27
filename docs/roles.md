@@ -6,9 +6,9 @@ Open decisions are issues in this repository.
 ## 1. Team
 
 ```
-                 Owner
-       specs, priorities, tags, budget
-                   │
+                 Owner ─────────────── Architect
+       specs, priorities, tags, budget   features, refactoring,
+                   │                     design cleanup
               Controller ───────────── Triage
       verdicts, merges, pins       labels, slices, owner
                    │               question batches
@@ -28,6 +28,14 @@ Open decisions are issues in this repository.
   issues, folds duplicates, keeps the claimable backlog ordered, and batches
   questions for the owner into one labelled list. Writes no code. Workers
   claim only what triage labelled ready.
+- **ROLE-4 — Architect** (seat `architect`). Works with the owner, through the owner
+  channel (`docs/owner.md`), to expand features and to engineer refactoring and design
+  cleanup: makes the code more efficient and the design simpler. Writes the design
+  (parent issues such as hgl-compiler P-F1..P-F5, design notes in the owning repository),
+  proposes each to the owner as a question with options and a suggestion, and once a design
+  is agreed splits it into bounded tasks for triage, in an order that keeps `main` working
+  (quiet windows on hot files). Does not approve or merge; implements only a spike that
+  proves a design, never on `main` directly (HPH, 2026-11-27).
 - **ROLE-5 — Implementor** (`w1`..`wN`). One bounded issue at a time in the
   worktree its bridge made. Runs formatting, lints and tests under the memory
   cap before `ready` with the exact head. Answers a `sendback` with new
@@ -86,25 +94,37 @@ Families: `claude` (Claude Code, or Claude models through Antigravity),
 | balanced | `claude-sonnet-5-5` | `gpt-6.2-sol` | `gemini-4-hydrogen` |
 | fast | `claude-haiku-5-5` | `gpt-6-luna` | `gemini-3.8-flash` |
 
-The Gemini column is provisional until `docs/calibration.md` has results.
-`gemini-4-carbon` (close to Claude Fable) is trialled for controller and
-triage. Concrete slugs live in configuration (`[models]`), so a new release
+`claude-fable-5-2` (Fable) develops the specification (HPH, 2026-11-27: "specs largely
+developed by claude Fable and written by Fable or Opus or Astra"); it was not part of the
+calibration. `gemini-4-carbon` (close to Fable) is used for control, architecture and
+design review. Concrete slugs live in configuration (`[models]`), so a new release
 changes one file.
 
-| Work | Tier, effort | Primary family | Alternate |
-| --- | --- | --- | --- |
-| Controller | frontier, high | claude | gpt |
-| Specification text | frontier, high | claude | gpt |
-| Implementation: analyser, types, generics, runtime semantics | frontier, high | gpt | claude |
-| Implementation: target coverage, diagnostics, docs, tooling | balanced, high | gpt | gemini |
-| Review | frontier, xhigh | any family but the author's | the third family |
-| Triage | balanced, medium | claude | gemini |
-| Bulk mechanical edits (renames, label sweeps) | fast, medium | gemini | gpt |
-| Build agent (proposed): recipes, toolchains, build failures | balanced, high | gpt | claude |
-| Coordinator, bridge; builder, merge queue (proposed) | no model | — | — |
+Assignment agreed with the owner, 2026-11-27 (HPH: "lets use that for now"), from
+`docs/calibration.md`:
 
-- **ROLE-14 — Spread by subscription.** Implementors run mostly on `gpt`, so
-  `claude` and `gemini` keep capacity for control, review and triage.
+| Work | First choice | Second | Not alone |
+| --- | --- | --- | --- |
+| Architect: features, refactoring, design cleanup | Fable | Astra 6.2 high or Carbon high | — |
+| Controller | Carbon high | Astra 6.2 high | — |
+| Triage | Astra 6.2 high | Carbon high | — |
+| Specification design (rules, their reasoning, the questions for the owner) | Fable | Opus high | — |
+| Specification text | Fable, Opus high or Astra 6.2 high | — | — |
+| Implementation, runtime and semantics (hgraph, the C++ runtime) | Sol 6.2 xhigh, Astra 6.2 xhigh | Neon xhigh | Opus, Terra, Hydrogen high |
+| Implementation, checker edge cases | Neon xhigh | Astra 6.2 xhigh | Terra |
+| Implementation, cross-cutting refactors (analyser, IR) | Opus high | Astra 6.2 xhigh | Terra |
+| Implementation, tooling (hgl-ai, scripts, CI) | Opus high | Sol 6.2 xhigh | — |
+| Review (gate) | Neon xhigh or Carbon high | Astra 6.2 xhigh (fast) | Opus (lenient verdicts) |
+| Review (design, code, logic) | Carbon high | Neon xhigh | — |
+| Build agent, mechanical | Sol 6.2 high | Hydrogen high | — |
+| Coordinator, bridge, builder, merge queue | no model | — | — |
+
+The gate's reviewer is never of the author's family (ROLE-11). The GitHub review bot is
+a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the gate.
+
+- **ROLE-14 — Spread by subscription.** The table spreads work over the three
+  subscriptions (GPT implements runtime work, Claude refactors and tooling, Gemini
+  reviews and checker work); when one runs out, its rows move to their second choice.
 - **ROLE-15 — Escalate once.** A balanced or fast seat whose work is sent back
   twice for the same finding moves that task to the frontier tier.
 - **ROLE-16 — Record the model.** `ready` notes and receipts name the family

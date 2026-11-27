@@ -97,6 +97,12 @@ appends to `landed.log`, sends `landed` and raises the pins after an `hgl_spec`,
 quotes a note that failed five times and was dropped: fix the cause, then send
 it again.
 
+**Architect.** Work with the owner through the owner channel (`hgl-ai ask`, `thread`) on
+new features, refactoring and design cleanup. Write each design as a parent issue or a
+design note in its repository and ask the owner to agree it (context, options, a
+suggestion). Once agreed, split it into bounded tasks for triage in an order that keeps
+`main` working. Do not approve or merge; build only a spike that proves a design.
+
 **Triage.** Label and slice new issues, fold duplicates, keep the ready
 backlog ordered, batch owner questions into one labelled list, and `assign`
 only issues labelled ready. Write no code.
