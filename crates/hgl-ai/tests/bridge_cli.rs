@@ -487,3 +487,145 @@ fn the_bridge_serves_a_seat_against_a_live_hub() {
     assert!(!out(&o).contains("test-host"), "{}", out(&o));
     drop(hub);
 }
+
+/// Two bridges (two hosts) configured for one seat, started together against one hub:
+/// both find the seat unadvertised, and the seat lease lets only one serve it (PROTO-6).
+#[test]
+fn two_bridges_for_one_seat_only_one_serves() {
+    let d = Scratch::new("two");
+    let Some(hub) = Hub::start(&d.0) else { return };
+    let g = git(&d.0);
+    remote(&g, &d.0, "demo");
+    let token = d.0.join("hub.token");
+    std::fs::write(&token, format!("{}\n", hub.token)).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bridge/fixtures/codex-ok.jsonl");
+    let mut hosts = Vec::new();
+    for name in ["host-a", "host-b"] {
+        let dir = d.0.join(name);
+        std::fs::create_dir_all(dir.join("bin")).unwrap();
+        let (mut cfg, p) = config(&dir, &hub.url, &token);
+        cfg.host = name.into();
+        cfg.github.clone_url = format!("{}/{{repo}}.git", d.0.display());
+        cfg.seats.push(SeatConfig {
+            name: Seat::new("w1").unwrap(),
+            role: Role::Implementor,
+            binding: Binding {
+                runtime: Runtime::Codex,
+                family: None,
+                tier: Some(Tier::Fast),
+                model: None,
+                effort: None,
+            },
+            fallback: vec![],
+            memcap_gb: Some(4),
+        });
+        cfg.save(&p).unwrap();
+        let script = format!(
+            "#!/bin/sh\npwd >> '{}'\ncat '{}'\n",
+            dir.join("calls").display(),
+            fixture.display()
+        );
+        let codex = dir.join("bin/codex");
+        std::fs::write(&codex, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+        hosts.push((name, dir, p));
+    }
+    assert!(
+        hgl(&hosts[0].2, &["init"])
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let mut daemons = Vec::new();
+    for (_, dir, p) in &hosts {
+        let path = format!(
+            "{}:{}",
+            dir.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let mut bridge = hgl(p, &["bridge", "run", "--seat", "w1"]);
+        isolate(&mut bridge, &d.0);
+        let log = std::fs::File::create(dir.join("bridge.log")).unwrap();
+        daemons.push(Daemon(
+            bridge
+                .env("PATH", &path)
+                .env("HGL_AI_LOG", "info")
+                .stdout(Stdio::null())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        ));
+    }
+    let log_of =
+        |i: usize| std::fs::read_to_string(hosts[i].1.join("bridge.log")).unwrap_or_default();
+    let logs = || format!("host-a:\n{}\nhost-b:\n{}", log_of(0), log_of(1));
+    let serving = || -> Vec<String> {
+        out(&hgl(&hosts[0].2, &["hosts"]).output().unwrap())
+            .lines()
+            .filter(|l| l.contains("w1 implementor/codex"))
+            .map(String::from)
+            .collect()
+    };
+    until("a host lists w1", 20, &logs, || !serving().is_empty());
+    let winner = if serving()[0].starts_with("host-a ") {
+        0
+    } else {
+        1
+    };
+    let loser = 1 - winner;
+    until(
+        "the other bridge waits on the seat lease",
+        20,
+        &logs,
+        || {
+            log_of(loser).contains(&format!(
+                "the seat lease seat.w1 is held by {} pid",
+                hosts[winner].0
+            ))
+        },
+    );
+    // Both have beaten several times since: still one.
+    std::thread::sleep(Duration::from_secs(2));
+    let now = serving();
+    assert_eq!(now.len(), 1, "{now:?}\n{}", logs());
+    assert!(now[0].starts_with(hosts[winner].0), "{now:?}");
+
+    let o = hgl(
+        &hosts[loser].2,
+        &[
+            "note",
+            "send",
+            "--from",
+            "claude",
+            "--to",
+            "w1",
+            "--kind",
+            "assign",
+            "--repo",
+            "demo",
+            "--issue",
+            "9",
+            "--body",
+            "[claude] Assign: demo#9 Nine",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+    let src = hosts[winner].1.join("work/w1/demo-9/src");
+    until("the serving bridge ran the turn", 30, &logs, || {
+        std::fs::read_to_string(hosts[winner].1.join("calls"))
+            .is_ok_and(|c| c.trim() == src.display().to_string())
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert!(
+        !hosts[loser].1.join("calls").exists(),
+        "the other bridge ran a turn\n{}",
+        logs()
+    );
+    assert!(!hosts[loser].1.join("work/w1").exists());
+    drop(daemons);
+    drop(hub);
+}

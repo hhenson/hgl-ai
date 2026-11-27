@@ -252,12 +252,14 @@ fn scope_kills_a_command_over_the_cap() {
         .unwrap()
         .wait()
         .unwrap();
+    // The kernel's `oom_kill` count can lag the kill; the limit is known either way.
     assert!(o.memory_limit, "{o:?}");
     assert!([STATUS_KILL, STATUS_TERM].contains(&o.status), "{o:?}");
-    assert!(o.oom_kills >= 1);
     let report = o.report(&spec);
+    assert_eq!(report.len(), 1, "{report:?}");
     assert!(
-        report[0].starts_with("hgl-ai cap: the 100M memory limit was reached; the kernel killed"),
+        report[0].starts_with("hgl-ai cap: the 100M memory limit was reached; the kernel killed")
+            && report[0].ends_with(&format!("(exit status {})", o.status)),
         "{report:?}"
     );
 

@@ -765,19 +765,51 @@ async fn one_of_two_concurrent_acquirers_holds_the_lease() {
 async fn a_released_lease_can_be_taken_again() {
     let Some(hub) = Hub::start() else { return };
     let bus = hub.ready().await;
+    assert_eq!(bus.lock_get(LAND).await.unwrap(), None);
     let first = bus.lock_acquire(LAND, "first").await.unwrap();
+    assert_eq!(
+        bus.lock_get(LAND).await.unwrap().as_ref(),
+        Some(first.record())
+    );
     assert!(matches!(
         bus.lock_acquire(LAND, "second").await,
         Err(BusError::Held { .. })
     ));
     assert!(first.release().await.unwrap());
+    assert_eq!(bus.lock_get(LAND).await.unwrap(), None);
     let second = bus.lock_acquire(LAND, "second").await.unwrap();
     assert_eq!(second.record().holder, "second");
     assert!(matches!(
         bus.lock_acquire(LAND, "third").await,
         Err(BusError::Held { holder, .. }) if holder == "second"
     ));
-    assert!(second.release().await.unwrap());
+    // Taken over only from the holder named as dead, and only once.
+    assert!(matches!(
+        bus.lock_take_over(LAND, "third", "first").await,
+        Err(BusError::Held { holder, .. }) if holder == "second"
+    ));
+    let (a, b) = tokio::join!(
+        bus.lock_take_over(LAND, "third", "second"),
+        bus.lock_take_over(LAND, "fourth", "second")
+    );
+    assert!(a.is_ok() != b.is_ok(), "one takes it over");
+    let third = a.or(b).unwrap();
+    assert!(
+        !second.release().await.unwrap(),
+        "the dead holder's lease is gone"
+    );
+    assert_eq!(
+        bus.lock_get(LAND).await.unwrap().map(|r| r.holder),
+        Some(third.record().holder.clone())
+    );
+    assert!(third.release().await.unwrap());
+    let fresh = bus.lock_take_over(LAND, "fifth", "gone").await.unwrap();
+    assert_eq!(
+        fresh.record().holder,
+        "fifth",
+        "absent: taken as by lock_acquire"
+    );
+    assert!(fresh.release().await.unwrap());
     assert!(matches!(
         bus.lock_acquire("bad..name", "x").await,
         Err(BusError::Nats(_))

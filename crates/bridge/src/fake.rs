@@ -1,5 +1,5 @@
-//! An in-memory bus for the loop tests: per-seat queues, redelivery after `nak`, and a
-//! record of every ack, nak and in-progress.
+//! An in-memory bus for the loop tests: per-seat queues, redelivery after `nak`, leases,
+//! and a record of every ack, nak and in-progress.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
@@ -12,7 +12,7 @@ use hgl_ai_proto::{HostRecord, Note, Seat, TreeRecord};
 use hgl_ai_tree::Registry;
 use tokio::sync::Notify;
 
-use crate::bus::{BusApi, DeliveryApi, InboxApi};
+use crate::bus::{BusApi, DeliveryApi, InboxApi, LeaseApi};
 use crate::disk::DiskProbe;
 
 /// JetStream's `max_deliver` of an inbox (docs/protocol.md §3).
@@ -39,6 +39,9 @@ struct Inner {
     trees: Mutex<BTreeMap<String, TreeRecord>>,
     events: Mutex<Vec<(u64, Ev)>>,
     seq: AtomicU64,
+    /// name -> (holder, revision)
+    leases: Mutex<HashMap<String, (String, u64)>>,
+    revision: AtomicU64,
 }
 
 #[derive(Clone, Default)]
@@ -55,6 +58,27 @@ impl FakeBus {
         let seq = self.0.seq.fetch_add(1, Ordering::SeqCst) + 1;
         self.enqueue(Seat::new(to).unwrap(), seq, 1, note);
         seq
+    }
+
+    /// Deliver again a note sent earlier as `seq` (JetStream redelivering it).
+    pub fn redeliver(&self, to: &str, seq: u64, note: Note) {
+        self.enqueue(Seat::new(to).unwrap(), seq, 2, note);
+    }
+
+    /// Who holds the lease `name`.
+    pub fn lease_holder(&self, name: &str) -> Option<String> {
+        g(&self.0.leases).get(name).map(|(h, _)| h.clone())
+    }
+
+    /// The lease `name` goes (its holder released it, or it expired).
+    pub fn drop_lease(&self, name: &str) {
+        g(&self.0.leases).remove(name);
+    }
+
+    /// Another holder takes the lease `name` (as after its expiry): ours is lost.
+    pub fn steal_lease(&self, name: &str, holder: &str) {
+        let rev = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        g(&self.0.leases).insert(name.into(), (holder.into(), rev));
     }
 
     fn enqueue(&self, seat: Seat, seq: u64, delivered: u64, note: Note) {
@@ -130,6 +154,7 @@ impl Registry for FakeBus {
 impl BusApi for FakeBus {
     type Inbox = FakeInbox;
     type Delivery = FakeDelivery;
+    type Lease = FakeLease;
 
     async fn inbox(&self, seat: &Seat) -> Result<FakeInbox> {
         Ok(FakeInbox {
@@ -163,6 +188,76 @@ impl BusApi for FakeBus {
             .values()
             .find(|h| h.seats.iter().any(|s| &s.seat == seat))
             .map(|h| h.host.clone()))
+    }
+    async fn lock_acquire(&self, name: &str, holder: &str) -> Result<FakeLease> {
+        let mut leases = g(&self.0.leases);
+        if let Some((h, _)) = leases.get(name) {
+            return Err(BusError::Held {
+                name: name.into(),
+                holder: h.clone(),
+                since: "earlier".into(),
+            });
+        }
+        let rev = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        leases.insert(name.into(), (holder.into(), rev));
+        Ok(FakeLease {
+            bus: self.clone(),
+            name: name.into(),
+            rev,
+        })
+    }
+    async fn lock_take_over(&self, name: &str, holder: &str, stale: &str) -> Result<FakeLease> {
+        let held = g(&self.0.leases).get(name).map(|(h, _)| h.clone());
+        match held {
+            None => self.lock_acquire(name, holder).await,
+            Some(h) if h == stale => {
+                let rev = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
+                g(&self.0.leases).insert(name.into(), (holder.into(), rev));
+                Ok(FakeLease {
+                    bus: self.clone(),
+                    name: name.into(),
+                    rev,
+                })
+            }
+            Some(h) => Err(BusError::Held {
+                name: name.into(),
+                holder: h,
+                since: "earlier".into(),
+            }),
+        }
+    }
+}
+
+pub struct FakeLease {
+    bus: FakeBus,
+    name: String,
+    rev: u64,
+}
+
+impl LeaseApi for FakeLease {
+    async fn refresh(&mut self) -> Result<()> {
+        let mut leases = g(&self.bus.0.leases);
+        match leases.get_mut(&self.name) {
+            Some((_, rev)) if *rev == self.rev => {
+                *rev = self.bus.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
+                self.rev = *rev;
+                Ok(())
+            }
+            _ => Err(BusError::LeaseLost {
+                name: self.name.clone(),
+            }),
+        }
+    }
+    async fn release(self) -> Result<bool> {
+        let mut leases = g(&self.bus.0.leases);
+        if leases
+            .get(&self.name)
+            .is_some_and(|(_, rev)| *rev == self.rev)
+        {
+            leases.remove(&self.name);
+            return Ok(true);
+        }
+        Ok(false)
     }
 }
 

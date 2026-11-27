@@ -1,4 +1,4 @@
-//! Host-level duties: heartbeat (§9), the `assign` gate (ROLE-16, ROLE-17), the daily
+//! Host-level duties: heartbeat (§9, with the seat leases' refresh), the `assign` gate (ROLE-16, ROLE-17), the daily
 //! report of stale trees and disk use (PROTO-15), and the cleanup receipt's text.
 
 use std::fmt::Write as _;
@@ -50,10 +50,10 @@ impl<B: BusApi> Bridge<B> {
             let host = &self.cfg.host;
             let body = match g {
                 Gate::Drain => format!(
-                    "[bridge] {host}: mode is drain; not taking `assign` notes (naked for later)."
+                    "[bridge] {host}: mode is drain; not taking `assign` notes (held until it opens)."
                 ),
                 Gate::LowDisk => format!(
-                    "[bridge] {host}: work_root has {} GB free, below min_free_gb {min}; not taking `assign` notes.",
+                    "[bridge] {host}: work_root has {} GB free, below min_free_gb {min}; not taking `assign` notes (held until it opens).",
                     free.unwrap_or(0)
                 ),
                 Gate::Open => format!("[bridge] {host}: taking `assign` notes again."),
@@ -96,6 +96,7 @@ impl<B: BusApi> Bridge<B> {
 
     pub(crate) async fn heartbeat_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         loop {
+            self.refresh_leases().await;
             self.beat().await;
             self.gate_check().await;
             tokio::select! {

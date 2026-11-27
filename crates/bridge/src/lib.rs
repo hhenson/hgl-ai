@@ -1,15 +1,16 @@
 //! The hgl-ai bridge daemon (docs/protocol.md §2, §3, §5, §6; docs/design.md §4).
 //!
-//! Per served seat: hold the seat lock, fetch the inbox, and per note either create the
-//! task's tree and run one headless agent turn in it (`assign`, `review`, and every
-//! other note), or remove the task's trees and send a cleanup receipt (`landed`,
-//! `closed`). One turn runs per seat at a time, and one per task directory, enforced by
-//! the directory's turn lock. Beside the seats: a heartbeat (`HGL_HOSTS`) and a daily
-//! report of stale trees and disk use.
+//! Per served seat: hold the seat lock and the hub's seat lease, fetch the inbox, and per
+//! note either create the task's tree and run one headless agent turn in it (`assign`,
+//! `review`, and every other note), or remove the task's trees and send a cleanup receipt
+//! (`landed`, `closed`). One turn runs per seat at a time, and one per task directory,
+//! enforced by the directory's turn lock. Beside the seats: a heartbeat (`HGL_HOSTS`, and
+//! the seat leases' refresh) and a daily report of stale trees and disk use.
 
 pub mod adapter;
 pub mod bus;
 pub mod disk;
+mod ended;
 pub mod lock;
 pub mod proc;
 pub mod prompt;
@@ -22,17 +23,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hgl_ai_bus::BusError;
 use hgl_ai_config::{Binding, Config, SeatConfig};
-use hgl_ai_proto::{Kind, Role, Runtime, Seat, TaskKey};
+use hgl_ai_proto::{Kind, Role, Runtime, Seat, TaskKey, seat_lock_key};
 use hgl_ai_tree::{IsClosed, Trees};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 
-pub use bus::{BusApi, DeliveryApi, InboxApi};
+pub use bus::{BusApi, DeliveryApi, InboxApi, LeaseApi};
 pub use disk::{DiskProbe, Statvfs};
 pub use hgl_ai_cap::Method as CapMethod;
 
+use crate::ended::EndedTasks;
 use crate::lock::FileLock;
 use crate::proc::{Stop, TreeSlot};
 use crate::turn::{Outcome, Target, TurnOut};
@@ -61,14 +64,14 @@ pub struct Options {
     pub fetch_wait: Duration,
     /// PROTO-8.
     pub nak_delay: Duration,
-    /// `assign` notes refused in drain mode or on low disk.
-    pub gate_delay: Duration,
     /// Retry of a task whose turn lock another process holds.
     pub busy_retry: Duration,
+    /// Also how often held `assign` notes are looked at again.
     pub in_progress_every: Duration,
+    /// Also the refresh of the seat leases.
     pub heartbeat_every: Duration,
     pub report_every: Duration,
-    /// Retry of a seat whose seat lock another process holds.
+    /// Retry of a seat whose seat lock or lease another process holds.
     pub seat_retry: Duration,
     pub turn_timeout: Duration,
     pub shutdown_grace: Duration,
@@ -88,7 +91,6 @@ impl Options {
             fetch_max: 8,
             fetch_wait: Duration::from_secs(30),
             nak_delay: Duration::from_secs(15),
-            gate_delay: Duration::from_secs(600),
             busy_retry: Duration::from_secs(30),
             in_progress_every: Duration::from_secs(60),
             heartbeat_every: Duration::from_secs(30),
@@ -129,9 +131,16 @@ pub struct Bridge<B: BusApi> {
     deps: Deps,
     opts: Options,
     gate: Mutex<Gate>,
-    /// Seats this bridge serves now (it holds their seat lock).
+    /// Seats this bridge serves now (it holds their seat lock and lease).
     served: Mutex<BTreeMap<Seat, Arc<SeatRt>>>,
+    /// The seat leases held (PROTO-6), refreshed with the heartbeat.
+    leases: tokio::sync::Mutex<BTreeMap<Seat, HeldLease<B::Lease>>>,
     turns: AtomicU64,
+}
+
+struct HeldLease<L> {
+    lease: L,
+    seat: Arc<SeatRt>,
 }
 
 /// One seat at run time: its configuration and current binding.
@@ -141,15 +150,20 @@ struct SeatRt {
     binding: Mutex<usize>,
     exhausted_told: AtomicBool,
     busy_told: Mutex<HashSet<Target>>,
+    /// Raised when a refresh finds the seat lease no longer ours.
+    lost: watch::Sender<bool>,
+    ended: Mutex<EndedTasks>,
 }
 
 impl SeatRt {
-    fn new(cfg: SeatConfig) -> Self {
+    fn new(cfg: SeatConfig, ended: EndedTasks) -> Self {
         SeatRt {
             cfg,
             binding: Mutex::new(0),
             exhausted_told: AtomicBool::new(false),
             busy_told: Mutex::default(),
+            lost: watch::Sender::new(false),
+            ended: Mutex::new(ended),
         }
     }
     fn name(&self) -> &Seat {
@@ -166,6 +180,12 @@ impl SeatRt {
         let i = *lock(&self.binding);
         (i, self.binding_at(i))
     }
+}
+
+/// How a seat loop ended.
+struct LoopEnd {
+    /// The seat lease was lost; whether a turn was running then.
+    lost: Option<bool>,
 }
 
 /// A turn in flight in a seat loop.
@@ -191,6 +211,7 @@ impl<B: BusApi> Bridge<B> {
             opts,
             gate: Mutex::new(Gate::Open),
             served: Mutex::default(),
+            leases: tokio::sync::Mutex::default(),
             turns: AtomicU64::new(0),
         })
     }
@@ -239,11 +260,17 @@ impl<B: BusApi> Bridge<B> {
             ));
         }
         tracing::info!(host = %self.cfg.host, seats = ?seats.iter().map(|s| s.name.to_string()).collect::<Vec<_>>(), "bridge starting");
+        let data = self.cfg.data_dir()?;
         let mut set = tokio::task::JoinSet::new();
         for s in seats {
+            let ended = EndedTasks::load(
+                data.join("bridge")
+                    .join("ended")
+                    .join(format!("{}.json", s.name)),
+            );
             set.spawn(
                 self.clone()
-                    .seat_main(Arc::new(SeatRt::new(s)), shutdown.clone()),
+                    .seat_main(Arc::new(SeatRt::new(s, ended)), shutdown.clone()),
             );
         }
         set.spawn(self.clone().heartbeat_loop(shutdown.clone()));
@@ -261,51 +288,171 @@ impl<B: BusApi> Bridge<B> {
         Ok(())
     }
 
-    /// Hold the seat lock (waiting while another process serves the seat), then serve it.
-    async fn seat_main(self: Arc<Self>, seat: Arc<SeatRt>, mut shutdown: watch::Receiver<bool>) {
+    /// Serve the seat while this bridge holds it (its seat lock and lease, [`Self::take_seat`]);
+    /// after a lost lease, wait to take it again.
+    async fn seat_main(self: Arc<Self>, seat: Arc<SeatRt>, shutdown: watch::Receiver<bool>) {
         let path = match self.cfg.seat_lock_path(seat.name()) {
             Ok(p) => p,
             Err(e) => return tracing::error!(seat = %seat.name(), "seat lock path: {e}"),
         };
-        let mut told = false;
-        let _held = loop {
-            if *shutdown.borrow() {
+        let mut down_rx = shutdown.clone();
+        loop {
+            let Some(held) = self.take_seat(&seat, &path, &mut down_rx).await else {
                 return;
-            }
-            match FileLock::try_exclusive(&path) {
-                Ok(Some(l)) => match self.bus.bridge_host(seat.name()).await {
-                    Ok(Some(h)) if h != self.cfg.host => {
-                        if !told {
-                            told = true;
-                            tracing::warn!(seat = %seat.name(), host = %h, "the bridge of another host serves this seat; waiting");
-                        }
+            };
+            // Advertise the seat before taking notes, so `note wait` refuses it (PROTO-6).
+            lock(&self.served).insert(seat.name().clone(), seat.clone());
+            self.beat().await;
+            let ended = self.clone().seat_loop(&seat, shutdown.clone()).await;
+            lock(&self.served).remove(seat.name());
+            self.beat().await;
+            // Released once the host record no longer lists the seat.
+            let lease = self.leases.lock().await.remove(seat.name());
+            if let Some(l) = lease {
+                match l.lease.release().await {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        tracing::warn!(seat = %seat.name(), "the seat lease was no longer ours at release")
                     }
-                    _ => break l,
-                },
-                Ok(None) if !told => {
-                    told = true;
-                    tracing::warn!(seat = %seat.name(), holder = ?lock::holder(&path), "seat is served elsewhere on this host (interactive session?); waiting for its lock");
+                    Err(e) => {
+                        tracing::warn!(seat = %seat.name(), "releasing the seat lease: {e}; it expires on its own")
+                    }
                 }
-                Ok(None) => {}
-                Err(e) => tracing::error!(seat = %seat.name(), "seat lock {}: {e}", path.display()),
+            }
+            drop(held);
+            let Some(stopped) = ended.lost else { return };
+            let body = format!(
+                "[bridge] {}/{}: the seat lease {} is no longer ours (it expired or another bridge took it); stopped serving the seat{}, naked its notes, and wait to take it again.",
+                self.cfg.host,
+                seat.name(),
+                seat_lock_key(seat.name()),
+                if stopped {
+                    ", stopped its running turn"
+                } else {
+                    ""
+                }
+            );
+            self.tell(seat.name(), Kind::Note, None, body).await;
+        }
+    }
+
+    /// Take the seat: the seat lock on this host, then the hub lease `seat.<seat>` with no
+    /// other host's bridge advertising the seat (PROTO-6). Waits, saying why once, while
+    /// another holder has either; `None` at shutdown.
+    async fn take_seat(
+        &self,
+        seat: &Arc<SeatRt>,
+        path: &std::path::Path,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Option<FileLock> {
+        let key = seat_lock_key(seat.name());
+        let holder = format!("{} pid {} (bridge)", self.cfg.host, std::process::id());
+        let mut told: Option<String> = None;
+        loop {
+            if *shutdown.borrow() {
+                return None;
+            }
+            let why = match FileLock::try_exclusive(path) {
+                Ok(Some(l)) => match self.acquire_seat_lease(&key, &holder).await {
+                    Ok(lease) => match self.bus.bridge_host(seat.name()).await {
+                        Ok(Some(h)) if h != self.cfg.host => {
+                            if let Err(e) = lease.release().await {
+                                tracing::warn!(seat = %seat.name(), "releasing the seat lease: {e}");
+                            }
+                            format!("the bridge of host {h} still advertises this seat")
+                        }
+                        _ => {
+                            seat.lost.send_replace(false);
+                            self.leases.lock().await.insert(
+                                seat.name().clone(),
+                                HeldLease {
+                                    lease,
+                                    seat: seat.clone(),
+                                },
+                            );
+                            if told.is_some() {
+                                tracing::info!(seat = %seat.name(), "seat lock and lease taken; serving");
+                            }
+                            return Some(l);
+                        }
+                    },
+                    Err(BusError::Held { holder, since, .. }) => {
+                        format!("the seat lease {key} is held by {holder} since {since}")
+                    }
+                    Err(e) => format!("taking the seat lease {key}: {e}"),
+                },
+                Ok(None) => format!(
+                    "seat is served elsewhere on this host (holder {:?}; interactive session?)",
+                    lock::holder(path)
+                ),
+                Err(e) => format!("seat lock {}: {e}", path.display()),
+            };
+            if told.as_deref() != Some(why.as_str()) {
+                tracing::warn!(seat = %seat.name(), "{why}; waiting");
+                told = Some(why);
             }
             tokio::select! {
                 _ = tokio::time::sleep(self.opts.seat_retry) => {}
-                _ = down(&mut shutdown) => return,
+                _ = down(shutdown) => return None,
             }
-        };
-        if told {
-            tracing::info!(seat = %seat.name(), "seat lock taken; serving");
         }
-        // Advertise the seat before taking notes, so `note wait` refuses it (PROTO-6).
-        lock(&self.served).insert(seat.name().clone(), seat.clone());
-        self.beat().await;
-        self.clone().seat_loop(&seat, shutdown).await;
-        lock(&self.served).remove(seat.name());
-        self.beat().await;
     }
 
-    async fn seat_loop(self: Arc<Self>, seat: &Arc<SeatRt>, mut shutdown: watch::Receiver<bool>) {
+    /// Take the seat lease, under the seat lock. A lease that names a bridge of this host
+    /// whose process is gone (a crash; or this process, after a refresh whose answer was
+    /// lost) is taken over at once rather than left to expire: no live bridge of this host
+    /// can serve the seat without the seat lock held here.
+    async fn acquire_seat_lease(&self, key: &str, holder: &str) -> hgl_ai_bus::Result<B::Lease> {
+        match self.bus.lock_acquire(key, holder).await {
+            Err(BusError::Held { holder: h, .. }) if self.dead_own_bridge(&h) => {
+                tracing::warn!(lease = key, stale = %h, "taking over the seat lease of a bridge of this host that is gone");
+                self.bus.lock_take_over(key, holder, &h).await
+            }
+            r => r,
+        }
+    }
+
+    /// `<host> pid <pid> (bridge)` of this host, with `pid` this process or a dead one.
+    fn dead_own_bridge(&self, holder: &str) -> bool {
+        let pid = holder
+            .strip_prefix(&format!("{} pid ", self.cfg.host))
+            .and_then(|r| r.strip_suffix(" (bridge)"))
+            .and_then(|p| p.parse::<u32>().ok());
+        match pid {
+            Some(p) if p == std::process::id() => true,
+            Some(p) => !proc_alive(p),
+            None => false,
+        }
+    }
+
+    /// Refresh every held seat lease (with the heartbeat); a lease no longer ours stops
+    /// its seat.
+    pub(crate) async fn refresh_leases(&self) {
+        let mut leases = self.leases.lock().await;
+        let mut lost = Vec::new();
+        for (seat, held) in leases.iter_mut() {
+            match held.lease.refresh().await {
+                Ok(()) => {}
+                Err(BusError::LeaseLost { .. }) => lost.push(seat.clone()),
+                Err(e) => tracing::warn!(%seat, "refreshing the seat lease: {e}; trying again"),
+            }
+        }
+        for seat in lost {
+            if let Some(held) = leases.remove(&seat) {
+                tracing::error!(%seat, "the seat lease is no longer ours; stopping the seat");
+                held.seat.lost.send_replace(true);
+            }
+        }
+    }
+
+    /// Serve until shutdown or a lost lease; the notes held at the end are naked.
+    async fn seat_loop(
+        self: Arc<Self>,
+        seat: &Arc<SeatRt>,
+        mut shutdown: watch::Receiver<bool>,
+    ) -> LoopEnd {
+        let mut lost = seat.lost.subscribe();
+        let mut end = LoopEnd { lost: None };
         let (tx, mut rx) = mpsc::channel::<B::Delivery>(64);
         let fetcher = tokio::spawn(self.clone().fetch_loop(
             seat.name().clone(),
@@ -333,6 +480,15 @@ impl<B: BusApi> Bridge<B> {
                         let _ = r.stop.send(Stop::Graceful(self.opts.shutdown_grace));
                     }
                 }
+                _ = down(&mut lost), if !stopping => {
+                    // Another bridge may serve the seat now: start nothing more, stop the
+                    // running turn at once, hand every note back.
+                    stopping = true;
+                    end.lost = Some(running.is_some());
+                    if let Some(r) = &running {
+                        let _ = r.stop.send(Stop::Graceful(Duration::ZERO));
+                    }
+                }
                 d = rx.recv(), if !stopping => match d {
                     Some(d) => self.on_delivery(seat, Arc::new(d), &mut pending, &mut running, &mut busy).await,
                     None => stopping = true,
@@ -356,6 +512,7 @@ impl<B: BusApi> Bridge<B> {
         for d in pending {
             let _ = d.nak(self.opts.nak_delay).await;
         }
+        end
     }
 
     async fn fetch_loop(
@@ -421,6 +578,14 @@ impl<B: BusApi> Bridge<B> {
             }
         }
         tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, from = %d.note().sender, "note");
+        if let Some(task) = d.note().task()
+            && lock(&seat.ended).moot(&task, seq)
+        {
+            // Sent before its task ended, delivered after (hgl-ai#2): moot.
+            tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, %task, "a note of an ended task sent before its end; acked");
+            let _ = d.ack().await;
+            return;
+        }
         if d.note().kind.ends_task() {
             self.end_task(seat, d, pending, running, busy).await;
         } else {
@@ -504,6 +669,9 @@ impl<B: BusApi> Bridge<B> {
                 Err(e) => errors.push(format!("removal panicked: {e}")),
             }
         }
+        if let Err(e) = lock(&seat.ended).end(task.clone(), d.seq()) {
+            tracing::warn!(seat = %seat.name(), %task, "recording the end of the task: {e}");
+        }
         if !removed.is_empty() || stopped || !errors.is_empty() {
             let body = service::cleanup_body(
                 &self.cfg.host,
@@ -521,78 +689,75 @@ impl<B: BusApi> Bridge<B> {
     }
 
     /// Start the next turn from `pending`: the first group of notes sharing a target that
-    /// is not busy. Gated `assign` notes are naked here.
+    /// is not busy. While the `assign` gate is closed (ROLE-16, ROLE-17), an `assign` that
+    /// would start a new task stays held in `pending`, kept alive, until the gate opens.
     async fn start_next(
         self: &Arc<Self>,
         seat: &Arc<SeatRt>,
         pending: &mut Vec<Arc<B::Delivery>>,
         busy: &HashMap<Target, Instant>,
     ) -> Option<Running<B::Delivery>> {
-        loop {
-            let now = Instant::now();
-            let plans: Vec<turn::Plan> =
-                pending.iter().map(|d| self.plan(seat, d.note())).collect();
-            let idx = plans
-                .iter()
-                .position(|p| busy.get(&p.target).is_none_or(|u| *u <= now))?;
-            let target = plans[idx].target.clone();
-            let mut group = Vec::new();
-            let mut creates = Vec::new();
-            let mut rest = Vec::new();
-            for (d, p) in pending.drain(..).zip(plans) {
-                if p.target == target {
-                    group.push(d);
-                    creates.push(p.create);
-                } else {
-                    rest.push(d);
-                }
-            }
-            *pending = rest;
-            let new_task = matches!(&target, Target::Tree { task, review: false } if self.trees.existing(seat.name(), task, false).is_none());
-            if new_task && group.iter().any(|d| d.note().kind == Kind::Assign) {
-                let gate = self.gate_check().await;
-                if gate != Gate::Open {
-                    let (assigns, others): (Vec<_>, Vec<_>) = group
-                        .into_iter()
-                        .partition(|d| d.note().kind == Kind::Assign);
-                    for a in assigns {
-                        tracing::info!(seat = %seat.name(), seq = a.seq(), ?gate, "assign refused for now");
-                        let _ = a.nak(self.opts.gate_delay).await;
-                    }
-                    pending.splice(0..0, others);
-                    continue;
-                }
-            }
-            let create = turn::choose_create(creates);
-            let hold = self.bus.state_get("hold").await.ok().flatten();
-            let mode = self.bus.state_get("mode").await.ok().flatten();
-            let (binding_idx, _) = seat.current();
-            let notes = group
-                .iter()
-                .map(|d| (d.seq(), d.delivered(), d.note().clone()))
-                .collect();
-            let (stop_tx, stop_rx) = watch::channel(Stop::None);
-            let slot = TreeSlot::default();
-            let job = turn::Job {
-                seat: seat.clone(),
-                target: target.clone(),
-                create,
-                notes,
-                hold,
-                mode,
-                binding_idx,
-                stop: stop_rx,
-                slot: slot.clone(),
+        let now = Instant::now();
+        let plans: Vec<turn::Plan> = pending.iter().map(|d| self.plan(seat, d.note())).collect();
+        let mut gate = None;
+        let mut held = Vec::with_capacity(plans.len());
+        for (d, p) in pending.iter().zip(&plans) {
+            let new_task = matches!(&p.target, Target::Tree { task, review: false } if self.trees.existing(seat.name(), task, false).is_none());
+            let gated = if d.note().kind == Kind::Assign && new_task {
+                let g = match gate {
+                    Some(g) => g,
+                    None => *gate.insert(self.gate_check().await),
+                };
+                g != Gate::Open
+            } else {
+                false
             };
-            let handle = tokio::spawn(self.clone().turn(job));
-            return Some(Running {
-                target,
-                deliveries: Arc::new(Mutex::new(group)),
-                stop: stop_tx,
-                handle,
-                slot,
-            });
+            held.push(gated);
         }
+        let idx = (0..plans.len())
+            .find(|&i| !held[i] && busy.get(&plans[i].target).is_none_or(|u| *u <= now))?;
+        let target = plans[idx].target.clone();
+        let mut group = Vec::new();
+        let mut creates = Vec::new();
+        let mut rest = Vec::new();
+        for ((d, p), h) in pending.drain(..).zip(plans).zip(held) {
+            if p.target == target && !h {
+                group.push(d);
+                creates.push(p.create);
+            } else {
+                rest.push(d);
+            }
+        }
+        *pending = rest;
+        let create = turn::choose_create(creates);
+        let hold = self.bus.state_get("hold").await.ok().flatten();
+        let mode = self.bus.state_get("mode").await.ok().flatten();
+        let (binding_idx, _) = seat.current();
+        let notes = group
+            .iter()
+            .map(|d| (d.seq(), d.delivered(), d.note().clone()))
+            .collect();
+        let (stop_tx, stop_rx) = watch::channel(Stop::None);
+        let slot = TreeSlot::default();
+        let job = turn::Job {
+            seat: seat.clone(),
+            target: target.clone(),
+            create,
+            notes,
+            hold,
+            mode,
+            binding_idx,
+            stop: stop_rx,
+            slot: slot.clone(),
+        };
+        let handle = tokio::spawn(self.clone().turn(job));
+        Some(Running {
+            target,
+            deliveries: Arc::new(Mutex::new(group)),
+            stop: stop_tx,
+            handle,
+            slot,
+        })
     }
 
     async fn finish(
@@ -741,6 +906,22 @@ impl<B: BusApi> Bridge<B> {
             tracing::warn!(kind = %kind, "sending to {CONTROLLER}: {e}");
         }
     }
+}
+
+/// Whether process `pid` exists on this host (`EPERM`: it exists, someone else's).
+#[cfg(unix)]
+fn proc_alive(pid: u32) -> bool {
+    let Ok(p) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    // SAFETY: signal 0 checks existence only.
+    let r = unsafe { libc::kill(p, 0) };
+    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+}
+
+#[cfg(not(unix))]
+fn proc_alive(_: u32) -> bool {
+    true
 }
 
 /// Resolves once `shutdown` is true (the guard of `wait_for` is not held past it).

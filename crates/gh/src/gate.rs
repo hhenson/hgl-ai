@@ -26,6 +26,7 @@ use serde_json::Value;
 
 use crate::bot::{BotView, Comment, Review};
 use crate::exec::{self, Gh};
+use crate::lock::LandLock;
 use crate::{Error, GateRules, Result, Settings, short, state};
 
 /// The pull request fields the gate reads (REST `pulls/N`).
@@ -249,6 +250,8 @@ pub enum Kind {
     Blocked,
     BotLimit,
     Behind,
+    /// `gh land`: `HGL_STATE/hold` was still active at the deadline; the gate did not run.
+    Hold,
     /// Dry run: the gate is satisfied and it would merge.
     WouldMerge,
     /// Dry run: it would bring the branch up to date.
@@ -264,6 +267,7 @@ impl Kind {
             Kind::Blocked => "BLOCKED",
             Kind::BotLimit => "BOTLIMIT",
             Kind::Behind => "BEHIND",
+            Kind::Hold => "HOLD",
             Kind::WouldMerge => "WOULD-MERGE",
             Kind::WouldUpdate => "WOULD-UPDATE",
         }
@@ -714,7 +718,8 @@ async fn fill<G: Gh>(
 }
 
 /// Run the gate on `repo#number` for the head `asked`. With `act`, bring the branch up to
-/// date or merge where the gate says so; without, say what it would do.
+/// date or merge where the gate says so; without, say what it would do. Under a landing
+/// lock, the lock is confirmed ours right before the merge ([`LandLock::confirm`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn evaluate<G: Gh>(
     gh: &G,
@@ -725,6 +730,7 @@ pub async fn evaluate<G: Gh>(
     asked: &str,
     opts: &Opts,
     act: bool,
+    lock: Option<&LandLock>,
 ) -> Result<Outcome> {
     hgl_ai_proto::check_head(asked)?;
     let rules = s.gate_rules(repo);
@@ -768,6 +774,9 @@ pub async fn evaluate<G: Gh>(
                 });
             }
             Step::Merge(line) => {
+                if let Some(l) = lock {
+                    l.confirm(&format!("merging {repo} #{number}")).await?;
+                }
                 let path = format!("repos/{}/pulls/{number}/merge", s.full(repo));
                 let res = exec::write(
                     gh,
@@ -1330,7 +1339,7 @@ mod tests {
         let s = settings();
         // A dry run on a read-only runner: the decision, and no write.
         let gh = crate::exec::ReadOnly(fake().on("pulls/7", &fixture("pr-open.json")));
-        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), false)
+        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), false, None)
             .await
             .unwrap();
         assert_eq!(o.kind, Kind::WouldMerge, "{}", o.line);
@@ -1339,7 +1348,7 @@ mod tests {
         let gh = fake()
             .once("pulls/7", &fixture("pr-open.json"))
             .on("pulls/7", &fixture("pr-merged.json"));
-        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true)
+        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true, None)
             .await
             .unwrap();
         assert_eq!(o.kind, Kind::Merged, "{}", o.line);
@@ -1361,16 +1370,26 @@ mod tests {
         // A merged pull request is reported as such; a short head is refused before any call.
         let gh = fake().on("pulls/7", &fixture("pr-merged.json"));
         assert_eq!(
-            evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true)
+            evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true, None)
                 .await
                 .unwrap()
                 .kind,
             Kind::AlreadyMerged
         );
         assert!(
-            evaluate(&gh, &s, None, REPO, 7, "1f461fa7", &Opts::default(), true)
-                .await
-                .is_err()
+            evaluate(
+                &gh,
+                &s,
+                None,
+                REPO,
+                7,
+                "1f461fa7",
+                &Opts::default(),
+                true,
+                None
+            )
+            .await
+            .is_err()
         );
     }
 
@@ -1394,7 +1413,7 @@ mod tests {
                 "graphql",
                 &fixture("threads-page2.json").replace("false", "true"),
             );
-        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true)
+        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true, None)
             .await
             .unwrap();
         assert_eq!(o.kind, Kind::Updated, "{}", o.line);

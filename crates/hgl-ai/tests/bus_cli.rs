@@ -286,6 +286,31 @@ fn bridged_seats_refuse_interactive_waits() {
     }
     let forced = hub.run(&["note", "wait", "w3", "--timeout", "1s", "--force"]);
     assert_eq!(forced.status.code(), Some(3), "{}", err(&forced));
+
+    // A held seat lease refuses too, with no host record (a bridge between the two).
+    let lease = rt.block_on(async {
+        let bus = hgl_ai_bus::Bus::connect_url(&hub.url, Some(hub.token()))
+            .await
+            .unwrap();
+        bus.lock_acquire("seat.w4", "build-2 pid 7 (bridge)")
+            .await
+            .unwrap()
+    });
+    for sub in ["wait", "peek"] {
+        let refused = hub.run(&["note", sub, "w4"]);
+        assert_eq!(refused.status.code(), Some(1), "{sub}");
+        assert!(
+            err(&refused)
+                .contains("seat w4 is held by build-2 pid 7 (bridge) (lease seat.w4 since"),
+            "{}",
+            err(&refused)
+        );
+    }
+    let forced = hub.run(&["note", "wait", "w4", "--timeout", "1s", "--force"]);
+    assert_eq!(forced.status.code(), Some(3), "{}", err(&forced));
+    rt.block_on(lease.release()).unwrap();
+    let free = hub.run(&["note", "wait", "w4", "--timeout", "1s"]);
+    assert_eq!(free.status.code(), Some(3), "{}", err(&free));
 }
 
 #[test]

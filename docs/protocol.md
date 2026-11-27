@@ -28,6 +28,8 @@ Status: proposed. Open decisions are issues in this repository.
   interactively, never both: `note wait` and `note peek` refuse a seat that a
   live `HGL_HOSTS` record lists, unless given `--force`. On one host, whoever
   serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`.
+  A bridge serves a seat only while it holds the lease `HGL_LOCKS/seat.<seat>`,
+  refreshed with its heartbeat; `note wait` and `note peek` refuse a held one.
 
 ```sh
 hgl-ai note send --to claude --issue 980 --kind ready --body-file ready.md
