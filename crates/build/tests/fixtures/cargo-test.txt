@@ -1,0 +1,33 @@
+{"reason":"compiler-artifact","package_id":"path+file:///work/src#demo@0.1.0","manifest_path":"/work/src/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/work/src/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/work/build/target/debug/deps/demo-1"],"executable":"/work/build/target/debug/deps/demo-1","fresh":true}
+{"reason":"build-finished","success":true}
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.05s
+     Running unittests src/lib.rs (/work/build/target/debug/deps/demo-1)
+
+running 5 tests
+test tests::adds ... ok
+test tests::subtracts ... FAILED
+test tests::divides ... FAILED
+test tests::slow ... ignored, needs a large machine
+test tests::parses ... ok
+
+failures:
+
+---- tests::subtracts stdout ----
+
+thread 'tests::subtracts' panicked at src/lib.rs:21:9:
+assertion `left == right` failed
+  left: 1
+ right: 2
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- tests::divides stdout ----
+thread 'tests::divides' panicked at 'attempt to divide by zero', src/lib.rs:30:5
+
+
+failures:
+    tests::divides
+    tests::subtracts
+
+test result: FAILED. 2 passed; 2 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

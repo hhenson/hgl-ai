@@ -570,7 +570,10 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         let mut svcs = if system_units {
             Vec::new()
         } else {
-            vec![(Service::Bridge, reinstall.clone())]
+            vec![
+                (Service::Bridge, reinstall.clone()),
+                (Service::Builder, reinstall.clone()),
+            ]
         };
         if c.server.is_some() || c.server_user.is_some() {
             svcs.push((Service::Hub, "`hgl-ai server install`".into()));
@@ -580,7 +583,9 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 "`hgl-ai server install --console-url https://<stable name>`".into(),
             ));
         }
-        let system = |s: Service| system_units || (s != Service::Bridge && c.server_user.is_some());
+        // The client's own services (bridge, builder) are never the server user's.
+        let client = |s: Service| matches!(s, Service::Bridge | Service::Builder);
+        let system = |s: Service| system_units || (!client(s) && c.server_user.is_some());
         for (s, install) in svcs {
             let name = format!("service {}", s.short());
             let st = if system(s) {
@@ -613,6 +618,12 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                     name,
                     "not installed on this hub host; the owner has no console",
                     install,
+                ),
+                State::NotInstalled if s == Service::Builder => Check::new(
+                    name,
+                    Level::Warn,
+                    "not installed (`client install --no-builder`?)",
+                    None,
                 ),
                 State::NotInstalled => Check::fail(name, "not installed", install),
             });
@@ -802,6 +813,7 @@ mod tests {
         }
         std::fs::create_dir_all(home.join(".config/systemd/user")).unwrap();
         std::fs::write(home.join(".config/systemd/user/hgl-ai-bridge.service"), "").unwrap();
+        std::fs::write(home.join(".config/systemd/user/hgl-ai-builder.service"), "").unwrap();
         f.on(|c| {
             let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
             match (c.program.as_str(), a.as_slice()) {

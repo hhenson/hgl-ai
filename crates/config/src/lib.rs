@@ -7,8 +7,10 @@ use std::time::Duration;
 use hgl_ai_proto::{Family, Role, Runtime, Seat, Tier};
 use serde::{Deserialize, Serialize};
 
+pub mod builder;
 pub mod console;
 pub mod github;
+pub use builder::{Builder, Remote};
 pub use console::{
     AppleOAuth, Console, GithubOAuth, GoogleOAuth, Identity, Ids, LinkedEntry, Member, Notify,
     Person, SmtpTls, Unresolved, User,
@@ -70,6 +72,8 @@ pub struct Config {
     /// configuration): that user, for `server status` and `doctor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server_user: Option<ServerUser>,
+    #[serde(default, skip_serializing_if = "Builder::is_default")]
+    pub builder: Builder,
 }
 
 /// The OS user the hub, coordinator and console run as (docs/install.md).
@@ -486,6 +490,7 @@ impl Config {
             server: None,
             console: None,
             server_user: None,
+            builder: Builder::default(),
         }
     }
 
@@ -559,6 +564,12 @@ impl Config {
                     s.name
                 )));
             }
+            if hgl_ai_proto::build::is_build_address(&s.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "a seat cannot be named `{}`: `builder-*` and `r-*` are builders' and builds' addresses",
+                    s.name
+                )));
+            }
             if s.headless && s.role != Role::Controller {
                 return Err(ConfigError::Invalid(format!(
                     "seat {}: `headless` is for a controller; the bridge serves every other seat",
@@ -581,6 +592,7 @@ impl Config {
         if let Some(c) = &self.console {
             c.validate().map_err(ConfigError::Invalid)?;
         }
+        builder::validate(&self.builder, &self.host).map_err(ConfigError::Invalid)?;
         for d in [
             &self.limits.stale_after,
             &self.limits.turn_timeout,
@@ -834,7 +846,13 @@ model = "claude-opus-5-5-high"
 
     #[test]
     fn reserved_seat_names() {
-        for name in ["all", "owner", "console"] {
+        for name in [
+            "all",
+            "owner",
+            "console",
+            "builder-lab1",
+            "r-20261127-083000-3fa9c1",
+        ] {
             let t = format!(
                 "host = \"h\"\n[[seat]]\nname = \"{name}\"\nrole = \"reviewer\"\nruntime = \"codex\"\ntier = \"fast\"\n"
             );

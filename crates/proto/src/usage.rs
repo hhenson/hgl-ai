@@ -1,4 +1,4 @@
-//! Subscription usage records (PROTO-21, PROTO-22): one record per login, keyed by the
+//! Subscription usage records (PROTO-23, PROTO-24): one record per login, keyed by the
 //! runtime and a fingerprint of the runtime's own account id. No id, email or token is
 //! ever part of a record.
 
@@ -79,7 +79,7 @@ pub struct UsageBucket {
     pub resets_at: Option<String>,
 }
 
-/// `HGL_USAGE/<runtime>.<account>` (PROTO-21).
+/// `HGL_USAGE/<runtime>.<account>` (PROTO-23).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageRecord {
     pub runtime: Runtime,
@@ -92,7 +92,7 @@ pub struct UsageRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub plan: Option<String>,
     /// When the source's numbers were true: the probe for claude and agy, the last Codex
-    /// turn's event for codex. The hub keeps the newest (PROTO-22).
+    /// turn's event for codex. The hub keeps the newest (PROTO-24).
     pub observed_at: String,
     /// When the collector ran.
     pub collected_at: String,

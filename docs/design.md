@@ -22,8 +22,9 @@ no GitHub or git library.
 | `gh` | Coordinator service, merge gate, landing, pin sync, release watch, tap release; `backlog` and `HGL_METRICS`. Landing and release watch hold the hub lease `HGL_LOCKS/lock.land.<repo>`, so they exclude each other across hosts. | `proto`, `config`, `bus` |
 | `owner` | Owner channel: thread records, events, the console's fold, status reports, `decisions.log`. | `proto`, `bus` |
 | `notify` | Owner notifications: ntfy, Slack webhook, SMTP; first channel that accepts. | `config` |
-| `usage` | The usage collector: the claude, codex and agy sources, account fingerprints, the `usage show` table (PROTO-21). | `proto` |
+| `usage` | The usage collector: the claude, codex and agy sources, account fingerprints, the `usage show` table (PROTO-23). | `proto` |
 | `console` | The owner's web console: pages, telemetry, passkey and OAuth sign-in, the fold, ticks. | `proto`, `config`, `bus`, `owner`, `gh`, `notify` |
+| `build` | Recipes, output parsers, bounded summaries, executors (this host under `cap`; a remote over one owned ssh connection), the build driver, the builder service (`docs/build.md`). | `proto`, `config`, `bus`, `cap`, `tree` |
 | `hgl-ai` | The `clap` command line; thin over the crates. | all |
 
 Async runtime `tokio`; NATS client `async-nats`; errors `anyhow` at the edge,
@@ -42,7 +43,7 @@ hgl-ai server install [--listen ADDR] [--port 4222] [--store DIR] [--users] [--n
 hgl-ai server start|stop|status|uninstall
 hgl-ai server user add NAME --role seat|coord|console|admin [--nkey PUBKEY] [--rotate]
 hgl-ai server user list|remove NAME
-hgl-ai client install --hub URL --token-file FILE --host LABEL [--work-root DIR]
+hgl-ai client install --hub URL --token-file FILE --host LABEL [--work-root DIR] [--no-builder]
 hgl-ai client uninstall
 hgl-ai init                               provision stream and buckets (idempotent)
 hgl-ai doctor                             check config, hub, CLIs, skills, services, disk
@@ -61,7 +62,7 @@ hgl-ai note peek SEAT                     print what the inbox has not acked; sp
 hgl-ai state get|put|del KEY [VALUE|-] [--if-revision N]
 hgl-ai state append KEY LINE|-
 hgl-ai hosts
-hgl-ai usage collect [--runtime R ...] [--dry-run]   one record per signed-in login (PROTO-21)
+hgl-ai usage collect [--runtime R ...] [--dry-run]   one record per signed-in login (PROTO-23)
 hgl-ai usage show                         every login's limits, with hours to reset
 hgl-ai usage label ACCOUNT LABEL          an owner's label for a fingerprint; empty removes it
 
@@ -83,6 +84,16 @@ hgl-ai ask --title T --priority P [--issue R#N] [--context-file F] --question Q 
 hgl-ai thread list|show|reply|withdraw
 hgl-ai status post|list
 hgl-ai decision add|tail
+hgl-ai build run [REPO] [--steps A,B] [--platform P [--builder L] [--base REF]] [--keep-going]
+                [--detach] [--notify SEAT] [--dir D] [--log-dir D] [--recipe FILE]
+hgl-ai build status|wait ID [--timeout DUR]
+hgl-ai build list [--repo R] [--failed] [--limit N]
+hgl-ai build log ID [STEP] [--bytes START-END]
+hgl-ai build shell --platform P [REPO] [--head SHA]
+hgl-ai build recipe show|edit|import|export|history [REPO|FILE] [--rev N]
+hgl-ai builder run                        the builder service (the user service runs this)
+hgl-ai builder list
+hgl-ai builder drain|retire|resume LABEL
 ```
 
 Every `gh` command takes `--dry-run`. Exit status: 0 success, 1 failure, 2 usage,
@@ -142,11 +153,22 @@ fast = "gemini-3.8-flash"
 
 [[seat]]
 name = "w1"
-role = "implementor"                   # controller|triage|implementor|reviewer
+role = "implementor"                   # controller|architect|triage|implementor|reviewer
 runtime = "codex"                      # claude|codex|agy
 tier = "frontier"                      # or `model = "<slug>"` to pin one
 effort = "high"
 fallback = [{ runtime = "agy", family = "claude", tier = "frontier" }]
+
+[builder]                              # all optional
+concurrency = 1                        # builds at a time on this host
+sdk = { hgraph = "~/sdk/hgraph" }      # needs = ["sdk:hgraph"]; steps see HGL_SDK_HGRAPH
+local = true                           # false: only drive the remotes
+
+[[builder.remote]]                     # a proxy builder's remote (docs/build.md §2a)
+platform = "windows"
+ssh = "winbox"
+work_dir = "C:/hgl-ai/work"
+shell = "powershell"
 
 [server]                               # hub host only
 listen = "127.0.0.1"
@@ -264,6 +286,7 @@ for all four.
 | Coordinator | server user | `hgl-ai-coord.service`: `hgl-ai gh coord run` | `io.github.hhenson.hgl-ai.coord` |
 | Console | server user | `hgl-ai-console.service`: `hgl-ai console run` | `io.github.hhenson.hgl-ai.console` |
 | Bridge | owner | `systemd --user` `hgl-ai-bridge.service`: `hgl-ai bridge run` | LaunchAgent `io.github.hhenson.hgl-ai.bridge` |
+| Builder | owner | `systemd --user` `hgl-ai-builder.service`: `hgl-ai builder run` | LaunchAgent `io.github.hhenson.hgl-ai.builder` |
 
 Linux services enable lingering (`loginctl enable-linger`) when the user
 allows it, so they survive logout.

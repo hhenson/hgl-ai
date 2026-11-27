@@ -13,14 +13,16 @@ pub enum Service {
     Bridge,
     Coord,
     Console,
+    Builder,
 }
 
 impl Service {
-    pub const ALL: [Service; 4] = [
+    pub const ALL: [Service; 5] = [
         Service::Hub,
         Service::Bridge,
         Service::Coord,
         Service::Console,
+        Service::Builder,
     ];
 
     pub fn short(self) -> &'static str {
@@ -29,6 +31,7 @@ impl Service {
             Service::Bridge => "bridge",
             Service::Coord => "coord",
             Service::Console => "console",
+            Service::Builder => "builder",
         }
     }
     /// `hgl-ai-<short>.service`
@@ -45,6 +48,7 @@ impl Service {
             Service::Bridge => "hgl-ai bridge",
             Service::Coord => "hgl-ai coordinator",
             Service::Console => "hgl-ai owner console",
+            Service::Builder => "hgl-ai builder",
         }
     }
 }
@@ -79,6 +83,7 @@ impl Spec {
         let args = match service {
             Service::Coord => vec!["gh", "coord", "run"],
             Service::Console => vec!["console", "run"],
+            Service::Builder => vec!["builder", "run"],
             _ => vec!["bridge", "run"],
         };
         Spec {

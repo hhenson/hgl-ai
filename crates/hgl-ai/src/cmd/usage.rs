@@ -1,4 +1,4 @@
-//! `hgl-ai usage collect|show|label` (docs/protocol.md PROTO-21, PROTO-22).
+//! `hgl-ai usage collect|show|label` (docs/protocol.md PROTO-23, PROTO-24).
 
 use hgl_ai_bus::{Bus, UsagePut};
 use hgl_ai_proto::Runtime;

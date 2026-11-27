@@ -1,0 +1,29 @@
+   Compiling demo v0.1.0 (/work/src)
+{"reason":"compiler-artifact","package_id":"path+file:///work/src#demo@0.1.0","manifest_path":"/work/src/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/work/src/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":false},"features":[],"filenames":["/work/src/target/debug/deps/libdemo-21dab3a1347fbbe2.rlib","/work/src/target/debug/deps/libdemo-21dab3a1347fbbe2.rmeta"],"executable":null,"fresh":false}
+{"reason":"compiler-artifact","package_id":"path+file:///work/src#demo@0.1.0","manifest_path":"/work/src/Cargo.toml","target":{"kind":["lib"],"crate_types":["lib"],"name":"demo","src_path":"/work/src/src/lib.rs","edition":"2024","doc":true,"doctest":true,"test":true},"profile":{"opt_level":"0","debuginfo":2,"debug_assertions":true,"overflow_checks":true,"test":true},"features":[],"filenames":["/work/src/target/debug/deps/demo-7e8058a2c8442f1e"],"executable":"/work/src/target/debug/deps/demo-7e8058a2c8442f1e","fresh":false}
+{"reason":"build-finished","success":true}
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.09s
+     Running unittests src/lib.rs (target/debug/deps/demo-7e8058a2c8442f1e)
+
+running 2 tests
+test tests::adds ... ok
+test tests::checks_math ... FAILED
+
+failures:
+
+---- tests::checks_math stdout ----
+setup line before assertion
+
+thread 'tests::checks_math' (3116192) panicked at src/lib.rs:11:9:
+assertion `left == right` failed
+  left: 41
+ right: 42
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    tests::checks_math
+
+test result: FAILED. 1 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `--lib`

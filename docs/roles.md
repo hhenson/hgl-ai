@@ -27,7 +27,7 @@ Open decisions are issues in this repository.
 - **ROLE-3 — Triage** (seat `triage`). Owns intake: labels and slices new
   issues, folds duplicates, keeps the claimable backlog ordered, and batches
   questions for the owner into one labelled list. Gives every task its class
-  (simple, standard or complex, §3), which picks the model that does it. Writes no
+  (simple, standard or complex, §3), which picks the seat, and so the model, that does it. Writes no
   code. Workers claim only what triage labelled ready.
 - **ROLE-4 — Architect** (seat `architect`). Works with the owner, through the owner
   channel (`docs/owner.md`), to expand features and to engineer refactoring and design
@@ -53,13 +53,16 @@ Open decisions are issues in this repository.
     merged onto `main`, one run at a time, and sends a factual receipt. Not part of
     this repository.
   - *bridge*: delivers notes, runs agent turns, owns worktrees (protocol §5).
-  - *builder* (proposed, not implemented): runs build recipes for local and remote
-    requests and the merge queue, and returns bounded summaries (`docs/build.md`).
+  - *builder*: runs build recipes for local and remote requests (the merge queue's
+    too, once it exists), and returns bounded summaries (`docs/build.md`).
   - *merge queue* (proposed, not implemented): builds approved pull requests in
     batches on every platform and lands them (`docs/build.md` §3).
-- **ROLE-8 — Build agent** (seat `build`; proposed, not implemented). Writes and
-  repairs recipes, provisions toolchains and SDKs, diagnoses failures of the build
-  itself; never changes the code under build.
+- **ROLE-8 — Build agent** (proposed, not implemented). Proposes recipe changes as
+  pull requests (a repository's recipe lives in its `recipes/`; the hub's admin imports
+  it), provisions toolchains and SDKs, diagnoses failures of the build itself; never
+  changes the code under build. It gets no seat role while seats share their host's
+  hub credential (hgl-ai#16); until then a build that is *not run* goes to the
+  controller.
 
 ## 2. Gates
 
@@ -134,6 +137,13 @@ Triage classes each task when it labels it ready, and the `assign` note carries 
 A task whose work turns out to change behaviour is reclassed by its seat with a `blocked`
 note; triage reassigns it. ROLE-15 moves a class up after two sendbacks.
 
+The class picks the seat, not the model (controller, 2026-11-27, hgl-ai#25): triage
+assigns a task (`hgl-ai note send --kind assign --class C`) to a seat whose binding is the
+row for its class. A seat runs its own binding, and its fallbacks, whatever the class; the
+bridge records the class with the task and names it in the prompt (PROTO-21). A task moves
+to a seat for a higher class in one step, `hgl-ai gh sendback REPO PR HEAD --class C --to
+SEAT` (ROLE-15); no `assign` follows.
+
 The gate's reviewer is never of the author's family (ROLE-11). The GitHub review bot is
 a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the gate.
 
@@ -141,7 +151,12 @@ a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the g
   subscriptions (GPT implements runtime work, Claude refactors and tooling, Gemini
   reviews and checker work); when one runs out, its rows move to their second choice.
 - **ROLE-15 — Escalate once.** A task whose work is sent back twice for the same
-  finding moves up a class (simple to standard, standard to complex).
+  finding moves up a class (simple to standard, standard to complex). The controller
+  judges "the same finding" and sends that second sendback with the next class and a
+  seat for it: `hgl-ai gh sendback REPO PR HEAD --class C --to SEAT`. Only SEAT gets the
+  note; its bridge makes its tree on the pull request's branch at class C (the note's
+  class wins over the older record) and wakes no other seat. No `assign` follows. Later
+  verdicts without `--to` reach only SEAT, the task's current seat.
 - **ROLE-16 — Record the model.** `ready` notes and receipts name the family
   and model that did the work, so ROLE-11 can be checked.
 

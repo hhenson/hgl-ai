@@ -746,6 +746,11 @@ impl<B: BusApi> Bridge<B> {
             }
         }
         tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, from = %d.note().sender, "note");
+        if d.note().kind == Kind::Build {
+            // Only builders take `build` jobs (docs/build.md BUILD-6, hgl-ai#15): no turn.
+            self.refuse_build(seat.name(), &d).await;
+            return;
+        }
         // Every note passes here before it can start a turn.
         if let Some(task) = d.note().task() {
             match self.known_end(seat, &task, seq).await {
@@ -1528,6 +1533,25 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
+    /// Terminate a `build` note sent to an agent seat and tell its sender.
+    async fn refuse_build(&self, seat: &Seat, d: &B::Delivery) {
+        let n = d.note();
+        tracing::warn!(%seat, seq = d.seq(), from = %n.sender, "a build job at an agent seat; terminated");
+        if let Err(e) = d.term().await {
+            tracing::warn!(%seat, seq = d.seq(), "terminating: {e}");
+        }
+        let body = format!(
+            "[bridge] Not a builder: {seat} is an agent seat, so your `build` note (seq {}) was dropped. Builders take jobs at `builder-<label>`; use `hgl-ai build run --platform P` (`hgl-ai builder list`).",
+            d.seq()
+        );
+        let mut r = hgl_ai_proto::Note::new(seat.clone(), n.sender.clone(), Kind::Note, body);
+        r.repo = n.repo.clone();
+        r.issue = n.issue;
+        if let Err(e) = self.bus.send(&r).await {
+            tracing::warn!(%seat, "telling {}: {e}", n.sender);
+        }
+    }
+
     /// Send a note to the controller (`[github] controller`); failures are logged.
     async fn tell(&self, from: &Seat, kind: Kind, task: Option<&TaskKey>, body: String) {
         let to = match self.cfg.controller() {
@@ -1574,6 +1598,9 @@ fn describe_note(seq: u64, n: &Note) -> String {
     }
     if let Some(x) = &n.base {
         h.push_str(&format!(" base={x}"));
+    }
+    if let Some(x) = n.class {
+        h.push_str(&format!(" class={x}"));
     }
     format!("{h} at {}\n{}", n.created_at, n.body)
 }

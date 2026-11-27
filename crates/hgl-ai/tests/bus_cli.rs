@@ -164,7 +164,7 @@ fn notes_send_wait_peek() {
     };
     assert_eq!(
         ok(&hub.run(&["init"])),
-        "provisioned HGL_NOTES HGL_OWNER HGL_USAGE_LOG HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS HGL_ENDED HGL_THREADS HGL_METRICS HGL_CONSOLE HGL_USAGE\n"
+        "provisioned HGL_NOTES HGL_OWNER HGL_USAGE_LOG HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS HGL_ENDED HGL_THREADS HGL_METRICS HGL_CONSOLE HGL_USAGE HGL_BUILD\n"
     );
     ok(&hub.run(&["init"]));
 
@@ -559,7 +559,7 @@ fn cap_passes_status_and_reports_limits() {
 }
 
 /// `usage collect`, `show` and `label` against a live hub, the sources being the captured
-/// fixtures behind stand-in CLIs (PROTO-21, PROTO-22).
+/// fixtures behind stand-in CLIs (PROTO-23, PROTO-24).
 #[test]
 fn usage_collect_show_label() {
     use std::os::unix::fs::PermissionsExt as _;

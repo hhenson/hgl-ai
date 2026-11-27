@@ -18,6 +18,7 @@ hgl-ai-tree = { path = "crates/tree" }
 hgl-ai-bridge = { path = "crates/bridge" }
 hgl-ai-install = { path = "crates/install" }
 hgl-ai-gh = { path = "crates/gh" }
+hgl-ai-build = { path = "crates/build" }
 hgl-ai-owner = { path = "crates/owner" }
 hgl-ai-notify = { path = "crates/notify" }
 hgl-ai-console = { path = "crates/console" }

@@ -14,12 +14,12 @@ What `hgl-ai` does now:
 - [docs/design.md](docs/design.md): crates, command line, configuration, services.
 - [docs/install.md](docs/install.md): hub, clients, agents.
 - [docs/work.md](docs/work.md): how a seat works an issue: labels, claiming, branches, pull requests, blocking.
+- [docs/build.md](docs/build.md): build recipes, the build tool and its summaries, builders and proxy builders (the merge queue, §3, is proposed).
 
 Proposed, not implemented:
 
 - [docs/owner.md](docs/owner.md): the owner channel (status, questions, conversations) and the console with telemetry.
 - [docs/fleet.md](docs/fleet.md): hosts register with the hub, which gives each its workers and roles.
-- [docs/build.md](docs/build.md): build recipes, the build tool and its summaries, the merge queue.
 
 ## Install
 
@@ -77,6 +77,8 @@ Every install command takes `--dry-run`.
 | `crates/owner` | Owner channel: threads, events, status reports, decision log. |
 | `crates/notify` | Owner notifications: ntfy, Slack, email. |
 | `crates/console` | The owner's web console: sign-in, threads, telemetry. |
+| `crates/build` | Build recipes, parsers, summaries, executors, the builder service. |
 | `crates/hgl-ai` | The command line. |
 
-`skill/SKILL.md` is the skill every agent CLI loads.
+`skill/SKILL.md` is the skill every agent CLI loads. `recipes/` holds the build recipes
+(`hgl-ai build recipe import recipes/<repo>.toml`).

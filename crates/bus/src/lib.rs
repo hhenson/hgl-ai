@@ -34,7 +34,7 @@
 //!   credential: the legacy shared token or a hub user's NKey seed (OWN-5).
 //! - [`Bus::usage_put`] keeps the newest usage record per login in `HGL_USAGE`
 //!   (compare-and-set on `observed_at`) and publishes it to `HGL_USAGE_LOG`;
-//!   [`Bus::usage`] lists them with their labels (PROTO-21, PROTO-22).
+//!   [`Bus::usage`] lists them with their labels (PROTO-23, PROTO-24).
 //! - A publish the connection's hub user may not make fails with [`BusError::Denied`].
 //!
 //! Nothing here starts a hub; the operations other than `connect*` and
@@ -66,6 +66,9 @@ use hgl_ai_proto::{
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use tokio::sync::OnceCell;
+
+mod build;
+pub use build::BUILD_HISTORY;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BusError {
@@ -138,7 +141,7 @@ pub const INBOX_MAX_DELIVER: i64 = -1;
 pub const MAX_NOTE_BYTES: usize = 1 << 20;
 /// Largest value a bucket holds.
 pub const MAX_VALUE_BYTES: usize = 1 << 20;
-/// `HGL_USAGE_LOG` keeps usage records 35 days, the burn-down history (PROTO-21).
+/// `HGL_USAGE_LOG` keeps usage records 35 days, the burn-down history (PROTO-23).
 pub const USAGE_MAX_AGE: Duration = Duration::from_secs(35 * 86_400);
 /// Attempts [`Bus::append_line`] makes before giving up with [`BusError::Conflict`].
 const APPEND_ATTEMPTS: u32 = 200;
@@ -242,6 +245,7 @@ pub struct Bus {
     metrics: OnceCell<kv::Store>,
     console: OnceCell<kv::Store>,
     usage: OnceCell<kv::Store>,
+    build: OnceCell<kv::Store>,
 }
 
 impl Bus {
@@ -318,6 +322,7 @@ impl Bus {
             metrics: OnceCell::new(),
             console: OnceCell::new(),
             usage: OnceCell::new(),
+            build: OnceCell::new(),
         })
     }
 
@@ -509,6 +514,7 @@ impl Bus {
                 1,
                 Duration::ZERO,
             ),
+            build::BUCKET,
         ];
         for (bucket, description, storage, history, max_age) in buckets {
             self.js
@@ -887,10 +893,11 @@ impl Bus {
             .map_err(|e| nats(&format!("deleting host {host}"), e))
     }
 
-    /// Every live host record, ordered by host label.
+    /// Every live host record, ordered by host label (builder records are apart:
+    /// [`Bus::builders`]).
     pub async fn hosts(&self) -> Result<Vec<HostRecord>> {
         let store = self.store(&self.hosts, KV_HOSTS).await?;
-        list_json(store).await
+        list_json_where(store, |k| !build::is_builder_key(k)).await
     }
 
     /// The live host whose bridge serves `seat`, if any. A seat is served by a
@@ -1433,10 +1440,21 @@ async fn put_json<T: Serialize>(store: &kv::Store, key: &str, rec: &T) -> Result
 /// Every live value of a JSON bucket, ordered by key. A value that does not
 /// parse is logged and skipped.
 async fn list_json<T: DeserializeOwned>(store: &kv::Store) -> Result<Vec<T>> {
+    list_json_where(store, |_| true).await
+}
+
+/// [`list_json`] of the keys `keep` accepts.
+async fn list_json_where<T: DeserializeOwned>(
+    store: &kv::Store,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<T>> {
     let mut keys = store.keys().await.map_err(|e| nats("listing keys", e))?;
     let mut names = Vec::new();
     while let Some(k) = keys.next().await {
-        names.push(k.map_err(|e| nats("listing keys", e))?);
+        let k = k.map_err(|e| nats("listing keys", e))?;
+        if keep(&k) {
+            names.push(k);
+        }
     }
     names.sort();
     names.dedup();

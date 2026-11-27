@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use hgl_ai_bus::Credential;
+use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS,
     KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
@@ -251,8 +252,9 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     .to_vec();
     let buckets = [
         KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_USAGE,
+        KV_BUILD,
     ];
-    // The usage history (PROTO-22) is read by every role through short-lived consumers.
+    // The usage history (PROTO-24) is read by every role through short-lived consumers.
     let mut streams: Vec<String> = vec![STREAM_NOTES.to_string(), STREAM_USAGE.to_string()];
     streams.extend(buckets.iter().map(|b| kv(b)));
     if role == Role::Console {
@@ -278,8 +280,12 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_USAGE] {
                 allow.push(format!("$KV.{b}.>"));
             }
-            // Usage records and their history (PROTO-21).
+            // Usage records and their history (PROTO-23).
             allow.push(format!("{USAGE_PREFIX}.>"));
+            // `HGL_BUILD`: the run summaries builders and `build run` keep. The recipes,
+            // which every builder runs, only the admin user writes: seats share their
+            // host's credential, so no seat may (docs/build.md BUILD-1).
+            allow.push(format!("$KV.{KV_BUILD}.run.>"));
             if role == Role::Coord {
                 allow.push(format!("$KV.{KV_METRICS}.>"));
             }
@@ -430,6 +436,24 @@ mod tests {
         ] {
             assert!(seat.publish_deny.iter().any(|x| x == d), "{d}");
         }
+        // Builders and `build run` keep runs; a build job is a note; recipes are the
+        // admin's.
+        assert!(
+            seat.publish_allow
+                .iter()
+                .any(|a| a == "$KV.HGL_BUILD.run.>")
+        );
+        assert!(
+            !seat
+                .publish_allow
+                .iter()
+                .any(|a| a.starts_with("$KV.HGL_BUILD.recipe"))
+        );
+        assert!(
+            seat.publish_allow
+                .iter()
+                .any(|a| a == "$JS.API.CONSUMER.CREATE.KV_HGL_BUILD.>")
+        );
         let coord = permissions(Role::Coord).unwrap();
         assert!(coord.publish_allow.iter().any(|a| a == "$KV.HGL_METRICS.>"));
         assert!(!seat.publish_allow.iter().any(|a| a == "$KV.HGL_METRICS.>"));

@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- written by --gtest_output=xml -->
+<testsuites tests="3" failures="1" disabled="1" errors="0" name="AllTests">
+  <testsuite name="Clock" tests="3" failures="1" disabled="1" errors="0">
+    <testcase name="Ticks" status="run" result="completed" time="0" classname="Clock"/>
+    <testcase name="Rewinds" status="run" result="completed" time="0.001" classname="Clock">
+      <failure message="/work/src/tests/clock.cpp:40&#x0A;Expected equality of these values:&#x0A;  now&#x0A;  start" type=""><![CDATA[/work/src/tests/clock.cpp:40
+Expected equality of these values:
+  now
+  start]]></failure>
+    </testcase>
+    <testcase name="DISABLED_Skips" status="notrun" result="suppressed" time="0" classname="Clock"/>
+  </testsuite>
+</testsuites>

@@ -159,7 +159,7 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
     );
     seat_bus.hosts().await.unwrap();
     seat_bus.trees().await.unwrap();
-    // Usage records, their history and labels (PROTO-21).
+    // Usage records, their history and labels (PROTO-23).
     let usage = hgl_ai_proto::UsageRecord {
         runtime: hgl_ai_proto::Runtime::Codex,
         account: hgl_ai_proto::account_fingerprint("acct"),
@@ -185,7 +185,7 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
         seat_bus.usage().await.unwrap()[0].label.as_deref(),
         Some("team")
     );
-    // Every role reads the usage history (PROTO-22).
+    // Every role reads the usage history (PROTO-24).
     for who in ["build-1", "hub-coord", "console"] {
         let got = hub
             .bus(who)
@@ -445,4 +445,40 @@ async fn a_reload_keeps_connections() {
     let text_err = Bus::connect_with(&hub.url, hgl_ai_bus::parse_credential(&text).unwrap()).await;
     assert!(text_err.is_err(), "build-2 was removed");
     send("still").await;
+}
+
+/// Carbon's finding 4 on #12: a seat keeps build runs but may not write recipes, which
+/// every builder runs.
+#[tokio::test]
+async fn seats_keep_build_runs_but_not_recipes() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let recipe = b"repo = \"demo\"\n[[step]]\nname = \"t\"\nrun = \"true\"\n";
+    admin.build_put("recipe.demo", recipe).await.unwrap();
+    let seat_bus = hub.bus("build-1").await;
+    seat_bus
+        .build_put("run.20261127-120000-aaaaaa", b"{}")
+        .await
+        .unwrap();
+    seat_bus
+        .build_del("run.20261127-120000-aaaaaa")
+        .await
+        .unwrap();
+    assert!(
+        seat_bus.build_get("recipe.demo").await.unwrap().is_some(),
+        "seats read recipes"
+    );
+    denied(seat_bus.build_put("recipe.demo", b"repo = \"evil\"").await);
+    denied(seat_bus.build_del("recipe.demo").await);
+    assert_eq!(
+        admin.build_get("recipe.demo").await.unwrap().unwrap().value,
+        recipe
+    );
+    // No hub role but the admin writes recipes: seats share one host credential, so a
+    // recipe-writing seat role would hand every seat of its host the fleet's builders
+    // (Carbon's second review of #12, finding 1). Recipes change by pull request and the
+    // admin imports them.
+    assert!("build".parse::<Role>().is_err(), "no `build` hub role");
+    admin.build_del("recipe.demo").await.unwrap();
 }

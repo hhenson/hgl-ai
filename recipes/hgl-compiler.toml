@@ -1,0 +1,131 @@
+# hgl-compiler (draft): the CI jobs of .github/workflows/ci.yml as steps.
+# The C++ steps need the hgraph SDK and its dependency prefix on the builder:
+#   [builder.sdk]
+#   hgraph = "~/sdk/hgraph"            # scripts/provision-hgraph-sdk.sh TAG DIR
+#   hgraph-deps = "~/sdk/hgraph-deps"  # fmt, spdlog, simdjson, CMake, Ninja
+# Steps see them as HGL_SDK_HGRAPH and HGL_SDK_HGRAPH_DEPS. Submodules (the
+# pinned hgl_spec and hgl_core) are checked out with the head.
+repo = "hgl-compiler"
+env = { CARGO_TERM_COLOR = "never", CARGO_INCREMENTAL = "0", CARGO_PROFILE_DEV_DEBUG = "0" }
+
+# --- lint (ci.yml `lint`) ---
+
+[[step]]
+name = "fmt"
+run = "cargo fmt --check"
+memcap_gb = 4
+time = "10m"
+parser = "lines"
+patterns = { error = ['^Diff in (?P<file>.+?):(?P<line>\d+):'] }
+
+[[step]]
+name = "clippy"
+run = "cargo clippy --workspace --all-targets --locked --message-format=json -- -D warnings"
+memcap_gb = 64
+time = "40m"
+parser = "cargo"
+
+# --- test (ci.yml `test`, all three platforms) ---
+
+[[step]]
+name = "test"
+run = "cargo test --workspace --locked --message-format=json"
+memcap_gb = 64
+time = "60m"
+parser = "cargo"
+
+# --- cpp (ci.yml `cpp`): libhglrt and its tests, plain then sanitized; GCC 15 ---
+# Each step that needs the SDK names it as the compiler expects:
+#   HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS".
+
+[[step]]
+name = "runtime-plain"
+run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && cmake -S runtime/cpp -B "$HGL_AI_BUILD_DIR/cpp-plain" -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build "$HGL_AI_BUILD_DIR/cpp-plain"'
+platforms = ["linux"]
+env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS" }
+memcap_gb = 64
+time = "30m"
+parser = "gcc"
+needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
+
+[[step]]
+name = "runtime-plain-test"
+run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && ctest --test-dir "$HGL_AI_BUILD_DIR/cpp-plain" --output-on-failure'
+platforms = ["linux"]
+memcap_gb = 32
+time = "20m"
+parser = "ctest"
+needs = ["step:runtime-plain", "sdk:hgraph-deps"]
+
+[[step]]
+name = "runtime-sanitize"
+run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && cmake -S runtime/cpp -B "$HGL_AI_BUILD_DIR/cpp-sanitize" -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHGLRT_SANITIZE=ON && cmake --build "$HGL_AI_BUILD_DIR/cpp-sanitize"'
+platforms = ["linux"]
+address_limit = false
+env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS" }
+memcap_gb = 64
+time = "30m"
+parser = "gcc"
+needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
+
+[[step]]
+name = "runtime-sanitize-test"
+run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && ctest --test-dir "$HGL_AI_BUILD_DIR/cpp-sanitize" --output-on-failure'
+platforms = ["linux"]
+address_limit = false
+memcap_gb = 32
+time = "20m"
+parser = "ctest"
+needs = ["step:runtime-sanitize", "sdk:hgraph-deps"]
+
+# The C++ target on the SDK (the ignored cpp tests), plain then sanitized.
+[[step]]
+name = "sdk-plain"
+run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && jobs=$(nproc) && cases=$((jobs < 8 ? jobs : 8)) && scripts/check-cpp-sdk.sh "$jobs" "$cases" --message-format=json'
+platforms = ["linux"]
+env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS", HGL_CPP_FLAGS = "" }
+memcap_gb = 64
+time = "90m"
+parser = "cargo"
+needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
+
+[[step]]
+name = "sdk-sanitize"
+address_limit = false
+run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && jobs=$(nproc) && cases=$((jobs < 8 ? jobs : 8)) && scripts/check-cpp-sdk.sh "$jobs" "$cases" --message-format=json'
+platforms = ["linux"]
+env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS", HGL_CPP_FLAGS = "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined" }
+memcap_gb = 64
+time = "120m"
+parser = "cargo"
+needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
+
+# Core's cases, held to crates/hgl_cpp/ci/unsupported_cases.toml by the build tool.
+[[step]]
+name = "build-tool-test"
+run = "cargo test --locked -p hgl_build_tool --message-format=json"
+platforms = ["linux"]
+memcap_gb = 32
+time = "20m"
+parser = "cargo"
+
+[[step]]
+name = "core-cases"
+run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && cargo build --locked --bin hgl && cargo run --locked --quiet -p hgl_build_tool -- check-core "${CARGO_TARGET_DIR:-target}/debug/hgl" spec/hgl_core'
+platforms = ["linux"]
+env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS" }
+memcap_gb = 64
+time = "60m"
+parser = "lines"
+needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
+
+# Core's documentation examples (ci.yml: plain mode only).
+[[step]]
+name = "core-doc-examples"
+run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && "${CARGO_TARGET_DIR:-target}/debug/hgl" test spec/hgl_core/hgl --target cpp'
+platforms = ["linux"]
+env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS" }
+memcap_gb = 32
+time = "60m"
+parser = "hgl-test"
+needs = ["step:core-cases", "sdk:hgraph", "sdk:hgraph-deps"]

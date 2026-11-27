@@ -191,6 +191,7 @@ string_enum!(
     Assign => "assign", Ready => "ready", Blocked => "blocked", Question => "question",
     Answer => "answer", Review => "review", Receipt => "receipt", Sendback => "sendback",
     Approved => "approved", Landed => "landed", Closed => "closed", Done => "done", Note => "note",
+    Build => "build",
     Tick => "tick",
 });
 
@@ -206,7 +207,12 @@ impl Kind {
     pub fn needs_head(self) -> bool {
         matches!(
             self,
-            Kind::Ready | Kind::Review | Kind::Receipt | Kind::Sendback | Kind::Approved
+            Kind::Ready
+                | Kind::Review
+                | Kind::Receipt
+                | Kind::Sendback
+                | Kind::Approved
+                | Kind::Build
         )
     }
     /// Kinds after which the bridge removes the issue's worktrees (PROTO-14).
@@ -236,6 +242,20 @@ string_enum!(
 string_enum!(
     /// Capability tiers (docs/roles.md §3).
     Tier, "tier", { Frontier => "frontier", Balanced => "balanced", Fast => "fast" });
+
+string_enum!(
+    /// Task classes (docs/roles.md §3), in order: ROLE-15 moves a task up one.
+    TaskClass, "task class", { Simple => "simple", Standard => "standard", Complex => "complex" });
+
+impl TaskClass {
+    /// The next class up (ROLE-15); `complex` stays.
+    pub fn up(self) -> Self {
+        match self {
+            TaskClass::Simple => TaskClass::Standard,
+            TaskClass::Standard | TaskClass::Complex => TaskClass::Complex,
+        }
+    }
+}
 
 string_enum!(
     /// Review receipt verdicts (PROTO-19).
@@ -296,6 +316,10 @@ pub struct Note {
     /// For a note from `owner`: the handle of the signed-in owner who wrote it (OWN-10).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub by: Option<String>,
+    /// The task's class (docs/roles.md §3): set on `assign`, and on a `sendback` that moves
+    /// the task up a class (ROLE-15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<TaskClass>,
     pub body: String,
 }
 
@@ -341,6 +365,7 @@ impl Note {
             head: None,
             base: None,
             by: None,
+            class: None,
             body,
         }
     }
@@ -389,6 +414,12 @@ impl Note {
             }
             check_handle(h)?;
         }
+        if self.class.is_some() && !matches!(self.kind, Kind::Assign | Kind::Sendback) {
+            return Err(ProtoError::Note(format!(
+                "a `{}` note carries no class; only `assign` and `sendback` do",
+                self.kind
+            )));
+        }
         if self.body.trim().is_empty() {
             return Err(ProtoError::Note("empty body".into()));
         }
@@ -411,6 +442,8 @@ impl Note {
     pub fn msg_id(&self) -> String {
         let mut h = Sha256::new();
         let issue = self.issue.to_string();
+        // `class=` cannot be a handle (no `=` in one), so it never reads as `by`.
+        let class = self.class.map(|c| format!("class={c}"));
         for field in [
             Some(self.recipient.as_str()),
             Some(self.kind.as_str()),
@@ -423,6 +456,7 @@ impl Note {
         .into_iter()
         // `by` only when set, so notes without it keep the ids they always had.
         .chain(self.by.as_deref().map(Some))
+        .chain(class.as_deref().map(Some))
         {
             // Tagged and length-prefixed: no two envelopes encode alike.
             match field {
@@ -529,6 +563,16 @@ pub struct TreeRecord {
     /// Model families whose turns ran in an implementor tree: the task's authors (ROLE-11).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub families: Vec<Family>,
+    /// The task's class, as its notes last set it (docs/roles.md §3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<TaskClass>,
+    /// The stream sequence of the note that last set `class` (PROTO-21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class_seq: Option<u64>,
+    /// The stream sequence of the note whose turn made the tree (PROTO-14): of a task's
+    /// implementor trees, the newest is its current seat, which verdicts go to (PROTO-21).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seq: Option<u64>,
 }
 
 impl TreeRecord {
@@ -603,6 +647,9 @@ pub fn ended_key(seat: &Seat, task: &TaskKey) -> String {
     format!("{seat}.{}-{}", task.repo, task.issue)
 }
 
+/// Build recipes, jobs, summaries and builder records (docs/build.md).
+pub mod build;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -660,6 +707,40 @@ mod tests {
 
         let b = Note::new(Seat::broadcast(), seat("w1"), Kind::Note, "x");
         assert!(b.validate().is_err());
+    }
+
+    #[test]
+    fn task_classes() {
+        let mut a = Note::new(seat("triage"), seat("w1"), Kind::Assign, "take it");
+        a.repo = Some("hgl-ai".into());
+        a.issue = 17;
+        let plain = a.msg_id();
+        a.class = Some(TaskClass::Simple);
+        assert!(a.validate().is_ok());
+        assert_ne!(a.msg_id(), plain, "the class is part of the envelope");
+        let j = serde_json::to_string(&a).unwrap();
+        assert!(j.contains(r#""class":"simple""#), "{j}");
+        assert_eq!(serde_json::from_str::<Note>(&j).unwrap(), a);
+        a.class = None;
+        let old = serde_json::to_string(&a).unwrap();
+        assert!(
+            !old.contains("class"),
+            "no class, no field: older bridges read it"
+        );
+        assert_eq!(a.msg_id(), plain, "notes without a class keep their ids");
+        let mut r = Note::new(seat("w1"), seat("claude"), Kind::Ready, "[claude] Ready");
+        r.head = Some("8a5c3d264c2edbbdaa61530d810bff276c3eebba".into());
+        r.class = Some(TaskClass::Complex);
+        assert!(
+            r.validate().is_err(),
+            "only assign and sendback carry a class"
+        );
+        r.kind = Kind::Sendback;
+        assert!(r.validate().is_ok());
+        assert!("huge".parse::<TaskClass>().is_err());
+        assert!(
+            TaskClass::Simple < TaskClass::Standard && TaskClass::Standard < TaskClass::Complex
+        );
     }
 
     #[test]

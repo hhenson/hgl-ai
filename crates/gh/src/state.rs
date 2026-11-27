@@ -112,6 +112,37 @@ pub fn author_seats(
     out
 }
 
+/// The seats a verdict (`approved`, `sendback`) should reach: the task's current seat, the
+/// one whose implementor tree a later note made (`TreeRecord::seq`; a task moved to another
+/// seat, PROTO-21); else, with no tree recording its note, as [`author_seats`].
+pub fn current_seats(
+    trees: &[TreeRecord],
+    repo: &str,
+    branch: &str,
+    issue: u64,
+    known: &[String],
+    signers: &[String],
+) -> Vec<Seat> {
+    let mine = |t: &&TreeRecord| {
+        t.task.repo == repo
+            && !t.review
+            && (t.branch.as_deref() == Some(branch) || t.task.issue == issue)
+    };
+    let newest = trees.iter().filter(mine).filter_map(|t| t.seq).max();
+    match newest {
+        Some(n) => {
+            let mut out: Vec<Seat> = Vec::new();
+            for t in trees.iter().filter(mine).filter(|t| t.seq == Some(n)) {
+                if !out.contains(&t.seat) {
+                    out.push(t.seat.clone());
+                }
+            }
+            out
+        }
+        None => author_seats(trees, repo, branch, issue, known, signers),
+    }
+}
+
 /// The task's author families (ROLE-11): the families recorded in the implementor trees of
 /// `repo` registered for this branch or issue (`HGL_TREES`, written by the bridges).
 pub fn author_families(trees: &[TreeRecord], repo: &str, branch: &str, issue: u64) -> Vec<Family> {
@@ -241,6 +272,9 @@ mod tests {
             created_at: "x".into(),
             size_bytes: 0,
             families: Vec::new(),
+            class: None,
+            class_seq: None,
+            seq: None,
         }
     }
 
@@ -332,6 +366,60 @@ mod tests {
             .is_empty()
         );
         assert!(author_seats(&[], "alpha", "codex/695-x", 695, &known, &["all".into()]).is_empty());
+    }
+
+    /// r3's major on hgl-ai PR 25: once a task moved seats, a verdict reaches only its current
+    /// seat, the one whose implementor tree is newest; `landed` still reaches every seat.
+    #[test]
+    fn a_verdict_goes_to_the_current_seat_only() {
+        let known: Vec<String> = ["w1", "w2"].map(String::from).to_vec();
+        let at = |seat, seq| TreeRecord {
+            seq,
+            ..tree(seat, "alpha", 17, "codex/q17-x", false)
+        };
+        let seats = |v: Vec<Seat>| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let moved = vec![
+            at("w1", Some(10)),
+            at("w2", Some(40)),
+            tree("r1", "alpha", 17, "", true),
+        ];
+        assert_eq!(
+            seats(current_seats(
+                &moved,
+                "alpha",
+                "codex/q17-x",
+                17,
+                &known,
+                &[]
+            )),
+            ["w2"]
+        );
+        assert_eq!(
+            seats(author_seats(
+                &moved,
+                "alpha",
+                "codex/q17-x",
+                17,
+                &known,
+                &[]
+            )),
+            ["w1", "w2"],
+            "landed cleans up every tree"
+        );
+        // Records from bridges before `seq`: every seat, as before.
+        let old = vec![at("w1", None), at("w2", None)];
+        assert_eq!(
+            seats(current_seats(&old, "alpha", "codex/q17-x", 17, &known, &[])),
+            ["w1", "w2"]
+        );
+        // One seat on two hosts (a moved seat) is one seat.
+        let mut other = at("w2", Some(40));
+        other.host = "h2".into();
+        let two = vec![at("w1", Some(10)), at("w2", Some(40)), other];
+        assert_eq!(
+            seats(current_seats(&two, "alpha", "codex/q17-x", 17, &known, &[])),
+            ["w2"]
+        );
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! Subscription usage (PROTO-21, PROTO-22): `HGL_USAGE` keeps the newest record per login,
+//! Subscription usage (PROTO-23, PROTO-24): `HGL_USAGE` keeps the newest record per login,
 //! compared on `observed_at`; each record that wins its key also goes to `hgl.usage.<key>`
 //! on `HGL_USAGE_LOG`, the history.
 

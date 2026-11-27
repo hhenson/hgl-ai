@@ -57,7 +57,7 @@ async fn serve(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
     Ok(EXIT_OK)
 }
 
-async fn shutdown_signal() {
+pub(super) async fn shutdown_signal() {
     #[cfg(unix)]
     {
         use tokio::signal::unix::{SignalKind, signal};

@@ -75,6 +75,7 @@ before hub users takes one shared token until it moves.
 | Locks | KV `HGL_LOCKS` | file storage, history 1, `max_age` 30 min |
 | Ended | KV `HGL_ENDED` | file storage, history 1, `max_age` 15 d |
 | Usage | KV `HGL_USAGE`; stream `HGL_USAGE_LOG`, subjects `hgl.usage.>` | KV file storage, history 1; stream file storage, `max_age` 35 d, dedup window 24 h (§10) |
+| Builds | KV `HGL_BUILD` | file storage, history 64: `recipe.<repo>` (TOML), `run.<id>` (summary JSON; newest 1000 kept) |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
   broadcast address. `owner` and `console` are senders, never seats: no seat takes
@@ -99,7 +100,8 @@ before hub users takes one shared token until it moves.
   - At shutdown or a lost lease, held and running notes are naked (handed back).
 - **PROTO-9 — Idempotent sends.** Each note carries a `Nats-Msg-Id` of
   `<sender>-<created_at>-<sha256(envelope)[0:12]>` over recipient, kind, repo,
-  issue, head, base and body, so a retried send is dropped and no other note is.
+  issue, head, base and body (and `by` and `class` when set), so a retried send is
+  dropped and no other note is.
 
 ## 4. Notes
 
@@ -124,18 +126,19 @@ before hub users takes one shared token until it moves.
 
 | Kind | From → to | Meaning |
 | --- | --- | --- |
-| `assign` | controller or triage → seat | Take this issue. Carries `repo`, `issue`, optional `base`. The bridge creates the worktree first (§5). |
+| `assign` | controller or triage → seat | Take this issue. Carries `repo`, `issue`, optional `base` and `class` (`simple`, `standard` or `complex`; PROTO-21). The bridge creates the worktree first (§5). |
 | `ready` | implementor → controller | Pull request at `head` passes the author's checks. |
 | `blocked` | any → controller | Cannot proceed; states the question or dependency. |
 | `question` / `answer` | any ↔ any | Clarification; no GitHub comment unless it settles something. |
 | `review` | controller → reviewer | Review `repo#issue` at `head`. The bridge creates a review worktree. |
 | `receipt` | reviewer or desk → controller | Gate result at `head` (§7). |
-| `sendback` | controller → implementor | Findings at `head`; fix with new commits. |
+| `sendback` | controller → implementor | Findings at `head`; fix with new commits. An optional `class` moves the task up (ROLE-15). |
 | `approved` | controller → implementor | Sign-off for `head` on a verified `main`. |
 | `landed` | controller → seat, `all` | Merged; carries the merge commit. The bridge removes the issue's worktrees (§5). |
 | `closed` | controller → seat | Closed unmerged or superseded; same removal as `landed`. |
 | `done` | any → controller | A bounded non-PR assignment finished, or a cleanup receipt. |
 | `note` | any → any | Operational fact: an alert, a `hold`, a `drain`. |
+| `build` | any → `builder-<label>` | Build `repo` at `head` (optionally merged onto `base`); the body is the job JSON (`docs/build.md`). The builder answers with a `receipt`. |
 | `tick` | console → controller | A status report is due (`[console] status_every`). |
 
 - **PROTO-20 — Owner notes.** A note with sender `owner` travels on
@@ -184,6 +187,19 @@ before hub users takes one shared token until it moves.
 - **PROTO-16 — Binding.** A seat binds a role to a runtime (`claude`, `codex`
   or `agy`) and a model on one host, in that host's configuration. Its record
   in `HGL_HOSTS` advertises role, runtime, model family and memory budget.
+- **PROTO-21 — Task class.** An `assign` carries the task's class (docs/roles.md §3);
+  only `assign` and `sendback` carry one. The class picks the seat, not the model: a seat
+  runs its own binding (and its fallbacks, PROTO-17) whatever the class. The bridge records
+  the class, with the stream sequence of the note that set it, in the task's `task.json`
+  and `HGL_TREES` record, and the turn's prompt names it. An `assign` sets it; a `sendback`
+  with a class only moves it up, never down (ROLE-15); a note no newer than the one that set
+  it (an older note delivered again) changes nothing. A tree made anew for a task begun
+  elsewhere (another host or seat) takes the class of the task's record set last, unless
+  the note that made it carries a class: that note moved the task (`gh sendback --class C
+  --to SEAT`, ROLE-15) and its class is the task's there. Each `HGL_TREES` record carries the
+  stream sequence of the note that made its tree (`seq`): the task's newest implementor tree
+  is its current seat, and `gh approve` and `gh sendback` without `--to` go only there
+  (`landed` and `closed` still reach every seat that has a tree, PROTO-14).
 - **PROTO-17 — Failover.** A seat may list fallback bindings. A quota refusal
   is known from the CLI's structured output (an error event or result and its
   status), never from text on stderr. On one, the bridge holds the notes and
@@ -234,6 +250,23 @@ before hub users takes one shared token until it moves.
   the note. The authors' families are those the bridges record in the task's
   implementor trees (`families` in `task.json` and `HGL_TREES`).
 
+- **PROTO-21 — Build receipt.** A builder answers a `build` job with a `receipt` from
+  `builder-<label>` at the job's `head`, to the job's `reply_to` (`r-<id>`, an address no
+  inbox serves; the sender reads the last note on `hgl.notes.r-<id>`) and to its `notify`
+  seat. The body is the build summary as JSON (`docs/build.md` BUILD-4):
+
+```json
+{"v": 1, "id": "20261127-083000-3fa9c1", "repo": "hgl-compiler", "head": "8a5c...", "host": "lab1",
+ "platform": "linux", "executor": "local", "status": "fail", "steps": [{"name": "test", "status": "fail",
+ "exit": 101, "wall_ms": 81000, "cpu_ms": 302000, "peak_bytes": 3650000000, "cap_bytes": 34359738368,
+ "log": ".../test.log"}], "errors": [{"step": "test", "file": "src/lib.rs", "line": 10, "col": 5,
+ "code": "E0308", "message": "mismatched types", "count": 1, "start": 1234, "end": 2345}],
+ "errors_total": 1, "tests": {"passed": 120, "failed": 2, "skipped": 3, "failures": [...]},
+ "warnings_total": 4, "warnings": {"unused_variables": 3, "dead_code": 1}, "log_dir": "..."}
+```
+
+  `status` is `pass`, `fail`, `not-run` (a missing prerequisite), or `stopped`.
+
 ## 8. Shared state
 
 `HGL_STATE` keys match `^[a-zA-Z0-9_./=-]{1,64}$`. An empty value deletes.
@@ -256,7 +289,8 @@ before hub users takes one shared token until it moves.
 
 `HGL_LOCKS` holds leases, `{"holder", "acquired_at"}`, created only if absent,
 rewritten every minute while held, deleted by their holder; one not rewritten
-within `max_age` expires. `lock.land.<repo>` is the landing lock: `gh land`,
+within `max_age` expires. `builder.<label>` is held by the one process serving that builder (`docs/build.md`).
+`lock.land.<repo>` is the landing lock: `gh land`,
 `gh merge-if-clean` and `gh release watch` hold it from before the gate until
 the merge, `landed.log`, `main` and the `landed` notes are done.
 
@@ -290,6 +324,18 @@ Each bridge writes `HGL_HOSTS/<host>` every 30 s:
 
 `host` is a configured label, never a network name or address.
 
+A builder writes `HGL_HOSTS/builder.<label>` with the same heartbeat and TTL
+(`hgl-ai hosts` leaves these out; `hgl-ai builder list` shows them):
+
+```json
+{"label": "win1", "inbox": "builder-win1", "platform": "windows", "executor": "ssh",
+ "proxy": "lab1", "reachable": true, "state": "active", "slots": 1, "busy": 0,
+ "free_gb": 410, "toolchains": {"git": "git version 2.53.0"}, "updated_at": "20261127T083000Z"}
+```
+
+`proxy` names the host that drives a remote over ssh; `state` is `active`, `draining` or
+`retired`.
+
 ## 10. Subscription usage
 
 `hgl-ai usage collect` reads each signed-in CLI of the host's agent user, by slash
@@ -301,7 +347,7 @@ command or file, never a prompt (no model turn):
 | `codex` | the newest `rate_limits` (by event time) over the recently written `~/.codex/sessions/**/rollout-*.jsonl` whose `session_meta` is of the account; a rollout is read from its tail | `tokens.account_id` of `~/.codex/auth.json` |
 | `agy` | `agy -p "/usage"`: `<bucket>\t<window> Limit Remaining\t<pct>%\t<reset>`; a reset at the epoch is a window not started | the `applyAuthResult: email=` line of its newest log |
 
-- **PROTO-21 — One record per login.** `HGL_USAGE/<runtime>.<account>`, where
+- **PROTO-23 — One record per login.** `HGL_USAGE/<runtime>.<account>`, where
   `<account>` is the first 12 hex digits of the SHA-256 of the account id. No id, email
   or token is published; the account files are parsed into the id fields alone.
   A record: `runtime`, `account`, `label`, `host` (the reporter), `plan`,
@@ -312,7 +358,7 @@ command or file, never a prompt (no model turn):
   that did not parse, kept as they were (at most 20). A source that fails skips its
   runtime; one that does not parse keeps its lines; neither fails the collection.
   `HGL_USAGE/label.<account>` holds the owner's label (`hgl-ai usage label`).
-- **PROTO-22 — Newest observation wins.** Every host holding a login may report it. A
+- **PROTO-24 — Newest observation wins.** Every host holding a login may report it. A
   record replaces its key only if its `observed_at` is newer (compare-and-set), so the
   record stays fresh while any of those hosts is up. Each record that replaces its key
   is also published to `hgl.usage.<runtime>.<account>` (message id

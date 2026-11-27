@@ -547,6 +547,9 @@ async fn hosts_and_trees_round_trip() {
         created_at: "20261127T083000Z".into(),
         size_bytes: 42,
         families: Vec::new(),
+        class: None,
+        class_seq: None,
+        seq: None,
     };
     let a = tree("w1", 992, false);
     let b = tree("r1", 992, true);
@@ -1056,7 +1059,7 @@ fn usage(host: &str, observed_at: &str) -> hgl_ai_proto::UsageRecord {
     }
 }
 
-/// PROTO-22: of hosts reporting one login, the newest observation stays, and only the
+/// PROTO-24: of hosts reporting one login, the newest observation stays, and only the
 /// records that won their key reach the history.
 #[tokio::test]
 async fn usage_keeps_the_newest_observation() {

@@ -1,0 +1,20 @@
+/Volumes/work/src/runtime/cpp/src/clock.cpp:5:10: fatal error: 'hgraph/types/generated.h' file not found
+    5 | #include <hgraph/types/generated.h>
+      |          ^~~~~~~~~~~~~~~~~~~~~~~~~~
+1 error generated.
+/Volumes/work/src/runtime/cpp/src/text.cpp:12:9: warning: variable 'n' set but not used [-Wunused-but-set-variable]
+Undefined symbols for architecture arm64:
+  "_hglrt_start", referenced from:
+      _main in main.o
+  "_hglrt_stop", referenced from:
+      _main in main.o
+ld: symbol(s) not found for architecture arm64
+clang++: error: linker command failed with exit code 1 (use -v to see invocation)
+CMake Error at CMakeLists.txt:14 (find_package):
+  Could not find a package configuration file provided by "hgraph" with any
+  of the following names:
+
+    hgraphConfig.cmake
+    hgraph-config.cmake
+
+-- Configuring incomplete, errors occurred!

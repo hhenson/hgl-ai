@@ -1,4 +1,4 @@
-//! Parsers of the three sources (docs/protocol.md PROTO-21). The claude and agy outputs
+//! Parsers of the three sources (docs/protocol.md PROTO-23). The claude and agy outputs
 //! are display text, not an API: a line that does not parse is kept as it was, never an
 //! error. Pure functions; `now` is a parameter.
 

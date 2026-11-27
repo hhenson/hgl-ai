@@ -1,6 +1,6 @@
 [package]
 name = "hgl-ai-usage"
-description = "Subscription usage collector: claude, codex and agy limits per login (PROTO-21)"
+description = "Subscription usage collector: claude, codex and agy limits per login (PROTO-23)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

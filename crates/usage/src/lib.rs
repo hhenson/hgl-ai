@@ -1,4 +1,4 @@
-//! The usage collector (docs/protocol.md PROTO-21, PROTO-22): read each signed-in CLI of
+//! The usage collector (docs/protocol.md PROTO-23, PROTO-24): read each signed-in CLI of
 //! this host's agent user and make one [`UsageRecord`] per login.
 //!
 //! | Runtime | Limits | Account id (fingerprinted, never published) |

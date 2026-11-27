@@ -1,8 +1,8 @@
 # Builds
 
-Status: proposed — not implemented. Nothing here is built yet: today the controller
-lands with `hgl-ai gh land` (`docs/protocol.md` §8) and builds run under `hgl-ai cap`.
-The current rules are in `docs/protocol.md`, `docs/roles.md` and `docs/design.md`.
+Status: proposed. §1, §2 and §2a are implemented (`crates/build`); §3, the merge queue,
+is not: today the controller lands with `hgl-ai gh land` (`docs/protocol.md` §8). The
+current rules are in `docs/protocol.md`, `docs/roles.md` and `docs/design.md`.
 
 Building and testing is deterministic work: a tool runs it, an agent only writes and
 repairs the instructions and reads the summary.
@@ -25,19 +25,44 @@ repairs the instructions and reads the summary.
   | `lines` | lines matching configured patterns, as a fallback |
 
 ```toml
+repo = "hgl-compiler"
+env = { CARGO_TERM_COLOR = "never" }     # every step
+
 [[step]]
 name = "test"
 run = "cargo test --workspace --locked --message-format=json"
-platforms = ["linux", "macos", "windows"]
-memcap_gb = 32
-time = "40m"
-parser = "cargo"
-needs = ["sdk:hgraph"]
+platforms = ["linux", "macos", "windows"] # default: all
+cwd = "."                                 # in the checkout
+memcap_gb = 64                            # default 32; no cap on a Windows remote
+address_limit = false                     # sanitizers: no per-process address limit
+time = "40m"                              # default 60m
+parser = "cargo"                          # default lines
+needs = ["sdk:hgraph", "tool:cmake", "step:build"]
+artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
 ```
 
-- **BUILD-3 — Who writes them.** The build agent (`docs/roles.md`) writes and repairs
-  recipes, provisions toolchains and SDKs on hosts, and diagnoses failures of the build
-  itself. It never changes the code under build.
+- A step's `run` may be a table per platform: `run.default = "..."`, `run.windows = "..."`.
+- `needs`: `sdk:NAME` is met by `[builder.sdk] NAME = PREFIX` on the builder's host (steps
+  see `HGL_SDK_NAME`); `tool:NAME` by a command on `PATH`; `step:NAME` by that earlier step
+  passing. A missing SDK or tool is *not run*, not a failure.
+- Steps see `HGL_AI_BUILD_ID`, `HGL_AI_SRC`, `HGL_AI_BUILD_DIR` (CMake trees go there) and,
+  in a builder's checkout, `CARGO_TARGET_DIR` and `TMPDIR` inside the job directory. `env`
+  values expand `$VAR` from these.
+- `artifacts` are copied to `<log dir>/artifacts/<step>/`; `junit` and `catch2` read the
+  `.xml` ones (else the log). `lines` takes `patterns = { error = [...], warning = [...] }`
+  with named groups `file`, `line`, `col`, `code`, `message`.
+- Stored as written (comments kept) in `HGL_BUILD/recipe.<repo>`, history 64:
+  `recipe show [--rev N]`, `recipe history`. `recipes/` in this repository holds the
+  first ones. A repository's recipe is a file in its own `recipes/` directory (the drafts
+  for others start in this repository's), changed by pull request. Every builder runs
+  recipes, so on the hub only the admin user writes `HGL_BUILD/recipe.*`: `hgl-ai build
+  recipe import FILE`, run as the server user. Seats and builders read recipes and keep
+  `run.*`; no seat writes recipes while seats share their host's credential (hgl-ai#16).
+
+- **BUILD-3 — Who writes them.** The build agent (`docs/roles.md` ROLE-8, proposed)
+  proposes recipe changes as pull requests, provisions toolchains and SDKs on hosts, and
+  diagnoses failures of the build itself. It never changes the code under build. Until it
+  exists, a build that is *not run* goes to the controller.
 
 ## 2. Running a build
 
@@ -51,16 +76,75 @@ needs = ["sdk:hgraph"]
   - warnings counted by kind;
   - the log's path and the byte ranges of each error, for reading more.
 
-  An agent reads the summary, not the log. The summary is bounded (about 4 KiB).
+  An agent reads the summary, not the log. The summary is bounded (at most 4 KiB of text;
+  `summary.json` keeps 200 errors and failures). Steps run in recipe order; the first that
+  does not pass skips the rest unless `--keep-going`. Logs go to
+  `$HGL_AI_TASK_DIR/build-logs/<id>/<step>.log` (stdout and stderr together), with
+  `status.json` and `summary.json`; `hgl-ai build log ID STEP --bytes A-B` prints a range.
+  Exit status 0 pass, 1 fail, 3 not run. Build ids are `YYYYMMDD-HHMMSS-xxxxxx` (UTC).
 - **BUILD-5 — Detached.** `--detach` returns a build id at once; `hgl-ai build status ID`
   and `hgl-ai build wait ID` report progress and the summary. A long build costs an agent no
-  tokens while it runs.
+  tokens while it runs. Inside an agent turn a local `--detach` is refused (the bridge
+  ends the turn's processes with it): `--platform P --detach` hands it to a builder.
 - **BUILD-6 — Elsewhere.** `--platform macos` (or `windows`) sends the build to a host of
   that platform through the bus (a `build` job); the builder service there runs it and
   returns the summary as a `receipt`. The agent's own host need not have that platform.
+  - Builders advertise in `HGL_HOSTS/builder.<label>` (platform, reachable, active,
+    draining or retired, busy of slots, free disk, tool versions). The sender picks a ready
+    one (`--builder LABEL` to choose); an unreachable one holds the job until it is back.
+  - The job is a `build` note to `builder-<label>` at the exact head (optionally `--base`
+    to merge onto). The builder checks it out in `<work_root>/builder/jobs/<id>/` from its
+    clone in `clones/<repo>` (submodules too), runs the recipe, and removes the checkout
+    (cleanup is part of done). One build at a time unless `[builder] concurrency = N`.
+    One process serves a builder: it holds a `flock` on this host and the lease
+    `HGL_LOCKS/builder.<label>` (holder `<host> pid <pid> (builder) id <host-id>`, taken
+    over as PROTO-6 says) before it cleans, connects or takes a job; a second `builder
+    run` refuses to start. A lease lost, or not confirmed for half the bucket's
+    `max_age`, or any lane that cannot serve, ends the whole service with an error, and
+    the service manager restarts it. Checkouts and removals on one shared clone take
+    turns.
+  - The receipt (the summary JSON) goes to `r-<id>`, which the sender reads from the
+    stream, and to `--notify SEAT`. The step logs stay on the builder's host.
+  - `hgl-ai builder drain|retire|resume LABEL` sets `HGL_STATE/builder.<label>`;
+    `mode = drain` drains every builder. A shutdown cancels running builds and returns
+    their jobs to the inbox.
 - **BUILD-7 — Metrics.** Every run's summary is kept on the hub (`HGL_BUILD/run.<id>`, with
   a retention limit) so the console can chart build time, failure rate and peak memory per
-  repository, step and platform.
+  repository, step and platform. The hub keeps the first 20 errors and failures of each
+  run, rewritten as steps finish, and the newest 1000 runs; `hgl-ai build list [--repo R]
+  [--failed]`.
+
+## 2a. Proxy builders
+
+- **BUILD-12 — A remote over ssh.** A host without hgl-ai (Windows) is built by a proxy
+  builder on a Linux or macOS host, configured there only:
+
+  ```toml
+  [[builder.remote]]
+  platform = "windows"
+  ssh = "winbox"              # an alias from the user's ssh configuration
+  work_dir = "C:/hgl-ai/work"
+  shell = "powershell"        # or sh
+  label = "win1"              # default <host>-<platform>
+  ```
+
+  It is a builder like any other (`builder-win1`, its own record with `proxy`). The proxy
+  owns one OpenSSH master connection per remote (control socket in
+  `<data_dir>/builder/ssh/`, mode 0700), checks it on its heartbeat and reconnects with
+  backoff. A job in flight when it drops is *remote unreachable*, not a failure, and is
+  retried once on reconnect; jobs wait while it is down.
+- **BUILD-13 — How it runs.** Git checks out the head in `<work_dir>/jobs/<id>/` on the
+  remote; each step runs as `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass
+  -EncodedCommand <step>` (no machine-wide policy change), its output streamed back into
+  the proxy's log and parsed there. The proxy enforces the time limit: on expiry or cancel
+  it kills the remote tree (`taskkill /T /F`), then the session. No memory cap on Windows.
+  The job directory is always removed; a shutdown kills the running tree, removes job
+  directories and closes the connection.
+- **BUILD-14 — Debugging.** `hgl-ai build shell --platform P [REPO] [--head SHA]` opens an
+  interactive shell in a fresh checkout on this host's builder of P (over ssh for a
+  remote), removed when the shell ends. It checks out under `shells/`, which a builder's
+  startup cleanup of `jobs/` leaves alone, and takes turns with the builder on the
+  shared clone (a host lock, beside the remote's control socket for a proxy).
 
 ## 3. The merge queue
 
