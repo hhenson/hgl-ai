@@ -9,7 +9,7 @@ use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
 use async_nats::jetstream::{self, AckKind, context::Publish};
 use futures::StreamExt;
 use hgl_ai_proto::{
-    CONSOLE_PREFIX, KV_METRICS, KV_THREADS, MetricsSample, OWNER_PREFIX, STREAM_OWNER,
+    CONSOLE_PREFIX, KV_CONSOLE, KV_METRICS, KV_THREADS, MetricsSample, OWNER_PREFIX, STREAM_OWNER,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -293,6 +293,64 @@ impl Bus {
             put_json(store, &s.key(), s),
         )
         .await
+    }
+
+    /// Write `HGL_CONSOLE/<key>` (the console's own state).
+    pub async fn console_put<T: Serialize>(&self, key: &str, v: &T) -> Result<()> {
+        let store = self.store(&self.console, KV_CONSOLE).await?;
+        self.guarded(&format!("$KV.{KV_CONSOLE}.{key}"), put_json(store, key, v))
+            .await
+    }
+
+    /// Delete `HGL_CONSOLE/<key>`; a missing key is fine.
+    pub async fn console_del(&self, key: &str) -> Result<()> {
+        check_kv_key(key)?;
+        let store = self.store(&self.console, KV_CONSOLE).await?;
+        store
+            .purge(key)
+            .await
+            .map_err(|e| nats(&format!("deleting {key}"), e))
+    }
+
+    /// `HGL_CONSOLE/<key>`, if present.
+    pub async fn console_get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<T>> {
+        check_kv_key(key)?;
+        let store = self.store(&self.console, KV_CONSOLE).await?;
+        match live_entry(store, key).await? {
+            None => Ok(None),
+            Some(e) => serde_json::from_slice(&e.value)
+                .map(Some)
+                .map_err(|err| BusError::Nats(format!("{key} is unreadable: {err}"))),
+        }
+    }
+
+    /// Every `HGL_CONSOLE` value whose key starts with `prefix`.
+    pub async fn console_list<T: DeserializeOwned>(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<(String, T)>> {
+        let store = self.store(&self.console, KV_CONSOLE).await?;
+        let mut keys = store.keys().await.map_err(|e| nats("listing keys", e))?;
+        let mut names = Vec::new();
+        while let Some(k) = keys.next().await {
+            let k = k.map_err(|e| nats("listing keys", e))?;
+            if k.starts_with(prefix) {
+                names.push(k);
+            }
+        }
+        names.sort();
+        names.dedup();
+        let mut out = Vec::new();
+        for k in names {
+            let Some(e) = live_entry(store, &k).await? else {
+                continue;
+            };
+            match serde_json::from_slice(&e.value) {
+                Ok(v) => out.push((k, v)),
+                Err(err) => tracing::warn!(key = %k, "skipping an unreadable value: {err}"),
+            }
+        }
+        Ok(out)
     }
 
     /// Every metrics sample, ordered by key (repository, then day).

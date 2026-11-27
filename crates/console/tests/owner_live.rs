@@ -386,3 +386,98 @@ async fn ask_answer_converse_and_refuse_forgery() {
     assert_eq!(snap["mode"], "normal");
     assert!(snap["error"].is_null(), "{}", snap["error"]);
 }
+
+/// A console restart keeps who is signed in and the pending p2 batch (both on the hub,
+/// in `HGL_CONSOLE`); sign-out still ends a session. Seats cannot read it.
+#[tokio::test]
+async fn sessions_and_the_p2_batch_survive_a_restart() {
+    let Some(hub) = start_hub() else { return };
+    let admin = Bus::connect_with(&hub.url, Some(hub.creds["hub-admin"].clone()))
+        .await
+        .unwrap();
+    admin.provision().await.unwrap();
+    let (pem, public) = apple_key();
+    let providers = Providers::start(public).await;
+    let mut h = Harness::new(&providers, &pem);
+    h.cfg.hub.url = hub.url.clone();
+    let start = || async {
+        let app = Arc::new(App::new(h.cfg.clone()).unwrap());
+        let bus = Arc::new(
+            Bus::connect_with(&hub.url, Some(hub.creds["console"].clone()))
+                .await
+                .unwrap(),
+        );
+        app.set_hub(bus.clone());
+        hgl_ai_console::service::restore(&app, &bus).await;
+        let base = serve(app.clone()).await;
+        (app, base)
+    };
+
+    let (first, base) = start().await;
+    let (mut b, _key) = signed_in(&base).await;
+    assert_eq!(b.get("/telemetry").await.status(), 200);
+    let t = owner::Thread {
+        id: "q-0000000a".into(),
+        kind: owner::ThreadKind::Question,
+        title: "Later".into(),
+        issue: None,
+        priority: Some(Priority::P2),
+        state: ThreadState::Open,
+        seat: "claude".into(),
+        created_at: "20261127T000000Z".into(),
+        updated_at: "20261127T000000Z".into(),
+        context: String::new(),
+        question: "q".into(),
+        options: vec![],
+        suggested: None,
+        answer: None,
+        messages: vec![],
+        seq: 1,
+    };
+    assert!(hgl_ai_console::service::on_new_question(&first, &t).is_none());
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    // The console restarts: the same cookie is still signed in, the batch still waits.
+    let (second, base2) = start().await;
+    b.base = base2;
+    assert_eq!(b.get("/telemetry").await.status(), 200, "still signed in");
+    let batch = hgl_ai_console::service::p2_batch(&second).unwrap();
+    assert_eq!(batch.title, "p2 question: Later");
+
+    // Seats cannot read the console's state.
+    let seat_bus = Bus::connect_with(&hub.url, Some(hub.creds["hub"].clone()))
+        .await
+        .unwrap();
+    let read = tokio::time::timeout(
+        Duration::from_secs(8),
+        seat_bus.console_list::<serde_json::Value>("session."),
+    )
+    .await;
+    assert!(
+        !matches!(read, Ok(Ok(ref v)) if !v.is_empty()),
+        "a seat read the sessions"
+    );
+
+    // Sign-out reaches the hub: a third start does not bring the session back, and
+    // the sent batch stays sent.
+    let token = b.csrf("/telemetry").await;
+    let before = b.jar.clone();
+    let r = b
+        .post_form("/auth/signout", &[("csrf", &token)], Some(ORIGIN))
+        .await;
+    assert_eq!(r.status(), 303);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let (third, base3) = start().await;
+    // Replay the cookie from before the sign-out.
+    let mut old = Browser::new(&base3);
+    old.jar = before;
+    assert_eq!(
+        old.get("/telemetry").await.status(),
+        303,
+        "signed out stays signed out"
+    );
+    assert!(
+        hgl_ai_console::service::p2_batch(&third).is_none(),
+        "the batch was sent"
+    );
+}

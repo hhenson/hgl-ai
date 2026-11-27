@@ -27,6 +27,9 @@ pub const STREAM_OWNER: &str = "HGL_OWNER";
 pub const KV_THREADS: &str = "HGL_THREADS";
 /// Daily samples per repository; the coordinator writes them.
 pub const KV_METRICS: &str = "HGL_METRICS";
+/// The console's own state (sign-in sessions, the pending `p2` batch); only the console
+/// reads or writes it.
+pub const KV_CONSOLE: &str = "HGL_CONSOLE";
 /// Owner words: `hgl.owner.thread.<id>`. Only the console's hub user publishes here (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
 /// Agent traffic for the owner: `hgl.console.status`, `hgl.console.thread.<id>`.

@@ -50,9 +50,9 @@ use async_nats::jetstream::{self, AckKind, context::Publish, kv, stream};
 use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
-    BROADCAST, CONSOLE_PREFIX, HostRecord, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS,
-    KV_TREES, LockRecord, Note, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, SUBJECT_PREFIX, Seat,
-    TreeRecord, utc_now_stamp,
+    BROADCAST, CONSOLE_PREFIX, HostRecord, KV_CONSOLE, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE,
+    KV_THREADS, KV_TREES, LockRecord, Note, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER,
+    SUBJECT_PREFIX, Seat, TreeRecord, utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -211,6 +211,7 @@ pub struct Bus {
     locks: OnceCell<kv::Store>,
     threads: OnceCell<kv::Store>,
     metrics: OnceCell<kv::Store>,
+    console: OnceCell<kv::Store>,
 }
 
 impl Bus {
@@ -284,6 +285,7 @@ impl Bus {
             locks: OnceCell::new(),
             threads: OnceCell::new(),
             metrics: OnceCell::new(),
+            console: OnceCell::new(),
         })
     }
 
@@ -435,6 +437,13 @@ impl Bus {
             (
                 KV_METRICS,
                 "hgl-ai daily metrics",
+                stream::StorageType::File,
+                1,
+                Duration::ZERO,
+            ),
+            (
+                KV_CONSOLE,
+                "hgl-ai console state",
                 stream::StorageType::File,
                 1,
                 Duration::ZERO,

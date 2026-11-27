@@ -54,10 +54,9 @@ pub fn on_new_question(app: &App, t: &Thread) -> Option<Notification> {
             link: app.thread_link(&t.id),
         }),
         Some(Priority::P2) => {
-            app.pending_p2
-                .lock()
-                .expect("pending")
-                .push((t.id.clone(), t.title.clone()));
+            let mut p = app.pending_p2.lock().expect("pending");
+            p.push((t.id.clone(), t.title.clone()));
+            app.auth.persist(crate::auth::Persist::P2(p.clone()));
             None
         }
         _ => None,
@@ -67,6 +66,9 @@ pub fn on_new_question(app: &App, t: &Thread) -> Option<Notification> {
 /// The hourly notification of the `p2` questions that came in, if any.
 pub fn p2_batch(app: &App) -> Option<Notification> {
     let pending = std::mem::take(&mut *app.pending_p2.lock().expect("pending"));
+    if !pending.is_empty() {
+        app.auth.persist(crate::auth::Persist::P2(Vec::new()));
+    }
     match pending.len() {
         0 => None,
         1 => Some(Notification {
@@ -205,6 +207,54 @@ fn snap_view(s: &Arc<crate::telemetry::Snapshot>) -> Arc<crate::telemetry::Snaps
     Arc::new(c)
 }
 
+/// The key of the pending `p2` batch in `HGL_CONSOLE`.
+const P2_KEY: &str = "p2.pending";
+
+/// Take the sessions and the pending `p2` batch kept on the hub, then keep them there.
+pub async fn restore(app: &Arc<App>, bus: &Arc<Bus>) {
+    let stored = match bus.console_list::<crate::auth::Session>("session.").await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("reading the kept sessions: {e}");
+            Vec::new()
+        }
+    };
+    match bus.console_get::<Vec<(String, String)>>(P2_KEY).await {
+        Ok(Some(v)) => {
+            let mut p = app.pending_p2.lock().expect("pending");
+            for x in v {
+                if !p.contains(&x) {
+                    p.push(x);
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("reading the pending p2 batch: {e}"),
+    }
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    tracing::info!("{} sessions kept on the hub", stored.len());
+    app.auth.attach(stored, tx);
+    let pending = app.pending_p2.lock().expect("pending").clone();
+    if !pending.is_empty() {
+        app.auth.persist(crate::auth::Persist::P2(pending));
+    }
+    let b = bus.clone();
+    tokio::spawn(async move {
+        use crate::auth::Persist;
+        while let Some(p) = rx.recv().await {
+            let res = match &p {
+                Persist::Put(k, s) => b.console_put(k, s).await,
+                Persist::Del(k) => b.console_del(k).await,
+                Persist::P2(v) if v.is_empty() => b.console_del(P2_KEY).await,
+                Persist::P2(v) => b.console_put(P2_KEY, v).await,
+            };
+            if let Err(e) = res {
+                tracing::warn!("keeping the console's state on the hub: {e}");
+            }
+        }
+    });
+}
+
 /// Connect to the hub (retrying), then start the background work.
 pub async fn start_background(app: Arc<App>) {
     let bus = loop {
@@ -224,6 +274,7 @@ pub async fn start_background(app: Arc<App>) {
             }
         }
     };
+    restore(&app, &bus).await;
     tokio::spawn(fold_loop(app.clone(), bus.clone()));
     tokio::spawn(tick_loop(app.clone(), bus.clone()));
     tokio::spawn(batch_loop(app.clone()));

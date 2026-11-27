@@ -3,8 +3,8 @@
 use anyhow::Context as _;
 use hgl_ai_bus::{Bus, BusError, MAX_VALUE_BYTES};
 use hgl_ai_proto::{
-    HostRecord, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES, STREAM_NOTES,
-    STREAM_OWNER,
+    HostRecord, KV_CONSOLE, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES,
+    STREAM_NOTES, STREAM_OWNER,
 };
 
 use super::note::read_bounded;
@@ -137,6 +137,7 @@ pub async fn init(ctx: &Ctx) -> anyhow::Result<i32> {
         KV_LOCKS,
         KV_THREADS,
         KV_METRICS,
+        KV_CONSOLE,
     ];
     if ctx.json {
         println!("{}", serde_json::json!({ "provisioned": names }));

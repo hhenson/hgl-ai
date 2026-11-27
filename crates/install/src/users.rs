@@ -13,7 +13,7 @@ use std::str::FromStr;
 
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::{
-    CONSOLE_PREFIX, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES,
+    CONSOLE_PREFIX, KV_CONSOLE, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES,
     OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, SUBJECT_PREFIX,
 };
 use serde::{Deserialize, Serialize};
@@ -255,6 +255,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     streams.extend(buckets.iter().map(|b| kv(b)));
     if role == Role::Console {
         streams.push(STREAM_OWNER.to_string());
+        streams.push(kv(KV_CONSOLE));
     }
     for s in &streams {
         allow.extend(consumers_on(s));
@@ -289,6 +290,16 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 ]
                 .map(String::from),
             );
+            // The console's own state (sessions) is not for agents to read.
+            let c = kv(KV_CONSOLE);
+            deny.extend([
+                format!("$KV.{KV_CONSOLE}.>"),
+                format!("$JS.API.DIRECT.GET.{c}"),
+                format!("$JS.API.DIRECT.GET.{c}.>"),
+                format!("$JS.API.STREAM.MSG.GET.{c}"),
+                format!("$JS.API.CONSUMER.CREATE.{c}"),
+                format!("$JS.API.CONSUMER.CREATE.{c}.>"),
+            ]);
         }
         Role::Console => {
             // `tick` notes to the controller, the owner's notes and thread events.
@@ -296,6 +307,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             allow.extend(owner);
             allow.extend(pull_from(STREAM_OWNER));
             allow.push(format!("$KV.{KV_STATE}.decisions.log"));
+            allow.push(format!("$KV.{KV_CONSOLE}.>"));
         }
         Role::Admin => unreachable!(),
     }

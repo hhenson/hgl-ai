@@ -67,6 +67,9 @@ fn b64(data: &[u8]) -> String {
 /// in, the form token, and when it ends (UTC seconds).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Session {
+    /// The id in the cookie; never stored on the hub, where a session is keyed by its
+    /// SHA-256.
+    #[serde(skip, default)]
     pub id: String,
     pub user: String,
     /// `github:<login>`, `apple:<email>`, `google:<email>` or `passkey`.
@@ -77,6 +80,22 @@ pub struct Session {
 
 fn now_secs() -> i64 {
     chrono::Utc::now().timestamp()
+}
+
+/// `session.<sha256 of the id>`: a session's key in `HGL_CONSOLE`.
+pub fn session_key(id: &str) -> String {
+    use sha2::Digest as _;
+    format!("session.{}", hex::encode(Sha256::digest(id.as_bytes())))
+}
+
+/// A write of the console's state to the hub (`HGL_CONSOLE`), done in the background so
+/// a sign-in never waits on it.
+#[derive(Debug, Clone)]
+pub enum Persist {
+    Put(String, Session),
+    Del(String),
+    /// The pending `p2` batch: thread ids and titles.
+    P2(Vec<(String, String)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,7 +202,9 @@ pub struct Auth {
     key: Vec<u8>,
     store_path: PathBuf,
     store: Mutex<Store>,
+    /// By [`session_key`].
     sessions: Mutex<HashMap<String, Session>>,
+    persist: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Persist>>>,
     flows: Mutex<HashMap<String, Flow>>,
     enrolments: Mutex<HashMap<String, Enrolment>>,
     logins: Mutex<HashMap<String, (PasskeyAuthentication, Instant)>>,
@@ -237,6 +258,7 @@ impl Auth {
             store_path,
             store: Mutex::new(store),
             sessions: Mutex::default(),
+            persist: Mutex::default(),
             flows: Mutex::default(),
             enrolments: Mutex::default(),
             logins: Mutex::default(),
@@ -342,11 +364,42 @@ impl Auth {
             csrf: random_hex(),
             expires_at: now_secs() + self.console.session_ttl().as_secs() as i64,
         };
+        let key = session_key(&s.id);
         self.sessions
             .lock()
             .expect("sessions")
-            .insert(s.id.clone(), s.clone());
+            .insert(key.clone(), s.clone());
+        self.persist(Persist::Put(key, s.clone()));
         s
+    }
+
+    /// Queue a write to the hub; nothing while the hub is not connected yet.
+    pub fn persist(&self, p: Persist) {
+        if let Some(tx) = self.persist.lock().expect("persist").as_ref() {
+            let _ = tx.send(p);
+        }
+    }
+
+    /// Take the sessions kept on the hub (a restart), then send every change there.
+    /// Sessions made before the hub answered are written now.
+    pub fn attach(
+        &self,
+        stored: Vec<(String, Session)>,
+        tx: tokio::sync::mpsc::UnboundedSender<Persist>,
+    ) {
+        let now = now_secs();
+        let mut all = self.sessions.lock().expect("sessions");
+        for (key, s) in stored {
+            if s.expires_at > now && self.console.member(&s.user).is_some() {
+                all.entry(key).or_insert(s);
+            } else {
+                let _ = tx.send(Persist::Del(key));
+            }
+        }
+        for (key, s) in all.iter() {
+            let _ = tx.send(Persist::Put(key.clone(), s.clone()));
+        }
+        *self.persist.lock().expect("persist") = Some(tx);
     }
 
     /// The session cookie for a new sign-in.
@@ -358,17 +411,23 @@ impl Auth {
     /// has none.
     pub fn session(&self, cookie_header: Option<&str>) -> Option<Session> {
         let id = self.cookie(cookie_header, SESSION_COOKIE)?;
+        let key = session_key(&id);
         let mut all = self.sessions.lock().expect("sessions");
-        let s = all.get(&id)?.clone();
+        let mut s = all.get(&key)?.clone();
         if s.expires_at <= now_secs() || self.console.member(&s.user).is_none() {
-            all.remove(&id);
+            all.remove(&key);
+            drop(all);
+            self.persist(Persist::Del(key));
             return None;
         }
+        s.id = id;
         Some(s)
     }
 
     pub fn sign_out(&self, id: &str) {
-        self.sessions.lock().expect("sessions").remove(id);
+        let key = session_key(id);
+        self.sessions.lock().expect("sessions").remove(&key);
+        self.persist(Persist::Del(key));
     }
 
     fn sweep(&self) {
@@ -385,10 +444,17 @@ impl Auth {
             .lock()
             .expect("logins")
             .retain(|_, (_, t)| now.duration_since(*t) < PENDING_TTL);
-        self.sessions
-            .lock()
-            .expect("sessions")
-            .retain(|_, s| s.expires_at > now_secs());
+        let mut gone = Vec::new();
+        self.sessions.lock().expect("sessions").retain(|k, s| {
+            let keep = s.expires_at > now_secs();
+            if !keep {
+                gone.push(k.clone());
+            }
+            keep
+        });
+        for k in gone {
+            self.persist(Persist::Del(k));
+        }
     }
 
     // ---- OAuth ----
