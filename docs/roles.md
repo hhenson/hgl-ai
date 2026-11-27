@@ -6,9 +6,9 @@ Open decisions are issues in this repository.
 ## 1. Team
 
 ```
-                 Owner
-       specs, priorities, tags, budget
-                   │
+                 Owner ─────────────── Architect
+       specs, priorities, tags, budget   features, refactoring,
+                   │                     design cleanup
               Controller ───────────── Triage
       verdicts, merges, pins       labels, slices, owner
                    │               question batches
@@ -28,6 +28,14 @@ Open decisions are issues in this repository.
   issues, folds duplicates, keeps the claimable backlog ordered, and batches
   questions for the owner into one labelled list. Writes no code. Workers
   claim only what triage labelled ready.
+- **ROLE-3a — Architect** (seat `architect`). Works with the owner, through the owner
+  channel (`docs/owner.md`), to expand features and to engineer refactoring and design
+  cleanup: makes the code more efficient and the design simpler. Writes the design
+  (parent issues such as hgl-compiler P-F1..P-F5, design notes in the owning repository),
+  proposes each to the owner as a question with options and a suggestion, and once a design
+  is agreed splits it into bounded tasks for triage, in an order that keeps `main` working
+  (quiet windows on hot files). Does not approve or merge; implements only a spike that
+  proves a design, never on `main` directly (HPH, 2026-11-27).
 - **ROLE-4 — Implementor** (`w1`..`wN`). One bounded issue at a time in the
   worktree its bridge made. Runs formatting, lints and tests under the memory
   cap before `ready` with the exact head. Answers a `sendback` with new
@@ -97,7 +105,8 @@ Assignment agreed with the owner, 2026-11-27 (HPH: "lets use that for now"), fro
 
 | Work | First choice | Second | Not alone |
 | --- | --- | --- | --- |
-| Controller, architecture | Carbon high | Astra 6.2 high | — |
+| Architect: features, refactoring, design cleanup | Fable | Astra 6.2 high or Carbon high | — |
+| Controller | Carbon high | Astra 6.2 high | — |
 | Triage | Astra 6.2 high | Carbon high | — |
 | Specification design (rules, their reasoning, the questions for the owner) | Fable | Opus high | — |
 | Specification text | Fable, Opus high or Astra 6.2 high | — | — |
