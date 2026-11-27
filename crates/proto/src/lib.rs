@@ -21,6 +21,26 @@ pub const KV_LOCKS: &str = "HGL_LOCKS";
 /// The broadcast seat (PROTO-7).
 pub const BROADCAST: &str = "all";
 
+/// The owner channel (docs/owner.md §4): status reports, thread events, no age limit.
+pub const STREAM_OWNER: &str = "HGL_OWNER";
+/// One record per owner thread; only the console writes it.
+pub const KV_THREADS: &str = "HGL_THREADS";
+/// Daily samples per repository; the coordinator writes them.
+pub const KV_METRICS: &str = "HGL_METRICS";
+/// Owner words: `hgl.owner.thread.<id>`. Only the console's hub user publishes here (OWN-5).
+pub const OWNER_PREFIX: &str = "hgl.owner";
+/// Agent traffic for the owner: `hgl.console.status`, `hgl.console.thread.<id>`.
+pub const CONSOLE_PREFIX: &str = "hgl.console";
+/// Owner notes to a seat travel on `hgl.notes.owner.<seat>`, which only the console's hub
+/// user may publish; a note with sender `owner` is valid only there (OWN-5).
+pub const OWNER_NOTES_PREFIX: &str = "hgl.notes.owner";
+/// The sender of the owner's words; never a seat.
+pub const OWNER: &str = "owner";
+/// The sender of the console's own notes (`tick`); never a seat.
+pub const CONSOLE: &str = "console";
+/// Names no configured seat may take.
+pub const RESERVED_SEATS: [&str; 3] = [BROADCAST, OWNER, CONSOLE];
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProtoError {
     #[error("invalid seat name {0:?}: expected ^[a-z0-9][a-z0-9_-]{{0,31}}$")]
@@ -63,9 +83,28 @@ impl Seat {
     pub fn is_broadcast(&self) -> bool {
         self.0 == BROADCAST
     }
+    /// The owner's sender name (OWN-5).
+    pub fn owner() -> Self {
+        Seat(OWNER.to_string())
+    }
+    /// The console's sender name.
+    pub fn console() -> Self {
+        Seat(CONSOLE.to_string())
+    }
+    pub fn is_owner(&self) -> bool {
+        self.0 == OWNER
+    }
+    /// `all`, `owner` or `console`: an address or sender, never a configured seat.
+    pub fn is_reserved(&self) -> bool {
+        RESERVED_SEATS.contains(&self.0.as_str())
+    }
     /// `hgl.notes.<seat>`
     pub fn subject(&self) -> String {
         format!("{SUBJECT_PREFIX}.{}", self.0)
+    }
+    /// `hgl.notes.owner.<seat>`: the owner's notes to this seat (OWN-5).
+    pub fn owner_subject(&self) -> String {
+        format!("{OWNER_NOTES_PREFIX}.{}", self.0)
     }
     /// Durable consumer name `inbox-<seat>`.
     pub fn consumer(&self) -> String {
@@ -142,6 +181,7 @@ string_enum!(
     Assign => "assign", Ready => "ready", Blocked => "blocked", Question => "question",
     Answer => "answer", Review => "review", Receipt => "receipt", Sendback => "sendback",
     Approved => "approved", Landed => "landed", Closed => "closed", Done => "done", Note => "note",
+    Tick => "tick",
 });
 
 impl Kind {
@@ -252,6 +292,17 @@ impl Note {
         if self.sender.is_broadcast() {
             return Err(ProtoError::Note("sender cannot be `all`".into()));
         }
+        if self.recipient.is_owner() || self.recipient.as_str() == CONSOLE {
+            return Err(ProtoError::Note(format!(
+                "`{}` has no inbox; ask the owner with `hgl-ai ask`",
+                self.recipient
+            )));
+        }
+        if self.sender.is_owner() && self.recipient.is_broadcast() {
+            return Err(ProtoError::Note(
+                "owner notes go to one seat, not `all`".into(),
+            ));
+        }
         if let Some(h) = &self.head {
             check_head(h)?;
         } else if self.kind.needs_head() {
@@ -272,6 +323,16 @@ impl Note {
             return Err(ProtoError::Note("empty body".into()));
         }
         Ok(())
+    }
+
+    /// The subject the note travels on: `hgl.notes.<recipient>`, or for a note from the
+    /// owner `hgl.notes.owner.<recipient>`, which only the console may publish (OWN-5).
+    pub fn subject(&self) -> String {
+        if self.sender.is_owner() {
+            self.recipient.owner_subject()
+        } else {
+            self.recipient.subject()
+        }
     }
 
     /// `Nats-Msg-Id` for deduplication (PROTO-9): `<sender>-<created_at>-<digest>`, the
@@ -414,6 +475,34 @@ pub struct LockRecord {
     pub acquired_at: String,
 }
 
+/// `HGL_METRICS/<repo>.<YYYYMMDD>`: one sample per repository and day (docs/owner.md §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsSample {
+    pub repo: String,
+    /// UTC day, `YYYYMMDD`.
+    pub date: String,
+    /// Open issues when sampled.
+    pub open: u64,
+    /// Issues opened that day.
+    pub opened: u64,
+    /// Issues closed that day.
+    pub closed: u64,
+    /// Open issues per label when sampled.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, u64>,
+    pub taken_at: String,
+}
+
+impl MetricsSample {
+    pub fn key(&self) -> String {
+        metrics_key(&self.repo, &self.date)
+    }
+}
+
+pub fn metrics_key(repo: &str, date: &str) -> String {
+    format!("{repo}.{date}")
+}
+
 /// The landing lock of `repo` (§8): one landing or release watch at a time, on any host.
 pub fn land_lock_key(repo: &str) -> String {
     format!("lock.land.{repo}")
@@ -481,6 +570,31 @@ mod tests {
 
         let b = Note::new(Seat::broadcast(), seat("w1"), Kind::Note, "x");
         assert!(b.validate().is_err());
+    }
+
+    #[test]
+    fn owner_notes() {
+        let mut a = Note::new(Seat::owner(), seat("claude"), Kind::Answer, "accept");
+        assert!(a.validate().is_ok());
+        assert_eq!(a.subject(), "hgl.notes.owner.claude");
+        a.recipient = Seat::broadcast();
+        assert!(a.validate().is_err(), "owner notes go to one seat");
+        let n = Note::new(seat("w1"), seat("claude"), Kind::Note, "x");
+        assert_eq!(n.subject(), "hgl.notes.claude");
+        for to in [OWNER, CONSOLE] {
+            let n = Note::new(seat("w1"), seat(to), Kind::Question, "x");
+            assert!(n.validate().is_err(), "{to} has no inbox");
+        }
+        let t = Note::new(
+            Seat::console(),
+            seat("claude"),
+            Kind::Tick,
+            "[console] Tick",
+        );
+        assert!(t.validate().is_ok());
+        assert!(Seat::owner().is_reserved() && Seat::broadcast().is_reserved());
+        assert!(!seat("w1").is_reserved());
+        assert_eq!(metrics_key("hgl_spec", "20261127"), "hgl_spec.20261127");
     }
 
     #[test]

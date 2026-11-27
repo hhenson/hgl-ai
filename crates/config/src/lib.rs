@@ -7,7 +7,9 @@ use std::time::Duration;
 use hgl_ai_proto::{Family, Role, Runtime, Seat, Tier};
 use serde::{Deserialize, Serialize};
 
+pub mod console;
 pub mod github;
+pub use console::{AppleOAuth, Console, GithubOAuth, Identity, Notify, SmtpTls};
 pub use github::{Pin, ReleaseWatch, RepoGate, Tap};
 
 #[derive(Debug, thiserror::Error)]
@@ -35,6 +37,9 @@ pub enum ConfigError {
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
+/// Overrides `hub.token_file` for one process: a service that has a hub user of its own.
+pub const CREDENTIAL_ENV: &str = "HGL_AI_HUB_CREDENTIAL";
+
 /// The whole file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -55,6 +60,9 @@ pub struct Config {
     pub seats: Vec<SeatConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<Server>,
+    /// The owner's console (hub host only; docs/owner.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<Console>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -396,6 +404,7 @@ impl Config {
             models: default_models(),
             seats: Vec::new(),
             server: None,
+            console: None,
         }
     }
 
@@ -457,8 +466,11 @@ impl Config {
         }
         let mut seen = std::collections::BTreeSet::new();
         for s in &self.seats {
-            if s.name.is_broadcast() {
-                return Err(ConfigError::Invalid("a seat cannot be named `all`".into()));
+            if s.name.is_reserved() {
+                return Err(ConfigError::Invalid(format!(
+                    "a seat cannot be named `{}`: `all`, `owner` and `console` are reserved",
+                    s.name
+                )));
             }
             if !seen.insert(s.name.clone()) {
                 return Err(ConfigError::Invalid(format!(
@@ -472,6 +484,9 @@ impl Config {
             }
         }
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
+        if let Some(c) = &self.console {
+            c.validate().map_err(ConfigError::Invalid)?;
+        }
         for d in [
             &self.limits.stale_after,
             &self.limits.turn_timeout,
@@ -535,8 +550,17 @@ impl Config {
     pub fn data_dir(&self) -> Result<PathBuf> {
         expand(&self.paths.data_dir)
     }
+    /// The hub credential this process connects with: `HGL_AI_HUB_CREDENTIAL` when set (the
+    /// coordinator and console services each get their own hub user), else `hub.token_file`.
     pub fn token_file(&self) -> Result<PathBuf> {
-        expand(&self.hub.token_file)
+        match std::env::var_os(CREDENTIAL_ENV) {
+            Some(p) if !p.is_empty() => expand(&p.to_string_lossy()),
+            _ => expand(&self.hub.token_file),
+        }
+    }
+    /// `<data_dir>/console`: the console's passkeys and cookie key.
+    pub fn console_dir(&self) -> Result<PathBuf> {
+        Ok(self.data_dir()?.join("console"))
     }
     /// `<data_dir>/seats/<seat>.lock`: exclusively `flock`ed by whoever serves the seat,
     /// the bridge or an interactive session, never both.
@@ -657,6 +681,17 @@ model = "claude-opus-5-5-high"
         assert!(c.resolve(&b(Runtime::Claude, None, None, None)).is_err());
         c.host = "Bad Host".into();
         assert!(c.validate().is_err());
+    }
+
+    #[test]
+    fn reserved_seat_names() {
+        for name in ["all", "owner", "console"] {
+            let t = format!(
+                "host = \"h\"\n[[seat]]\nname = \"{name}\"\nrole = \"reviewer\"\nruntime = \"codex\"\ntier = \"fast\"\n"
+            );
+            let c: Config = toml::from_str(&t).unwrap();
+            assert!(c.validate().is_err(), "{name}");
+        }
     }
 
     #[test]
