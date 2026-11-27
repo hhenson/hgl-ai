@@ -28,8 +28,13 @@ script instead and runs none. The script is quoted for `sh` and names absolute p
 | units | `install -m 0644 ... /etc/systemd/system/hgl-ai-{hub,coord,console}.service`, `systemctl daemon-reload`, `enable`, `restart` | `/Library/LaunchDaemons/io.github.hhenson.hgl-ai.*.plist`, `launchctl bootstrap system`, `kickstart` |
 | provisioning, as the server user's admin hub user | `sudo -u hgl-ai env ... HGL_AI_HUB_CREDENTIAL=.../<hub>-admin.cred hgl-ai init` | same |
 | the coordinator's GitHub token (not `--no-coord`), before it starts | `sudo -u hgl-ai sh -c '...'`: reads it from the terminal without echo, writes `github.token` mode 0600; Enter keeps the current one | same |
-| this host's client credential, for you | `install -m 0600 -o <you> /var/lib/hgl-ai/.config/hgl-ai/hub.token <your config dir>/hub.token` | same |
-| or, with `--client-user NAME`, for it | `install -d -o NAME -m 0700 <its home>/.config <its home>/.config/hgl-ai`, `install -m 0600 -o NAME ... <its home>/.config/hgl-ai/hub.token`; nothing for you | same |
+| this host's client credential, for you (no root) | `sudo -u hgl-ai cat /var/lib/hgl-ai/.config/hgl-ai/hub.token \| sh -c '...' sh <your config dir>`: written by you, mode 0600 | same |
+| or, with `--client-user NAME`, for it (no root) | `sudo -u hgl-ai cat ... \| sudo -u NAME sh -c '...' sh <its home>/.config/hgl-ai`: new directories 0700, `hub.token` 0600; nothing for you | same |
+
+Root never reads a file the server user controls nor writes where a less-privileged
+user can plant a symlink: the server user reads the credential and its owner writes
+it, as themselves, in a temporary file renamed over `hub.token`. An empty read keeps
+the old one. The server home's parent must be root's (the defaults are).
 
 `nats-server` is chosen once, by the install: the first on the server user's `PATH`
 (yours without your home), else the pinned release in its `<data_dir>/bin`. The unit
