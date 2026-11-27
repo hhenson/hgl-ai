@@ -123,7 +123,7 @@ pub async fn verdict<G: Gh>(
         }
     };
     let to = if o.to.is_empty() {
-        land::author_seats(gh, s, bus, repo, &pr.branch, number, Some(issue)).await?
+        land::author_seats(gh, s, bus, repo, &pr.branch, number, Some(issue), true).await?
     } else {
         o.to.clone()
     };

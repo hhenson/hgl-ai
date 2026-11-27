@@ -85,8 +85,10 @@ pub type Classed = (Option<TaskClass>, Option<u64>);
 /// The task's class after these notes (docs/roles.md §3), in stream order: an `assign`
 /// sets it (triage may reclass a task by assigning it again); a `sendback` only moves it up
 /// (ROLE-15). A note no newer than the one that last set it (an older note delivered again,
-/// in this turn or a later one) changes nothing.
-pub fn task_class(recorded: Classed, notes: &[(u64, u64, Note)]) -> Classed {
+/// in this turn or a later one) changes nothing. The note at `made_by` made the tree of a
+/// task that moved here (a `sendback --to` this seat): its class sets the class, as an
+/// `assign` would, over the record it moved from.
+pub fn task_class(recorded: Classed, notes: &[(u64, u64, Note)], made_by: Option<u64>) -> Classed {
     let mut by_seq: Vec<&(u64, u64, Note)> = notes.iter().collect();
     by_seq.sort_by_key(|(seq, _, _)| *seq);
     by_seq.iter().fold(recorded, |(c, at), (seq, _, n)| {
@@ -94,6 +96,7 @@ pub fn task_class(recorded: Classed, notes: &[(u64, u64, Note)]) -> Classed {
             return (c, at);
         }
         match (n.kind, n.class) {
+            (_, Some(new)) if made_by == Some(*seq) => (Some(new), Some(*seq)),
             (Kind::Assign, Some(new)) => (Some(new), Some(*seq)),
             (Kind::Sendback, Some(new)) if c.is_none_or(|c| new > c) => (Some(new), Some(*seq)),
             _ => (c, at),
@@ -117,8 +120,9 @@ mod tests {
         use TaskClass::*;
         let a = |seq, c| classed(seq, Kind::Assign, Some(c));
         let sb = |seq, c| classed(seq, Kind::Sendback, c);
-        let tc =
-            |rec: Option<TaskClass>, notes: &[(u64, u64, Note)]| task_class((rec, None), notes).0;
+        let tc = |rec: Option<TaskClass>, notes: &[(u64, u64, Note)]| {
+            task_class((rec, None), notes, None).0
+        };
         assert_eq!(tc(None, &[a(1, Simple)]), Some(Simple));
         assert_eq!(tc(Some(Standard), &[sb(5, None)]), Some(Standard), "kept");
         assert_eq!(tc(None, &[sb(5, None)]), None, "an unclassed task stays so");
@@ -143,21 +147,41 @@ mod tests {
         assert_eq!(tc(Some(Simple), &[note]), Some(Simple));
         // r3's finding 2: the sequence that set it is kept, and older notes change nothing.
         assert_eq!(
-            task_class((None, None), &[a(3, Simple)]),
+            task_class((None, None), &[a(3, Simple)], None),
             (Some(Simple), Some(3))
         );
         let up = (Some(Complex), Some(5));
-        assert_eq!(task_class(up, &[a(3, Simple)]), up, "an older assign again");
-        assert_eq!(task_class(up, &[a(5, Simple)]), up, "the same note again");
         assert_eq!(
-            task_class(up, &[a(6, Simple)]),
+            task_class(up, &[a(3, Simple)], None),
+            up,
+            "an older assign again"
+        );
+        assert_eq!(
+            task_class(up, &[a(5, Simple)], None),
+            up,
+            "the same note again"
+        );
+        assert_eq!(
+            task_class(up, &[a(6, Simple)], None),
             (Some(Simple), Some(6)),
             "a newer one"
         );
         assert_eq!(
-            task_class(up, &[sb(8, Some(Simple))]),
+            task_class(up, &[sb(8, Some(Simple))], None),
             up,
             "a lower sendback"
+        );
+        // The sendback that made the tree of a task moved here sets its class.
+        let moved = (Some(Complex), Some(5));
+        assert_eq!(
+            task_class(moved, &[sb(7, Some(Standard))], Some(7)),
+            (Some(Standard), Some(7))
+        );
+        assert_eq!(task_class(moved, &[sb(7, Some(Standard))], None), moved);
+        assert_eq!(
+            task_class(moved, &[sb(7, None)], Some(7)),
+            moved,
+            "no class, no change"
         );
         assert_eq!(Simple.up(), Standard);
         assert_eq!(Standard.up(), Complex);
@@ -335,7 +359,7 @@ impl<B: BusApi> Bridge<B> {
                     Err(e) => return Outcome::PrepFailed(e.to_string()),
                 };
                 match take_lock(&dir).await {
-                    Ok(l) => (dir, l, None, (None, None)),
+                    Ok(l) => (dir, l, None, None),
                     Err(o) => return o,
                 }
             }
@@ -373,7 +397,8 @@ impl<B: BusApi> Bridge<B> {
                 }
                 // A tree made anew may continue a task begun on another host or seat: its
                 // class is in that tree's record (PROTO-21).
-                let mut inherited = (None, None);
+                // With the sequence of the note that made the tree.
+                let mut inherited: Option<(Classed, u64)> = None;
                 let file = match &job.create {
                     Some((seq, c)) => {
                         let trees = self.trees.clone();
@@ -384,7 +409,7 @@ impl<B: BusApi> Bridge<B> {
                             Ok(Ok(created)) => {
                                 // Read before this tree's own record replaces the old one.
                                 if !created.reused && !*review && created.file.class.is_none() {
-                                    inherited = self.class_elsewhere(task).await;
+                                    inherited = Some((self.class_elsewhere(task).await, seq));
                                 }
                                 if !created.reused
                                     && let Err(e) = self.bus.tree_put(&created.record).await
@@ -421,8 +446,11 @@ impl<B: BusApi> Bridge<B> {
         // The task's class (docs/roles.md §3), recorded in its tree; an inbox turn has none.
         let mut file = file;
         let (class, class_seq) = match file.as_ref() {
-            Some(f) if f.class.is_some() => task_class((f.class, f.class_seq), &job.notes),
-            Some(_) => task_class(inherited, &job.notes),
+            Some(f) if f.class.is_some() => task_class((f.class, f.class_seq), &job.notes, None),
+            Some(f) => match inherited {
+                Some((from, made_by)) => task_class(from, &job.notes, Some(made_by)),
+                None => task_class((f.class, f.class_seq), &job.notes, None),
+            },
             None => (None, None),
         };
         // The class picks the seat, not the model (PROTO-21): the seat's binding runs it.

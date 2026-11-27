@@ -38,8 +38,8 @@ hgl-ai note peek SEAT                   print what is not acked yet; takes nothi
 hgl-ai state put KEY VALUE|- [--if-revision N]
 hgl-ai state append KEY LINE|-
 hgl-ai gh approve|sendback REPO PR HEAD --body-file F   one GitHub comment, then the note
-                                        (sendback: --class C moves the task up, ROLE-15;
-                                        then reassign it to a seat for that class)
+                                        (sendback --class C --to SEAT: moves the task up a
+                                        class to SEAT in one step, ROLE-15; no assign)
 hgl-ai gh merge-if-clean REPO PR HEAD   one gate attempt; merges if every gate holds
 hgl-ai gh land REPO PR HEAD             the gate until it decides; then landed.log, main,
                                         the landed notes, the comment and the pins

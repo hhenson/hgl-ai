@@ -137,7 +137,9 @@ note; triage reassigns it. ROLE-15 moves a class up after two sendbacks.
 The class picks the seat, not the model (controller, 2026-11-27, hgl-ai#25): triage
 assigns a task (`hgl-ai note send --kind assign --class C`) to a seat whose binding is the
 row for its class. A seat runs its own binding, and its fallbacks, whatever the class; the
-bridge records the class with the task and names it in the prompt (PROTO-21).
+bridge records the class with the task and names it in the prompt (PROTO-21). A task moves
+to a seat for a higher class in one step, `hgl-ai gh sendback REPO PR HEAD --class C --to
+SEAT` (ROLE-15); no `assign` follows.
 
 The gate's reviewer is never of the author's family (ROLE-11). The GitHub review bot is
 a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the gate.
@@ -147,10 +149,11 @@ a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the g
   reviews and checker work); when one runs out, its rows move to their second choice.
 - **ROLE-15 — Escalate once.** A task whose work is sent back twice for the same
   finding moves up a class (simple to standard, standard to complex). The controller
-  judges "the same finding" and sends that second sendback with the next class
-  (`hgl-ai gh sendback ... --class C`); the bridge never moves a class down. The
-  controller or triage then reassigns the task to a seat for that class; its class
-  goes with it.
+  judges "the same finding" and sends that second sendback with the next class and a
+  seat for it: `hgl-ai gh sendback REPO PR HEAD --class C --to SEAT`. Only SEAT gets the
+  note; its bridge makes its tree on the pull request's branch at class C (the note's
+  class wins over the older record) and wakes no other seat. No `assign` follows. Later
+  verdicts without `--to` reach only SEAT, the task's current seat.
 - **ROLE-16 — Record the model.** `ready` notes and receipts name the family
   and model that did the work, so ROLE-11 can be checked.
 

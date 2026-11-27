@@ -679,6 +679,7 @@ impl Trees {
                         families: Vec::new(),
                         class: None,
                         class_seq: None,
+                        seq: None,
                     },
                 };
                 out.push(LocalTree { dir, record, file });
@@ -702,6 +703,7 @@ impl Trees {
             families: f.families.clone(),
             class: f.class,
             class_seq: f.class_seq,
+            seq: f.seq,
         }
     }
 
