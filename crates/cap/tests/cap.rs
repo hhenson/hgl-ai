@@ -223,7 +223,10 @@ fn fallback_watchdog_kills_a_tree_over_the_cap() {
     assert!(o.peak_line(&spec).unwrap().ends_with("of 300M (sampled)"));
 }
 
+// macOS accepts RLIMIT_AS but does not enforce it; there the cap's resident-memory
+// watchdog is what limits a command tree (see the tree-wide watchdog tests).
 #[test]
+#[cfg_attr(target_os = "macos", ignore = "macOS does not enforce RLIMIT_AS")]
 fn fallback_limits_one_process() {
     let spec = CapSpec::new(200 * MIB);
     let o = CapCommand::new(spec, &helper_cmd("alloc:512:0"))

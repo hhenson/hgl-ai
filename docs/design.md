@@ -15,7 +15,7 @@ no GitHub or git library.
 | `proto` | Note, kinds, receipts, host, tree and lock records, name and key validation, message ids. No I/O. | — |
 | `config` | `config.toml` schema, defaults, path expansion, load and save. | `proto` |
 | `bus` | NATS connection, provisioning, send, inbox fetch, ack/nak/in-progress, KV, leases. | `proto`, `config` |
-| `cap` | Memory and time caps for a command tree (`systemd-run --user --scope` on Linux, `setrlimit` and a watchdog elsewhere). | — |
+| `cap` | Memory and time caps for a command tree (`systemd-run --user --scope` on Linux, `setrlimit` and a resident-memory watchdog elsewhere; macOS does not enforce `RLIMIT_AS`, so there the watchdog alone limits memory). | — |
 | `tree` | Worktree layout, create, register, salvage, remove, stale listing. | `proto`, `config`, `bus` |
 | `bridge` | Seat loops, runtime adapters, prompt building, heartbeats, failover, cleanup on `landed`. | all above |
 | `install` | Hub and client installers, user services, `nats-server` provisioning, skill installation, agent launch. | `config`, `bus` |
