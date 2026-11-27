@@ -18,6 +18,7 @@ hgl-ai-tree = { path = "crates/tree" }
 hgl-ai-bridge = { path = "crates/bridge" }
 hgl-ai-install = { path = "crates/install" }
 hgl-ai-gh = { path = "crates/gh" }
+hgl-ai-owner = { path = "crates/owner" }
 anyhow = "1"
 thiserror = "2"
 serde = { version = "1", features = ["derive"] }
