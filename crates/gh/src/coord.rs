@@ -605,7 +605,7 @@ mod tests {
         let n = alert_note(&s, &a).unwrap();
         assert_eq!(
             (n.sender.as_str(), n.recipient.as_str(), n.kind),
-            ("coord", "claude", Kind::Note)
+            ("coord", "controller", Kind::Note)
         );
         assert_eq!((n.repo.as_deref(), n.issue), (Some("alpha"), 11));
         assert!(
