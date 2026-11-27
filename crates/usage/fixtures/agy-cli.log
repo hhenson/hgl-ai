@@ -1,0 +1,5 @@
+I1127 21:41:26.529043       1 printmode.go:410] Print mode: not authenticated, trying silent auth
+I1127 21:41:26.531008     498 keyring.go:64] keyringAuth: loaded token, expiry=2026-11-27 22:41:24.849454283 +0400 +04 expired=false
+I1127 21:41:26.531024       1 auth.go:157] ChainedAuth: authenticated via keyring (effective: keyring)
+I1127 21:41:26.531030       1 server_oauth.go:221] applyAuthResult: email=someone@example.com, authMethod=consumer, quotaProject=
+I1127 21:41:26.531036       1 server_oauth.go:226] OAuth: authenticated successfully as someone@example.com

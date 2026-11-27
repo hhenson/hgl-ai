@@ -1,0 +1,16 @@
+{
+  "loggedIn": true,
+  "authMethod": "claude.ai",
+  "apiProvider": "firstParty",
+  "analyticsDisabled": false,
+  "projectsDirectory": "~/.claude/projects",
+  "configDirectory": "~/.claude",
+  "loginExpiresAt": "2026-12-25T09:46:16.666Z",
+  "consoleProfileSignInOffered": true,
+  "email": "someone@example.com",
+  "orgId": "00000000-0000-4000-8000-000000000001",
+  "orgName": "someone@example.com's Organization",
+  "subscriptionType": "max",
+  "storedClaudeAiLogin": true,
+  "planTier": "max_20x"
+}

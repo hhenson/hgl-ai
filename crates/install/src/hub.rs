@@ -7,8 +7,8 @@ use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_config::Config;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES,
-    STREAM_NOTES, STREAM_OWNER,
+    KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE,
+    STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
 };
 
 pub trait Hub {
@@ -50,14 +50,14 @@ impl Hub for BusHub {
             .map_err(|e| e.to_string())?;
         let js = async_nats::jetstream::new(client);
         let mut missing = Vec::new();
-        for s in [STREAM_NOTES, STREAM_OWNER] {
+        for s in [STREAM_NOTES, STREAM_OWNER, STREAM_USAGE] {
             if js.get_stream(s).await.is_err() {
                 missing.push(s.to_string());
             }
         }
         for b in [
             KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
-            KV_BUILD,
+            KV_USAGE, KV_BUILD,
         ] {
             if js.get_key_value(b).await.is_err() {
                 missing.push(b.to_string());
@@ -196,6 +196,7 @@ mod live {
             [
                 STREAM_NOTES,
                 STREAM_OWNER,
+                STREAM_USAGE,
                 KV_STATE,
                 KV_HOSTS,
                 KV_TREES,
@@ -204,6 +205,7 @@ mod live {
                 KV_THREADS,
                 KV_METRICS,
                 KV_CONSOLE,
+                KV_USAGE,
                 KV_BUILD
             ]
         );
@@ -213,7 +215,11 @@ mod live {
             .await
             .unwrap();
         let js = async_nats::jetstream::new(client);
-        for (name, subject) in [(STREAM_NOTES, "hgl.notes.>"), (STREAM_OWNER, "hgl.owner.>")] {
+        for (name, subject) in [
+            (STREAM_NOTES, "hgl.notes.>"),
+            (STREAM_OWNER, "hgl.owner.>"),
+            (STREAM_USAGE, "hgl.usage.>"),
+        ] {
             js.create_stream(async_nats::jetstream::stream::Config {
                 name: name.into(),
                 subjects: vec![subject.into()],
@@ -224,7 +230,7 @@ mod live {
         }
         for b in [
             KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
-            KV_BUILD,
+            KV_USAGE, KV_BUILD,
         ] {
             js.create_key_value(async_nats::jetstream::kv::Config {
                 bucket: b.into(),

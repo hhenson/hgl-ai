@@ -1037,3 +1037,203 @@ async fn pages_go_on_past_a_malformed_message() {
     let (notes, last) = bus.read_page(&c, good.seq + 1, 10).await.unwrap();
     assert_eq!((notes.len(), last), (0, None));
 }
+
+fn usage(host: &str, observed_at: &str) -> hgl_ai_proto::UsageRecord {
+    hgl_ai_proto::UsageRecord {
+        runtime: Runtime::Claude,
+        account: hgl_ai_proto::account_fingerprint("org/someone@example.com"),
+        label: None,
+        host: host.into(),
+        plan: Some("max".into()),
+        observed_at: observed_at.into(),
+        collected_at: observed_at.into(),
+        source_age_s: 0,
+        buckets: vec![hgl_ai_proto::UsageBucket {
+            scope: "all".into(),
+            window: "week".into(),
+            used_pct: 20.0,
+            resets_at: Some("20261204T060000Z".into()),
+        }],
+        limit_reached: None,
+        unparsed: vec![],
+    }
+}
+
+/// PROTO-24: of hosts reporting one login, the newest observation stays, and only the
+/// records that won their key reach the history.
+#[tokio::test]
+async fn usage_keeps_the_newest_observation() {
+    use hgl_ai_bus::UsagePut;
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    assert!(bus.usage().await.unwrap().is_empty());
+    assert!(matches!(
+        bus.usage_put(&usage("host-1", "20261127T100000Z"))
+            .await
+            .unwrap(),
+        UsagePut::Written { history_seq: 1, .. }
+    ));
+    assert_eq!(
+        bus.usage_put(&usage("host-2", "20261127T090000Z"))
+            .await
+            .unwrap(),
+        UsagePut::Stale {
+            host: "host-1".into(),
+            observed_at: "20261127T100000Z".into()
+        }
+    );
+    // The same observation again is stale too.
+    assert!(matches!(
+        bus.usage_put(&usage("host-2", "20261127T100000Z"))
+            .await
+            .unwrap(),
+        UsagePut::Stale { .. }
+    ));
+    assert!(matches!(
+        bus.usage_put(&usage("host-2", "20261127T110000Z"))
+            .await
+            .unwrap(),
+        UsagePut::Written { history_seq: 2, .. }
+    ));
+    let got = bus.usage().await.unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].host, "host-2");
+
+    // Racing writers: the newest wins, whatever the order.
+    let mut set = tokio::task::JoinSet::new();
+    for h in 12..20 {
+        let url = hub.url.clone();
+        let token = hub.token.clone();
+        set.spawn(async move {
+            let b = Bus::connect_url(&url, Some(token)).await.unwrap();
+            b.usage_put(&usage(&format!("host-{h}"), &format!("20261127T{h}0000Z")))
+                .await
+                .unwrap()
+        });
+    }
+    let won = set
+        .join_all()
+        .await
+        .into_iter()
+        .filter(|p| matches!(p, UsagePut::Written { .. }))
+        .count();
+    let got = bus.usage().await.unwrap();
+    assert_eq!(
+        (got[0].host.as_str(), got[0].observed_at.as_str()),
+        ("host-19", "20261127T190000Z")
+    );
+    let history = bus
+        .history(
+            hgl_ai_proto::STREAM_USAGE,
+            "hgl.usage.>",
+            chrono::DateTime::UNIX_EPOCH,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 2 + won);
+    assert_eq!(history[0].subject, got[0].subject());
+
+    // Labels apply to records at once, and come off.
+    let account = got[0].account.clone();
+    bus.usage_label(&account, Some("max-1")).await.unwrap();
+    assert_eq!(
+        bus.usage().await.unwrap()[0].label.as_deref(),
+        Some("max-1")
+    );
+    assert_eq!(bus.usage_labels().await.unwrap().len(), 1);
+    bus.usage_label(&account, None).await.unwrap();
+    assert_eq!(bus.usage().await.unwrap()[0].label, None);
+    assert!(bus.usage_label("not-hex", Some("x")).await.is_err());
+    assert!(bus.usage_label(&account, Some("a b")).await.is_err());
+}
+
+/// A label removed after a record embedded it is gone from `usage` at once (r1 finding 2),
+/// and a record the KV holds but the history missed (a crash between the two writes) reaches
+/// the history when the same observation comes again, once (r1 minor 1).
+#[tokio::test]
+async fn usage_labels_come_off_and_history_catches_up() {
+    use hgl_ai_bus::UsagePut;
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let mut rec = usage("host-1", "20261127T100000Z");
+    rec.label = Some("old".into());
+    bus.usage_put(&rec).await.unwrap();
+    // The label written into a record is history; `usage` shows the one in force.
+    assert_eq!(bus.usage().await.unwrap()[0].label, None);
+    bus.usage_label(&rec.account, Some("max-1")).await.unwrap();
+    bus.usage_label(&rec.account, None).await.unwrap();
+    assert_eq!(bus.usage().await.unwrap()[0].label, None);
+
+    // The KV written, the history not.
+    let js = hub.raw().await;
+    let kv = js.get_key_value(hgl_ai_proto::KV_USAGE).await.unwrap();
+    let later = usage("host-1", "20261127T110000Z");
+    kv.put(later.key(), serde_json::to_vec(&later).unwrap().into())
+        .await
+        .unwrap();
+    let count = || async {
+        bus.history(
+            hgl_ai_proto::STREAM_USAGE,
+            "hgl.usage.>",
+            chrono::DateTime::UNIX_EPOCH,
+            100,
+        )
+        .await
+        .unwrap()
+        .len()
+    };
+    assert_eq!(count().await, 1);
+    for _ in 0..2 {
+        assert!(matches!(
+            bus.usage_put(&usage("host-2", "20261127T110000Z"))
+                .await
+                .unwrap(),
+            UsagePut::Stale { .. }
+        ));
+    }
+    assert_eq!(count().await, 2, "sent once, the second deduplicated");
+}
+
+/// Bot round 2: an equal observation collected after the history's dedup window is not
+/// appended again; the history's last record for the key is checked, not the window.
+#[tokio::test]
+async fn usage_history_never_repeats_an_observation() {
+    use hgl_ai_bus::UsagePut;
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let js = hub.raw().await;
+    let mut cfg = js
+        .get_stream(hgl_ai_proto::STREAM_USAGE)
+        .await
+        .unwrap()
+        .info()
+        .await
+        .unwrap()
+        .config
+        .clone();
+    cfg.duplicate_window = Duration::from_millis(200);
+    js.update_stream(&cfg).await.unwrap();
+    let rec = usage("host-1", "20261127T100000Z");
+    assert!(matches!(
+        bus.usage_put(&rec).await.unwrap(),
+        UsagePut::Written { .. }
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..2 {
+        assert!(matches!(
+            bus.usage_put(&rec).await.unwrap(),
+            UsagePut::Stale { .. }
+        ));
+    }
+    let history = bus
+        .history(
+            hgl_ai_proto::STREAM_USAGE,
+            "hgl.usage.>",
+            chrono::DateTime::UNIX_EPOCH,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+}

@@ -16,6 +16,7 @@ pub mod seat;
 pub mod server;
 pub mod state;
 pub mod tree;
+pub mod usage;
 
 use std::path::PathBuf;
 

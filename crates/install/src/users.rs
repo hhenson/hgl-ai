@@ -15,7 +15,8 @@ use hgl_ai_bus::Credential;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS,
-    KV_TREES, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, SUBJECT_PREFIX,
+    KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
+    SUBJECT_PREFIX, USAGE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 
@@ -250,9 +251,11 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     .map(String::from)
     .to_vec();
     let buckets = [
-        KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_BUILD,
+        KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_USAGE,
+        KV_BUILD,
     ];
-    let mut streams: Vec<String> = vec![STREAM_NOTES.to_string()];
+    // The usage history (PROTO-24) is read by every role through short-lived consumers.
+    let mut streams: Vec<String> = vec![STREAM_NOTES.to_string(), STREAM_USAGE.to_string()];
     streams.extend(buckets.iter().map(|b| kv(b)));
     if role == Role::Console {
         streams.push(STREAM_OWNER.to_string());
@@ -262,6 +265,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         allow.extend(consumers_on(s));
     }
     allow.extend(pull_from(STREAM_NOTES));
+    allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_USAGE}.*"));
     // The owner's subjects; denied to every client but the console.
     let owner = vec![
         format!("{OWNER_PREFIX}.>"),
@@ -273,9 +277,11 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         Role::Seat | Role::Coord => {
             allow.push(format!("{SUBJECT_PREFIX}.*"));
             allow.push(format!("{CONSOLE_PREFIX}.>"));
-            for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED] {
+            for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_USAGE] {
                 allow.push(format!("$KV.{b}.>"));
             }
+            // Usage records and their history (PROTO-23).
+            allow.push(format!("{USAGE_PREFIX}.>"));
             // `HGL_BUILD`: the run summaries builders and `build run` keep. The recipes,
             // which every builder runs, only the admin user writes: seats share their
             // host's credential, so no seat may (docs/build.md BUILD-1).
@@ -451,6 +457,9 @@ mod tests {
         let coord = permissions(Role::Coord).unwrap();
         assert!(coord.publish_allow.iter().any(|a| a == "$KV.HGL_METRICS.>"));
         assert!(!seat.publish_allow.iter().any(|a| a == "$KV.HGL_METRICS.>"));
+        for s in ["$KV.HGL_USAGE.>", "hgl.usage.>"] {
+            assert!(seat.publish_allow.iter().any(|a| a == s), "{s}");
+        }
         let console = permissions(Role::Console).unwrap();
         for s in ["hgl.owner.>", "hgl.notes.owner.>", "$KV.HGL_THREADS.>"] {
             assert!(console.publish_allow.iter().any(|a| a == s), "{s}");
