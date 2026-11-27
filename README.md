@@ -11,6 +11,7 @@ worktrees, and gives agents the commands they use through one installed skill.
 - [docs/roles.md](docs/roles.md): roles, gates, model assignment, resources.
 - [docs/design.md](docs/design.md): crates, command line, configuration, services.
 - [docs/install.md](docs/install.md): hub, clients, agents.
+- [docs/work.md](docs/work.md): how a seat works an issue: labels, claiming, branches, pull requests, blocking.
 
 ## Install
 
