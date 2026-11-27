@@ -42,6 +42,8 @@ struct Inner {
     seq: AtomicU64,
     /// name -> (holder, revision)
     leases: Mutex<HashMap<String, (String, u64)>>,
+    /// name -> when its holder's last write (take or refresh) was confirmed.
+    confirmed: Mutex<HashMap<String, std::time::Instant>>,
     revision: AtomicU64,
     /// `HGL_ENDED`: key -> seq
     ended: Mutex<HashMap<String, u64>>,
@@ -80,6 +82,12 @@ impl FakeBus {
     /// Who holds the lease `name`.
     pub fn lease_holder(&self, name: &str) -> Option<String> {
         g(&self.0.leases).get(name).map(|(h, _)| h.clone())
+    }
+
+    /// When the last write of the lease `name` by its holder was confirmed: the lease expires
+    /// `max_age` after it unless refreshed.
+    pub fn lease_confirmed_at(&self, name: &str) -> Option<std::time::Instant> {
+        g(&self.0.confirmed).get(name).copied()
     }
 
     /// The lease `name` goes (its holder released it, or it expired).
@@ -166,7 +174,10 @@ impl FakeBus {
     }
 
     /// Lease refreshes fail without an answer (`true`), as in a partition, or work.
+    /// Set under the leases' lock, which a refresh checks it under: once this returns no
+    /// refresh started before it can still succeed.
     pub fn refresh_down(&self, down: bool) {
+        let _leases = g(&self.0.leases);
         self.0.refresh_down.store(down, Ordering::SeqCst);
     }
 
@@ -267,6 +278,7 @@ impl BusApi for FakeBus {
         }
         let rev = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
         leases.insert(name.into(), (holder.into(), rev));
+        g(&self.0.confirmed).insert(name.into(), std::time::Instant::now());
         Ok(FakeLease {
             bus: self.clone(),
             name: name.into(),
@@ -280,6 +292,7 @@ impl BusApi for FakeBus {
             Some(h) if h == stale => {
                 let rev = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
                 g(&self.0.leases).insert(name.into(), (holder.into(), rev));
+                g(&self.0.confirmed).insert(name.into(), std::time::Instant::now());
                 Ok(FakeLease {
                     bus: self.clone(),
                     name: name.into(),
@@ -314,14 +327,15 @@ pub struct FakeLease {
 
 impl LeaseApi for FakeLease {
     async fn refresh(&mut self) -> Result<()> {
+        let mut leases = g(&self.bus.0.leases);
         if self.bus.0.refresh_down.load(Ordering::SeqCst) {
             return Err(BusError::Nats("HGL_LOCKS: no responders".into()));
         }
-        let mut leases = g(&self.bus.0.leases);
         match leases.get_mut(&self.name) {
             Some((_, rev)) if *rev == self.rev => {
                 *rev = self.bus.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
                 self.rev = *rev;
+                g(&self.bus.0.confirmed).insert(self.name.clone(), std::time::Instant::now());
                 Ok(())
             }
             _ => Err(BusError::LeaseLost {
