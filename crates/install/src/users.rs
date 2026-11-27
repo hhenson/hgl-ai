@@ -411,7 +411,20 @@ mod tests {
             assert!(!seat.publish_allow.iter().any(|a| a == s), "{s}");
         }
         assert!(seat.publish_allow.iter().any(|a| a == "hgl.notes.*"));
-        assert!(!seat.publish_allow.iter().any(|a| a.contains("HGL_OWNER")));
+        // Status reports by a short-lived consumer; never the console's feed or an ack.
+        assert!(
+            seat.publish_allow
+                .iter()
+                .any(|a| a == "$JS.API.CONSUMER.CREATE.HGL_OWNER")
+        );
+        for d in [
+            "$JS.API.CONSUMER.CREATE.HGL_OWNER.>",
+            "$JS.API.CONSUMER.DURABLE.CREATE.HGL_OWNER.*",
+            "$JS.API.CONSUMER.MSG.NEXT.HGL_OWNER.console",
+            "$JS.ACK.HGL_OWNER.>",
+        ] {
+            assert!(seat.publish_deny.iter().any(|x| x == d), "{d}");
+        }
         let coord = permissions(Role::Coord).unwrap();
         assert!(coord.publish_allow.iter().any(|a| a == "$KV.HGL_METRICS.>"));
         assert!(!seat.publish_allow.iter().any(|a| a == "$KV.HGL_METRICS.>"));

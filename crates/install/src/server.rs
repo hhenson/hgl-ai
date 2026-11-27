@@ -914,12 +914,31 @@ mod tests {
         // With the hub's pid file, a reload instead: connections stay.
         let store = f.env.home.join(".local/share/hgl-ai/nats");
         std::fs::write(crate::nats::pid_path(&store), "4242\n").unwrap();
+        f.on(
+            |c| match (c.program.as_str(), c.args.first().map(String::as_str)) {
+                ("ps", _) => Output::success("/usr/bin/nats-server\n"),
+                ("id", _) => Output::success("1000\n"),
+                _ => Output::success(""),
+            },
+        );
         let before = f.runs().len();
         user_add(&f, "build-2", Role::Seat, None, false).unwrap();
         assert_eq!(f.runs()[before..], ["kill -HUP 4242"]);
         assert!(
             f.output()
                 .contains("reloaded with the new users (connections kept)")
+        );
+        // A stale pid file (no such process): a restart, not a failure.
+        f.on(|c| match c.program.as_str() {
+            "ps" => Output::failure(1, ""),
+            "id" => Output::success("1000\n"),
+            _ => Output::success(""),
+        });
+        let before = f.runs().len();
+        user_add(&f, "build-3", Role::Seat, None, false).unwrap();
+        assert_eq!(
+            f.runs()[before..],
+            ["systemctl --user restart hgl-ai-hub.service"]
         );
         assert!(
             user_add(&f, "build-1", Role::Seat, None, false).is_err(),

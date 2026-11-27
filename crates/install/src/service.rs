@@ -393,8 +393,18 @@ pub fn reload_hub(sys: &dyn System, store_dir: &Path) -> Result<bool> {
     if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
         return Ok(false);
     }
-    run_ok(sys, &Cmd::new("kill").args(["-HUP", pid]))?;
-    Ok(true)
+    // A stale pid file (the hub stopped): no such process, or another program now.
+    let alive = sys
+        .query(&Cmd::new("ps").args(["-p", pid, "-o", "comm="]))
+        .is_ok_and(|o| o.ok() && o.stdout.trim().ends_with("nats-server"));
+    if !alive {
+        return Ok(false);
+    }
+    match sys.run(&Cmd::new("kill").args(["-HUP", pid])) {
+        Ok(o) if o.ok() => Ok(true),
+        // It went between the two.
+        _ => Ok(false),
+    }
 }
 
 /// Restart an installed service (it rereads its configuration and credential).
