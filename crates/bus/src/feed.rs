@@ -79,7 +79,8 @@ fn to_msg(m: jetstream::Message, keep: bool) -> Result<StreamMsg> {
     })
 }
 
-/// A durable consumer of `HGL_OWNER` (the console's): every event once, in order.
+/// A durable consumer of `HGL_OWNER` (the console's): every event once, in order, one
+/// in flight at a time.
 pub struct Feed {
     consumer: jetstream::consumer::PullConsumer,
 }
@@ -168,6 +169,9 @@ impl Bus {
                 deliver_policy: DeliverPolicy::All,
                 ack_policy: AckPolicy::Explicit,
                 ack_wait: Duration::from_secs(60),
+                // One event at a time, so a thread's events fold in order: a later one is
+                // never delivered while an earlier one waits for redelivery.
+                max_ack_pending: 1,
                 filter_subjects: filters,
                 ..Default::default()
             })

@@ -14,6 +14,8 @@ use hgl_ai_proto::{CONSOLE_PREFIX, Kind, Note, OWNER_PREFIX, Seat};
 
 use crate::{App, Error};
 
+/// A failed fold is tried again after this long.
+pub const FOLD_RETRY: Duration = Duration::from_secs(2);
 /// Between attempts to reach the hub.
 const RECONNECT: Duration = Duration::from_secs(10);
 /// Between telemetry readings.
@@ -110,8 +112,20 @@ pub async fn fold_batch(
     wait: Duration,
 ) -> hgl_ai_owner::Result<usize> {
     let msgs = feed.fetch(32, wait).await?;
-    for m in &msgs {
-        match owner::apply(bus, &app.controller, m).await {
+    for (i, m) in msgs.iter().enumerate() {
+        #[cfg(test)]
+        let applied = match tests::FAIL_ONCE.compare_exchange(
+            m.seq,
+            0,
+            std::sync::atomic::Ordering::SeqCst,
+            std::sync::atomic::Ordering::SeqCst,
+        ) {
+            Ok(_) => Err(hgl_ai_owner::Error::Invalid("injected failure".into())),
+            Err(_) => owner::apply(bus, &app.controller, m).await,
+        };
+        #[cfg(not(test))]
+        let applied = owner::apply(bus, &app.controller, m).await;
+        match applied {
             Ok(Applied::Folded {
                 thread,
                 new_question,
@@ -130,8 +144,14 @@ pub async fn fold_batch(
                 m.ack().await?;
             }
             Err(e) => {
-                tracing::warn!(seq = m.seq, "folding failed, retrying later: {e}");
-                m.nak(Duration::from_secs(15)).await?;
+                // Stop here: nothing after this event folds until it has. The feed has one
+                // event in flight, so this is all of the batch; any other goes back as is.
+                tracing::warn!(seq = m.seq, "folding failed, retrying: {e}");
+                m.nak(FOLD_RETRY).await?;
+                for rest in &msgs[i + 1..] {
+                    rest.nak(Duration::ZERO).await?;
+                }
+                return Ok(i);
             }
         }
     }
@@ -339,8 +359,153 @@ pub async fn run(cfg: hgl_ai_config::Config) -> Result<(), Error> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
+
+    /// A fold of the event at this sequence fails once (a transient hub error).
+    pub(crate) static FAIL_ONCE: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
+    struct Server(std::process::Child, #[allow(dead_code)] tempfile::TempDir);
+    impl Drop for Server {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A token hub from `PATH` on a free port; `None` (skipped) without `nats-server`.
+    fn hub() -> Option<(Server, String, String)> {
+        let bin = std::env::split_paths(&std::env::var_os("PATH")?)
+            .map(|d| d.join("nats-server"))
+            .find(|p| p.is_file())?;
+        let d = tempfile::tempdir().unwrap();
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let token = format!("t{}", std::process::id());
+        let child = std::process::Command::new(bin)
+            .args([
+                "-js",
+                "-a",
+                "127.0.0.1",
+                "-p",
+                &port.to_string(),
+                "--auth",
+                &token,
+                "-sd",
+            ])
+            .arg(d.path().join("store"))
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let s = Server(child, d);
+        assert!((0..200).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+        }));
+        Some((s, format!("nats://127.0.0.1:{port}"), token))
+    }
+
+    /// Carbon's probe: the answer's fold fails once while the thread's next event waits.
+    /// The next event is not folded first, the answer is not lost, and its ruling reaches
+    /// `decisions.log`.
+    #[tokio::test]
+    async fn a_failed_fold_holds_the_threads_later_events() {
+        let Some((_srv, url, token)) = hub() else {
+            eprintln!("skipped: nats-server is not on PATH");
+            return;
+        };
+        let bus = Bus::connect_url(&url, Some(token)).await.unwrap();
+        bus.provision().await.unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let a = app(d.path());
+        let claude = Seat::new("claude").unwrap();
+        let id = owner::ask(
+            &bus,
+            &claude,
+            owner::Ask {
+                title: "Pick".into(),
+                priority: Priority::P3,
+                issue: Some("alpha#7".into()),
+                context: String::new(),
+                question: "Which?".into(),
+                options: vec![owner::QOption::parse("a:One").unwrap()],
+                suggested: Some("a".into()),
+            },
+        )
+        .await
+        .unwrap();
+        let answer = owner::owner_event(
+            &bus,
+            &id,
+            "owner@example.com",
+            Some("This Dude"),
+            owner::Body::Answer {
+                choice: owner::Choice::Accept,
+                option: None,
+                text: String::new(),
+                note: String::new(),
+            },
+        )
+        .await
+        .unwrap();
+        owner::owner_event(
+            &bus,
+            &id,
+            "owner@example.com",
+            Some("This Dude"),
+            owner::Body::OwnerMessage {
+                body: "And thanks.".into(),
+            },
+        )
+        .await
+        .unwrap();
+        FAIL_ONCE.store(answer, std::sync::atomic::Ordering::SeqCst);
+        let filters = vec![format!("{CONSOLE_PREFIX}.>"), format!("{OWNER_PREFIX}.>")];
+        let mut feed = bus.owner_feed(owner::FEED, filters).await.unwrap();
+        let mut seen_answer_fail = false;
+        for _ in 0..40 {
+            let before = owner::show(&bus, &id).await.unwrap();
+            fold_batch(&a, &bus, &mut feed, Duration::from_millis(500))
+                .await
+                .unwrap();
+            if FAIL_ONCE.load(std::sync::atomic::Ordering::SeqCst) == 0 && !seen_answer_fail {
+                seen_answer_fail = true;
+                let t = owner::show(&bus, &id).await.unwrap().unwrap();
+                assert_eq!(
+                    t.seq,
+                    before.map(|t| t.seq).unwrap_or(0),
+                    "nothing folded past the failed answer"
+                );
+                assert!(t.messages.is_empty(), "the later message waited");
+            }
+            let t = owner::show(&bus, &id).await.unwrap();
+            if t.as_ref().is_some_and(|t| t.messages.len() == 2) {
+                break;
+            }
+        }
+        let t = owner::show(&bus, &id).await.unwrap().unwrap();
+        assert!(seen_answer_fail);
+        assert_eq!(t.state, owner::ThreadState::Answered, "{t:?}");
+        assert_eq!(t.messages.last().unwrap().body, "And thanks.");
+        let log = owner::decisions_tail(&bus, 5).await.unwrap();
+        assert_eq!(log.iter().filter(|l| l.contains(&id)).count(), 1, "{log:?}");
+        // The inbox got the answer and the message, once each.
+        let mut inbox = bus.inbox(&claude).await.unwrap();
+        let got = inbox.fetch(10, Duration::from_secs(2)).await.unwrap();
+        let owner_notes: Vec<_> = got.iter().filter(|d| d.note.sender.is_owner()).collect();
+        assert_eq!(
+            owner_notes.len(),
+            2,
+            "{:?}",
+            got.iter().map(|d| &d.note.body).collect::<Vec<_>>()
+        );
+        assert_eq!(owner_notes[0].note.kind, Kind::Answer, "in order");
+    }
 
     fn app(dir: &std::path::Path) -> App {
         let mut cfg = hgl_ai_config::Config::new("hub");

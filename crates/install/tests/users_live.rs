@@ -164,7 +164,13 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
         issue: 7,
     };
     seat_bus.ended_put(&seat("w1"), &task, 42).await.unwrap();
-    assert!(seat_bus.ended_get(&seat("w1"), &task).await.unwrap().is_some());
+    assert!(
+        seat_bus
+            .ended_get(&seat("w1"), &task)
+            .await
+            .unwrap()
+            .is_some()
+    );
     let mut lease = seat_bus.lock_acquire("seat.w1", "build-1").await.unwrap();
     lease.refresh().await.unwrap();
     assert!(lease.release().await.unwrap());

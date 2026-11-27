@@ -278,8 +278,13 @@ pub async fn apply(bus: &Bus, controller: &Seat, msg: &StreamMsg) -> Result<Appl
             Ok(x) => x,
             Err(r) => return Ok(Applied::Skipped(r.0)),
         };
+        // Every effect before the record, each one idempotent: a fold that fails part
+        // way is folded again, and only the record's write makes it done.
         for n in &fx.notes {
             bus.send(n).await?;
+        }
+        if let Some(line) = &fx.decision {
+            decision_once(bus, line).await?;
         }
         match bus
             .thread_put(id, &t, rec.as_ref().map_or(0, |(_, r)| *r))
@@ -288,11 +293,6 @@ pub async fn apply(bus: &Bus, controller: &Seat, msg: &StreamMsg) -> Result<Appl
             Ok(_) => {}
             Err(BusError::Conflict { .. }) => continue,
             Err(e) => return Err(e.into()),
-        }
-        if let Some(line) = &fx.decision
-            && let Err(e) = decision_append(bus, line).await
-        {
-            tracing::warn!("appending to {KEY_DECISIONS}: {e}");
         }
         return Ok(Applied::Folded {
             thread: Box::new(t),
@@ -317,38 +317,45 @@ pub async fn wait_folded(bus: &Bus, id: &str, seq: u64, wait: Duration) -> Resul
     }
 }
 
-/// The newest `keep` non-empty lines of `text`, when there are more.
-fn newest_lines(text: &str, keep: usize) -> Option<String> {
-    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
-    if lines.len() <= keep {
-        return None;
-    }
-    let mut s = lines[lines.len() - keep..].join("\n");
-    s.push('\n');
-    Some(s)
+/// Append one line to `decisions.log`, keeping its newest [`DECISIONS_KEEP`] lines in
+/// the same compare-and-set (OWN-8; like `landed.log`), so the value never outgrows the
+/// bucket. Newlines in `line` become spaces.
+pub async fn decision_append(bus: &Bus, line: &str) -> Result<()> {
+    append_decision(bus, line, false).await
 }
 
-/// Append one line to `decisions.log` and keep its newest [`DECISIONS_KEEP`] lines
-/// (OWN-8; like `landed.log`). Newlines in `line` become spaces.
-pub async fn decision_append(bus: &Bus, line: &str) -> Result<()> {
+/// [`decision_append`], unless the log already holds `line` (a fold done again).
+pub async fn decision_once(bus: &Bus, line: &str) -> Result<()> {
+    append_decision(bus, line, true).await
+}
+
+async fn append_decision(bus: &Bus, line: &str, once: bool) -> Result<()> {
     let line = line.replace(['\n', '\r'], " ");
-    bus.append_line(KEY_DECISIONS, line.trim()).await?;
-    for _ in 0..8 {
-        let Some(e) = bus.state_get(KEY_DECISIONS).await? else {
+    let line = line.trim();
+    for _ in 0..64 {
+        let cur = bus.state_get(KEY_DECISIONS).await?;
+        let (text, rev) = cur.map_or((String::new(), 0), |e| (e.value, e.revision));
+        if once && text.lines().any(|l| l == line) {
             return Ok(());
-        };
-        let Some(trimmed) = newest_lines(&e.value, DECISIONS_KEEP) else {
-            return Ok(());
-        };
-        match bus.state_update(KEY_DECISIONS, &trimmed, e.revision).await {
-            Err(BusError::Conflict { .. }) => continue,
+        }
+        let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+        lines.push(line);
+        let skip = lines.len().saturating_sub(DECISIONS_KEEP);
+        let mut value = lines[skip..].join("\n");
+        value.push('\n');
+        match bus.state_update(KEY_DECISIONS, &value, rev).await {
+            Err(BusError::Conflict { .. }) => {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             other => {
                 other?;
                 return Ok(());
             }
         }
     }
-    Ok(())
+    Err(invalid(format!(
+        "{KEY_DECISIONS}: other writers keep changing it"
+    )))
 }
 
 /// The newest `n` lines of `decisions.log`, oldest first.
@@ -408,7 +415,5 @@ mod tests {
                 "q-00000005"
             ]
         );
-        assert_eq!(newest_lines("a\nb\nc\n", 2).as_deref(), Some("b\nc\n"));
-        assert_eq!(newest_lines("a\n", 2), None);
     }
 }
