@@ -51,8 +51,15 @@ impl Bus {
                 None => 0,
                 Some(e) => {
                     if let Ok(old) = serde_json::from_slice::<UsageRecord>(&e.value)
-                        && parse_stamp(&old.observed_at).is_some_and(|t| Some(t) >= new_at)
+                        && let Some(old_at) = parse_stamp(&old.observed_at)
+                        && Some(old_at) >= new_at
                     {
+                        if Some(old_at) == new_at {
+                            // The history may have missed it (a stop between the two
+                            // writes): send the held record again; its message id drops
+                            // a copy the history has.
+                            self.usage_history(&old, e.value.to_vec()).await?;
+                        }
                         return Ok(UsagePut::Stale {
                             host: old.host,
                             observed_at: old.observed_at,
@@ -95,10 +102,21 @@ impl Bus {
         let Some(revision) = revision else {
             return Err(conflict(&key, 0));
         };
+        Ok(UsagePut::Written {
+            revision,
+            history_seq: self.usage_history(rec, value).await?,
+        })
+    }
+
+    /// Publish `value` (the encoded `rec`) to the history, message id
+    /// `<key>.<observed_at>`; returns its stream sequence.
+    async fn usage_history(&self, rec: &UsageRecord, value: Vec<u8>) -> Result<u64> {
         let subject = rec.subject();
-        let publish = Publish::build()
-            .payload(value.into())
-            .message_id(format!("{key}.{}", rec.observed_at));
+        let publish = Publish::build().payload(value.into()).message_id(format!(
+            "{}.{}",
+            rec.key(),
+            rec.observed_at
+        ));
         let ack = self
             .guarded(&subject, async {
                 self.js
@@ -109,22 +127,18 @@ impl Bus {
                     .map_err(|e| publish_error(&subject, e))
             })
             .await?;
-        Ok(UsagePut::Written {
-            revision,
-            history_seq: ack.sequence,
-        })
+        Ok(ack.sequence)
     }
 
-    /// Every usage record, ordered by key, with the owner's labels applied (a label set
-    /// after a record was written shows at once).
+    /// Every usage record, ordered by key, with the owner's labels in force (a label set
+    /// or removed after a record was written shows at once).
     pub async fn usage(&self) -> Result<Vec<UsageRecord>> {
         let (records, labels) = self.usage_all().await?;
         Ok(records
             .into_iter()
             .map(|mut r| {
-                if let Some(l) = labels.get(&r.account) {
-                    r.label = Some(l.clone());
-                }
+                // The label in force, not the one the record was written with.
+                r.label = labels.get(&r.account).cloned();
                 r
             })
             .collect())

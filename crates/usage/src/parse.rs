@@ -165,7 +165,7 @@ pub fn claude_usage(text: &str, now: DateTime<Utc>) -> Parsed {
 }
 
 /// A claude reset time: `Dec 4, 9:59am (Asia/Dubai)` or `3pm (Asia/Dubai)`, in the zone
-/// named (the host's when none is). No year: the next such time from a day before `now`;
+/// named (the host's when none is). No year: the first such time from a day before `now`;
 /// no date: the next such time after `now`.
 pub fn claude_reset(s: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
     let c = CLAUDE_RESET.captures(s.trim())?;
@@ -200,12 +200,11 @@ pub fn claude_reset(s: &str, now: DateTime<Utc>) -> Option<DateTime<Utc>> {
         (Some(mon), Some(day)) => {
             let month = month_of(mon.as_str())?;
             let day: i8 = day.as_str().parse().ok()?;
-            let this = at(jiff::civil::Date::new(today.year(), month, day).ok()?)?;
-            if this >= now.timestamp() - 86_400 {
-                this
-            } else {
-                at(jiff::civil::Date::new(today.year() + 1, month, day).ok()?)?
-            }
+            // The earliest of last, this and next year's that is not over a day past.
+            [today.year() - 1, today.year(), today.year() + 1]
+                .into_iter()
+                .filter_map(|y| at(jiff::civil::Date::new(y, month, day).ok()?))
+                .find(|t| *t >= now.timestamp() - 86_400)?
         }
         _ => {
             let t = at(today)?;
@@ -473,6 +472,15 @@ mod tests {
         assert_eq!(
             claude_reset("1:30pm (Europe/London)", now).map(utc_stamp),
             Some("20261230T133000Z".into())
+        );
+        // r1 minor 3: on Jan 1, a reset just before midnight is last year's, not next Dec 31.
+        assert_eq!(
+            claude_reset("Dec 31, 11pm (UTC)", at("2027-01-01T00:30:00Z")).map(utc_stamp),
+            Some("20261231T230000Z".into())
+        );
+        assert_eq!(
+            claude_reset("Jan 1, 9am (UTC)", at("2026-12-31T20:00:00Z")).map(utc_stamp),
+            Some("20270101T090000Z".into())
         );
         assert_eq!(claude_reset("3pm (Mars/Olympus)", now), None);
         assert_eq!(claude_reset("soon", now), None);

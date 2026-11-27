@@ -213,3 +213,110 @@ codex.0123456789ab: unparsed: odd line
     assert_eq!(hours_to(Some("20261127T173000Z"), now), Some(-0.5));
     assert_eq!(hours_to(None, now), None);
 }
+
+fn rate_line(at: &str, used: f64) -> String {
+    format!(
+        r#"{{"timestamp":"{at}","type":"event_msg","payload":{{"type":"token_count","rate_limits":{{"primary":{{"used_percent":{used},"window_minutes":10080,"resets_at":1796365025}},"plan_type":"pro"}}}}}}"#
+    )
+}
+
+fn meta_line(account: &str) -> String {
+    format!(
+        r#"{{"timestamp":"2026-11-27T09:00:00Z","type":"session_meta","payload":{{"creator_account_id":"{account}"}}}}"#
+    )
+}
+
+fn rollout(dir: &Path, name: &str, lines: &[String], mtime: &str) -> PathBuf {
+    let p = dir.join(name);
+    std::fs::write(&p, lines.join("\n") + "\n").unwrap();
+    let t: SystemTime = DateTime::parse_from_rfc3339(mtime).unwrap().into();
+    std::fs::File::options()
+        .write(true)
+        .open(&p)
+        .unwrap()
+        .set_modified(t)
+        .unwrap();
+    p
+}
+
+/// r1 finding 3a: another seat's rollout, written later but holding older rate limits, does
+/// not hide the newest observation of the account.
+#[test]
+fn codex_takes_the_newest_observation_not_the_newest_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path();
+    rollout(
+        s,
+        "rollout-a.jsonl",
+        &[
+            meta_line("acct-1"),
+            rate_line("2026-11-27T18:01:00Z", 30.0),
+            r#"{"timestamp":"2026-11-27T18:19:00Z","type":"response_item","payload":{}}"#.into(),
+        ],
+        "2026-11-27T18:20:00Z",
+    );
+    rollout(
+        s,
+        "rollout-b.jsonl",
+        &[meta_line("acct-1"), rate_line("2026-11-27T18:14:00Z", 88.0)],
+        "2026-11-27T18:14:01Z",
+    );
+    // Of another account: newer still, never taken.
+    rollout(
+        s,
+        "rollout-c.jsonl",
+        &[meta_line("acct-2"), rate_line("2026-11-27T18:16:00Z", 1.0)],
+        "2026-11-27T18:16:01Z",
+    );
+    let l = codex_limits(s, "acct-1").unwrap();
+    assert_eq!(utc_stamp(l.observed_at), "20261127T181400Z");
+    assert_eq!(l.parsed.buckets[0].used_pct, 88.0);
+}
+
+/// r1 finding 3b: a rollout longer than the bytes read gives its tail's rate limits, and its
+/// head still names the account.
+#[test]
+fn codex_reads_a_long_rollouts_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let s = dir.path();
+    let filler = format!(
+        r#"{{"timestamp":"2026-11-27T12:00:00Z","type":"response_item","payload":{{"text":"{}"}}}}"#,
+        "x".repeat(1000)
+    );
+    let mut lines = vec![meta_line("acct-1"), rate_line("2026-11-27T10:01:00Z", 5.0)];
+    lines.extend(std::iter::repeat_n(filler.clone(), 200));
+    lines.push(rate_line("2026-11-27T18:30:00Z", 92.0));
+    lines.extend(std::iter::repeat_n(filler, 10));
+    rollout(s, "rollout-long.jsonl", &lines, "2026-11-27T18:31:00Z");
+    let l = codex_limits_in(s, "acct-1", 4096).unwrap();
+    assert_eq!(utc_stamp(l.observed_at), "20261127T183000Z");
+    assert_eq!(l.parsed.buckets[0].used_pct, 92.0);
+    assert!(
+        codex_limits_in(s, "acct-2", 4096).is_err(),
+        "the head's account is read"
+    );
+    // The last rate limits further back than the first tail read: found by reading more.
+    let mut lines = vec![meta_line("acct-1"), rate_line("2026-11-27T10:02:00Z", 6.0)];
+    lines.extend(std::iter::repeat_n(
+        format!(
+            r#"{{"timestamp":"2026-11-27T12:00:00Z","payload":"{}"}}"#,
+            "y".repeat(1000)
+        ),
+        20,
+    ));
+    rollout(s, "rollout-long.jsonl", &lines, "2026-11-27T18:31:00Z");
+    let l = codex_limits_in(s, "acct-1", 4096).unwrap();
+    assert_eq!(utc_stamp(l.observed_at), "20261127T100200Z");
+}
+
+/// r1 minor 2: a reset just passed is `passed`, never `-0.0h`.
+#[test]
+fn a_reset_just_passed() {
+    let now = parse_stamp("20261127T180000Z").unwrap();
+    assert_eq!(reset_cell(Some("20261127T175900Z"), now), "passed");
+    assert_eq!(reset_cell(Some("20261127T180000Z"), now), "passed");
+    assert_eq!(reset_cell(Some("20261127T180300Z"), now), "0.1h");
+    assert_eq!(reset_cell(None, now), "-");
+    let h = hours_to(Some("20261127T175900Z"), now).unwrap();
+    assert!(h.is_sign_negative() && h < 0.0, "{h}");
+}

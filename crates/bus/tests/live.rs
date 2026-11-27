@@ -1144,3 +1144,50 @@ async fn usage_keeps_the_newest_observation() {
     assert!(bus.usage_label("not-hex", Some("x")).await.is_err());
     assert!(bus.usage_label(&account, Some("a b")).await.is_err());
 }
+
+/// A label removed after a record embedded it is gone from `usage` at once (r1 finding 2),
+/// and a record the KV holds but the history missed (a crash between the two writes) reaches
+/// the history when the same observation comes again, once (r1 minor 1).
+#[tokio::test]
+async fn usage_labels_come_off_and_history_catches_up() {
+    use hgl_ai_bus::UsagePut;
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let mut rec = usage("host-1", "20261127T100000Z");
+    rec.label = Some("old".into());
+    bus.usage_put(&rec).await.unwrap();
+    // The label written into a record is history; `usage` shows the one in force.
+    assert_eq!(bus.usage().await.unwrap()[0].label, None);
+    bus.usage_label(&rec.account, Some("max-1")).await.unwrap();
+    bus.usage_label(&rec.account, None).await.unwrap();
+    assert_eq!(bus.usage().await.unwrap()[0].label, None);
+
+    // The KV written, the history not.
+    let js = hub.raw().await;
+    let kv = js.get_key_value(hgl_ai_proto::KV_USAGE).await.unwrap();
+    let later = usage("host-1", "20261127T110000Z");
+    kv.put(later.key(), serde_json::to_vec(&later).unwrap().into())
+        .await
+        .unwrap();
+    let count = || async {
+        bus.history(
+            hgl_ai_proto::STREAM_USAGE,
+            "hgl.usage.>",
+            chrono::DateTime::UNIX_EPOCH,
+            100,
+        )
+        .await
+        .unwrap()
+        .len()
+    };
+    assert_eq!(count().await, 1);
+    for _ in 0..2 {
+        assert!(matches!(
+            bus.usage_put(&usage("host-2", "20261127T110000Z"))
+                .await
+                .unwrap(),
+            UsagePut::Stale { .. }
+        ));
+    }
+    assert_eq!(count().await, 2, "sent once, the second deduplicated");
+}

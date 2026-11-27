@@ -14,7 +14,7 @@ use std::str::FromStr;
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS,
-    KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER,
+    KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
     SUBJECT_PREFIX, USAGE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
@@ -252,7 +252,8 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     let buckets = [
         KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_USAGE,
     ];
-    let mut streams: Vec<String> = vec![STREAM_NOTES.to_string()];
+    // The usage history (PROTO-22) is read by every role through short-lived consumers.
+    let mut streams: Vec<String> = vec![STREAM_NOTES.to_string(), STREAM_USAGE.to_string()];
     streams.extend(buckets.iter().map(|b| kv(b)));
     if role == Role::Console {
         streams.push(STREAM_OWNER.to_string());
@@ -262,6 +263,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         allow.extend(consumers_on(s));
     }
     allow.extend(pull_from(STREAM_NOTES));
+    allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_USAGE}.*"));
     // The owner's subjects; denied to every client but the console.
     let owner = vec![
         format!("{OWNER_PREFIX}.>"),

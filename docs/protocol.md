@@ -298,7 +298,7 @@ command or file, never a prompt (no model turn):
 | Runtime | Limits | Account id |
 | --- | --- | --- |
 | `claude` | `claude -p "/usage"`: `Current week\|session (<scope>): N% used · resets <time> (<zone>)` lines; the breakdown after them is ignored | `orgId/email` of `claude auth status` |
-| `codex` | the last `rate_limits` of the newest `~/.codex/sessions/**/rollout-*.jsonl` whose `session_meta` is of the account | `tokens.account_id` of `~/.codex/auth.json` |
+| `codex` | the newest `rate_limits` (by event time) over the recently written `~/.codex/sessions/**/rollout-*.jsonl` whose `session_meta` is of the account; a rollout is read from its tail | `tokens.account_id` of `~/.codex/auth.json` |
 | `agy` | `agy -p "/usage"`: `<bucket>\t<window> Limit Remaining\t<pct>%\t<reset>`; a reset at the epoch is a window not started | the `applyAuthResult: email=` line of its newest log |
 
 - **PROTO-21 — One record per login.** `HGL_USAGE/<runtime>.<account>`, where
@@ -316,6 +316,8 @@ command or file, never a prompt (no model turn):
   record replaces its key only if its `observed_at` is newer (compare-and-set), so the
   record stays fresh while any of those hosts is up. Each record that replaces its key
   is also published to `hgl.usage.<runtime>.<account>` (message id
-  `<key>.<observed_at>`), the history for burn-down. Seat and coordinator users may
-  publish both; a host is to publish only the accounts its registration lists
+  `<key>.<observed_at>`), the history for burn-down; the same observation again is sent
+  to the history again, which keeps one copy. `usage show` gives each record the label
+  in force. Seat and coordinator users may publish both, and every role reads the
+  history; a host is to publish only the accounts its registration lists
   (#36).

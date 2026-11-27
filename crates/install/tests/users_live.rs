@@ -185,6 +185,20 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
         seat_bus.usage().await.unwrap()[0].label.as_deref(),
         Some("team")
     );
+    // Every role reads the usage history (PROTO-22).
+    for who in ["build-1", "hub-coord", "console"] {
+        let got = hub
+            .bus(who)
+            .await
+            .history(
+                hgl_ai_proto::STREAM_USAGE,
+                "hgl.usage.>",
+                chrono::DateTime::UNIX_EPOCH,
+                10,
+            )
+            .await;
+        assert_eq!(got.map(|h| h.len()).ok(), Some(1), "{who}");
+    }
     let task = hgl_ai_proto::TaskKey {
         repo: "alpha".into(),
         issue: 7,

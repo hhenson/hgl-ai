@@ -21,8 +21,16 @@ use hgl_ai_proto::{Runtime, UsageRecord, account_fingerprint, parse_stamp, utc_s
 
 use crate::parse::Parsed;
 
-/// Codex rollouts read, newest first, looking for one with rate limits of the account.
-const ROLLOUTS_TRIED: usize = 20;
+/// Codex rollouts read at most, newest first, for the account's newest rate limits.
+const ROLLOUTS_TRIED: usize = 200;
+/// A rollout last written this long before the newest observation found cannot hold a
+/// newer one: the search stops there.
+const ROLLOUT_MTIME_SLACK_S: i64 = 300;
+/// The tail of a rollout read first; doubled, up to [`MAX_FILE_BYTES`], while it holds no
+/// rate limits.
+const ROLLOUT_TAIL_BYTES: u64 = 8 << 20;
+/// The most of a rollout's first line (its `session_meta`, naming the account) read.
+const ROLLOUT_HEAD_BYTES: u64 = 1 << 20;
 /// agy logs read, newest first, looking for its sign-in line.
 const AGY_LOGS_TRIED: usize = 8;
 /// The most of a file read: account files, a rollout, a log.
@@ -176,23 +184,71 @@ async fn codex(src: &Sources, host: &str) -> Result<UsageRecord, String> {
     .await
 }
 
-/// The newest rate limits among the newest rollouts not of another account.
+/// The account's newest rate limits: the latest `observed_at` over the recently written
+/// rollouts not of another account (several seats may share `~/.codex/sessions`).
 fn codex_limits(sessions: &Path, id: &str) -> Result<parse::CodexLimits, String> {
+    codex_limits_in(sessions, id, ROLLOUT_TAIL_BYTES)
+}
+
+fn codex_limits_in(sessions: &Path, id: &str, tail: u64) -> Result<parse::CodexLimits, String> {
     let files = newest_tree(sessions, |n| {
         n.starts_with("rollout-") && n.ends_with(".jsonl")
     })
     .map_err(|e| format!("codex sessions at {}: {e}", sessions.display()))?;
-    for p in files.iter().take(ROLLOUTS_TRIED) {
-        let Ok(text) = read_bounded(p) else { continue };
-        let r = parse::codex_rollout(&text);
+    let mut best: Option<parse::CodexLimits> = None;
+    for (written, p) in files.iter().take(ROLLOUTS_TRIED) {
+        if let Some(b) = &best {
+            let written = DateTime::<Utc>::from(*written);
+            if (b.observed_at - written).num_seconds() > ROLLOUT_MTIME_SLACK_S {
+                break;
+            }
+        }
+        let Ok(r) = read_rollout(p, tail) else {
+            continue;
+        };
         if r.account_id.as_deref().is_some_and(|a| a != id) {
             continue;
         }
-        if let Some(l) = r.limits {
-            return Ok(l);
+        if let Some(l) = r.limits
+            && best.as_ref().is_none_or(|b| l.observed_at > b.observed_at)
+        {
+            best = Some(l);
         }
     }
-    Err("no recent Codex turn of this account recorded rate limits".into())
+    best.ok_or_else(|| "no recent Codex turn of this account recorded rate limits".into())
+}
+
+/// A rollout's account (its first line) and last rate limits (its tail, read further back
+/// while it holds none): a long session is never read from the front only.
+fn read_rollout(p: &Path, tail: u64) -> std::io::Result<parse::Rollout> {
+    use std::io::{BufRead as _, Read as _, Seek as _, SeekFrom};
+    let mut f = std::fs::File::open(p)?;
+    let len = f.metadata()?.len();
+    let mut head = Vec::new();
+    std::io::BufReader::new((&mut f).take(ROLLOUT_HEAD_BYTES)).read_until(b'\n', &mut head)?;
+    let account_id = parse::codex_rollout(&String::from_utf8_lossy(&head)).account_id;
+    let mut want = tail.max(1);
+    loop {
+        let start = len.saturating_sub(want);
+        f.seek(SeekFrom::Start(start))?;
+        let mut buf = Vec::new();
+        (&mut f).take(want).read_to_end(&mut buf)?;
+        let text = String::from_utf8_lossy(&buf);
+        // A tail starting inside a line drops that partial line.
+        let text = if start == 0 {
+            &text[..]
+        } else {
+            text.split_once('\n').map_or("", |(_, rest)| rest)
+        };
+        let r = parse::codex_rollout(text);
+        if r.limits.is_some() || start == 0 || want >= MAX_FILE_BYTES {
+            return Ok(parse::Rollout {
+                account_id: account_id.or(r.account_id),
+                limits: r.limits,
+            });
+        }
+        want = (want * 2).min(MAX_FILE_BYTES);
+    }
 }
 
 async fn blocking<T: Send + 'static>(
@@ -248,11 +304,15 @@ fn newest(dir: &Path, keep: impl Fn(&str) -> bool) -> std::io::Result<Vec<PathBu
             found.push((mtime(&e.path()), e.path()));
         }
     }
-    Ok(sorted(found))
+    Ok(sorted(found).into_iter().map(|(_, p)| p).collect())
 }
 
-/// [`newest`] over `dir` and its subdirectories (symbolic links not followed).
-fn newest_tree(dir: &Path, keep: impl Fn(&str) -> bool) -> std::io::Result<Vec<PathBuf>> {
+/// [`newest`] over `dir` and its subdirectories (symbolic links not followed), with each
+/// file's modification time.
+fn newest_tree(
+    dir: &Path,
+    keep: impl Fn(&str) -> bool,
+) -> std::io::Result<Vec<(SystemTime, PathBuf)>> {
     let mut found = Vec::new();
     let mut todo = vec![dir.to_path_buf()];
     std::fs::read_dir(dir)?;
@@ -278,17 +338,27 @@ fn mtime(p: &Path) -> SystemTime {
         .unwrap_or(SystemTime::UNIX_EPOCH)
 }
 
-fn sorted(mut v: Vec<(SystemTime, PathBuf)>) -> Vec<PathBuf> {
+fn sorted(mut v: Vec<(SystemTime, PathBuf)>) -> Vec<(SystemTime, PathBuf)> {
     v.sort_by(|a, b| b.cmp(a));
-    v.into_iter().map(|(_, p)| p).collect()
+    v
 }
 
 // ---- usage show ---------------------------------------------------------------------
 
 /// Hours from `now` to a bucket's reset, one decimal; negative once passed.
 pub fn hours_to(resets_at: Option<&str>, now: DateTime<Utc>) -> Option<f64> {
-    let t = parse_stamp(resets_at?)?;
-    Some(((t - now).num_seconds() as f64 / 360.0).round() / 10.0)
+    let secs = (parse_stamp(resets_at?)? - now).num_seconds();
+    let h = (secs as f64 / 360.0).round() / 10.0;
+    // Passed by under six minutes still reads as passed: never `-0.0` or `0.0`.
+    Some(if secs <= 0 && h == 0.0 { -0.1 } else { h })
+}
+
+fn reset_cell(resets_at: Option<&str>, now: DateTime<Utc>) -> String {
+    match hours_to(resets_at, now) {
+        None => "-".to_string(),
+        Some(h) if h < 0.0 => "passed".to_string(),
+        Some(h) => format!("{h:.1}h"),
+    }
 }
 
 fn age(secs: i64) -> String {
@@ -327,11 +397,7 @@ pub fn table(records: &[UsageRecord], now: DateTime<Utc>) -> String {
             rows.push(base("-".into(), "-".into(), "-".into(), "-".into()));
         }
         for b in &r.buckets {
-            let reset = match hours_to(b.resets_at.as_deref(), now) {
-                None => "-".to_string(),
-                Some(h) if h < 0.0 => "passed".to_string(),
-                Some(h) => format!("{h:.1}h"),
-            };
+            let reset = reset_cell(b.resets_at.as_deref(), now);
             rows.push(base(
                 b.scope.clone(),
                 b.window.clone(),
