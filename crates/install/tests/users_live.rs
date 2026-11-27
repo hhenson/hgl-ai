@@ -46,6 +46,7 @@ impl Hub {
             ("build-1", Role::Seat),
             ("hub-coord", Role::Coord),
             ("console", Role::Console),
+            ("build-agent", Role::Build),
             ("hub-admin", Role::Admin),
         ] {
             let text = reg.issue(name, role, false).unwrap();
@@ -405,4 +406,45 @@ async fn a_reload_keeps_connections() {
     let text_err = Bus::connect_with(&hub.url, hgl_ai_bus::parse_credential(&text).unwrap()).await;
     assert!(text_err.is_err(), "build-2 was removed");
     send("still").await;
+}
+
+/// Carbon's finding 4 on #12: a seat keeps build runs but may not write recipes, which
+/// every builder runs.
+#[tokio::test]
+async fn seats_keep_build_runs_but_not_recipes() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let recipe = b"repo = \"demo\"\n[[step]]\nname = \"t\"\nrun = \"true\"\n";
+    admin.build_put("recipe.demo", recipe).await.unwrap();
+    let seat_bus = hub.bus("build-1").await;
+    seat_bus
+        .build_put("run.20261127-120000-aaaaaa", b"{}")
+        .await
+        .unwrap();
+    seat_bus
+        .build_del("run.20261127-120000-aaaaaa")
+        .await
+        .unwrap();
+    assert!(
+        seat_bus.build_get("recipe.demo").await.unwrap().is_some(),
+        "seats read recipes"
+    );
+    denied(seat_bus.build_put("recipe.demo", b"repo = \"evil\"").await);
+    denied(seat_bus.build_del("recipe.demo").await);
+    assert_eq!(
+        admin.build_get("recipe.demo").await.unwrap().unwrap().value,
+        recipe
+    );
+    // The build agent's user writes recipes, and keeps runs as a seat does.
+    let agent = hub.bus("build-agent").await;
+    agent
+        .build_put("recipe.demo", b"repo = \"demo\"\n")
+        .await
+        .unwrap();
+    agent
+        .build_put("run.20261127-120000-bbbbbb", b"{}")
+        .await
+        .unwrap();
+    agent.build_del("recipe.demo").await.unwrap();
 }

@@ -52,7 +52,7 @@ enum UserCmd {
     Add {
         /// The user: a host label for a seat user.
         name: String,
-        /// seat (a client host), coord, console or admin.
+        /// seat (a client host), coord, console, build (the build agent: recipes) or admin.
         #[arg(long, value_parser = |s: &str| s.parse::<install::users::Role>())]
         role: install::users::Role,
         /// Register this public NKey (U...) instead of making a credential: the

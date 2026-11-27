@@ -71,9 +71,10 @@ hgl-ai server user ...`).
 
 | Role | May publish |
 | --- | --- |
-| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, stream changes |
+| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`, `HGL_BUILD/run.*`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, recipes, stream changes |
 | `coord` | a seat's, and `HGL_METRICS` |
 | `console` | `hgl.owner.>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
+| `build` | a seat's, and the recipes `HGL_BUILD/recipe.*` (the build agent, ROLE-8) |
 | `admin` | everything (`hgl-ai init`, `server install`) |
 
 Every role reads every stream and bucket but `HGL_CONSOLE` (the console's own); seat

@@ -53,7 +53,8 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   with named groups `file`, `line`, `col`, `code`, `message`.
 - Stored as written (comments kept) in `HGL_BUILD/recipe.<repo>`, history 64:
   `recipe show [--rev N]`, `recipe history`. `recipes/` in this repository holds the
-  first ones.
+  first ones. Every builder runs them, so only the build agent's hub user writes them
+  (`hgl-ai server user add NAME --role build`); seats keep `run.*` and read recipes.
 
 - **BUILD-3 — Who writes them.** The build agent (`docs/roles.md`) writes and repairs
   recipes, provisions toolchains and SDKs on hosts, and diagnoses failures of the build

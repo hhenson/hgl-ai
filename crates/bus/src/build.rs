@@ -90,20 +90,26 @@ impl Bus {
         check_kv_key(key)?;
         super::check_value_size(key, value.len())?;
         let store = self.build_store().await?;
-        store
-            .put(key, value.to_vec().into())
-            .await
-            .map_err(|e| nats(&format!("writing {key}"), e))
+        self.guarded(&format!("$KV.{KV_BUILD}.{key}"), async {
+            store
+                .put(key, value.to_vec().into())
+                .await
+                .map_err(|e| nats(&format!("writing {key}"), e))
+        })
+        .await
     }
 
     /// Delete `key` and its history. A missing key is fine.
     pub async fn build_del(&self, key: &str) -> Result<()> {
         check_kv_key(key)?;
         let store = self.build_store().await?;
-        store
-            .purge(key)
-            .await
-            .map_err(|e| nats(&format!("deleting {key}"), e))
+        self.guarded(&format!("$KV.{KV_BUILD}.{key}"), async {
+            store
+                .purge(key)
+                .await
+                .map_err(|e| nats(&format!("deleting {key}"), e))
+        })
+        .await
     }
 
     /// The live keys of `HGL_BUILD` that start with `prefix`, sorted.
