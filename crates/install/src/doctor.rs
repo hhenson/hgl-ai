@@ -876,6 +876,7 @@ mod tests {
         cfg.server_user = Some(hgl_ai_config::ServerUser {
             name: "hgl-ai".into(),
             home: "/var/lib/hgl-ai".into(),
+            console_url: None,
         });
         crate::save_config(&f, &f.env, &cfg).unwrap();
         let stat = std::rc::Rc::new(std::cell::RefCell::new("hgl-ai 700".to_string()));

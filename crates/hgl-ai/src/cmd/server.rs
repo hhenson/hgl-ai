@@ -211,26 +211,37 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     match args.cmd {
         Sub::Install(a) if !a.same_user => {
             let os = real.env().os;
+            // A reinstall keeps what an earlier one set unless told otherwise.
+            let prev = install::system::previous(&real);
             let host = a
                 .host
                 .clone()
+                .or(prev.host)
                 .unwrap_or_else(|| server::DEFAULT_HOST.to_string());
+            let console_url = a.console_url.clone().or(prev.console_url);
             let o = install::system::SystemOpts {
                 user: a
                     .server_user
                     .clone()
+                    .or(prev.user)
                     .unwrap_or_else(|| install::system::default_user(os).to_string()),
                 home: a
                     .server_home
                     .clone()
+                    .or(prev.home.map(std::path::PathBuf::from))
                     .unwrap_or_else(|| install::system::default_home(os)),
                 print_only: a.print_root_steps || a.dry_run,
                 host,
                 inner_args: a.forwarded(),
-                listen: a.listen.clone().unwrap_or_else(|| "127.0.0.1".into()),
-                port: a.port.unwrap_or(4222),
+                listen: a
+                    .listen
+                    .clone()
+                    .or(prev.listen)
+                    .unwrap_or_else(|| "127.0.0.1".into()),
+                port: a.port.or(prev.port).unwrap_or(4222),
                 coord: !a.no_coord,
-                console: !a.no_console,
+                console: !a.no_console && console_url.is_some(),
+                console_url,
                 wait: std::time::Duration::from_secs(install::HUB_WAIT_SECS),
             };
             if let Some(script) = install::system::install(&real, &o).map_err(lift)? {

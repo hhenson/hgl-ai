@@ -79,6 +79,9 @@ pub struct ServerUser {
     pub name: String,
     /// Its home: the server side's configuration, credentials and data.
     pub home: String,
+    /// The console's origin, when the server side runs one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_url: Option<String>,
 }
 
 /// Where the hub's services are installed.

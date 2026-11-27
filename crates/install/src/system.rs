@@ -45,8 +45,51 @@ pub struct SystemOpts {
     pub listen: String,
     pub port: u16,
     pub coord: bool,
+    /// Install the console service: only when the server side has `[console]`.
     pub console: bool,
+    /// `--console-url`, recorded so a later reinstall keeps the console.
+    pub console_url: Option<String>,
     pub wait: Duration,
+}
+
+/// What an earlier system install left in this client's configuration: a reinstall
+/// that omits `--host`, `--listen`, `--port` or `--console-url` keeps them.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Previous {
+    pub host: Option<String>,
+    pub listen: Option<String>,
+    pub port: Option<u16>,
+    pub user: Option<String>,
+    pub home: Option<String>,
+    pub console_url: Option<String>,
+}
+
+pub fn previous(sys: &dyn System) -> Previous {
+    let Ok(Some(cfg)) = load_config(sys, sys.env()) else {
+        return Previous::default();
+    };
+    let Some(su) = cfg.server_user else {
+        return Previous::default();
+    };
+    let addr = cfg
+        .hub
+        .url
+        .strip_prefix("nats://")
+        .and_then(|r| r.rsplit_once(':'))
+        .map(|(h, p)| {
+            (
+                h.trim_matches(['[', ']']).to_string(),
+                p.parse::<u16>().ok(),
+            )
+        });
+    Previous {
+        host: Some(cfg.host),
+        listen: addr.as_ref().map(|(h, _)| h.clone()),
+        port: addr.and_then(|(_, p)| p),
+        user: Some(su.name),
+        home: Some(su.home),
+        console_url: su.console_url,
+    }
 }
 
 /// Where the server user keeps things, by its home.
@@ -443,6 +486,7 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
     cfg.server_user = Some(hgl_ai_config::ServerUser {
         name: user.to_string(),
         home: home.clone(),
+        console_url: o.console_url.clone().filter(|_| o.console),
     });
     cfg.hub.url = crate::server::local_url(&o.listen, o.port);
     save_config(sys, env, &cfg)?;
@@ -622,6 +666,7 @@ mod tests {
             port: 4222,
             coord: true,
             console: true,
+            console_url: Some("https://console.example.com".into()),
             wait: Duration::ZERO,
         }
     }
@@ -710,6 +755,34 @@ mod tests {
         assert!(f.output().contains(
             "sudo -u hgl-ai sh -c 'umask 077; cat > /var/lib/hgl-ai/.config/hgl-ai/github.token'"
         ));
+    }
+
+    #[test]
+    fn no_console_service_without_a_console() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux, true);
+        let mut o = opts(true);
+        o.console = false;
+        o.console_url = None;
+        let script = install(&f, &o).unwrap().unwrap();
+        assert!(!script.contains("hgl-ai-console.service"), "{script}");
+    }
+
+    #[test]
+    fn a_reinstall_keeps_the_address_and_the_console() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux, true);
+        assert_eq!(previous(&f), Previous::default());
+        install(&f, &opts(false)).unwrap();
+        let p = previous(&f);
+        assert_eq!(p.listen.as_deref(), Some("192.0.2.10"));
+        assert_eq!(p.port, Some(4222));
+        assert_eq!(p.host.as_deref(), Some("hub"));
+        assert_eq!(
+            p.console_url.as_deref(),
+            Some("https://console.example.com")
+        );
+        assert_eq!(p.user.as_deref(), Some("hgl-ai"));
     }
 
     #[test]
