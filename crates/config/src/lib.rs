@@ -102,7 +102,7 @@ pub struct Limits {
 impl Default for Limits {
     fn default() -> Self {
         Limits {
-            memcap_gb: 64,
+            memcap_gb: 96,
             min_free_gb: 200,
             stale_after: "3d".into(),
             turn_timeout: "2h".into(),

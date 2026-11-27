@@ -47,8 +47,9 @@ The first body line names runtime and action: `[codex] Ready: hgl-compiler#980 a
   40-character head (`git rev-parse HEAD`). A new commit voids every verdict.
 - `ready` notes and receipts name your model family and model.
 - Every build, test, probe and generated program runs under
-  `hgl-ai cap SIZE --time DUR -- ...`: 16G for one compiler run or program,
-  up to 64G for a workspace build or test. A hit cap is a finding; never raise it.
+  `hgl-ai cap SIZE --time DUR -- ...`: 32G for one compiler run or program,
+  64G for a C++ build or a whole-workspace build or test. A hit cap is a finding;
+  never raise it yourself.
 - All scratch goes inside `$HGL_AI_TASK_DIR` (`TMPDIR` and `CARGO_TARGET_DIR`
   point there), never `/tmp`.
 - Never remove worktrees or branches; the bridge does on `landed` or `closed`.

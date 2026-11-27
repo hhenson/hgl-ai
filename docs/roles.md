@@ -103,8 +103,10 @@ changes one file.
 ## 4. Resources
 
 - **ROLE-15 — Memory and time caps.** Every build, test, probe and generated
-  program runs under `hgl-ai cap SIZE -- CMD` with a time limit: 16 GiB for one
-  compiler run or program, up to 64 GiB for a workspace build or test run.
+  program runs under `hgl-ai cap SIZE -- CMD` with a time limit: 32 GiB for one
+  compiler run or program, 64 GiB for a C++ build or a whole-workspace build or test
+  run (a C++ build at 16 parallel jobs needs 1–4 GiB a job), and 96 GiB for an agent
+  turn's whole tree (HPH, 2026-11-27).
   Reaching a cap is a finding, never a reason to raise it. A tree in
   `/dev/shm` counts as memory and is removed when the run ends.
 - **ROLE-16 — Disk.** The desk stops below 170 GB free. Each bridge stops

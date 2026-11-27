@@ -82,7 +82,7 @@ work_root = "~/hgl-ai/work"            # every task directory lives here
 data_dir = "~/.local/share/hgl-ai"     # bridge state, server store, logs
 
 [limits]
-memcap_gb = 64                         # cap of one agent turn's command tree
+memcap_gb = 96                         # cap of one agent turn's command tree
 min_free_gb = 200                      # stop taking `assign` below this
 stale_after = "3d"
 turn_timeout = "2h"
