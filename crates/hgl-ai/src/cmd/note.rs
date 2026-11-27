@@ -235,7 +235,8 @@ async fn receive_held(
         let got = tokio::select! {
             r = bus.peek(seat, max.max(1), wait) => r?,
             _ = lost(lease) => bail!(
-                "the seat lease {} is no longer ours (it expired or another holder took it); \
+                "the seat lease {} is no longer ours (it expired, another holder took it, or the hub did not \
+             confirm it in time); \
                  stopped",
                 seat_lock_key(seat)
             ),
@@ -254,7 +255,8 @@ async fn receive_held(
     let got = tokio::select! {
         r = inbox.fetch(max.max(1), wait) => r?,
         _ = lost(lease) => bail!(
-            "the seat lease {} is no longer ours (it expired or another holder took it); \
+            "the seat lease {} is no longer ours (it expired, another holder took it, or the hub did not \
+             confirm it in time); \
              stopped waiting",
             seat_lock_key(seat)
         ),
@@ -324,7 +326,16 @@ impl SeatLease {
         };
         let (lost_tx, lost) = watch::channel(false);
         let (stop, stopped) = oneshot::channel();
-        let task = tokio::spawn(keep_lease(lease, LEASE_REFRESH, stopped, lost_tx));
+        // As a bridge keeps its lease (PROTO-6): refreshed well within `max_age`, and given
+        // up as lost when the hub has not confirmed it for half of it.
+        let max_age = bus
+            .locks_max_age()
+            .await
+            .unwrap_or(hgl_ai_bus::LOCKS_MAX_AGE);
+        let every = LEASE_REFRESH
+            .min(max_age / 6)
+            .max(Duration::from_millis(50));
+        let task = tokio::spawn(keep_lease(lease, every, max_age / 2, stopped, lost_tx));
         Ok(SeatLease {
             stop: Some(stop),
             task: Some(task),
@@ -356,22 +367,35 @@ async fn lost(lease: Option<&mut SeatLease>) {
 async fn keep_lease(
     mut lease: Lease,
     every: Duration,
+    deadline: Duration,
     mut stopped: oneshot::Receiver<()>,
     lost: watch::Sender<bool>,
 ) {
+    let mut ok_at = tokio::time::Instant::now();
     loop {
         tokio::select! {
             _ = &mut stopped => break,
-            _ = tokio::time::sleep(every) => match lease.refresh().await {
-                Ok(()) => {}
-                Err(BusError::LeaseLost { .. }) => {
-                    lost.send_replace(true);
-                    // Keep the sender until told to stop, so the loss stays visible.
-                    let _ = stopped.await;
-                    return;
+            _ = tokio::time::sleep(every) => {
+                let failed = match tokio::time::timeout(every, lease.refresh()).await {
+                    Ok(Ok(())) => {
+                        ok_at = tokio::time::Instant::now();
+                        continue;
+                    }
+                    Ok(Err(BusError::LeaseLost { .. })) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(_) => Some(format!("no answer within {every:?}")),
+                };
+                if let Some(e) = &failed
+                    && ok_at.elapsed() < deadline
+                {
+                    eprintln!("warning: refreshing the seat lease {}: {e}; trying again", lease.name());
+                    continue;
                 }
-                Err(e) => eprintln!("warning: refreshing the seat lease {}: {e}; trying again", lease.name()),
-            },
+                lost.send_replace(true);
+                // Keep the sender until told to stop, so the loss stays visible.
+                let _ = stopped.await;
+                return;
+            }
         }
     }
     let name = lease.name().to_string();

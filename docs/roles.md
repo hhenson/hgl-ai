@@ -125,7 +125,7 @@ changes one file.
   one removes it when the run ends (the cap does not).
 - **ROLE-16 — Disk.** Free space is in decimal GB (10^9 bytes) everywhere. The
   desk stops below 170 GB free. Each bridge makes no new tree (`assign`, `review`,
-  a moved task's tree) when `work_root` has less than its configured
+  a moved task's tree), in `drain` mode too, when `work_root` has less than its configured
   `min_free_gb`, and says so to the controller.
 - **ROLE-17 — Hold and drain.** While `HGL_STATE/hold` exists, defer every
   GitHub call that can wait. In `drain` mode, finish in-flight work only and
