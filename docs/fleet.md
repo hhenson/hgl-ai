@@ -5,9 +5,15 @@ given its part. A host's own file keeps only what it needs to reach the hub.
 
 ## 1. Hosts
 
-- **FLEET-1 — Name.** A client is named by its computer's host name (lowercase,
-  `[a-z0-9-]`). The name lives in the hub's state and the host's file, never in a
-  repository.
+- **FLEET-1 — Name and alias.** A client is named by its computer's host name. The
+  owner may give it a short alias (`client join --alias lab1`, or `fleet host alias
+  NAME ALIAS`). The **label** is the alias where there is one, else the host name,
+  lowercased to `[a-z0-9-]`; it names the seats (`lab1-w3`) and is what every command
+  and the console show, with the host name beside it. Labels are unique in a fleet
+  and at most 20 characters, so seat names stay within PROTO-7's 32. A label is fixed
+  while seats run: changing it drains the host's seats and brings them up under the
+  new label, and pinned tasks re-pin (FLEET-9). Names and aliases live in the hub's
+  state and the host's file, never in a repository.
 - **FLEET-2 — Registration.** `hgl-ai client join --hub URL --credential FILE --work-root DIR`
   registers the host with:
   - its name, OS and architecture;
@@ -81,9 +87,10 @@ stops seats as they change. Only admin and console credentials write `plan.*`,
 ## 4. Commands
 
 ```
-hgl-ai client join --hub URL --credential FILE --work-root DIR
+hgl-ai client join --hub URL --credential FILE --work-root DIR [--alias LABEL]
 hgl-ai fleet show                                  hosts, seats, roles, states
 hgl-ai fleet host accept|retire NAME
+hgl-ai fleet host alias NAME LABEL                 drains and renames the host's seats
 hgl-ai fleet host set NAME [--workers N] [--reviewers N] [--memcap-gb G] [--min-free-gb G]
 hgl-ai fleet role place ROLE --host NAME           place or move a role
 ```
