@@ -19,17 +19,25 @@ no GitHub or git library.
 | `tree` | Worktree layout, create, register, salvage, remove, stale listing. | `proto`, `config`, `bus` |
 | `bridge` | Seat loops, runtime adapters, prompt building, heartbeats, failover, cleanup on `landed`. | all above |
 | `install` | Hub and client installers, user services, `nats-server` provisioning, skill installation, agent launch. | `config`, `bus` |
-| `gh` | Coordinator service, merge gate, landing, pin sync, release watch, tap release. Landing and release watch hold the hub lease `HGL_LOCKS/lock.land.<repo>`, so they exclude each other across hosts. | `proto`, `config`, `bus` |
+| `gh` | Coordinator service, merge gate, landing, pin sync, release watch, tap release; `backlog` and `HGL_METRICS`. Landing and release watch hold the hub lease `HGL_LOCKS/lock.land.<repo>`, so they exclude each other across hosts. | `proto`, `config`, `bus` |
+| `owner` | Owner channel: thread records, events, the console's fold, status reports, `decisions.log`. | `proto`, `bus` |
+| `notify` | Owner notifications: ntfy, Slack webhook, SMTP; first channel that accepts. | `config` |
+| `console` | The owner's web console: pages, telemetry, passkey and OAuth sign-in, the fold, ticks. | `proto`, `config`, `bus`, `owner`, `gh`, `notify` |
 | `hgl-ai` | The `clap` command line; thin over the crates. | all |
 
 Async runtime `tokio`; NATS client `async-nats`; errors `anyhow` at the edge,
-`thiserror` in libraries; logs `tracing` to stderr.
+`thiserror` in libraries; logs `tracing` to stderr. Web: `axum`, `axum-server`
+(TLS), `webauthn-rs` (passkeys), `reqwest` (OAuth, notifications), `lettre` (SMTP).
+TLS is `rustls` with `ring` only. Rust 1.89 or later.
 
 ## 2. Command line
 
 ```
-hgl-ai server install [--listen ADDR] [--port 4222] [--store DIR]
+hgl-ai server install [--listen ADDR] [--port 4222] [--store DIR] [--users] [--no-coord]
+                [--no-console] [--console-url URL] [--console-user NAME ...] [--console-listen ADDR]
 hgl-ai server start|stop|status|uninstall
+hgl-ai server user add NAME --role seat|coord|console|admin [--nkey PUBKEY] [--rotate]
+hgl-ai server user list|remove NAME
 hgl-ai client install --hub URL --token-file FILE --host LABEL [--work-root DIR]
 hgl-ai client uninstall
 hgl-ai init                               provision stream and buckets (idempotent)
@@ -60,6 +68,12 @@ hgl-ai gh land REPO PR HEAD
 hgl-ai gh pins sync
 hgl-ai gh release watch SHA
 hgl-ai gh tap release VERSION
+
+hgl-ai console run                        the owner's console (its user service runs this)
+hgl-ai ask --title T --priority P [--issue R#N] [--context-file F] --question Q [--option L:LINE ...] [--suggest L]
+hgl-ai thread list|show|reply|withdraw
+hgl-ai status post|list
+hgl-ai decision add|tail
 ```
 
 Exit status: 0 success, 1 failure, 2 usage, 3 not ready (a gate is not
@@ -122,7 +136,49 @@ listen = "127.0.0.1"
 port = 4222
 store_dir = "~/.local/share/hgl-ai/nats"
 nats_version = "2.15.3"
+auth = "users"                         # a hub user per client; "token": older single token
+
+[console]                              # hub host only (docs/owner.md)
+listen = "127.0.0.1:8443"              # loopback or tailnet address, never 0.0.0.0
+url = "https://hub.example.ts.net"     # the stable name passkeys are bound to
+# tls_cert = "~/.config/hgl-ai/console/cert.pem"   # omit both behind a TLS proxy
+# tls_key = "~/.config/hgl-ai/console/key.pem"
+users = ["hhenson", "owner@example.com"]           # GitHub logins, Apple emails
+status_every = "2h"
+session_ttl = "7d"
+
+[console.github]
+client_id = "Iv1.0123456789abcdef"
+secret_file = "~/.config/hgl-ai/console/github.secret"   # mode 0600
+
+[console.apple]
+client_id = "com.example.hgl-console"  # Services ID
+team_id = "ABCDE12345"
+key_id = "KEY1234567"
+key_file = "~/.config/hgl-ai/console/apple.p8"           # mode 0600
+
+[[console.notify]]                     # tried in order
+kind = "ntfy"
+url = "https://ntfy.sh/<topic>"
+# token_file = "~/.config/hgl-ai/console/ntfy.token"
+
+[[console.notify]]
+kind = "slack"
+webhook_file = "~/.config/hgl-ai/console/slack.url"
+
+[[console.notify]]
+kind = "email"
+smtp = "smtp.example.com:587"
+tls = "starttls"                       # or "tls", or "none" (loopback only)
+from = "console@example.com"
+to = ["owner@example.com"]
+# user = "console@example.com"
+# password_file = "~/.config/hgl-ai/console/smtp.password"
 ```
+
+`hub.token_file` holds the host's hub credential: its own hub user's NKey seed, or
+the shared token of an older hub. `HGL_AI_HUB_CREDENTIAL` overrides it for one
+process; the coordinator and console services set it to their own users.
 
 A model's family comes from the `[models.<family>]` table that names it; an
 `agy` seat with a Claude slug is family `claude`.
@@ -170,6 +226,7 @@ Reviewer tasks use `<seat>/<repo>-<pr>-review/` with a detached checkout of
 | Hub | `hgl-ai-hub.service` running `nats-server -c <data_dir>/nats.conf` | `io.github.hhenson.hgl-ai.hub` |
 | Bridge | `hgl-ai-bridge.service` running `hgl-ai bridge run` | `io.github.hhenson.hgl-ai.bridge` |
 | Coordinator | `hgl-ai-coord.service` running `hgl-ai gh coord run` | `io.github.hhenson.hgl-ai.coord` |
+| Console | `hgl-ai-console.service` running `hgl-ai console run` | `io.github.hhenson.hgl-ai.console` |
 
 Linux services enable lingering (`loginctl enable-linger`) when the user
 allows it, so they survive logout.

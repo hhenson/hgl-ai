@@ -14,18 +14,59 @@ hgl-ai server install --listen <tailnet-address>
 1. Uses `nats-server` from `PATH`, or installs it (`brew install
    nats-server` where Homebrew exists, else the pinned release, checksum
    verified, into `<data_dir>/bin`).
-2. Writes a token (32 random bytes, hex) to `hub.token_file`
-   (`~/.config/hgl-ai/hub.token`) with mode 0600, keeping an existing one
-   unless `--rotate-token`, and `<data_dir>/nats.conf` (mode 0600: listen
-   address, JetStream store directory, token authorization).
+2. Makes the hub users (below): `<host>-admin`, `<host>` (this host's client,
+   in `hub.token_file`), `<host>-coord` and `console`, keeping existing keys, and
+   writes `<data_dir>/nats.conf` (mode 0600: listen address, JetStream store,
+   one NKey user per client with its role's permissions).
 3. Writes the `[server]` section, installs and starts the hub user service,
-   waits for the port, provisions the stream and buckets (as `hgl-ai init`),
-   then installs the coordinator service (`--no-coord` skips it).
-4. Prints the client command to run on other hosts. The token file is copied
-   to them by hand or a secret manager; the token is never printed.
+   waits for the port, provisions the streams and buckets as the admin user (as
+   `hgl-ai init`), then installs the coordinator service (`--no-coord` skips it)
+   and the console service (`--no-console` skips it; it needs `[console]`).
+4. Prints the client commands. A credential is copied to its host by hand or a
+   secret manager; no secret is ever printed.
 
 `server start|stop|status` manage the services; `server uninstall` removes
 them and `nats.conf`, keeping the JetStream store unless `--purge`.
+
+## Hub users
+
+Every client has its own NKey user (OWN-5). `<data_dir>/hub-users.toml` lists
+names, roles and public keys; a credential (`user`, `role`, `seed`, mode 0600) is
+written once to `~/.config/hgl-ai/hub-users/<name>.cred`.
+
+| Role | May publish |
+| --- | --- |
+| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, stream changes |
+| `coord` | a seat's, and `HGL_METRICS` |
+| `console` | `hgl.owner.>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
+| `admin` | everything (`hgl-ai init`, `server install`) |
+
+Every role reads every stream and bucket.
+
+```sh
+hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred
+hgl-ai server user add build-2 --role seat --nkey U...   # a host's own key; no secret here
+hgl-ai server user list
+hgl-ai server user remove build-1                  # the hub refuses it from then on
+```
+
+`user add` and `remove` rewrite `nats.conf` and restart the hub (clients
+reconnect). On the client: `hgl-ai client install --token-file <the .cred>`. A
+credential file may also be a bare NKey seed (`SU...`). `hgl-ai init` needs the
+admin user: `HGL_AI_HUB_CREDENTIAL=~/.config/hgl-ai/hub-users/<hub>-admin.cred hgl-ai init`.
+
+### From a single token
+
+A hub installed before hub users keeps its shared token (`[server] auth =
+"token"`); `doctor` warns that any client can then publish as the owner. To move:
+
+1. On the hub, `hgl-ai server user add <label> --role seat` for every other host;
+   copy each credential to its host.
+2. `hgl-ai server install --users`: users replace the token, the hub restarts,
+   this host's `hub.token` becomes its seat credential and its bridge restarts.
+   Other clients are refused until step 3.
+3. On each other host, `hgl-ai client install --hub ... --token-file <credential> --host <label>`.
+4. `hgl-ai doctor` everywhere: `hub auth` is `ok`.
 
 ## Clients (every host, the hub too)
 
@@ -50,6 +91,43 @@ hgl-ai doctor
 `client uninstall` removes the service and the skills, keeping the
 configuration unless `--purge`. Both installers take `--dry-run`, and
 `--linger` to run `loginctl enable-linger` on Linux so services survive logout.
+
+## Console (hub host)
+
+The console (docs/owner.md) serves the owner over HTTPS at a stable name, as its
+own hub user `console`.
+
+1. **Name and TLS.** Pick the name, for example the hub's tailnet name
+   `hub.example.ts.net`. Either a local TLS proxy in front of plain HTTP on loopback:
+
+   ```sh
+   hgl-ai server install --console-url https://hub.example.ts.net --console-user hhenson
+   tailscale serve --bg --https=443 http://127.0.0.1:8443
+   ```
+
+   or the console's own certificate (`tailscale cert hub.example.ts.net`, or any CA),
+   with `listen` on the tailnet address and `tls_cert`, `tls_key` in `[console]`.
+   Never listen on `0.0.0.0` or a public interface.
+2. **Users.** `[console] users`: GitHub logins and Apple account emails that may sign
+   in. Edit the list, then restart the console service.
+3. **GitHub OAuth app** (github.com → Settings → Developer settings → OAuth Apps → New):
+   homepage `https://<name>`, callback `https://<name>/auth/github/callback`. Put the
+   client id in `[console.github] client_id` and the client secret in
+   `~/.config/hgl-ai/console/github.secret` (mode 0600).
+4. **Sign in with Apple** (developer.apple.com → Identifiers): an App ID with Sign in
+   with Apple, a Services ID for the console with domain `<name>` and return URL
+   `https://<name>/auth/apple/callback`, and a key with Sign in with Apple. Put the
+   Services ID, team id and key id in `[console.apple]`, the `.p8` key in
+   `~/.config/hgl-ai/console/apple.p8` (mode 0600). One of GitHub or Apple is enough.
+5. **Notifications** (`[[console.notify]]`, tried in order): an ntfy topic URL (a
+   hard-to-guess topic, or a token in `token_file`), a Slack incoming webhook URL in
+   `webhook_file`, SMTP as the last resort. Secrets in mode-0600 files.
+6. `hgl-ai doctor`, then open `https://<name>/signin`: GitHub or Apple once, then
+   register a passkey; later sign-ins use the passkey. A new device: GitHub or Apple
+   again.
+
+Seats on the hub host run as the console's user and can read its credential
+(`doctor` warns): run them elsewhere, or the console as another OS user.
 
 ## Agents
 

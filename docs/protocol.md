@@ -11,7 +11,8 @@ Status: proposed. Open decisions are issues in this repository.
   state between agents and hosts. History is bounded (14 days); nothing that
   decides something lives only on the bus.
 - **PROTO-3 — No fabricated owner words.** A note is agent traffic. It never
-  states an owner decision unless it quotes the GitHub record that holds it.
+  states an owner decision unless it quotes the GitHub record that holds it. The one
+  exception is a note from `owner`, which only the console can send (OWN-5).
 
 ## 2. Access
 
@@ -43,19 +44,23 @@ hgl-ai tree list --stale
 ## 3. Transport
 
 All participants connect to one `nats-server -js` hub over an authenticated
-link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
+link (tailnet, WireGuard or an SSH forward). Each client is its own hub user, an
+NKey with its role's permissions (docs/install.md, Hub users); a hub installed
+before hub users takes one shared token until it moves.
 
 | Primitive | Name | Settings |
 | --- | --- | --- |
 | Stream | `HGL_NOTES`, subjects `hgl.notes.>` | file storage, `max_age` 14 d, dedup window 24 h |
-| Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>` and `hgl.notes.all`; explicit ack; `ack_wait` 300 s; `max_deliver` 5 |
+| Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>`, `hgl.notes.all` and `hgl.notes.owner.<seat>`; explicit ack; `ack_wait` 300 s; `max_deliver` 5 |
+| Owner | stream `HGL_OWNER`, KV `HGL_THREADS`, KV `HGL_METRICS` | docs/owner.md §4 |
 | State | KV `HGL_STATE` | file storage, history 5 |
 | Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
 | Trees | KV `HGL_TREES` | file storage, history 1 |
 | Locks | KV `HGL_LOCKS` | file storage, history 1, `max_age` 30 min |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
-  broadcast address. A seat is a logical address; the runtime and model bound
+  broadcast address. `owner` and `console` are senders, never seats: no seat takes
+  `all`, `owner` or `console`, and no note goes to `owner` or `console`. A seat is a logical address; the runtime and model bound
   to it can change (§6) without peers noticing.
 - **PROTO-8 — Ack after the turn.** The bridge sends `in_progress` every 60 s
   while a turn runs, `ack` after a clean exit, and `nak` with a 15 s delay on a
@@ -99,6 +104,14 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
 | `closed` | controller → seat | Closed unmerged or superseded; same removal as `landed`. |
 | `done` | any → controller | A bounded non-PR assignment finished, or a cleanup receipt. |
 | `note` | any → any | Operational fact: an alert, a `hold`, a `drain`. |
+| `tick` | console → controller | A status report is due (`[console] status_every`). |
+
+- **PROTO-20 — Owner notes.** A note with sender `owner` travels on
+  `hgl.notes.owner.<recipient>`, which only the console's hub user may publish. The
+  receiver accepts sender `owner` on that subject only, and only sender `owner` there;
+  anything else is terminated as malformed. An owner note is an `answer` (to the
+  asker of a question) or a `note` (an owner message; conversations go to the
+  controller), and its body names the thread and the signed-in user.
 
 ## 5. Worktrees
 
@@ -174,6 +187,8 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
 | `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha>` per merge. |
 | `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
+| `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
+| `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.

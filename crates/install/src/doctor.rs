@@ -148,6 +148,97 @@ fn parse_df(out: &str) -> Option<u64> {
     Some(kb / (1024 * 1024))
 }
 
+/// A secret file: present, and readable by its owner only.
+fn secret_check(sys: &dyn System, name: &str, shown: &str) -> Check {
+    let p = sys.env().expand(shown);
+    match sys.mode(&p) {
+        Err(_) => Check::fail(
+            name,
+            format!("no {shown}"),
+            format!("write it, then `chmod 600 {shown}`"),
+        ),
+        Ok(m) if !token::mode_ok(m) => Check::fail(
+            name,
+            format!("{shown} has mode {m:o}"),
+            format!("`chmod 600 {shown}`"),
+        ),
+        Ok(_) => Check::ok(name, shown.to_string()),
+    }
+}
+
+/// `[console]`: who can sign in, how, and the secrets beside the configuration.
+fn console_checks(sys: &dyn System, c: &hgl_ai_config::Console) -> Vec<Check> {
+    let mut out = Vec::new();
+    out.push(if c.users.is_empty() {
+        Check::warn(
+            "console users",
+            "nobody may sign in",
+            "add GitHub logins or Apple emails to [console] users",
+        )
+    } else {
+        Check::ok("console users", c.users.join(", "))
+    });
+    if c.github.is_none() && c.apple.is_none() {
+        out.push(Check::warn(
+            "console sign-in",
+            "no GitHub or Apple app: a first sign-in or a new device cannot enrol a passkey",
+            "set [console.github] or [console.apple] (docs/install.md)",
+        ));
+    }
+    if let Some(g) = &c.github {
+        out.push(secret_check(sys, "console github", &g.secret_file));
+    }
+    if let Some(a) = &c.apple {
+        out.push(secret_check(sys, "console apple", &a.key_file));
+    }
+    match (&c.tls_cert, &c.tls_key) {
+        (Some(cert), Some(key)) => {
+            let p = sys.env().expand(cert);
+            out.push(if sys.exists(&p) {
+                Check::ok("console tls", format!("{cert} for {}", c.url))
+            } else {
+                Check::fail(
+                    "console tls",
+                    format!("no {cert}"),
+                    "write the certificate for the console's name",
+                )
+            });
+            out.push(secret_check(sys, "console tls key", key));
+        }
+        _ => out.push(Check::ok(
+            "console tls",
+            format!(
+                "plain HTTP on {} behind a TLS proxy for {}",
+                c.listen, c.url
+            ),
+        )),
+    }
+    if c.notify.is_empty() {
+        out.push(Check::warn(
+            "console notify",
+            "no channel: p1 questions show only in the console",
+            "add [[console.notify]] (ntfy, slack, email)",
+        ));
+    }
+    for n in &c.notify {
+        match n {
+            hgl_ai_config::Notify::Ntfy {
+                token_file: Some(t),
+                ..
+            } => out.push(secret_check(sys, "console notify ntfy", t)),
+            hgl_ai_config::Notify::Slack { webhook_file } => {
+                out.push(secret_check(sys, "console notify slack", webhook_file))
+            }
+            hgl_ai_config::Notify::Email {
+                password_file: Some(p),
+                ..
+            } => out.push(secret_check(sys, "console notify email", p)),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Run every check. Checks that need the configuration are skipped when it
 /// does not load.
 pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
@@ -332,6 +423,9 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 ),
                 State::NotInstalled => Check::fail(name, "not installed", install),
             });
+        }
+        if let Some(con) = &c.console {
+            out.extend(console_checks(sys, con));
         }
         if service::state(sys, Service::Console) != State::NotInstalled && !c.seats.is_empty() {
             out.push(Check::warn(
@@ -520,6 +614,42 @@ mod tests {
             cs.iter()
                 .any(|c| c.name == "token" && c.detail.contains("hub user build-1 (seat)"))
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn console_configuration() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        let secret = f.env.home.join(".config/hgl-ai/console/github.secret");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret, "s\n").unwrap();
+        std::fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        cfg.console = Some(hgl_ai_config::Console {
+            url: "https://hub.example.com".into(),
+            github: Some(hgl_ai_config::GithubOAuth::new("Iv1.example")),
+            ..hgl_ai_config::Console::default()
+        });
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        let get = |n: &str| {
+            cs.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+        };
+        assert_eq!(get("console users").level, Level::Warn);
+        assert_eq!(get("console github").level, Level::Fail);
+        assert!(
+            get("console github")
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("chmod 600")
+        );
+        assert_eq!(get("console tls").level, Level::Ok);
+        assert_eq!(get("console notify").level, Level::Warn);
     }
 
     #[tokio::test]
