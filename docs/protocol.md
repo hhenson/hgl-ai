@@ -30,6 +30,8 @@ Status: proposed. Open decisions are issues in this repository.
   serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`.
   A bridge serves a seat only while it holds the lease `HGL_LOCKS/seat.<seat>`,
   refreshed with its heartbeat; `note wait` and `note peek` refuse a held one.
+  A restarted bridge takes over at once a lease its own host's dead bridge held
+  (same host label, the recorded process gone); host labels are unique in a fleet.
 
 ```sh
 hgl-ai note send --to claude --issue 980 --kind ready --body-file ready.md
