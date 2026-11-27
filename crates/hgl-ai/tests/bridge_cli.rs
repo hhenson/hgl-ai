@@ -52,13 +52,15 @@ fn err(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).into_owned()
 }
 
-/// A configuration in `dir`: work root, data dir, and clone URLs pointing into it.
+/// A configuration in `dir`: work root, data dir, and clone URLs pointing into it. The
+/// free-disk gate is off, so the result does not depend on the machine's free space.
 fn config(dir: &Path, hub_url: &str, token_file: &Path) -> (Config, PathBuf) {
     let mut cfg = Config::new("test-host");
     cfg.hub.url = hub_url.into();
     cfg.hub.token_file = token_file.display().to_string();
     cfg.paths.work_root = dir.join("work").display().to_string();
     cfg.paths.data_dir = dir.join("data").display().to_string();
+    cfg.limits.min_free_gb = 0;
     cfg.github.clone_url = format!("{}/{{repo}}.git", dir.display());
     let p = dir.join("config.toml");
     cfg.save(&p).unwrap();
