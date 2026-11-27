@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites>
+  <testsuite name="hglrt_tests" errors="0" failures="1" skipped="1" tests="4" hostname="tbd" time="0.012" timestamp="2026-11-27T08:30:00Z">
+    <properties>
+      <property name="random-seed" value="1234"/>
+    </properties>
+    <testcase classname="hglrt_tests.global" name="add of i64" time="0.001" status="run"/>
+    <testcase classname="hglrt_tests.global" name="division &amp; zero policy" time="0.002" status="run">
+      <failure message="hglrt::div__f64_f64(1.0, 0.0) == 0.0" type="REQUIRE">
+FAILED:
+  REQUIRE( hglrt::div__f64_f64(1.0, 0.0) == 0.0 )
+with expansion:
+  inf == 0.0
+at /work/src/runtime/cpp/tests/scalar.cpp:120
+      </failure>
+    </testcase>
+    <testcase classname="hglrt_tests.global" name="list hashing" time="0.001" status="run"/>
+    <testcase classname="hglrt_tests.global" name="slow tenor walk" time="0" status="skipped">
+      <skipped message="tagged [.slow]"/>
+    </testcase>
+    <system-out><![CDATA[seed 1234 <noise>]]></system-out>
+  </testsuite>
+</testsuites>

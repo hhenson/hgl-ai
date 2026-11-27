@@ -272,7 +272,10 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
     }
 
     if let Some(c) = &cfg {
-        let mut svcs = vec![(Service::Bridge, reinstall.clone())];
+        let mut svcs = vec![
+            (Service::Bridge, reinstall.clone()),
+            (Service::Builder, reinstall.clone()),
+        ];
         if c.server.is_some() {
             svcs.push((Service::Hub, "`hgl-ai server install`".into()));
             svcs.push((Service::Coord, "`hgl-ai server install`".into()));
@@ -289,6 +292,12 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 State::NotInstalled if s == Service::Coord => {
                     Check::new(name, Level::Warn, "not installed on this hub host", None)
                 }
+                State::NotInstalled if s == Service::Builder => Check::new(
+                    name,
+                    Level::Warn,
+                    "not installed (`client install --no-builder`?)",
+                    None,
+                ),
                 State::NotInstalled => Check::fail(name, "not installed", install),
             });
         }
@@ -415,6 +424,7 @@ mod tests {
         }
         std::fs::create_dir_all(home.join(".config/systemd/user")).unwrap();
         std::fs::write(home.join(".config/systemd/user/hgl-ai-bridge.service"), "").unwrap();
+        std::fs::write(home.join(".config/systemd/user/hgl-ai-builder.service"), "").unwrap();
         f.on(|c| {
             let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
             match (c.program.as_str(), a.as_slice()) {

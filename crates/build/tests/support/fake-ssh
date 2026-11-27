@@ -1,0 +1,55 @@
+#!/bin/sh
+# A stand-in for ssh in tests: runs the remote command on this host, as the remote would.
+# The host alias is a directory that holds the remote's state:
+#   down    present: the remote is unreachable (commands exit 255, the master ends)
+#   master  the master connection's pid while it runs
+#   log     one line per remote command
+ctl=
+master=
+socket=
+while [ $# -gt 0 ]; do
+  case $1 in
+    -o) case $2 in ControlPath=*) socket=${2#ControlPath=} ;; esac; shift 2 ;;
+    -O) ctl=$2; shift 2 ;;
+    -N) master=1; shift ;;
+    --) shift; break ;;
+    -*) shift ;;
+    *) break ;;
+  esac
+done
+alias=$1
+state=$alias
+shift
+if [ -e "$state/down" ]; then
+  echo "ssh: connect to host $alias port 22: Connection refused" >&2
+  exit 255
+fi
+case $ctl in
+  check)
+    if [ -e "$state/master" ] && kill -0 "$(cat "$state/master")" 2>/dev/null; then exit 0; fi
+    echo "Control socket connect: No such file or directory" >&2
+    exit 255 ;;
+  exit)
+    if [ -e "$state/master" ]; then kill "$(cat "$state/master")" 2>/dev/null; rm -f "$state/master" "$socket"; fi
+    exit 0 ;;
+esac
+if [ -n "$master" ]; then
+  echo $$ > "$state/master"
+  : > "$socket"
+  trap 'rm -f "$state/master" "$socket"; exit 0' TERM
+  while [ ! -e "$state/down" ]; do sleep 0.05; done
+  rm -f "$state/master" "$socket"
+  echo "Connection to $alias closed by remote host." >&2
+  exit 255
+fi
+printf '%s\n' "$*" >> "$state/log"
+sh -c "$*" &
+pid=$!
+while kill -0 "$pid" 2>/dev/null; do
+  if [ -e "$state/down" ]; then
+    echo "Connection to $alias closed by remote host." >&2
+    exit 255
+  fi
+  sleep 0.05
+done
+wait "$pid"

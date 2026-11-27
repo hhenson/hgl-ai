@@ -7,7 +7,9 @@ use std::time::Duration;
 use hgl_ai_proto::{Family, Role, Runtime, Seat, Tier};
 use serde::{Deserialize, Serialize};
 
+pub mod builder;
 pub mod github;
+pub use builder::{Builder, Remote};
 pub use github::{Pin, ReleaseWatch, RepoGate, Tap};
 
 #[derive(Debug, thiserror::Error)]
@@ -55,6 +57,8 @@ pub struct Config {
     pub seats: Vec<SeatConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<Server>,
+    #[serde(default, skip_serializing_if = "Builder::is_default")]
+    pub builder: Builder,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -396,6 +400,7 @@ impl Config {
             models: default_models(),
             seats: Vec::new(),
             server: None,
+            builder: Builder::default(),
         }
     }
 
@@ -472,6 +477,7 @@ impl Config {
             }
         }
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
+        builder::validate(&self.builder, &self.host).map_err(ConfigError::Invalid)?;
         for d in [
             &self.limits.stale_after,
             &self.limits.turn_timeout,

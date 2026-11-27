@@ -1,0 +1,5 @@
+== check-core
+ERROR core/lib.hgl:7: unknown native `hgl.add2`
+WARN  core/lib.hgl:9: deprecated spelling
+ERROR core/lib.hgl:7: unknown native `hgl.add2`
+done: 1 error

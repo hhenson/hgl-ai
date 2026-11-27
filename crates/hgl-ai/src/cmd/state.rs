@@ -2,6 +2,7 @@
 
 use anyhow::Context as _;
 use hgl_ai_bus::{Bus, BusError, MAX_VALUE_BYTES};
+use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{HostRecord, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES, STREAM_NOTES};
 
 use super::note::read_bounded;
@@ -122,6 +123,7 @@ pub async fn init(ctx: &Ctx) -> anyhow::Result<i32> {
         KV_TREES,
         KV_LOCKS,
         KV_ENDED,
+        KV_BUILD,
     ];
     if ctx.json {
         println!("{}", serde_json::json!({ "provisioned": names }));

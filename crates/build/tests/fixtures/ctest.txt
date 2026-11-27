@@ -1,0 +1,23 @@
+Test project /work/build/cpp-plain
+    Start 1: hglrt_values
+1/4 Test #1: hglrt_values .....................   Passed    0.02 sec
+    Start 2: hglrt_scalar
+2/4 Test #2: hglrt_scalar .....................***Failed    0.11 sec
+Randomness seeded to: 1234
+/work/src/runtime/cpp/tests/scalar.cpp:88: FAILED:
+  REQUIRE( hglrt::add__i64_i64(1, 2) == 4 )
+with expansion:
+  3 == 4
+    Start 3: hglrt_takes_no_stdlib
+3/4 Test #3: hglrt_takes_no_stdlib ............***Exception: SegFault  0.30 sec
+    Start 4: hglrt_slow
+4/4 Test #4: hglrt_slow .......................***Skipped   0.00 sec
+
+50% tests passed, 2 tests failed out of 4
+
+Total Test time (real) =   0.45 sec
+
+The following tests FAILED:
+	  2 - hglrt_scalar (Failed)
+	  3 - hglrt_takes_no_stdlib (SEGFAULT)
+Errors while running CTest

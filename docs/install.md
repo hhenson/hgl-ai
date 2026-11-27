@@ -45,9 +45,12 @@ hgl-ai doctor
    exits 10.
 3. Finds the installed agent CLIs (`claude`, `codex`, `agy`) and installs the
    skill into each.
-4. Installs and starts the bridge user service, with the `PATH` of the install.
+4. Installs and starts the bridge user service, with the `PATH` of the install, and
+   the builder service (`hgl-ai builder run`; `--no-builder` skips it), which builds
+   this host's platform for the fleet (`docs/build.md`). SDK prefixes for recipes go in
+   `[builder.sdk]`.
 
-`client uninstall` removes the service and the skills, keeping the
+`client uninstall` removes the services and the skills, keeping the
 configuration unless `--purge`. Both installers take `--dry-run`, and
 `--linger` to run `loginctl enable-linger` on Linux so services survive logout.
 
@@ -68,3 +71,27 @@ The session starts the seat's runtime with its model and effort in
 
 Each CLI must be signed in once by its user (`claude`, `codex login`, `agy`).
 `doctor` reports a CLI that is installed but not signed in.
+
+## Proxy builders
+
+A Windows host is built from a Linux or macOS host over ssh (`docs/build.md` §2a); it
+runs no hgl-ai.
+
+1. On the remote: the OpenSSH server, key authentication for the proxy's user, `git`
+   and the toolchains on that user's `PATH` (Rust, CMake, Ninja, MSVC as the recipes
+   need), and a work directory.
+2. On the proxy: an alias in `~/.ssh/config` that logs in without a prompt
+   (`ssh winbox exit` works), then in `config.toml`:
+
+   ```toml
+   [[builder.remote]]
+   platform = "windows"
+   ssh = "winbox"
+   work_dir = "C:/hgl-ai/work"
+   shell = "powershell"
+   ```
+
+3. Restart the builder service. `hgl-ai builder list` shows the remote with `via
+   <proxy>`, its reachability, free disk and tool versions.
+
+The alias and directory stay in the proxy's file, never on the hub.

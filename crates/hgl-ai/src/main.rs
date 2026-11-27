@@ -50,6 +50,10 @@ enum Command {
     Cap(cmd::cap::Args),
     /// GitHub services and gates.
     Gh(cmd::gh::Args),
+    /// Build and test by recipe, here or on a builder of another platform.
+    Build(cmd::build::Args),
+    /// The builder service and the fleet's builders.
+    Builder(cmd::builder::Args),
 }
 
 #[tokio::main]
@@ -81,6 +85,8 @@ async fn main() {
         Command::Tree(a) => cmd::tree::run(&ctx, a).await,
         Command::Cap(a) => cmd::cap::run(&ctx, a).await,
         Command::Gh(a) => cmd::gh::run(&ctx, a).await,
+        Command::Build(a) => cmd::build::run(&ctx, a).await,
+        Command::Builder(a) => cmd::builder::run(&ctx, a).await,
     };
     let code = match res {
         Ok(code) => code,

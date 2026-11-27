@@ -1,0 +1,27 @@
+[package]
+name = "hgl-ai-build"
+description = "Build recipes, output parsers, executors and the builder service of hgl-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hgl-ai-proto.workspace = true
+hgl-ai-config.workspace = true
+hgl-ai-bus.workspace = true
+hgl-ai-cap.workspace = true
+hgl-ai-tree.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+regex.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+chrono.workspace = true
+libc.workspace = true
+base64.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

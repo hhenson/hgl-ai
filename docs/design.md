@@ -20,6 +20,7 @@ no GitHub or git library.
 | `bridge` | Seat loops, runtime adapters, prompt building, heartbeats, failover, cleanup on `landed`. | all above |
 | `install` | Hub and client installers, user services, `nats-server` provisioning, skill installation, agent launch. | `config`, `bus` |
 | `gh` | Coordinator service, merge gate, landing, pin sync, release watch, tap release. Landing and release watch hold the hub lease `HGL_LOCKS/lock.land.<repo>`, so they exclude each other across hosts. | `proto`, `config`, `bus` |
+| `build` | Recipes, output parsers, bounded summaries, executors (this host under `cap`; a remote over one owned ssh connection), the build driver, the builder service (`docs/build.md`). | `proto`, `config`, `bus`, `cap`, `tree` |
 | `hgl-ai` | The `clap` command line; thin over the crates. | all |
 
 Async runtime `tokio`; NATS client `async-nats`; errors `anyhow` at the edge,
@@ -60,6 +61,17 @@ hgl-ai gh land REPO PR HEAD
 hgl-ai gh pins sync
 hgl-ai gh release watch SHA
 hgl-ai gh tap release VERSION
+
+hgl-ai build run [REPO] [--steps A,B] [--platform P [--builder L] [--base REF]] [--keep-going]
+                [--detach] [--notify SEAT] [--dir D] [--log-dir D] [--recipe FILE]
+hgl-ai build status|wait ID [--timeout DUR]
+hgl-ai build list [--repo R] [--failed] [--limit N]
+hgl-ai build log ID [STEP] [--bytes START-END]
+hgl-ai build shell --platform P [REPO] [--head SHA]
+hgl-ai build recipe show|edit|import|export|history [REPO|FILE] [--rev N]
+hgl-ai builder run                        the builder service (the user service runs this)
+hgl-ai builder list
+hgl-ai builder drain|retire|resume LABEL
 ```
 
 Exit status: 0 success, 1 failure, 2 usage, 3 not ready (a gate is not
@@ -117,6 +129,17 @@ tier = "frontier"                      # or `model = "<slug>"` to pin one
 effort = "high"
 fallback = [{ runtime = "agy", family = "claude", tier = "frontier" }]
 
+[builder]                              # all optional
+concurrency = 1                        # builds at a time on this host
+sdk = { hgraph = "~/sdk/hgraph" }      # needs = ["sdk:hgraph"]; steps see HGL_SDK_HGRAPH
+local = true                           # false: only drive the remotes
+
+[[builder.remote]]                     # a proxy builder's remote (docs/build.md §2a)
+platform = "windows"
+ssh = "winbox"
+work_dir = "C:/hgl-ai/work"
+shell = "powershell"
+
 [server]                               # hub host only
 listen = "127.0.0.1"
 port = 4222
@@ -170,6 +193,7 @@ Reviewer tasks use `<seat>/<repo>-<pr>-review/` with a detached checkout of
 | Hub | `hgl-ai-hub.service` running `nats-server -c <data_dir>/nats.conf` | `io.github.hhenson.hgl-ai.hub` |
 | Bridge | `hgl-ai-bridge.service` running `hgl-ai bridge run` | `io.github.hhenson.hgl-ai.bridge` |
 | Coordinator | `hgl-ai-coord.service` running `hgl-ai gh coord run` | `io.github.hhenson.hgl-ai.coord` |
+| Builder | `hgl-ai-builder.service` running `hgl-ai builder run` | `io.github.hhenson.hgl-ai.builder` |
 
 Linux services enable lingering (`loginctl enable-linger`) when the user
 allows it, so they survive logout.

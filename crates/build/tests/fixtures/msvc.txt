@@ -1,0 +1,7 @@
+  values.cpp
+C:\work\src\runtime\cpp\src\values.cpp(42,12): error C2065: 'widht': undeclared identifier [C:\work\build\hglrt.vcxproj]
+C:\work\src\runtime\cpp\src\values.cpp(17): warning C4101: 'spare': unreferenced local variable [C:\work\build\hglrt.vcxproj]
+C:\work\src\runtime\cpp\src\text.cpp(9,3): warning C4996: 'strcpy': This function or variable may be unsafe. Consider using strcpy_s instead.
+main.obj : error LNK2019: unresolved external symbol "void __cdecl hglrt::start(void)" (?start@hglrt@@YAXXZ) referenced in function main [C:\work\build\demo.vcxproj]
+LINK : fatal error LNK1120: 1 unresolved externals [C:\work\build\demo.vcxproj]
+cl : command line warning D9002: ignoring unknown option '-fno-omit-frame-pointer'

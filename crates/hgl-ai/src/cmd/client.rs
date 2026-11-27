@@ -13,7 +13,8 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Sub {
-    /// Write config.toml, copy the token, check the hub, install the skill and the bridge service.
+    /// Write config.toml, copy the token, check the hub, install the skill and the bridge
+    /// and builder services.
     Install(InstallArgs),
     /// Remove the bridge service and the skills; keep config.toml and the token unless --purge.
     Uninstall {
@@ -43,6 +44,9 @@ struct InstallArgs {
     /// Enable lingering (`loginctl enable-linger`) so services survive logout.
     #[arg(long)]
     linger: bool,
+    /// Do not install the builder service.
+    #[arg(long)]
+    no_builder: bool,
     /// Print what would change; change nothing.
     #[arg(long)]
     dry_run: bool,
@@ -60,6 +64,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 host: a.host,
                 work_root: a.work_root,
                 linger: a.linger,
+                builder: !a.no_builder,
             };
             let out = client::install(pick(a.dry_run), &BusHub, &o)
                 .await

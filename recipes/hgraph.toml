@@ -1,0 +1,41 @@
+# hgraph (draft): CMake configure, build, ctest (README "Build & test").
+# The dependency prefix is configurable per builder:
+#   [builder.sdk]
+#   hgraph-deps = "~/sdk/hgraph-deps"   # a prefix with fmt, spdlog, simdjson, Catch2
+# It goes on CMAKE_PREFIX_PATH; without one, CMake fetches what is missing.
+# Windows steps run in PowerShell on a remote driven by a proxy builder.
+repo = "hgraph"
+
+[[step]]
+name = "configure"
+run.default = 'cmake -S . -B "$HGL_AI_BUILD_DIR/hgraph" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DHGRAPH_BUILD_PYTHON_BINDINGS=OFF -DHGRAPH_WARNINGS_AS_ERRORS=ON -DCMAKE_PREFIX_PATH="${HGL_SDK_HGRAPH_DEPS:-}"'
+run.windows = 'cmake -S . -B "$env:HGL_AI_BUILD_DIR/hgraph" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON -DHGRAPH_BUILD_PYTHON_BINDINGS=OFF -DHGRAPH_WARNINGS_AS_ERRORS=ON -DCMAKE_PREFIX_PATH="$env:HGL_SDK_HGRAPH_DEPS"'
+memcap_gb = 4
+time = "15m"
+parser = "gcc"
+needs = ["tool:cmake", "tool:ninja"]
+
+[[step]]
+name = "build"
+run = 'cmake --build "$HGL_AI_BUILD_DIR/hgraph" --parallel'
+platforms = ["linux", "macos"]
+memcap_gb = 48
+time = "60m"
+parser = "gcc"
+needs = ["step:configure"]
+
+[[step]]
+name = "build-msvc"
+run = 'cmake --build "$env:HGL_AI_BUILD_DIR/hgraph" --parallel'
+platforms = ["windows"]
+time = "90m"
+parser = "msvc"
+needs = ["step:configure"]
+
+[[step]]
+name = "test"
+run.default = 'ctest --test-dir "$HGL_AI_BUILD_DIR/hgraph" --output-on-failure --parallel 4'
+run.windows = 'ctest --test-dir "$env:HGL_AI_BUILD_DIR/hgraph" --output-on-failure --parallel 4'
+memcap_gb = 16
+time = "40m"
+parser = "ctest"

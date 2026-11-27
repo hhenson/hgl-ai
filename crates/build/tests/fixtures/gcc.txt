@@ -1,0 +1,22 @@
+[1/4] Building CXX object CMakeFiles/hglrt.dir/src/values.cpp.o
+FAILED: CMakeFiles/hglrt.dir/src/values.cpp.o
+/usr/bin/g++-15 -I/work/src/runtime/cpp/include -std=c++23 -c /work/src/runtime/cpp/src/values.cpp
+In file included from /work/src/runtime/cpp/include/hglrt/hglrt.h:4,
+                 from /work/src/runtime/cpp/src/values.cpp:1:
+/work/src/runtime/cpp/include/hglrt/values.h: In function 'int hglrt::width(int)':
+/work/src/runtime/cpp/include/hglrt/values.h:42:12: error: 'widht' was not declared in this scope; did you mean 'width'?
+   42 |     return widht;
+      |            ^~~~~
+      |            width
+/work/src/runtime/cpp/src/values.cpp:17:9: warning: unused variable 'spare' [-Wunused-variable]
+   17 |     int spare = 0;
+      |         ^~~~~
+/work/src/runtime/cpp/src/values.cpp:30:5: note: declared here
+In file included from /work/src/runtime/cpp/include/hglrt/hglrt.h:4,
+                 from /work/src/runtime/cpp/src/scalar.cpp:1:
+/work/src/runtime/cpp/include/hglrt/values.h:42:12: error: 'widht' was not declared in this scope; did you mean 'width'?
+/work/src/runtime/cpp/src/text.cpp:9:3: error: no matching function for call to 'concat(int)' [-Werror=format]
+/usr/bin/ld: CMakeFiles/demo.dir/main.cpp.o: in function `main':
+main.cpp:(.text+0x1d): undefined reference to `hglrt::start()'
+collect2: error: ld returned 1 exit status
+ninja: build stopped: subcommand failed.

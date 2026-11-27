@@ -3,6 +3,8 @@
 
 pub mod agent;
 pub mod bridge;
+pub mod build;
+pub mod builder;
 pub mod cap;
 pub mod client;
 pub mod doctor;

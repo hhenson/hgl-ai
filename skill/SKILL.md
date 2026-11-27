@@ -19,6 +19,10 @@ hgl-ai state put KEY VALUE|-            controller only
 hgl-ai hosts                            live hosts and their seats
 hgl-ai tree list [--stale]              task worktrees
 hgl-ai cap SIZE --time DUR -- CMD ...   run CMD under a memory and time cap
+hgl-ai build run [REPO] [--steps A,B]   build and test by the repo's recipe; prints a summary
+hgl-ai build run --platform macos|windows [--detach]   the same on a builder of that platform
+hgl-ai build status|wait ID             a detached build
+hgl-ai build log ID STEP --bytes A-B    the part of a step's log the summary points to
 ```
 
 `--json` gives machine output. Exit 3: a gate is not met (the message says
@@ -46,7 +50,11 @@ The first body line names runtime and action: `[codex] Ready: hgl-compiler#980 a
 - `ready`, `review`, `receipt`, `sendback`, `approved` carry the exact
   40-character head (`git rev-parse HEAD`). A new commit voids every verdict.
 - `ready` notes and receipts name your model family and model.
-- Every build, test, probe and generated program runs under
+- Build and test with `hgl-ai build run` (each step is capped; exit 0 pass, 1 fail, 3 not
+  run). Read its summary, not the log; open the log by byte range only when the summary
+  is not enough. A long or other-platform build: `--detach`, then `build wait ID`.
+  Not run (a missing SDK, tool or recipe) goes to the build agent; never work around it.
+- Every other build, test, probe and generated program runs under
   `hgl-ai cap SIZE --time DUR -- ...`: 16G for one compiler run or program,
   up to 64G for a workspace build or test. A hit cap is a finding; never raise it.
 - All scratch goes inside `$HGL_AI_TASK_DIR` (`TMPDIR` and `CARGO_TARGET_DIR`
@@ -76,6 +84,10 @@ only issues labelled ready. Write no code.
 the bridge made. Format, lint and test under `cap`, push, then send `ready`
 with the exact head. Answer `sendback` with new commits; never force-push
 reviewed history unless told.
+
+**Build agent.** Write and repair recipes (`hgl-ai build recipe edit|import`), provision
+toolchains and SDKs on builders (`[builder.sdk]`), diagnose failures of the build itself
+(`hgl-ai builder list` shows each builder's health). Never change the code under build.
 
 **Reviewer.** Fresh context per review; the bridge has merged `head` onto
 `main` in `$HGL_AI_TASK_DIR/src`. Write adversarial programs, accepting and

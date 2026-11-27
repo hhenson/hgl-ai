@@ -66,6 +66,8 @@ Every install command takes `--dry-run`.
 | `crates/bridge` | Seat loops, runtime adapters, heartbeats, failover. |
 | `crates/install` | Hub and client installers, user services, skill, agent sessions, `doctor`. |
 | `crates/gh` | Coordinator, merge gate, landing, pins, releases. |
+| `crates/build` | Build recipes, parsers, summaries, executors, the builder service. |
 | `crates/hgl-ai` | The command line. |
 
-`skill/SKILL.md` is the skill every agent CLI loads.
+`skill/SKILL.md` is the skill every agent CLI loads. `recipes/` holds the build recipes
+(`hgl-ai build recipe import recipes/<repo>.toml`).
