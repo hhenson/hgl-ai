@@ -1,7 +1,12 @@
 # Fleet
 
-Status: proposed. The hub holds the fleet's configuration; a client registers and is
-given its part. A host's own file keeps only what it needs to reach the hub.
+Status: proposed — not implemented. Nothing here is built yet: today each host's
+`config.toml` holds its seats and the hub token (`docs/design.md` §3, `docs/install.md`),
+and seats are named by `hgl-ai seat add`. The current rules are in `docs/protocol.md`,
+`docs/roles.md` and `docs/design.md`.
+
+The hub holds the fleet's configuration; a client registers and is given its part. A
+host's own file keeps only what it needs to reach the hub.
 
 ## 1. Hosts
 

@@ -3,7 +3,7 @@
 
 use std::sync::LazyLock;
 
-use hgl_ai_proto::{Seat, TreeRecord};
+use hgl_ai_proto::{Family, ReviewReceipt, Seat, TreeRecord};
 use regex::Regex;
 
 use crate::short;
@@ -110,6 +110,31 @@ pub fn author_seats(
     out
 }
 
+/// The task's author families (ROLE-9): the families recorded in the implementor trees of
+/// `repo` registered for this branch or issue (`HGL_TREES`, written by the bridges).
+pub fn author_families(trees: &[TreeRecord], repo: &str, branch: &str, issue: u64) -> Vec<Family> {
+    let mut out: Vec<Family> = trees
+        .iter()
+        .filter(|t| t.task.repo == repo && !t.review)
+        .filter(|t| t.branch.as_deref() == Some(branch) || t.task.issue == issue)
+        .flat_map(|t| t.families.iter().copied())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The review receipt (PROTO-19) a `receipt` note's body carries: the body as JSON, or the
+/// JSON object inside it (a fenced block, a line of text around it). `None` for a body that
+/// holds none (a desk receipt, PROTO-18).
+pub fn parse_receipt(body: &str) -> Option<ReviewReceipt> {
+    if let Ok(r) = serde_json::from_str(body.trim()) {
+        return Some(r);
+    }
+    let (a, z) = (body.find('{')?, body.rfind('}')?);
+    (a < z).then(|| serde_json::from_str(&body[a..=z]).ok())?
+}
+
 /// Body of a `landed` note (PROTO-11).
 pub fn landed_body(
     runtime: &str,
@@ -213,7 +238,42 @@ mod tests {
             branch: Some(branch.into()),
             created_at: "x".into(),
             size_bytes: 0,
+            families: Vec::new(),
         }
+    }
+
+    #[test]
+    fn authors_and_receipts() {
+        let mut a = tree("w1", "alpha", 980, "codex/q980-x", false);
+        a.families = vec![Family::Gpt];
+        let mut b = tree("w2", "alpha", 980, "", false);
+        b.families = vec![Family::Claude, Family::Gpt];
+        let mut r = tree("r1", "alpha", 980, "", true);
+        r.families = vec![Family::Gemini];
+        let mut other = tree("w3", "beta", 980, "codex/q980-x", false);
+        other.families = vec![Family::Gemini];
+        let trees = vec![a, b, r, other];
+        assert_eq!(
+            author_families(&trees, "alpha", "codex/q980-x", 980),
+            [Family::Claude, Family::Gpt],
+            "the implementor trees of the task; a review tree is not an author"
+        );
+        assert!(author_families(&trees, "alpha", "codex/q7-y", 7).is_empty());
+
+        let json = r#"{"repo":"alpha","pr":7,"head":"h","main":"m","reviewer":"r1","family":"gemini","model":"gemini-4-neon","verdict":"clean","evidence":"e"}"#;
+        let r = parse_receipt(json).unwrap();
+        assert_eq!(
+            (r.pr, r.family, r.limitations.as_str()),
+            (7, Family::Gemini, "")
+        );
+        let wrapped = format!("[agy] Receipt: alpha#7\n\n```json\n{json}\n```\n");
+        assert_eq!(parse_receipt(&wrapped), Some(r));
+        assert_eq!(
+            parse_receipt("[desk] Sets: alpha#7 at 1f461fa7 on main 0a0a0a0a, exit 0: r"),
+            None
+        );
+        assert_eq!(parse_receipt(r#"{"repo":"alpha"}"#), None);
+        assert_eq!(parse_receipt(&json.replace("clean", "maybe")), None);
     }
 
     #[test]

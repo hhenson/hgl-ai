@@ -1,6 +1,7 @@
 # Work on the HGL repositories
 
-Status: proposed. Replaces hhenson/hgl-compiler#334 (the file-queue protocol).
+Status: proposed; the bridge, notes and gates it relies on are implemented. Replaces
+hhenson/hgl-compiler#334 (the file-queue protocol).
 Roles and gates are in `docs/roles.md`; notes and worktrees in `docs/protocol.md`.
 
 ## 1. Issues and labels
@@ -32,8 +33,9 @@ Roles and gates are in `docs/roles.md`; notes and worktrees in `docs/protocol.md
 4. Do what the issue lists and nothing else. A defect outside it goes in a new,
    unlabelled issue (ROLE-11).
 5. Run every check `AGENTS.md` names, under `hgl-ai cap`. A change reaching the C++
-   target also runs that target's checks, plain and sanitized, against the pinned
-   hgraph SDK. The list of unsupported cases does not grow.
+   target also runs that target's checks, plain and sanitized (under
+   `hgl-ai cap --no-address-limit`), against the pinned hgraph SDK. The list of
+   unsupported cases does not grow.
 6. Open the pull request: what changed, the rule ids, the checks with counts, and
    `Closes #N` (in another repository `Part of hhenson/hgl-compiler#N`). Where Core and
    the compiler both change, Core's pull request comes first and the compiler pins it.

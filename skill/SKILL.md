@@ -13,16 +13,33 @@ prompt: never poll.
 
 ```
 hgl-ai note send --to SEAT --kind KIND [--repo R] [--issue N] [--head SHA] --body-file F
-hgl-ai note wait SEAT [--timeout DUR]   controller only: block, print, ack
 hgl-ai state get KEY                    main, prs, landed.log, hold, mode
-hgl-ai state put KEY VALUE|-            controller only
 hgl-ai hosts                            live hosts and their seats
 hgl-ai tree list [--stale]              task worktrees
 hgl-ai cap SIZE --time DUR -- CMD ...   run CMD under a memory and time cap
+hgl-ai cap SIZE --time DUR --no-address-limit -- CMD ...   the same for sanitizer runs (ASan, TSan)
 ```
 
-`--json` gives machine output. Exit 3: a gate is not met (the message says
-which). Exit 10: hub unreachable; retry later, never work around it.
+The controller also uses:
+
+```
+hgl-ai note wait SEAT [--timeout DUR]   block, print, ack
+hgl-ai note peek SEAT                   print what is not acked yet; takes nothing
+hgl-ai state put KEY VALUE|- [--if-revision N]
+hgl-ai state append KEY LINE|-
+hgl-ai gh approve|sendback REPO PR HEAD --body-file F   one GitHub comment, then the note
+hgl-ai gh merge-if-clean REPO PR HEAD   one gate attempt; merges if every gate holds
+hgl-ai gh land REPO PR HEAD             the gate until it decides; then landed.log, main,
+                                        the landed notes, the comment and the pins
+hgl-ai gh pins sync                     raise the wrapper's pins
+hgl-ai gh release watch SHA             every workflow run on SHA, under the landing lock
+hgl-ai gh tap release VERSION           the Homebrew bottle flow
+```
+
+Every `gh` command takes `--dry-run`. `--json` gives machine output. Exit 3: a
+gate is not met, or `PARTIAL` (merged, a step after it not done: run the same
+command again to finish); the message says which. Exit 10: hub unreachable;
+retry later, never work around it.
 
 ## Notes
 
@@ -66,8 +83,11 @@ The first body line names runtime and action: `[codex] Ready: hgl-compiler#980 a
 `hgl-ai note wait $HGL_AI_SEAT`. Judge each receipt at its exact head on the
 current `main`. A merge needs a clean receipt from a family other than the
 author's; with no other family available nothing lands. Land one change at a
-time, then rewrite `main`, append to `landed.log`, update pins after an
-`hgl_spec`, `hgl_core` or `hgl-compiler` merge, and send `landed`.
+time with `hgl-ai gh land`, which checks the receipt and rewrites `main`,
+appends to `landed.log`, sends `landed` and raises the pins after an `hgl_spec`,
+`hgl_core` or `hgl-compiler` merge. A note starting `[bridge] Dead letter:`
+quotes a note that failed five times and was dropped: fix the cause, then send
+it again.
 
 **Triage.** Label and slice new issues, fold duplicates, keep the ready
 backlog ordered, batch owner questions into one labelled list, and `assign`

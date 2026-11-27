@@ -5,8 +5,13 @@
 //!   that bringing it up to date made;
 //! - it targets `main`, is open, not a draft, has no conflict and no unresolved thread;
 //! - the review bot reviewed the head clean, or the head's first parent where the head only
-//!   merges the present `main` into it, or (`--triaged`) reviewed the head with findings the
-//!   controller triaged;
+//!   merges the present `main` into it and `main` moved since that parent only in files the
+//!   pull request does not touch and in none of the global paths, or (`--triaged`) reviewed
+//!   the head with findings the controller triaged;
+//! - (unless the repository turns it off) a clean review receipt (PROTO-19) for the head asked,
+//!   from a model family none of the task's authors used (ROLE-9), sent to the controller
+//!   and read from the notes stream on the hub; the authors' families come from the
+//!   implementor trees the bridges registered (`HGL_TREES`);
 //! - where the repository names local build verdicts, each passed for this head on this
 //!   `main`; then GitHub's checks are not waited for (one that failed still blocks) and the
 //!   branch is not brought up to date;
@@ -22,11 +27,13 @@
 use std::collections::BTreeMap;
 
 use hgl_ai_bus::Bus;
+use hgl_ai_proto::{Family, Kind as NoteKind, ReviewReceipt, Verdict};
 use serde_json::Value;
 
 use crate::bot::{BotView, Comment, Review};
 use crate::exec::{self, Gh};
 use crate::lock::LandLock;
+use crate::progress::{self, Progress};
 use crate::{Error, GateRules, Result, Settings, short, state};
 
 /// The pull request fields the gate reads (REST `pulls/N`).
@@ -194,6 +201,13 @@ pub fn lines_matching(diff: &str, patterns: &[regex::Regex]) -> usize {
 /// One local build verdict: its name and, for this head on this main, pass or fail.
 pub type VerdictResult = (String, Option<(bool, String)>);
 
+/// A review receipt as the gate saw it: the seat that sent the note, and its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SeenReceipt {
+    pub sender: String,
+    pub receipt: ReviewReceipt,
+}
+
 /// Everything the gate may read. `None` is not fetched yet.
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
@@ -214,6 +228,13 @@ pub struct Facts {
     pub pr_files: Option<Vec<PrFile>>,
     /// The pull request's diff, or why it could not be read.
     pub diff: Option<std::result::Result<String, String>>,
+    /// Where the head merges `main` into a reviewed parent: the pull request's files since
+    /// the merge base of that parent, and what `main` gained since then.
+    pub update_files: Option<(FileList, FileList)>,
+    /// The review receipts for this pull request, or why they could not be read.
+    pub receipts: Option<std::result::Result<Vec<SeenReceipt>, String>>,
+    /// The model families of the task's authors, or why they could not be read.
+    pub authors: Option<std::result::Result<Vec<Family>, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -229,6 +250,9 @@ pub enum Need {
     CompareFiles,
     PrFiles,
     Diff,
+    UpdateFiles,
+    Receipts,
+    Authors,
 }
 
 /// Switches the controller gives: `TRIAGED`, `HYGIENE_READ` and `NOUPDATE` of the shell gate,
@@ -238,6 +262,12 @@ pub struct Opts {
     pub triaged: bool,
     pub hygiene_read: bool,
     pub no_update: bool,
+    /// The issue the pull request closes (its task, for the authors' families); else the
+    /// issue in its branch name, else its number.
+    pub closes: Option<u64>,
+    /// A pull request the tool made, not an agent (the wrapper's pin pull requests): it has
+    /// no author family for a review receipt to differ from, so none is asked for.
+    pub tool_made: bool,
 }
 
 /// The last word of a gate line.
@@ -245,6 +275,10 @@ pub struct Opts {
 pub enum Kind {
     Merged,
     AlreadyMerged,
+    /// Merged by an earlier attempt, whose steps after the merge this one finished.
+    Resumed,
+    /// Merged, but a step after the merge is not done; the same command finishes it.
+    Partial,
     Updated,
     Wait,
     Blocked,
@@ -261,7 +295,8 @@ pub enum Kind {
 impl Kind {
     pub fn word(self) -> &'static str {
         match self {
-            Kind::Merged | Kind::AlreadyMerged => "MERGED",
+            Kind::Merged | Kind::AlreadyMerged | Kind::Resumed => "MERGED",
+            Kind::Partial => "PARTIAL",
             Kind::Updated => "UPDATED",
             Kind::Wait => "WAIT",
             Kind::Blocked => "BLOCKED",
@@ -274,7 +309,14 @@ impl Kind {
     }
     /// Whether the gate is satisfied (exit 0).
     pub fn satisfied(self) -> bool {
-        matches!(self, Kind::Merged | Kind::AlreadyMerged | Kind::WouldMerge)
+        matches!(
+            self,
+            Kind::Merged | Kind::AlreadyMerged | Kind::Resumed | Kind::WouldMerge
+        )
+    }
+    /// Merged by this command, or its landing finished by it.
+    pub fn landed(self) -> bool {
+        matches!(self, Kind::Merged | Kind::Resumed)
     }
 }
 
@@ -291,7 +333,7 @@ pub struct Outcome {
 }
 
 impl Outcome {
-    fn new(kind: Kind, line: String, retry: bool, head: &str) -> Outcome {
+    pub(crate) fn new(kind: Kind, line: String, retry: bool, head: &str) -> Outcome {
         Outcome {
             kind,
             line,
@@ -367,12 +409,20 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     let mut behind = *need!(f.behind, Need::Behind);
     let bot = need!(f.bot, Need::BotComments);
     let mut reviewed = "no";
+    // Why the reviewed parent does not count: `main` moved in what the review did not see.
+    let mut parent_stale = None;
     if bot.clean_on(head) {
         reviewed = "head";
     } else {
         let parents = need!(f.parents, Need::Parents);
         if parents.len() == 2 && parents[1] == main && bot.clean_on(&parents[0]) {
-            reviewed = "parent";
+            let (mine, theirs) = need!(f.update_files, Need::UpdateFiles);
+            match moved_in(mine, theirs, &rules.global_paths) {
+                None => reviewed = "parent",
+                Some(w) => {
+                    parent_stale = Some(format!("main moved in {w} since {}", short(&parents[0])))
+                }
+            }
         }
     }
     if reviewed == "no" && opts.triaged {
@@ -408,6 +458,9 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         }
         if reviewed == "no" {
             why.push("no clean review at the head".to_string());
+            if let Some(w) = &parent_stale {
+                why.push(format!("the reviewed parent is not enough: {w}"));
+            }
         }
         return done(
             Kind::Blocked,
@@ -420,6 +473,19 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     }
     if pr.draft {
         return done(Kind::Blocked, format!("{line} draft BLOCKED"), false);
+    }
+    if rules.receipt && !opts.tool_made {
+        let authors = need!(f.authors, Need::Authors);
+        let receipts = need!(f.receipts, Need::Receipts);
+        match receipt_check(authors, receipts, asked) {
+            Ok(r) => line.push_str(&format!(
+                " receipt {}/{}",
+                r.receipt.reviewer, r.receipt.family
+            )),
+            Err((why, retry)) => {
+                return done(Kind::Blocked, format!("{line} {why} BLOCKED"), retry);
+            }
+        }
     }
     if !rules.verdicts.is_empty() {
         let v = need!(f.verdicts, Need::Verdicts);
@@ -470,31 +536,12 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     if behind != 0 {
         let mine = need!(f.mine, Need::CompareFiles);
         let theirs = need!(f.theirs, Need::CompareFiles);
-        let mut overlap: String = mine
-            .files
-            .iter()
-            .filter(|m| theirs.files.contains(m))
-            .take(3)
-            .map(|m| format!("{m} "))
-            .collect();
-        let global: String = theirs
-            .files
-            .iter()
-            .filter(|t| rules.global_paths.iter().any(|g| t.starts_with(g.as_str())))
-            .take(3)
-            .map(|t| format!("{t} "))
-            .collect();
-        if mine.files.is_empty() || theirs.files.is_empty() || !mine.whole || !theirs.whole {
-            overlap.push_str("(file lists not known whole) ");
-        }
-        if overlap.is_empty() && global.is_empty() {
-            line.push_str(" behind-in-untouched-files-only");
-            behind = 0;
-        } else {
-            line.push_str(&format!(
-                " main-moved-in: {}",
-                format!("{overlap}{global}").trim_end()
-            ));
+        match moved_in(mine, theirs, &rules.global_paths) {
+            None => {
+                line.push_str(" behind-in-untouched-files-only");
+                behind = 0;
+            }
+            Some(w) => line.push_str(&format!(" main-moved-in: {w}")),
         }
     }
     if behind != 0 && opts.no_update {
@@ -574,6 +621,86 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     Step::Merge(line)
 }
 
+/// What `main` gained (`theirs`) that a change (`mine`) must be revalidated for: files both
+/// touch and global paths, at most three of each; also when either list is not known whole
+/// (the API lists at most 300) or is empty. `None`: nothing.
+fn moved_in(mine: &FileList, theirs: &FileList, global_paths: &[String]) -> Option<String> {
+    let mut overlap: String = mine
+        .files
+        .iter()
+        .filter(|m| theirs.files.contains(m))
+        .take(3)
+        .map(|m| format!("{m} "))
+        .collect();
+    let global: String = theirs
+        .files
+        .iter()
+        .filter(|t| global_paths.iter().any(|g| t.starts_with(g.as_str())))
+        .take(3)
+        .map(|t| format!("{t} "))
+        .collect();
+    if mine.files.is_empty() || theirs.files.is_empty() || !mine.whole || !theirs.whole {
+        overlap.push_str("(file lists not known whole) ");
+    }
+    let w = format!("{overlap}{global}");
+    (!w.is_empty()).then(|| w.trim_end().to_string())
+}
+
+/// ROLE-9 over what was read: a clean receipt for the head `asked`, sent by the reviewer it
+/// names, from a family none of the authors used. Else why not, and whether waiting may
+/// bring one.
+fn receipt_check<'a>(
+    authors: &std::result::Result<Vec<Family>, String>,
+    receipts: &'a std::result::Result<Vec<SeenReceipt>, String>,
+    asked: &str,
+) -> std::result::Result<&'a SeenReceipt, (String, bool)> {
+    let authors = match authors {
+        Ok(a) if a.is_empty() => {
+            return Err((
+                "ROLE-9: no author family known (no implementor tree of the task records one); a receipt cannot be checked".into(),
+                false,
+            ));
+        }
+        Ok(a) => a,
+        Err(e) => {
+            return Err((
+                format!("ROLE-9: the authors' families not read ({e})"),
+                false,
+            ));
+        }
+    };
+    let receipts = match receipts {
+        Ok(r) => r,
+        Err(e) => return Err((format!("ROLE-9: receipts not read ({e})"), false)),
+    };
+    let at_head: Vec<&SeenReceipt> = receipts
+        .iter()
+        .filter(|r| r.receipt.head == asked && r.receipt.reviewer.as_str() == r.sender)
+        .collect();
+    let names = |fs: &[Family]| fs.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(",");
+    if let Some(r) = at_head
+        .iter()
+        .rev()
+        .find(|r| r.receipt.verdict == Verdict::Clean && !authors.contains(&r.receipt.family))
+    {
+        return Ok(r);
+    }
+    let why = if at_head.iter().any(|r| r.receipt.verdict == Verdict::Clean) {
+        format!(
+            "ROLE-9: the clean receipts at the head are from the authors' family ({}); another family must review",
+            names(authors)
+        )
+    } else if !at_head.is_empty() {
+        "ROLE-9: the receipts at the head have findings".to_string()
+    } else {
+        format!(
+            "ROLE-9: no clean review receipt at the head from a family other than the authors' ({})",
+            names(authors)
+        )
+    };
+    Err((why, at_head.is_empty()))
+}
+
 const THREADS_QUERY: &str = "query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
   repository(owner: $owner, name: $name) { pullRequest(number: $number) {
     reviewThreads(first: 100, after: $endCursor) { pageInfo { hasNextPage endCursor } nodes { isResolved } }
@@ -608,6 +735,43 @@ pub async fn main_head<G: Gh>(gh: &G, s: &Settings, repo: &str) -> Result<String
         .ok_or_else(|| resp("git/ref/heads/main", "no object.sha"))
 }
 
+/// Notes read per pass over the controller's notes for receipts.
+const RECEIPT_WINDOW: usize = 1000;
+
+/// The review receipts for `repo` #`pr` among the controller's notes on the hub (HGL_NOTES
+/// keeps 14 days): `receipt` notes whose body holds PROTO-19 JSON for this pull request.
+pub async fn receipts(bus: &Bus, s: &Settings, repo: &str, pr: u64) -> Result<Vec<SeenReceipt>> {
+    let mut out = Vec::new();
+    let mut from = 1;
+    loop {
+        let (got, last) = bus
+            .read_page(std::slice::from_ref(&s.controller), from, RECEIPT_WINDOW)
+            .await?;
+        // From after the last message read, a malformed one skipped included.
+        let Some(last) = last else {
+            return Ok(out);
+        };
+        from = last + 1;
+        for sn in got {
+            if sn.note.kind != NoteKind::Receipt {
+                continue;
+            }
+            if let Some(r) = state::parse_receipt(&sn.note.body)
+                && r.repo == repo
+                && r.pr == pr
+            {
+                out.push(SeenReceipt {
+                    sender: sn.note.sender.to_string(),
+                    receipt: r,
+                });
+            }
+        }
+    }
+}
+
+const NO_HUB: &str = "no hub connection";
+
+#[allow(clippy::too_many_arguments)]
 async fn fill<G: Gh>(
     gh: &G,
     s: &Settings,
@@ -615,6 +779,7 @@ async fn fill<G: Gh>(
     repo: &str,
     f: &mut Facts,
     need: Need,
+    issue: u64,
 ) -> Result<()> {
     let r = s.full(repo);
     let n = f.pr.number;
@@ -713,6 +878,36 @@ async fn fill<G: Gh>(
             .await;
             f.diff = Some(d.map_err(|e| e.to_string()));
         }
+        Need::UpdateFiles => {
+            let parent = f
+                .parents
+                .as_ref()
+                .and_then(|p| p.first())
+                .cloned()
+                .ok_or_else(|| resp("git/commits", "no parent"))?;
+            let mine =
+                compare_files(&exec::get(gh, &format!("repos/{r}/compare/main...{parent}")).await?);
+            let theirs =
+                compare_files(&exec::get(gh, &format!("repos/{r}/compare/{parent}...main")).await?);
+            f.update_files = Some((mine, theirs));
+        }
+        Need::Receipts => {
+            f.receipts = Some(match bus {
+                Some(b) => Ok(receipts(b, s, repo, n).await?),
+                None => Err(NO_HUB.into()),
+            });
+        }
+        Need::Authors => {
+            f.authors = Some(match bus {
+                Some(b) => Ok(state::author_families(
+                    &b.trees().await?,
+                    repo,
+                    &f.pr.branch,
+                    issue,
+                )),
+                None => Err(NO_HUB.into()),
+            });
+        }
     }
     Ok(())
 }
@@ -738,9 +933,13 @@ pub async fn evaluate<G: Gh>(
         pr: fetch_pr(gh, s, repo, number).await?,
         ..Facts::default()
     };
+    let issue = opts
+        .closes
+        .or_else(|| state::issue_from_branch(&f.pr.branch, &s.branch_prefix))
+        .unwrap_or(number);
     loop {
         match decide(&f, repo, asked, &rules, opts) {
-            Step::Need(n) => fill(gh, s, bus, repo, &mut f, n).await?,
+            Step::Need(n) => fill(gh, s, bus, repo, &mut f, n, issue).await?,
             Step::Done(o) => return Ok(o),
             Step::Update(line) if !act => {
                 return Ok(Outcome::new(
@@ -777,6 +976,10 @@ pub async fn evaluate<G: Gh>(
                 if let Some(l) = lock {
                     l.confirm(&format!("merging {repo} #{number}")).await?;
                 }
+                // The intent first: a failure from here on leaves a record a retry resumes.
+                if let Some(b) = bus {
+                    progress::write(b, repo, number, &Progress::new(&f.pr.head, None)).await?;
+                }
                 let path = format!("repos/{}/pulls/{number}/merge", s.full(repo));
                 let res = exec::write(
                     gh,
@@ -788,6 +991,10 @@ pub async fn evaluate<G: Gh>(
                 let after = fetch_pr(gh, s, repo, number).await?;
                 if after.merged {
                     let m = after.merge_commit.clone().unwrap_or_default();
+                    if let Some(b) = bus {
+                        let p = Progress::new(&f.pr.head, Some(m.clone()));
+                        progress::write(b, repo, number, &p).await?;
+                    }
                     let mut o = Outcome::new(
                         Kind::Merged,
                         format!("{line} -> MERGED {} MERGED", short(&m)),
@@ -796,6 +1003,11 @@ pub async fn evaluate<G: Gh>(
                     );
                     o.merge_commit = Some(m);
                     return Ok(o);
+                }
+                if let Some(b) = bus
+                    && let Err(e) = progress::delete(b, repo, number).await
+                {
+                    eprintln!("{repo} #{number}: removing the landing record: {e}");
                 }
                 let why = res.err().map(|e| format!(" ({e})")).unwrap_or_default();
                 return Ok(Outcome::new(
@@ -813,7 +1025,7 @@ pub async fn evaluate<G: Gh>(
 mod tests {
     use super::*;
     use crate::exec::fake::FakeGh;
-    use crate::testutil::{fixture, json, settings};
+    use crate::testutil::{fixture, json, settings, without_receipts};
 
     const HEAD: &str = "1f461fa77bba922fe81383df4c475feb58b7c233";
     const MAIN: &str = "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a";
@@ -845,6 +1057,21 @@ mod tests {
             theirs: None,
             pr_files: Some(pr_files(json("pr-files.json").as_array().unwrap())),
             diff: Some(Ok(fixture("pr.diff"))),
+            update_files: None,
+            receipts: Some(Ok(vec![seen("r1", receipt())])),
+            authors: Some(Ok(vec![Family::Gpt])),
+        }
+    }
+
+    /// A clean review receipt of `alpha#7` at `HEAD` by `r1`, family claude.
+    fn receipt() -> ReviewReceipt {
+        state::parse_receipt(&fixture("receipt.json")).expect("PROTO-19 JSON")
+    }
+
+    fn seen(sender: &str, receipt: ReviewReceipt) -> SeenReceipt {
+        SeenReceipt {
+            sender: sender.into(),
+            receipt,
         }
     }
 
@@ -911,7 +1138,7 @@ mod tests {
             Step::Merge(line) => {
                 assert_eq!(
                     line,
-                    "alpha #7 codex/980-format-patterns CLEAN head 1f461fa7 unresolved 0 behind 0 reviewed head"
+                    "alpha #7 codex/980-format-patterns CLEAN head 1f461fa7 unresolved 0 behind 0 reviewed head receipt r1/claude"
                 )
             }
             other => panic!("{other:?}"),
@@ -960,16 +1187,186 @@ mod tests {
         f.pr.head = "e".repeat(40);
         f.parents = Some(vec!["d".repeat(40), MAIN.into()]);
         blocked(&f, "head moved");
-        // The update merge of the asked head onto the present main is the same head.
+        // The update merge of the asked head onto the present main is the same head, when
+        // main moved only in files it does not touch.
         f.parents = Some(vec![HEAD.into(), MAIN.into()]);
         f.bot = Some(bot_clean());
+        assert_eq!(
+            decide(&f, REPO, HEAD, &rules(), &Opts::default()),
+            Step::Need(Need::UpdateFiles)
+        );
+        f.update_files = Some((
+            compare_files(&json("compare.json")),
+            compare_files(&json("compare-docs.json")),
+        ));
         match decide(&f, REPO, HEAD, &rules(), &Opts::default()) {
-            Step::Merge(line) => assert!(line.ends_with("reviewed parent"), "{line}"),
+            Step::Merge(line) => assert!(line.contains("reviewed parent"), "{line}"),
             other => panic!("{other:?}"),
         }
         // Onto a main that has moved since, it is not.
         f.parents = Some(vec![HEAD.into(), "9".repeat(40)]);
         blocked(&f, "head moved");
+    }
+
+    /// Carbon's check 5: a branch brought up to date onto a `main` that moved in a file it
+    /// touches, or in a global path, is not reviewed by its parent's clean review.
+    #[test]
+    fn a_reviewed_parent_does_not_cover_main_moving_under_it() {
+        let rules = settings().gate_rules("hgl_spec");
+        let mut f = allowed();
+        f.pr.head = "3".repeat(40);
+        f.parents = Some(vec![HEAD.into(), MAIN.into()]);
+        let mine = FileList {
+            files: vec!["spec/rules.md".into()],
+            whole: true,
+        };
+        let check = |f: &Facts, theirs: &[&str], whole: bool| {
+            let mut f = f.clone();
+            f.update_files = Some((
+                mine.clone(),
+                FileList {
+                    files: theirs.iter().map(|t| t.to_string()).collect(),
+                    whole,
+                },
+            ));
+            decide(&f, "hgl_spec", HEAD, &rules, &Opts::default())
+        };
+        for (theirs, whole, word) in [
+            (&["spec/rules.md"][..], true, "spec/rules.md"),
+            (&["Cargo.toml"][..], true, "Cargo.toml"),
+            (&["docs/y.md"][..], false, "not known whole"),
+        ] {
+            match check(&f, theirs, whole) {
+                Step::Done(o) => {
+                    assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+                    assert!(o.retry, "a review at the head may still come");
+                    assert!(
+                        o.line.contains("reviewed no")
+                            && o.line
+                                .contains("the reviewed parent is not enough: main moved in")
+                            && o.line.contains(word),
+                        "{}",
+                        o.line
+                    );
+                }
+                s => panic!("{theirs:?}: {s:?}"),
+            }
+        }
+        assert!(
+            matches!(check(&f, &["docs/y.md"], true), Step::Merge(l) if l.contains("reviewed parent"))
+        );
+        // A review at the merge head itself is the head's.
+        let mut at = f.clone();
+        let c: Vec<Comment> = json("comments-clean.json")
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| {
+                let mut c = Comment::from_rest(v);
+                c.body = c
+                    .body
+                    .replace("1f461fa77bba922fe81383df4c475feb58b7c233", &"3".repeat(40));
+                c.body = c.body.replace("1f461fa77b", "3333333333");
+                c
+            })
+            .collect();
+        at.bot = Some(BotView::of("chatgpt-codex-connector", &c, &[]));
+        assert!(
+            matches!(decide(&at, "hgl_spec", HEAD, &rules, &Opts::default()), Step::Merge(l) if l.contains("reviewed head"))
+        );
+    }
+
+    /// ROLE-9: a clean receipt for the head asked, from a family none of the authors used.
+    #[test]
+    fn a_merge_needs_a_clean_receipt_from_another_family() {
+        let r = rules();
+        assert!(r.receipt, "required by default");
+        let mut f = allowed();
+        f.receipts = None;
+        f.authors = None;
+        assert_eq!(
+            decide(&f, REPO, HEAD, &r, &Opts::default()),
+            Step::Need(Need::Authors)
+        );
+        f.authors = Some(Ok(vec![Family::Gpt]));
+        assert_eq!(
+            decide(&f, REPO, HEAD, &r, &Opts::default()),
+            Step::Need(Need::Receipts)
+        );
+        let refused = |f: &Facts| outcome(f, &r, &Opts::default());
+        // None at all: a receipt may still come.
+        f.receipts = Some(Ok(vec![]));
+        let o = refused(&f);
+        assert!(o.kind == Kind::Blocked && o.retry, "{}", o.line);
+        assert!(
+            o.line.contains(
+                "no clean review receipt at the head from a family other than the authors' (gpt)"
+            ),
+            "{}",
+            o.line
+        );
+        // From the authors' family: never enough.
+        let mut gpt = receipt();
+        gpt.family = Family::Gpt;
+        f.receipts = Some(Ok(vec![seen("r1", gpt)]));
+        let o = refused(&f);
+        assert!(
+            !o.retry && o.line.contains("from the authors' family (gpt)"),
+            "{}",
+            o.line
+        );
+        // A family the task changed to after a failover is an author too.
+        f.receipts = Some(Ok(vec![seen("r1", receipt())]));
+        f.authors = Some(Ok(vec![Family::Claude, Family::Gpt]));
+        assert!(refused(&f).line.contains("authors' family (claude,gpt)"));
+        f.authors = Some(Ok(vec![Family::Gpt]));
+        // Findings, another head, or a receipt naming a reviewer other than its sender.
+        let mut bad = receipt();
+        bad.verdict = Verdict::Findings;
+        f.receipts = Some(Ok(vec![seen("r1", bad)]));
+        assert!(refused(&f).line.contains("have findings"));
+        let mut old = receipt();
+        old.head = "9".repeat(40);
+        f.receipts = Some(Ok(vec![seen("r1", old)]));
+        assert!(refused(&f).retry);
+        f.receipts = Some(Ok(vec![seen("w1", receipt())]));
+        assert!(refused(&f).line.contains("no clean review receipt"));
+        // A later clean one counts.
+        let mut bad = receipt();
+        bad.verdict = Verdict::Findings;
+        f.receipts = Some(Ok(vec![seen("r1", bad), seen("r1", receipt())]));
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &r, &Opts::default()),
+            Step::Merge(_)
+        ));
+        // No author family known, or nothing read from the hub: blocked, saying so.
+        f.authors = Some(Ok(vec![]));
+        assert!(refused(&f).line.contains("no author family known"));
+        f.authors = Some(Err(NO_HUB.into()));
+        assert!(
+            refused(&f)
+                .line
+                .contains("families not read (no hub connection)")
+        );
+        f.authors = Some(Ok(vec![Family::Gpt]));
+        f.receipts = Some(Err(NO_HUB.into()));
+        assert!(
+            refused(&f)
+                .line
+                .contains("receipts not read (no hub connection)")
+        );
+        // Turned off for the repository, or a pull request the tool made: not asked.
+        f.receipts = None;
+        f.authors = None;
+        let off = without_receipts(settings(), &[REPO]).gate_rules(REPO);
+        assert!(
+            matches!(decide(&f, REPO, HEAD, &off, &Opts::default()), Step::Merge(l) if !l.contains("receipt"))
+        );
+        let tool = Opts {
+            tool_made: true,
+            ..Opts::default()
+        };
+        assert!(matches!(decide(&f, REPO, HEAD, &r, &tool), Step::Merge(_)));
     }
 
     #[test]
@@ -1034,7 +1431,7 @@ mod tests {
             url: None,
         }]);
         assert!(
-            matches!(decide(&f, REPO, HEAD, &rules(), &opts), Step::Merge(l) if l.ends_with("reviewed triaged"))
+            matches!(decide(&f, REPO, HEAD, &rules(), &opts), Step::Merge(l) if l.contains("reviewed triaged"))
         );
     }
 
@@ -1336,7 +1733,7 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_acts_only_when_asked() {
-        let s = settings();
+        let s = without_receipts(settings(), &[REPO]);
         // A dry run on a read-only runner: the decision, and no write.
         let gh = crate::exec::ReadOnly(fake().on("pulls/7", &fixture("pr-open.json")));
         let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), false, None)
@@ -1395,7 +1792,7 @@ mod tests {
 
     #[tokio::test]
     async fn evaluate_brings_up_to_date() {
-        let s = settings();
+        let s = without_receipts(settings(), &[REPO]);
         let gh = FakeGh::default()
             .on(
                 "update-branch",

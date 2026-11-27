@@ -1,6 +1,6 @@
 # Install
 
-Status: proposed.
+Status: proposed; implemented.
 
 ## Hub (one host)
 

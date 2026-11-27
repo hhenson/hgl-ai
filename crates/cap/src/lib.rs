@@ -10,8 +10,20 @@
 //!   SIGKILL death at the peak counts as the limit too, for a kill the
 //!   counters do not show yet.
 //! - [`Method::Rlimit`] (macOS, a sandbox, a bare ssh command): every process
-//!   gets an address-space limit of SIZE (`setrlimit(RLIMIT_AS)`), and a
+//!   gets an address-space limit of SIZE (`setrlimit(RLIMIT_AS)`, unless
+//!   [`CapSpec::address_limit`] is off, as sanitizer builds need), and a
 //!   watchdog kills the tree when its sampled resident total passes SIZE.
+//!
+//! Nesting (Linux scopes): a bridge turn runs in a transient slice of its own
+//! ([`CapCommand::slice`], `app-hgl_ai_turn_<id>.slice`, `MemoryMax=SIZE`), and the
+//! command's environment names it in [`SLICE_ENV`]. A cap started inside the turn
+//! (`hgl-ai cap` run by the agent) puts its scope in that slice, so its own limit and
+//! the turn's both hold and the turn's reaper sees its processes. A scope's report file
+//! goes to the command's `TMPDIR` (the task's `tmp/`), never to the bridge's.
+//!
+//! [`CapCommand::process_group`] starts the command as the leader of a process group of
+//! its own; signals to the tree also go to the group, which reaches processes that left
+//! the parent chain where nothing else finds them (macOS).
 //!
 //! A time limit works like `timeout -k GRACE N`: TERM to the whole tree, then
 //! KILL after the grace. A run that reached a limit ends with status 137 or
@@ -48,6 +60,10 @@ const SAMPLE: Duration = Duration::from_millis(500);
 /// How long the scope's inner shell may outlive the KILL of its command, to write its report.
 const SHELL_GRACE: Duration = Duration::from_secs(2);
 const REPORT_ENV: &str = "HGL_AI_CAP_REPORT";
+/// Names the turn slice a nested cap puts its scope in ([`CapCommand::slice`]).
+pub const SLICE_ENV: &str = "HGL_AI_SLICE";
+/// Longest wait for one `systemctl` call about a slice.
+const SYSTEMCTL_WAIT: Duration = Duration::from_secs(10);
 /// Bound on any small file read here (`/proc` entries, the scope report).
 const SMALL_READ: u64 = 64 << 10;
 /// Bound on a process listing (`cgroup.procs`, `ps` output).
@@ -78,6 +94,10 @@ pub struct CapSpec {
     pub time: Option<Duration>,
     /// Grace between TERM and KILL when the time limit is reached or the run is stopped.
     pub kill_after: Duration,
+    /// [`Method::Rlimit`]: also give each process an address-space limit of `mem_bytes`.
+    /// Off for sanitizer builds (ASan, TSan reserve terabytes of address space); the
+    /// resident-memory watchdog still limits the tree.
+    pub address_limit: bool,
 }
 
 impl CapSpec {
@@ -89,6 +109,14 @@ impl CapSpec {
             mem_bytes,
             time: None,
             kill_after: CapSpec::DEFAULT_KILL_AFTER,
+            address_limit: true,
+        }
+    }
+
+    pub fn with_address_limit(self, address_limit: bool) -> CapSpec {
+        CapSpec {
+            address_limit,
+            ..self
         }
     }
 
@@ -210,14 +238,20 @@ impl Method {
         match self {
             Method::Scope => None,
             Method::Rlimit => Some(format!(
-                "{PREFIX}: {}; using a per-process address-space limit of {size} and a sampled \
-                 watchdog over the command tree instead",
+                "{PREFIX}: {}; using {}a sampled watchdog over the command tree instead",
                 if cfg!(target_os = "linux") {
                     "the user's systemd is not reachable here"
                 } else {
                     "no cgroup memory limit on this system"
                 },
-                size = format_size(spec.mem_bytes)
+                if spec.address_limit {
+                    format!(
+                        "a per-process address-space limit of {} and ",
+                        format_size(spec.mem_bytes)
+                    )
+                } else {
+                    String::new()
+                }
             )),
         }
     }
@@ -281,6 +315,171 @@ fn scope_runs(extra: &[&str]) -> bool {
     }
 }
 
+/// The transient slice of one bridge turn: `app-hgl_ai_turn_<id>.slice`, under `app.slice`
+/// where systemd puts user scopes. `id` is reduced to `[a-z0-9_]` (a dash in a slice name
+/// is a level of the hierarchy).
+pub fn turn_slice(id: &str) -> String {
+    let id: String = id
+        .chars()
+        .map(|c| c.to_ascii_lowercase())
+        .map(|c| {
+            if c.is_ascii_lowercase() || c.is_ascii_digit() {
+                c
+            } else {
+                '_'
+            }
+        })
+        .take(100)
+        .collect();
+    format!("app-hgl_ai_turn_{id}.slice")
+}
+
+/// Remove the turn slices of bridges that are gone: those `turn_slice` named after a
+/// process id (its last but one part) that no longer runs, left by a bridge that died
+/// before it could stop them. Returns the slices removed.
+pub fn remove_stale_turn_slices() -> Vec<String> {
+    let dir = runtime_dir().join("systemd").join("user.control");
+    let Ok(rd) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let Some(slice) = name.strip_suffix(".d") else {
+            continue;
+        };
+        let Some(id) = slice
+            .strip_prefix("app-hgl_ai_turn_")
+            .and_then(|r| r.strip_suffix(".slice"))
+        else {
+            continue;
+        };
+        let mut parts = id.rsplit('_');
+        let (Some(_n), Some(pid)) = (parts.next(), parts.next()) else {
+            continue;
+        };
+        let Ok(pid) = pid.parse::<libc::pid_t>() else {
+            continue;
+        };
+        // SAFETY: signal 0 checks existence only.
+        let gone = unsafe { libc::kill(pid, 0) } != 0
+            && io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
+        if gone && valid_slice(slice) {
+            remove_slice(slice);
+            out.push(slice.to_string());
+        }
+    }
+    out
+}
+
+/// A slice unit name as [`SLICE_ENV`] may give it.
+fn valid_slice(name: &str) -> bool {
+    name.len() <= 255
+        && name.len() > ".slice".len()
+        && name.ends_with(".slice")
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | ':'))
+}
+
+/// Run a quiet command, waiting at most `wait`; whether it exited 0.
+fn run_quiet(cmd: &mut Command, wait: Duration) -> bool {
+    let child = cmd
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn();
+    let Ok(mut child) = child else { return false };
+    let deadline = Instant::now() + wait;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(POLL),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
+}
+
+fn systemctl(args: &[&str]) -> bool {
+    run_quiet(
+        Command::new("systemctl")
+            .arg("--user")
+            .args(args)
+            .env("XDG_RUNTIME_DIR", runtime_dir()),
+        SYSTEMCTL_WAIT,
+    )
+}
+
+/// Give the slice `name` the turn's limit (a runtime drop-in; the slice is loaded on
+/// first use). Whether it worked.
+fn make_slice(name: &str, spec: &CapSpec) -> bool {
+    systemctl(&[
+        "set-property",
+        "--runtime",
+        name,
+        &format!("MemoryMax={}", spec.mem_bytes),
+        "MemorySwapMax=0",
+    ])
+}
+
+/// Stop the slice and remove its drop-in. `--no-block`: a process still in it is the
+/// caller's to reap ([`drain`]); systemd's own stop would wait for it.
+fn remove_slice(name: &str) {
+    systemctl(&["stop", "--no-block", name]);
+    systemctl(&["revert", name]);
+}
+
+/// TERM every process left in the cgroup, KILL them after `grace`, and wait a moment for
+/// them to go.
+fn drain(cg: &Path, grace: Duration) {
+    let left = |sig| {
+        let pids = cgroup_procs(cg);
+        for &p in &pids {
+            send(p, sig);
+        }
+        !pids.is_empty()
+    };
+    if !left(libc::SIGTERM) {
+        return;
+    }
+    let end = Instant::now() + grace;
+    while Instant::now() < end && !cgroup_procs(cg).is_empty() {
+        std::thread::sleep(POLL);
+    }
+    let end = Instant::now() + SHELL_GRACE;
+    while left(libc::SIGKILL) && Instant::now() < end {
+        std::thread::sleep(POLL);
+    }
+}
+
+/// The slice a nested cap joins: [`SLICE_ENV`] as the command sets it, else as this
+/// process has it.
+fn inherited_slice(envs: &[(OsString, Option<OsString>)]) -> Option<String> {
+    let v = match envs.iter().rev().find(|(k, _)| k == SLICE_ENV) {
+        Some((_, v)) => v.clone()?,
+        None => std::env::var_os(SLICE_ENV)?,
+    };
+    let v = v.into_string().ok()?;
+    valid_slice(&v).then_some(v)
+}
+
+/// Where a scope's report file goes: the command's `TMPDIR` when it sets one (a turn's
+/// `tmp/`), else this process's.
+fn report_dir(envs: &[(OsString, Option<OsString>)]) -> PathBuf {
+    envs.iter()
+        .rev()
+        .find(|(k, _)| k == "TMPDIR")
+        .and_then(|(_, v)| v.clone())
+        .map(PathBuf::from)
+        .filter(|d| d.is_dir())
+        .unwrap_or_else(std::env::temp_dir)
+}
+
 /// Runs in the scope: keeps the command in the foreground (so a terminal and
 /// Ctrl-C work as without the cap), then records the scope's counters before
 /// the cgroup goes away.
@@ -320,6 +519,8 @@ pub struct CapCommand {
     stdin: Option<Stdio>,
     stdout: Option<Stdio>,
     stderr: Option<Stdio>,
+    slice: Option<String>,
+    group: bool,
 }
 
 impl CapCommand {
@@ -338,7 +539,24 @@ impl CapCommand {
             stdin: None,
             stdout: None,
             stderr: None,
+            slice: None,
+            group: false,
         }
+    }
+
+    /// [`Method::Scope`]: run in the transient slice `name` (see [`turn_slice`]), limited to
+    /// the spec's memory, which the command's tree joins with its own caps ([`SLICE_ENV`]).
+    /// The slice is stopped when the run ends. Ignored by [`Method::Rlimit`].
+    pub fn slice(mut self, name: impl Into<String>) -> CapCommand {
+        self.slice = Some(name.into());
+        self
+    }
+
+    /// Start the command as the leader of a new process group; the tree's signals also go
+    /// to the group.
+    pub fn process_group(mut self) -> CapCommand {
+        self.group = true;
+        self
     }
 
     /// Use `method` instead of the detected one.
@@ -374,13 +592,32 @@ impl CapCommand {
     /// enforces the time limit and, for [`Method::Rlimit`], the watchdog.
     pub fn spawn(self) -> io::Result<CapChild> {
         let mut report = None;
+        let mut own_slice = None;
         let mut cmd = match self.method {
             Method::Scope => {
-                let file = tempfile::Builder::new().prefix("hgl-ai-cap-").tempfile()?;
+                let file = tempfile::Builder::new()
+                    .prefix("hgl-ai-cap-")
+                    .tempfile_in(report_dir(&self.envs))?;
+                let join_slice = match &self.slice {
+                    Some(s) if valid_slice(s) && make_slice(s, &self.spec) => {
+                        own_slice = Some(s.clone());
+                        Some(s.clone())
+                    }
+                    Some(s) => {
+                        eprintln!(
+                            "{PREFIX}: could not make the slice {s}; the command runs in a scope of its own, and caps inside it are not held to its limit"
+                        );
+                        None
+                    }
+                    None => inherited_slice(&self.envs),
+                };
                 let mut c = Command::new("systemd-run");
                 c.args(["--user", "--scope", "--quiet", "--collect"])
-                    .args(scope_probe().unwrap_or_default())
-                    .arg(format!("--property=MemoryMax={}", self.spec.mem_bytes))
+                    .args(scope_probe().unwrap_or_default());
+                if let Some(s) = &join_slice {
+                    c.arg(format!("--slice={s}"));
+                }
+                c.arg(format!("--property=MemoryMax={}", self.spec.mem_bytes))
                     .args([
                         "--property=MemorySwapMax=0",
                         "--property=OOMPolicy=stop",
@@ -401,9 +638,11 @@ impl CapCommand {
                 let mut c = Command::new(&self.program);
                 c.args(&self.args);
                 let limit = self.spec.mem_bytes;
-                // SAFETY: the closure only calls getrlimit/setrlimit, which are async-signal-safe.
-                unsafe {
-                    c.pre_exec(move || limit_address_space(limit));
+                if self.spec.address_limit {
+                    // SAFETY: the closure only calls getrlimit/setrlimit, which are async-signal-safe.
+                    unsafe {
+                        c.pre_exec(move || limit_address_space(limit));
+                    }
                 }
                 c
             }
@@ -413,6 +652,13 @@ impl CapCommand {
                 Some(v) => cmd.env(k, v),
                 None => cmd.env_remove(k),
             };
+        }
+        if let Some(s) = &own_slice {
+            // The tree's own caps join the turn's slice.
+            cmd.env(SLICE_ENV, s);
+        }
+        if self.group {
+            cmd.process_group(0);
         }
         if let Some(d) = &self.cwd {
             cmd.current_dir(d);
@@ -426,7 +672,16 @@ impl CapCommand {
         if let Some(s) = self.stderr {
             cmd.stderr(s);
         }
-        let child = cmd.spawn()?;
+        let child = match cmd.spawn() {
+            Ok(c) => c,
+            Err(e) => {
+                if let Some(s) = &own_slice {
+                    remove_slice(s);
+                }
+                return Err(e);
+            }
+        };
+        let pgid = self.group.then(|| child.id());
         Ok(CapChild {
             child,
             spec: self.spec,
@@ -434,6 +689,8 @@ impl CapCommand {
             report,
             started: Instant::now(),
             stop: Arc::new(AtomicBool::new(false)),
+            slice: own_slice,
+            pgid,
         })
     }
 }
@@ -483,6 +740,9 @@ pub struct CapChild {
     report: Option<tempfile::NamedTempFile>,
     started: Instant,
     stop: Arc<AtomicBool>,
+    /// The turn slice this run made, stopped when it ends.
+    slice: Option<String>,
+    pgid: Option<u32>,
 }
 
 /// How a capped run ended.
@@ -607,6 +867,16 @@ impl CapChild {
         Stopper(self.stop.clone())
     }
 
+    /// The process group the command leads ([`CapCommand::process_group`]).
+    pub fn pgid(&self) -> Option<u32> {
+        self.pgid
+    }
+
+    /// The turn slice this run made ([`CapCommand::slice`]), if it could.
+    pub fn slice(&self) -> Option<&str> {
+        self.slice.as_deref()
+    }
+
     /// Block until the command ends, enforcing the time limit, the stop request
     /// and (for [`Method::Rlimit`]) the memory watchdog.
     pub fn wait(self) -> io::Result<CapOutcome> {
@@ -622,18 +892,23 @@ impl CapChild {
         let mut watchdog_kills = 0u64;
         let mut peak: Option<u64> = None;
         let mut next_sample = Instant::now();
+        // The scope's cgroup, or the turn slice's that holds it and the tree's own caps.
         let mut scope_cg: Option<PathBuf> = None;
+        let pgid = self.pgid;
         let status = loop {
             if let Some(status) = self.child.try_wait()? {
                 break status;
             }
             let now = Instant::now();
             if self.method == Method::Scope && scope_cg.is_none() {
-                scope_cg = scope_cgroup(me);
+                scope_cg = scope_cgroup(me).map(|cg| match &self.slice {
+                    Some(s) => slice_of(&cg, s).unwrap_or(cg),
+                    None => cg,
+                });
             }
             if let Some(flags) = signals {
                 for sig in take_signals(flags) {
-                    signal_tree(me, scope_cg.as_deref(), sig, None);
+                    signal_tree(me, scope_cg.as_deref(), sig, None, pgid);
                 }
             }
             match phase {
@@ -646,7 +921,7 @@ impl CapChild {
                     if over_time || stop {
                         time_limit = over_time;
                         stopped = !over_time;
-                        signal_tree(me, scope_cg.as_deref(), libc::SIGTERM, None);
+                        signal_tree(me, scope_cg.as_deref(), libc::SIGTERM, None, pgid);
                         phase = Phase::Term(now);
                     } else if self.method == Method::Rlimit && now >= next_sample {
                         next_sample = now + SAMPLE;
@@ -675,7 +950,7 @@ impl CapChild {
                 let spare = (self.method == Method::Scope
                     && now.duration_since(since) < SHELL_GRACE)
                     .then_some(me);
-                signal_tree(me, scope_cg.as_deref(), libc::SIGKILL, spare);
+                signal_tree(me, scope_cg.as_deref(), libc::SIGKILL, spare, pgid);
             }
             std::thread::sleep(POLL);
         };
@@ -702,6 +977,18 @@ impl CapChild {
                 outcome.memory_limit = true;
                 outcome.oom_kills = r.oom_kills;
             }
+        }
+        if let (Some(_), Some(cg)) = (&self.slice, &scope_cg) {
+            // The turn's peak counts the caps it ran too.
+            let slice_peak = read_limited(cg.join("memory.peak"), SMALL_READ)
+                .ok()
+                .and_then(|t| t.trim().parse::<u64>().ok());
+            outcome.peak_bytes = outcome.peak_bytes.max(slice_peak);
+            // What is left in the slice goes as at a stop: TERM, the grace, KILL.
+            drain(cg, self.spec.kill_after);
+        }
+        if let Some(s) = &self.slice {
+            remove_slice(s);
         }
         outcome.status = final_status(&outcome);
         Ok(outcome)
@@ -796,6 +1083,36 @@ fn scope_cgroup(pid: u32) -> Option<PathBuf> {
         .then(|| PathBuf::from(format!("/sys/fs/cgroup{theirs}")))
 }
 
+/// The slice directory `name` that holds the scope cgroup `scope`.
+fn slice_of(scope: &Path, name: &str) -> Option<PathBuf> {
+    let parent = scope.parent()?;
+    (parent.file_name()? == name).then(|| parent.to_path_buf())
+}
+
+/// The processes of a cgroup and of every cgroup under it (a slice holds none itself).
+fn cgroup_procs(dir: &Path) -> Vec<u32> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    let mut seen = 0;
+    while let Some(d) = stack.pop() {
+        seen += 1;
+        if seen > 4096 {
+            break;
+        }
+        if let Ok(text) = read_limited(d.join("cgroup.procs"), LIST_READ) {
+            out.extend(text.lines().filter_map(|l| l.trim().parse::<u32>().ok()));
+        }
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            stack.extend(
+                rd.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.path()),
+            );
+        }
+    }
+    out
+}
+
 fn send(pid: u32, sig: libc::c_int) {
     if let Ok(p) = libc::pid_t::try_from(pid) {
         // SAFETY: kill has no memory-safety preconditions.
@@ -805,18 +1122,31 @@ fn send(pid: u32, sig: libc::c_int) {
     }
 }
 
-/// Signal every process of the tree: the scope's members (when known) and the
-/// child's descendants. `spare` is left alone.
-fn signal_tree(root: u32, scope: Option<&Path>, sig: libc::c_int, spare: Option<u32>) {
+/// Signal every process of the tree: the cgroup's members (the scope, or the turn slice
+/// with every scope in it), the child's descendants, and its process group. `spare` is
+/// left alone (and with it the group, which it leads).
+fn signal_tree(
+    root: u32,
+    cgroup: Option<&Path>,
+    sig: libc::c_int,
+    spare: Option<u32>,
+    pgid: Option<u32>,
+) {
     let mut pids: HashSet<u32> = descendants(root).into_iter().collect();
-    if let Some(dir) = scope
-        && let Ok(text) = read_limited(dir.join("cgroup.procs"), LIST_READ)
-    {
-        pids.extend(text.lines().filter_map(|l| l.trim().parse::<u32>().ok()));
+    if let Some(dir) = cgroup {
+        pids.extend(cgroup_procs(dir));
     }
     for pid in pids {
         if Some(pid) != spare {
             send(pid, sig);
+        }
+    }
+    if spare.is_none()
+        && let Some(g) = pgid.and_then(|g| libc::pid_t::try_from(g).ok())
+    {
+        // SAFETY: killpg has no memory-safety preconditions.
+        unsafe {
+            libc::killpg(g, sig);
         }
     }
 }
@@ -1243,6 +1573,37 @@ mod tests {
                 .contains("per-process address-space limit of 100M")
         );
         assert_eq!(Method::Scope.warning(&spec), None);
+    }
+
+    #[test]
+    fn turn_slices() {
+        assert_eq!(
+            turn_slice("build-1-W1-4242-7"),
+            "app-hgl_ai_turn_build_1_w1_4242_7.slice"
+        );
+        assert!(valid_slice(&turn_slice(&"x".repeat(300))));
+        for bad in [
+            "",
+            ".slice",
+            "a.scope",
+            "-a.slice",
+            "a b.slice",
+            "a/b.slice",
+        ] {
+            assert!(!valid_slice(bad), "{bad:?}");
+        }
+        let set = |v: Option<&str>| vec![(OsString::from(SLICE_ENV), v.map(OsString::from))];
+        assert_eq!(
+            inherited_slice(&set(Some("app-x.slice"))).as_deref(),
+            Some("app-x.slice")
+        );
+        assert_eq!(inherited_slice(&set(Some("bad name"))), None);
+        assert_eq!(inherited_slice(&set(None)), None, "removed by the command");
+        let d = tempfile::tempdir().unwrap();
+        let tmp = vec![(OsString::from("TMPDIR"), Some(d.path().as_os_str().into()))];
+        assert_eq!(report_dir(&tmp), d.path());
+        let gone = vec![(OsString::from("TMPDIR"), Some("/nonexistent/x".into()))];
+        assert_eq!(report_dir(&gone), std::env::temp_dir());
     }
 
     #[test]

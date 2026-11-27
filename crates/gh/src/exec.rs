@@ -165,6 +165,18 @@ pub fn is_rate_limit_text(t: &str) -> bool {
     t.contains("rate limit") || t.contains("rate_limited") || t.contains("submitted too quickly")
 }
 
+/// Whether a failed run says the object does not exist (HTTP 404), as opposed to a failure
+/// that a retry may cure (HTTP 5xx, a timeout, an unreadable answer).
+pub fn is_not_found(e: &Error) -> bool {
+    match e {
+        Error::Command { msg, .. } => {
+            let m = msg.to_ascii_lowercase();
+            m.contains("http 404") || m.contains("not found")
+        }
+        _ => false,
+    }
+}
+
 /// Whether a failed run's message says the credentials are missing or refused.
 pub fn is_auth_text(t: &str) -> bool {
     let t = t.to_ascii_lowercase();
@@ -387,6 +399,18 @@ pub(crate) mod fake {
                 true,
             )
         }
+        /// Fails the first matching run only.
+        pub fn push_fail_once(self, pattern: &str, stderr: &str) -> Self {
+            self.push(
+                pattern,
+                Output {
+                    ok: false,
+                    stdout: String::new(),
+                    stderr: stderr.into(),
+                },
+                true,
+            )
+        }
         pub fn fail(self, pattern: &str, stderr: &str) -> Self {
             self.push(
                 pattern,
@@ -487,6 +511,13 @@ mod tests {
             "To get started with GitHub CLI, please run:  gh auth login"
         ));
         assert!(!is_auth_text("HTTP 404: Not Found"));
+        let cmd = |m: &str| Error::Command {
+            args: "api x".into(),
+            msg: m.into(),
+        };
+        assert!(is_not_found(&cmd("gh: Not Found (HTTP 404)")));
+        assert!(!is_not_found(&cmd("gh: Server Error (HTTP 502)")));
+        assert!(!is_not_found(&Error::RateLimited("x".into())));
         assert!(is_read_only(&a("auth status --hostname github.com")));
         assert!(!is_read_only(&a("auth login")));
     }

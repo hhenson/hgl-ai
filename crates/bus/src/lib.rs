@@ -106,8 +106,9 @@ pub const LOCKS_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 pub const ENDED_MAX_AGE: Duration = Duration::from_secs(NOTES_MAX_AGE.as_secs() + 86_400);
 /// Inbox `ack_wait` (§3); the bridge extends it with `in_progress` (PROTO-8).
 pub const INBOX_ACK_WAIT: Duration = Duration::from_secs(300);
-/// Inbox `max_deliver` (§3).
-pub const INBOX_MAX_DELIVER: i64 = 5;
+/// Inbox `max_deliver` (§3): unlimited. JetStream never drops a note on its own; the bridge
+/// counts a note's real failures and dead-letters it to the controller (PROTO-8).
+pub const INBOX_MAX_DELIVER: i64 = -1;
 /// Largest note payload (the encoded JSON) that is sent or accepted.
 pub const MAX_NOTE_BYTES: usize = 1 << 20;
 /// Largest value a bucket holds.
@@ -122,6 +123,18 @@ const MAX_PULL: Duration = Duration::from_secs(30);
 const MIN_PULL: Duration = Duration::from_millis(10);
 /// JetStream API error code for a missing stream.
 const STREAM_NOT_FOUND: &str = "error code 10059";
+
+/// Largest batch one stream read asks for.
+const READ_BATCH: usize = 256;
+/// How long an ephemeral reader outlives its last use, should it not be deleted.
+const READER_IDLE: Duration = Duration::from_secs(30);
+
+/// A note read from the stream without an inbox delivery ([`Bus::read_notes`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StreamNote {
+    pub seq: u64,
+    pub note: Note,
+}
 
 /// What a send returned: the stream sequence (the bus receipt id) and whether
 /// JetStream dropped it as a duplicate (PROTO-9).
@@ -383,6 +396,140 @@ impl Bus {
             consumer,
             client: self.client.clone(),
         })
+    }
+
+    /// The notes for `seats` from stream sequence `from` on, oldest first, at most `max`;
+    /// waits up to `wait` for the first when none is there. Read through an ephemeral
+    /// consumer without acknowledgements, so no inbox delivery is spent and nothing is
+    /// acknowledged (`note peek`, the merge gate's receipts). A message that is not a valid
+    /// note is skipped.
+    pub async fn read_notes(
+        &self,
+        seats: &[Seat],
+        from: u64,
+        max: usize,
+        wait: Duration,
+    ) -> Result<Vec<StreamNote>> {
+        Ok(self.read(seats, from, max, wait).await?.0)
+    }
+
+    /// One page of a whole-history read: at most `max` messages for `seats` from stream
+    /// sequence `from` on, without waiting, and the sequence of the last message read
+    /// (`None`: there was none), so a reader goes on from after it whatever it skipped.
+    pub async fn read_page(
+        &self,
+        seats: &[Seat],
+        from: u64,
+        max: usize,
+    ) -> Result<(Vec<StreamNote>, Option<u64>)> {
+        self.read(seats, from, max, Duration::ZERO).await
+    }
+
+    async fn read(
+        &self,
+        seats: &[Seat],
+        from: u64,
+        max: usize,
+        wait: Duration,
+    ) -> Result<(Vec<StreamNote>, Option<u64>)> {
+        let mut out = Vec::new();
+        if max == 0 || seats.is_empty() {
+            return Ok((out, None));
+        }
+        let stream = self
+            .js
+            .get_stream(STREAM_NOTES)
+            .await
+            .map_err(|e| missing(&format!("stream {STREAM_NOTES}"), e))?;
+        let reader = stream
+            .create_consumer(pull::Config {
+                description: Some("hgl-ai reader".to_string()),
+                deliver_policy: DeliverPolicy::ByStartSequence {
+                    start_sequence: from.max(1),
+                },
+                ack_policy: AckPolicy::None,
+                filter_subjects: seats.iter().map(Seat::subject).collect(),
+                inactive_threshold: READER_IDLE,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| nats("opening a stream reader", e))?;
+        let name = reader.cached_info().name.clone();
+        let mut last = None;
+        let read = self
+            .read_with(&reader, max, wait, &mut out, &mut last)
+            .await;
+        if let Err(e) = stream.delete_consumer(&name).await {
+            tracing::debug!("deleting the stream reader {name}: {e}");
+        }
+        read.map(|()| (out, last))
+    }
+
+    /// Read up to `max` messages (malformed ones count, and are skipped); `last` is the
+    /// stream sequence of the last one read.
+    async fn read_with(
+        &self,
+        reader: &jetstream::consumer::PullConsumer,
+        max: usize,
+        wait: Duration,
+        out: &mut Vec<StreamNote>,
+        last: &mut Option<u64>,
+    ) -> Result<()> {
+        let deadline = Instant::now().checked_add(wait);
+        let mut seen = 0;
+        // Wait for the first, as an inbox fetch does; then read what is there without waiting.
+        loop {
+            let remaining = match deadline {
+                Some(d) => d.saturating_duration_since(Instant::now()),
+                None => MAX_PULL,
+            };
+            if remaining < MIN_PULL {
+                break;
+            }
+            let batch = reader
+                .batch()
+                .max_messages(1)
+                .expires(remaining.min(MAX_PULL))
+                .messages()
+                .await
+                .map_err(|e| nats("reading the stream", e))?;
+            let n = take_read(batch, out, last).await?;
+            seen += n;
+            if n > 0 {
+                break;
+            }
+        }
+        while seen < max {
+            let batch = reader
+                .fetch()
+                .max_messages((max - seen).min(READ_BATCH))
+                .messages()
+                .await
+                .map_err(|e| nats("reading the stream", e))?;
+            let n = take_read(batch, out, last).await?;
+            if n == 0 {
+                break;
+            }
+            seen += n;
+        }
+        Ok(())
+    }
+
+    /// What `seat`'s inbox has not acknowledged, oldest first, without a delivery: the notes
+    /// after its acknowledgement floor (one acknowledged out of order may be among them).
+    pub async fn peek(&self, seat: &Seat, max: usize, wait: Duration) -> Result<Vec<StreamNote>> {
+        let stream = self
+            .js
+            .get_stream(STREAM_NOTES)
+            .await
+            .map_err(|e| missing(&format!("stream {STREAM_NOTES}"), e))?;
+        let from = match stream.consumer_info(seat.consumer()).await {
+            Ok(i) => i.ack_floor.stream_sequence + 1,
+            Err(e) if e.kind() == jetstream::context::ConsumerInfoErrorKind::NotFound => 1,
+            Err(e) => return Err(nats(&format!("reading the inbox of {seat}"), e)),
+        };
+        self.read_notes(&[seat.clone(), Seat::broadcast()], from, max, wait)
+            .await
     }
 
     pub async fn state_get(&self, key: &str) -> Result<Option<StateEntry>> {
@@ -864,6 +1011,26 @@ impl Inbox {
             }
         }
     }
+}
+
+/// Collect one batch of a stream reader; returns how many messages it held.
+async fn take_read(
+    mut batch: pull::Batch,
+    out: &mut Vec<StreamNote>,
+    last: &mut Option<u64>,
+) -> Result<usize> {
+    let mut n = 0;
+    while let Some(m) = batch.next().await {
+        let msg = m.map_err(|e| nats("reading the stream", e))?;
+        n += 1;
+        let seq = msg.info().map(|i| i.stream_sequence).unwrap_or(0);
+        *last = Some(last.map_or(seq, |l| l.max(seq)));
+        match parse_note(msg.subject.as_str(), &msg.payload) {
+            Ok(note) => out.push(StreamNote { seq, note }),
+            Err(why) => tracing::debug!(seq, "skipping a malformed note: {why}"),
+        }
+    }
+    Ok(n)
 }
 
 /// Parse and check one inbox payload; the error says why it is rejected.

@@ -264,6 +264,27 @@ impl<B: BusApi> Bridge<B> {
             Ok(r) => r,
             Err(e) => return Outcome::PrepFailed(format!("seat binding: {e}")),
         };
+        // The task's authors (ROLE-9): every family whose turns run in an implementor
+        // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
+        let mut file = file;
+        if let (Some(f), Target::Tree { review: false, .. }) = (file.as_mut(), &job.target)
+            && !f.families.contains(&r.family)
+        {
+            f.families.push(r.family);
+            match hgl_ai_tree::write_task(&dir, f) {
+                Ok(()) => {
+                    let d = dir.clone();
+                    let size = tokio::task::spawn_blocking(move || hgl_ai_tree::dir_size(&d))
+                        .await
+                        .unwrap_or(0);
+                    let rec = self.trees.record(&dir, f, size);
+                    if let Err(e) = self.bus.tree_put(&rec).await {
+                        tracing::warn!(key = %rec.key(), "registering the task's families: {e}");
+                    }
+                }
+                Err(e) => return Outcome::PrepFailed(format!("recording the family: {e}")),
+            }
+        }
         let (cwd, writable) = match &job.target {
             Target::Inbox => (dir.clone(), vec![dir.clone()]),
             Target::Tree { task, .. } => {
@@ -461,6 +482,7 @@ fn holders(p: &Path) -> String {
         if let Ok(m) = std::fs::metadata(p) {
             let pids = proc::members(&TreeId {
                 lock: Some((m.dev(), m.ino())),
+                lock_path: Some(p.to_path_buf()),
                 ..TreeId::default()
             });
             if !pids.is_empty() {
@@ -484,6 +506,7 @@ pub async fn reap_lock_holders(path: &Path, grace: Duration) -> bool {
         };
         let t = TreeId {
             lock: Some((m.dev(), m.ino())),
+            lock_path: Some(path.to_path_buf()),
             ..TreeId::default()
         };
         tracing::warn!(lock = %path.display(), holders = ?proc::members(&t), "killing the holders of a turn lock");

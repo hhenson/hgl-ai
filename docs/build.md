@@ -1,7 +1,11 @@
 # Builds
 
-Status: proposed. Building and testing is deterministic work: a tool runs it, an agent
-only writes and repairs the instructions and reads the summary.
+Status: proposed — not implemented. Nothing here is built yet: today the controller
+lands with `hgl-ai gh land` (`docs/protocol.md` §8) and builds run under `hgl-ai cap`.
+The current rules are in `docs/protocol.md`, `docs/roles.md` and `docs/design.md`.
+
+Building and testing is deterministic work: a tool runs it, an agent only writes and
+repairs the instructions and reads the summary.
 
 ## 1. Recipes
 
