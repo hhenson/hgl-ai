@@ -176,7 +176,7 @@ pub trait Executor: Send + Sync {
     /// Run one step, its stdout and stderr together in `log` (a local file).
     fn run_step(&self, ws: &Workspace, step: &StepSpec, log: &Path, cancel: &Cancel) -> StepRun;
     /// Copy the files matching `patterns` (relative to the step's `cwd`; `$VAR` from
-    /// `env`) into `dest`; returns the copies.
+    /// `env`) into `dest`, stopping at `cancel`; returns the copies.
     fn collect(
         &self,
         ws: &Workspace,
@@ -184,6 +184,7 @@ pub trait Executor: Send + Sync {
         patterns: &[String],
         env: &[(String, String)],
         dest: &Path,
+        cancel: &Cancel,
     ) -> Vec<PathBuf>;
     /// Remove the job directory and its worktree. Always called after `prepare` succeeded.
     fn cleanup(&self, ws: &Workspace) -> Result<(), HostError>;

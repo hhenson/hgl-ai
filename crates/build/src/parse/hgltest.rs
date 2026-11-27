@@ -53,6 +53,7 @@ pub fn parse(log: &[u8]) -> Parsed {
                 start: l.start,
                 end: l.end,
                 source: None,
+                group: None,
             };
             let mut details = Vec::new();
             let mut j = i + 1;

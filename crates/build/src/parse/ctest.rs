@@ -42,6 +42,7 @@ pub fn parse(log: &[u8]) -> Parsed {
                 start: l.start,
                 end: l.end,
                 source: None,
+                group: None,
             };
             if outcome == Outcome::Fail {
                 // Its output, up to the next test, start line or total.

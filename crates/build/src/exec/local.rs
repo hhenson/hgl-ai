@@ -186,6 +186,7 @@ impl Executor for Local {
         patterns: &[String],
         env: &[(String, String)],
         dest: &Path,
+        cancel: &Cancel,
     ) -> Vec<PathBuf> {
         let base = Path::new(&ws.src).join(cwd);
         let mut out = Vec::new();
@@ -212,7 +213,7 @@ impl Executor for Local {
                 .collect();
             names.sort();
             for n in names {
-                if out.len() >= ARTIFACT_FILES {
+                if out.len() >= ARTIFACT_FILES || cancel.is_cancelled() {
                     return out;
                 }
                 let from = dir.join(&n);

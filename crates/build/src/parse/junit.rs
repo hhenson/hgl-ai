@@ -118,6 +118,7 @@ impl Case {
             start: self.start,
             end: self.end,
             source: source.map(String::from),
+            group: None,
         }
     }
 }

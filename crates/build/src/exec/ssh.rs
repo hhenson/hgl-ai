@@ -32,6 +32,8 @@ const SSH_FAILED: i32 = 255;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SHORT: Duration = Duration::from_secs(30);
 const KILL_GRACE: Duration = Duration::from_secs(10);
+/// Longest transfer of one artifact.
+const ARTIFACT_TIMEOUT: Duration = Duration::from_secs(600);
 const PID_MARK: &[u8] = b"hgl-ai-pid ";
 
 /// The remote's shell.
@@ -769,7 +771,16 @@ impl Ssh {
 
     /// Stream remote file `from` into local `to`, at most `budget` bytes: a file that
     /// grows past it is cut off and dropped (`None`). Returns the bytes written.
-    fn fetch(&self, from: &str, to: &Path, budget: u64) -> Option<u64> {
+    /// The reader runs on a thread of its own, so `timeout` and `cancel` end a transfer
+    /// that stalls: the session is killed and reaped, and the reader sees its pipe close.
+    fn fetch(
+        &self,
+        from: &str,
+        to: &Path,
+        budget: u64,
+        timeout: Duration,
+        cancel: &Cancel,
+    ) -> Option<u64> {
         let cmdline = self.dialect.command(&self.dialect.cat(from)).ok()?;
         let mut c = self.conn.command(false);
         c.arg(&cmdline)
@@ -778,29 +789,67 @@ impl Ssh {
             .stderr(Stdio::null());
         let mut child = c.spawn().ok()?;
         let mut out = child.stdout.take()?;
-        let mut file = std::fs::File::create(to).ok()?;
-        let mut buf = vec![0u8; 64 << 10];
-        let mut n = 0u64;
-        let deadline = Instant::now() + Duration::from_secs(600);
-        let ok = loop {
-            match out.read(&mut buf) {
-                Ok(0) => break true,
-                Ok(k) => {
-                    n += k as u64;
-                    if n > budget || Instant::now() > deadline || file.write_all(&buf[..k]).is_err()
-                    {
-                        break false;
-                    }
-                }
-                Err(_) => break false,
+        let mut file = match std::fs::File::create(to) {
+            Ok(f) => f,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
             }
         };
-        if !ok {
+        let (tx, rx) = std::sync::mpsc::channel::<Option<u64>>();
+        std::thread::spawn(move || {
+            let mut buf = vec![0u8; 64 << 10];
+            let mut n = 0u64;
+            let res = loop {
+                match out.read(&mut buf) {
+                    Ok(0) => break Some(n),
+                    Ok(k) => {
+                        n += k as u64;
+                        if n > budget || file.write_all(&buf[..k]).is_err() {
+                            break None;
+                        }
+                    }
+                    Err(_) => break None,
+                }
+            };
+            let _ = tx.send(res);
+        });
+        let deadline = Instant::now() + timeout;
+        let read = loop {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(r) => break r,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break None,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            }
+            if cancel.is_cancelled() || Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                // The session's pipe is closed now and the reader ends with it; it is not
+                // waited for long, in case something else still holds the pipe.
+                let _ = rx.recv_timeout(Duration::from_secs(1));
+                return None;
+            }
+        };
+        if read.is_none() {
             let _ = child.kill();
         }
-        drop(out);
-        let status = child.wait().ok()?;
-        (ok && status.success()).then_some(n)
+        // The session ends after its output; a few seconds more, never unbounded.
+        let until = Instant::now() + Duration::from_secs(10);
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(st)) => break Some(st),
+                Ok(None) if Instant::now() < until && !cancel.is_cancelled() => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                _ => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break None;
+                }
+            }
+        };
+        read.filter(|_| status.is_some_and(|s| s.success()))
     }
 
     fn is_absolute(&self, p: &str) -> bool {
@@ -938,6 +987,9 @@ impl Executor for Ssh {
         let _hook = cancel.hook(move || s2.store(true, Ordering::SeqCst));
         let deadline = started + step.time;
         let mut killing: Option<Instant> = None;
+        // The remote tree's kill was sent (or handed to cleanup); its pid may arrive after
+        // the stop, so it is looked for through the grace.
+        let mut remote_killed = false;
         let status = loop {
             match child.try_wait() {
                 Ok(Some(s)) => break s.code(),
@@ -954,11 +1006,20 @@ impl Executor for Ssh {
                 } else {
                     r.limit = Some("time");
                 }
+                killing = Some(now);
+            }
+            if killing.is_some() && !remote_killed {
                 let p = pid.load(Ordering::SeqCst);
                 if p > 0 {
-                    let _ = self.exec_line(&self.dialect.kill_tree(p), SHORT);
+                    if self.exec_line(&self.dialect.kill_tree(p), SHORT).is_err() {
+                        // Not reachable now: the next cleanup kills it.
+                        self.orphans
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(p);
+                    }
+                    remote_killed = true;
                 }
-                killing = Some(now);
             }
             if let Some(k) = killing
                 && now >= k + KILL_GRACE
@@ -967,6 +1028,16 @@ impl Executor for Ssh {
             }
             std::thread::sleep(Duration::from_millis(50));
         };
+        if killing.is_some() && !remote_killed {
+            // The pid came with the last output, after the session ended.
+            let p = pid.load(Ordering::SeqCst);
+            if p > 0 && self.exec_line(&self.dialect.kill_tree(p), SHORT).is_err() {
+                self.orphans
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(p);
+            }
+        }
         // Ask at once whether the session dropped, before the remote can come back.
         let dropped = killing.is_none() && status == Some(SSH_FAILED) && !self.conn.answers();
         if dropped {
@@ -1006,6 +1077,7 @@ impl Executor for Ssh {
         patterns: &[String],
         env: &[(String, String)],
         dest: &Path,
+        cancel: &Cancel,
     ) -> Vec<PathBuf> {
         let mut out = Vec::new();
         let mut total = 0u64;
@@ -1041,7 +1113,7 @@ impl Executor for Ssh {
                 }
                 let name = f.rsplit(['/', '\\']).next().unwrap_or(f).to_string();
                 let to = dest.join(&name);
-                match self.fetch(f, &to, budget) {
+                match self.fetch(f, &to, budget, ARTIFACT_TIMEOUT, cancel) {
                     Some(n) => {
                         total += n;
                         out.push(to);
@@ -1153,6 +1225,83 @@ mod tests {
             "git -C 'C:/w/clones/x' 'fetch' 'origin'\nexit $LASTEXITCODE"
         );
         assert!(d.command(&"x".repeat(MAX_COMMAND)).is_err());
+    }
+
+    /// A transfer that stalls (a FIFO no one writes) ends at its deadline, or at a cancel,
+    /// with the session killed.
+    #[test]
+    fn a_stalled_artifact_transfer_ends() {
+        let tmp = tempfile::Builder::new().prefix("hbf").tempdir().unwrap();
+        let state = tmp.path().join("remote");
+        std::fs::create_dir_all(&state).unwrap();
+        let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ssh");
+        let conn = Conn::new(
+            "r1",
+            state.to_str().unwrap(),
+            fake,
+            &tmp.path().join("ssh"),
+            Dialect::Posix,
+        )
+        .unwrap();
+        conn.connect().unwrap();
+        let ex = Ssh::new(
+            Platform::Linux,
+            Dialect::Posix,
+            tmp.path().to_str().unwrap(),
+            BTreeMap::new(),
+            conn.clone(),
+        );
+        let fifo = tmp.path().join("stall.xml");
+        let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+        // SAFETY: a valid path and mode.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        // Releases the remote readers still waiting on the FIFO, also on a panic.
+        struct Release(std::path::PathBuf);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                use std::os::unix::fs::OpenOptionsExt;
+                for _ in 0..8 {
+                    if std::fs::OpenOptions::new()
+                        .write(true)
+                        .custom_flags(libc::O_NONBLOCK)
+                        .open(&self.0)
+                        .is_err()
+                    {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+        let _release = Release(fifo.clone());
+        let to = tmp.path().join("copy.xml");
+        let t0 = Instant::now();
+        let got = ex.fetch(
+            fifo.to_str().unwrap(),
+            &to,
+            1 << 20,
+            Duration::from_secs(1),
+            &Cancel::default(),
+        );
+        assert_eq!(got, None);
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        let cancel = Cancel::default();
+        let c2 = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            c2.cancel();
+        });
+        let t0 = Instant::now();
+        let got = ex.fetch(
+            fifo.to_str().unwrap(),
+            &to,
+            1 << 20,
+            Duration::from_secs(600),
+            &cancel,
+        );
+        assert_eq!(got, None);
+        assert!(t0.elapsed() < Duration::from_secs(5), "{:?}", t0.elapsed());
+        conn.close();
     }
 
     #[test]

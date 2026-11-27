@@ -280,7 +280,7 @@ pub fn drive(
         let mut reports: Vec<(String, Vec<u8>)> = Vec::new();
         if !step.artifacts.is_empty() {
             let dest = log_dir.join("artifacts").join(&step.name);
-            for p in exec.collect(ws, &step.cwd, &step.artifacts, &env, &dest) {
+            for p in exec.collect(ws, &step.cwd, &step.artifacts, &env, &dest, cancel) {
                 let rel = p
                     .strip_prefix(log_dir)
                     .map(|r| r.display().to_string())

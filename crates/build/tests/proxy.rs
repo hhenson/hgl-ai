@@ -221,6 +221,36 @@ fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
     let pid = std::fs::read_to_string(&pidfile).unwrap();
     assert!(!alive(&pid), "the remote child is gone");
 
+    // A stop before the remote's pid has arrived still kills the remote tree.
+    let (shell_pid, sleep_pid) = (
+        w.root.join("early-shell.pid"),
+        w.root.join("early-sleep.pid"),
+    );
+    let script = format!(
+        "echo $$ > {}; sleep 30 & echo $! > {}; wait",
+        shell_pid.display(),
+        sleep_pid.display()
+    );
+    let t0 = Instant::now();
+    let r = ex.run_step(
+        &ws,
+        &step("early", &script, Duration::ZERO),
+        &logs.join("early.log"),
+        &Cancel::default(),
+    );
+    assert_eq!(r.limit, Some("time"), "{r:?}");
+    assert!(
+        t0.elapsed() < Duration::from_secs(8),
+        "killed, not left to the grace: {:?}",
+        t0.elapsed()
+    );
+    std::thread::sleep(Duration::from_millis(500));
+    for f in [&shell_pid, &sleep_pid] {
+        if let Ok(pid) = std::fs::read_to_string(f) {
+            assert!(!alive(&pid), "{} is still running", f.display());
+        }
+    }
+
     // Cancel does the same.
     let cancel = Cancel::default();
     let c2 = cancel.clone();
@@ -258,6 +288,7 @@ fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
         &["$HGL_AI_BUILD_DIR/*.xml".to_string()],
         &env,
         &logs.join("artifacts"),
+        &Cancel::default(),
     );
     assert_eq!(got.len(), 1);
     assert!(
@@ -282,6 +313,7 @@ fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
         &["$HGL_AI_BUILD_DIR/*.bin".to_string()],
         &env,
         &logs.join("bins"),
+        &Cancel::default(),
     );
     assert_eq!(got, [logs.join("bins/small.bin")]);
     assert!(!logs.join("bins/big.bin").exists());
@@ -740,4 +772,5 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
             .is_some_and(|r| r.contains("queued again")),
         "requeued although a step before failed: {s:?}"
     );
+    assert_eq!(s.status, BuildStatus::Queued, "not the partial aggregate");
 }

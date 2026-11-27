@@ -91,6 +91,9 @@ pub struct TestCase {
     pub start: u64,
     pub end: u64,
     pub source: Option<String>,
+    /// The test binary or report it ran in, where the output names one: the same name in
+    /// two binaries is two tests.
+    pub group: Option<String>,
 }
 
 /// What one step's output said.
@@ -114,17 +117,20 @@ impl Parsed {
     }
 
     /// Fold identical errors and warnings (same file, line, column, code and message)
-    /// into the first, counting them, and keep one result per test name (the last).
+    /// into the first, counting them, and keep one result per test (the last): the same
+    /// name in the same binary or report. A name in another binary is another test.
     pub fn dedupe(&mut self) {
         self.errors = dedupe(std::mem::take(&mut self.errors));
         self.warnings = dedupe(std::mem::take(&mut self.warnings));
-        let mut at: HashMap<String, usize> = HashMap::new();
+        type TestKey = (Option<String>, Option<String>, String);
+        let mut at: HashMap<TestKey, usize> = HashMap::new();
         let mut tests: Vec<TestCase> = Vec::new();
         for t in std::mem::take(&mut self.tests) {
-            match at.get(&t.name) {
+            let k = (t.group.clone(), t.source.clone(), t.name.clone());
+            match at.get(&k) {
                 Some(&i) => tests[i] = t,
                 None => {
-                    at.insert(t.name.clone(), tests.len());
+                    at.insert(k, tests.len());
                     tests.push(t);
                 }
             }

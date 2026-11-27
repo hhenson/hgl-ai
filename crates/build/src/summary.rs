@@ -43,9 +43,13 @@ impl Collect {
                 Outcome::Fail => {
                     self.failed += 1;
                     if self.failures.len() < KEEP {
+                        let name = match &t.group {
+                            Some(g) => format!("{} ({g})", t.name),
+                            None => t.name,
+                        };
                         self.failures.push(TestFailure {
                             step: step.to_string(),
-                            name: t.name,
+                            name,
                             message: t.message,
                             start: t.start,
                             end: t.end,
@@ -432,6 +436,7 @@ mod tests {
                 start: 0,
                 end: 1,
                 source: None,
+                group: None,
             });
         }
         let mut w = Found::new(Severity::Warning, "unused", 0, 1);

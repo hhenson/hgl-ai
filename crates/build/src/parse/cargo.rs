@@ -13,6 +13,11 @@ use super::{Found, Line, Outcome, Parsed, Severity, TestCase, clip, lines};
 static TEST: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^test (?P<name>.+?) \.\.\. (?P<res>ok|FAILED|ignored(?:, .*)?)$").unwrap()
 });
+/// `Running unittests src/lib.rs (target/debug/deps/demo-1f2e)`, `Doc-tests demo`.
+static RUNNING: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"^\s*(?:Running (?P<what>.+?)(?: \((?P<path>[^)]+)\))?|Doc-tests (?P<doc>\S+))\s*$")
+        .unwrap()
+});
 static SECTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^---- (?P<name>.+?) stdout ----$").unwrap());
 /// `thread 'x' panicked at src/lib.rs:3:5:` (Rust 1.73+), or the older
@@ -39,7 +44,9 @@ pub fn parse(log: &[u8]) -> Parsed {
     let mut p = Parsed::default();
     let (mut fresh, mut built) = (0u32, 0u32);
     let mut results: Vec<TestCase> = Vec::new();
-    let mut panics: HashMap<String, (String, u64, u64)> = HashMap::new();
+    let mut panics: HashMap<(Option<String>, String), (String, u64, u64)> = HashMap::new();
+    // The test binary running now; its name keeps tests of two binaries apart.
+    let mut group: Option<String> = None;
     let mut i = 0;
     while i < all.len() {
         let l = &all[i];
@@ -62,6 +69,16 @@ pub fn parse(log: &[u8]) -> Parsed {
             i += 1;
             continue;
         }
+        if let Some(c) = RUNNING.captures(t) {
+            group = Some(match (c.name("doc"), c.name("what"), c.name("path")) {
+                (Some(d), _, _) => format!("doc-tests {}", d.as_str()),
+                (None, Some(w), Some(p)) => format!("{} in {}", w.as_str(), binary(p.as_str())),
+                (None, Some(w), None) => w.as_str().to_string(),
+                _ => unreachable!("the pattern has one or the other"),
+            });
+            i += 1;
+            continue;
+        }
         if let Some(c) = TEST.captures(t) {
             let outcome = match &c["res"] {
                 "ok" => Outcome::Pass,
@@ -75,6 +92,7 @@ pub fn parse(log: &[u8]) -> Parsed {
                 start: l.start,
                 end: l.end,
                 source: None,
+                group: group.clone(),
             });
             i += 1;
             continue;
@@ -82,7 +100,7 @@ pub fn parse(log: &[u8]) -> Parsed {
         if let Some(c) = SECTION.captures(t) {
             let name = c["name"].to_string();
             let (msg, end, used) = failure_section(&all, i + 1);
-            panics.insert(name, (msg, l.start, end));
+            panics.insert((group.clone(), name), (msg, l.start, end));
             i += 1 + used;
             continue;
         }
@@ -113,7 +131,7 @@ pub fn parse(log: &[u8]) -> Parsed {
     }
     for mut r in results {
         if r.outcome == Outcome::Fail
-            && let Some((msg, start, end)) = panics.remove(&r.name)
+            && let Some((msg, start, end)) = panics.remove(&(r.group.clone(), r.name.clone()))
         {
             r.message = msg;
             r.start = start;
@@ -203,4 +221,16 @@ fn failure_section(all: &[Line<'_>], from: usize) -> (String, u64, usize) {
         }
     }
     (clip(&msg.join("\n")), end, j - from)
+}
+
+/// The crate of a test binary path: `target/debug/deps/demo_cli-1f2e3d` is `demo_cli`.
+fn binary(path: &str) -> &str {
+    let file = path.rsplit(['/', '\\']).next().unwrap_or(path);
+    let file = file.strip_suffix(".exe").unwrap_or(file);
+    match file.rsplit_once('-') {
+        Some((name, hash)) if !name.is_empty() && hash.chars().all(|c| c.is_ascii_hexdigit()) => {
+            name
+        }
+        _ => file,
+    }
 }

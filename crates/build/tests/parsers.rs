@@ -98,6 +98,42 @@ fn cargo_tests() {
     assert_eq!(p.cache, Some("hit"));
 }
 
+/// The same test name in two binaries is two tests (`--no-fail-fast`); a pass in one
+/// does not hide the failure in the other.
+#[test]
+fn cargo_tests_in_two_binaries() {
+    let (p, _) = run(ParserKind::Cargo, "cargo-test-two-binaries.txt");
+    let t: Vec<_> = p
+        .tests
+        .iter()
+        .map(|t| (t.name.as_str(), t.group.as_deref(), t.outcome))
+        .collect();
+    assert_eq!(
+        t,
+        [
+            (
+                "tests::same",
+                Some("unittests src/lib.rs in demo"),
+                Outcome::Pass
+            ),
+            (
+                "tests::same",
+                Some("unittests src/lib.rs in demo_cli"),
+                Outcome::Fail
+            ),
+            (
+                "src/lib.rs - same (line 3)",
+                Some("doc-tests demo"),
+                Outcome::Pass
+            ),
+        ]
+    );
+    assert_eq!(
+        p.tests[1].message,
+        "the cli's own copy fails\nat cli/src/lib.rs:9:9"
+    );
+}
+
 #[test]
 fn gcc() {
     let (p, log) = run(ParserKind::Gcc, "gcc.txt");

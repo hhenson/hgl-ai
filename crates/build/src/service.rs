@@ -564,7 +564,11 @@ async fn run_job(
             .iter()
             .any(|x| x.status == StepStatus::Stopped);
         if cancel.is_cancelled() && unfinished {
+            // Not the partial aggregate (a failed step before it under --keep-going): the
+            // job runs again, so what waiters see is that it is queued.
             let mut s = driven.summary;
+            s.status = BuildStatus::Queued;
+            s.ended_at = None;
             s.reason = Some("stopped by the builder's shutdown; the job is queued again".into());
             let _ = store::run_put(bus, &s).await;
             return None;
