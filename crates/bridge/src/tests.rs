@@ -627,6 +627,51 @@ async fn review_runs_in_a_detached_merge_and_landed_removes_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn landed_drops_the_queued_notes_of_its_task() {
+    let h = harness();
+    let gate = h.calls.join("go");
+    h.script(
+        "codex",
+        &format!(
+            "case \"$(pwd)\" in *demo-11*) while [ ! -e '{g}' ]; do sleep 0.05; done;; esac\ncat '{f}'",
+            g = gate.display(),
+            f = fixture("codex-ok.jsonl")
+        ),
+    );
+    let (tx, j) = h.start(&["w1"]);
+    let b = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 11, "[claude] Assign: demo#11 Busy"),
+    );
+    eventually("the turn of demo#11 runs", || h.calls("codex").len() == 1).await;
+    // Queued behind the running turn, then ended before it could start.
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 12, "[claude] Assign: demo#12 Moot"),
+    );
+    let s = h.bus.push(
+        "w1",
+        note(Kind::Sendback, "w1", 12, "[claude] Sendback: demo#12"),
+    );
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 12, "[claude] Landed: demo#12"),
+    );
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    assert_eq!(h.bus.events(a), [Ev::Ack], "the queued assign is acked");
+    assert_eq!(h.bus.events(s), [Ev::Ack], "and the queued sendback");
+    assert!(h.bus.events(b).is_empty(), "demo#11 still runs");
+
+    std::fs::write(&gate, "").unwrap();
+    eventually("demo#11 acked", || h.bus.events(b) == [Ev::Ack]).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(!h.work().join("w1/demo-12").exists(), "no tree for demo#12");
+    assert!(!h.bus.trees().contains_key("build-1.w1.demo-12"));
+    assert_eq!(h.calls("codex").len(), 1, "no turn for demo#12");
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn landed_without_a_tree_is_acked_silently() {
     let h = harness();
     let (tx, j) = h.start(&["w1"]);

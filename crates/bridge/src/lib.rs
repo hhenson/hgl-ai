@@ -428,8 +428,8 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// `landed` / `closed` (PROTO-14): stop the task's turn, remove the seat's trees of
-    /// it, send a cleanup receipt; no agent turn.
+    /// `landed` / `closed` (PROTO-14): stop the task's turn, drop its queued notes, remove
+    /// the seat's trees of it, send a cleanup receipt; no agent turn.
     async fn end_task(
         &self,
         seat: &Arc<SeatRt>,
@@ -458,6 +458,19 @@ impl<B: BusApi> Bridge<B> {
             self.finish(seat, r, out, pending, busy).await;
             stopped = true;
         }
+        // Notes of the task still queued (the seat was busy elsewhere) would recreate its
+        // tree and run a turn after the removal: they are moot. Notes sent after this one
+        // (a later seq) are newer intent and stay.
+        let (moot, rest): (Vec<_>, Vec<_>) = std::mem::take(pending)
+            .into_iter()
+            .partition(|p| p.seq() < d.seq() && p.note().task().as_ref() == Some(&task));
+        *pending = rest;
+        for p in moot {
+            tracing::info!(seat = %seat.name(), seq = p.seq(), kind = %p.note().kind, %task, "a queued note of an ended task; acked");
+            let _ = p.ack().await;
+        }
+        busy.retain(|t, _| t.task() != Some(&task));
+        lock(&seat.busy_told).retain(|t| t.task() != Some(&task));
         let mut removed = Vec::new();
         let mut errors = Vec::new();
         for review in [false, true] {
