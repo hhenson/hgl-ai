@@ -858,13 +858,20 @@ fn a_bridge_does_not_serve_a_seat_note_wait_holds() {
 
 /// Carbon's probe of hgl-ai PR 1: a turn capped at 128M runs `hgl-ai cap 512M`, which
 /// allocates 250M. The inner cap's scope is in the turn's slice, so the turn's limit holds
-/// and the allocation is killed; its report file stays in the turn's `TMPDIR`.
+/// and the allocation is killed; its report file stays in the turn's `TMPDIR`. It goes
+/// over a cap on purpose, so it runs only with `HGL_AI_OOM_TESTS=1` (CI sets it).
 #[test]
 fn a_cap_inside_a_turn_is_held_to_the_turn_cap() {
     use hgl_ai_bridge::proc::{self, CmdSpec, Ended, Limits, Stop};
     use hgl_ai_cap::Method;
     if Method::detect() != Method::Scope {
         eprintln!("skipped: systemd-run --user --scope is not available here");
+        return;
+    }
+    if !std::env::var_os("HGL_AI_OOM_TESTS").is_some_and(|v| v == "1") {
+        eprintln!(
+            "skipped: a_cap_inside_a_turn_is_held_to_the_turn_cap goes over a memory cap on purpose; set HGL_AI_OOM_TESTS=1 to run it"
+        );
         return;
     }
     let d = Scratch::new("nested-cap");

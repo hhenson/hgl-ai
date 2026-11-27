@@ -1,7 +1,9 @@
 //! Process tests of the cap. The rlimit fallback is tested everywhere; the
 //! systemd scope only where `systemd-run --user --scope` works (else skipped
 //! with the reason printed). Memory hogs are this test binary re-run as a
-//! helper (`HGL_AI_CAP_TEST_HELPER`).
+//! helper (`HGL_AI_CAP_TEST_HELPER`). The tests that go over a cap on purpose
+//! (the kernel or the watchdog kills them, which a desktop reports as an
+//! out-of-memory kill) run only with `HGL_AI_OOM_TESTS=1`, as CI sets it.
 
 use std::io::Read;
 use std::process::{Command, Stdio};
@@ -63,6 +65,17 @@ fn helper() {
         }
         _ => panic!("unknown helper mode {mode}"),
     }
+}
+
+/// Whether the tests that go over a cap on purpose run here; says why not when they do not.
+fn oom_tests(name: &str) -> bool {
+    if std::env::var_os("HGL_AI_OOM_TESTS").is_some_and(|v| v == "1") {
+        return true;
+    }
+    eprintln!(
+        "skipped: {name} goes over a memory cap on purpose; set HGL_AI_OOM_TESTS=1 to run it"
+    );
+    false
 }
 
 fn helper_cmd(mode: &str) -> Command {
@@ -222,6 +235,9 @@ fn stopper_ends_the_tree() {
 
 #[test]
 fn fallback_watchdog_kills_a_tree_over_the_cap() {
+    if !oom_tests("fallback_watchdog_kills_a_tree_over_the_cap") {
+        return;
+    }
     // Each process stays under its own address-space limit; together they pass the cap.
     let spec = CapSpec::new(300 * MIB);
     let o = CapCommand::new(spec, &helper_cmd("tree:3:150:5000"))
@@ -248,6 +264,9 @@ fn fallback_watchdog_kills_a_tree_over_the_cap() {
 #[test]
 #[cfg_attr(target_os = "macos", ignore = "macOS does not enforce RLIMIT_AS")]
 fn fallback_limits_one_process() {
+    if !oom_tests("fallback_limits_one_process") {
+        return;
+    }
     let spec = CapSpec::new(200 * MIB);
     let o = CapCommand::new(spec, &helper_cmd("alloc:512:0"))
         .method(Method::Rlimit)
@@ -264,6 +283,9 @@ fn fallback_limits_one_process() {
 
 #[test]
 fn scope_kills_a_command_over_the_cap() {
+    if !oom_tests("scope_kills_a_command_over_the_cap") {
+        return;
+    }
     if Method::detect() != Method::Scope {
         eprintln!("skipped: systemd-run --user --scope is not available here");
         return;
@@ -343,6 +365,9 @@ fn without_the_address_limit_only_the_watchdog_limits() {
             .contains("address-space")
     );
     // The watchdog still kills a tree over the cap.
+    if !oom_tests("without_the_address_limit_only_the_watchdog_limits (its over-cap part)") {
+        return;
+    }
     let o = CapCommand::new(
         CapSpec::new(200 * MIB).with_address_limit(false),
         &helper_cmd("alloc:400:5000"),
@@ -415,9 +440,11 @@ fn a_cap_inside_a_turn_slice_is_held_to_the_turn_limit() {
         eprintln!("skipped: systemd-run --user --scope is not available here");
         return;
     }
+    if !oom_tests("a_cap_inside_a_turn_slice_is_held_to_the_turn_limit") {
+        return;
+    }
     let tmp = tempfile::tempdir().unwrap();
     let slice = hgl_ai_cap::turn_slice(&format!("cap-test-{}", std::process::id()));
-    assert!(slice.starts_with("app-hgl_ai_turn_cap_test_") && slice.ends_with(".slice"));
     let mut cmd = helper_cmd("nested:512:250");
     cmd.env("TMPDIR", tmp.path());
     let o = CapCommand::new(CapSpec::new(128 * MIB), &cmd)
@@ -432,7 +459,19 @@ fn a_cap_inside_a_turn_slice_is_held_to_the_turn_limit() {
         o.command_status, STATUS_KILL,
         "the inner cap reports the kill: {o:?}"
     );
-    // Within the limit, the inner cap's command runs, and sees the slice.
+}
+
+/// A turn's slice is named to its command, holds it, takes its report file in the
+/// command's `TMPDIR`, and is gone with the run.
+#[test]
+fn a_turn_slice_is_named_to_its_command_and_removed() {
+    if Method::detect() != Method::Scope {
+        eprintln!("skipped: systemd-run --user --scope is not available here");
+        return;
+    }
+    let tmp = tempfile::tempdir().unwrap();
+    let slice = hgl_ai_cap::turn_slice(&format!("cap-test-named-{}", std::process::id()));
+    assert!(slice.starts_with("app-hgl_ai_turn_cap_test_named_") && slice.ends_with(".slice"));
     let mut cmd = sh("printf '%s\\n' \"$HGL_AI_SLICE\"; cat /proc/self/cgroup; ls \"$TMPDIR\"");
     cmd.env("TMPDIR", tmp.path());
     let mut child = CapCommand::new(CapSpec::new(128 * MIB), &cmd)
