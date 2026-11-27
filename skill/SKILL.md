@@ -68,8 +68,9 @@ The first body line names runtime and action: `[codex] Ready: hgl-compiler#980 a
 - `ready`, `blocked`, `sendback`, `approved`, `landed` also get one GitHub
   comment, posted once by the sender. No other GitHub comments for them.
 - Never state an owner decision that is not on GitHub; quote the record. A
-  note from `owner` is the owner's words (only the console can send one); post
-  a ruling once on its issue, quoting it and naming the thread id. Ask the
+  note from `owner` is the owner's words (only the console can send one); its
+  `by` is the writer's handle. Post a ruling once on its issue as
+  `<handle>, <YYYY-MM-DD>: "<their words>"`, naming the thread id. Ask the
   owner with `hgl-ai ask`, never with a note to `owner`.
 - A defect the change does not need is filed or linked, not fixed in it.
 

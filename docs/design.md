@@ -27,7 +27,8 @@ no GitHub or git library.
 
 Async runtime `tokio`; NATS client `async-nats`; errors `anyhow` at the edge,
 `thiserror` in libraries; logs `tracing` to stderr. Web: `axum`, `axum-server`
-(TLS), `webauthn-rs` (passkeys), `reqwest` (OAuth, notifications), `lettre` (SMTP).
+(TLS), `webauthn-rs` (passkeys), `reqwest` (GitHub, Apple and Google sign-in,
+notifications), `ring` (`id_token` signatures), `lettre` (SMTP).
 TLS is `rustls` with `ring` only. Rust 1.89 or later.
 
 ## 2. Command line
@@ -143,7 +144,7 @@ listen = "127.0.0.1:8443"              # loopback or tailnet address, never 0.0.
 url = "https://hub.example.ts.net"     # the stable name passkeys are bound to
 # tls_cert = "~/.config/hgl-ai/console/cert.pem"   # omit both behind a TLS proxy
 # tls_key = "~/.config/hgl-ai/console/key.pem"
-users = ["hhenson", "owner@example.com"]           # GitHub logins, Apple emails
+users = [{ email = "owner@example.com", handle = "This Dude", github = "<login>" }]
 status_every = "2h"
 session_ttl = "7d"
 
@@ -156,6 +157,10 @@ client_id = "com.example.hgl-console"  # Services ID
 team_id = "ABCDE12345"
 key_id = "KEY1234567"
 key_file = "~/.config/hgl-ai/console/apple.p8"           # mode 0600
+
+[console.google]
+client_id = "0123-example.apps.googleusercontent.com"
+secret_file = "~/.config/hgl-ai/console/google.secret"   # mode 0600
 
 [[console.notify]]                     # tried in order
 kind = "ntfy"
@@ -171,7 +176,7 @@ kind = "email"
 smtp = "smtp.example.com:587"
 tls = "starttls"                       # or "tls", or "none" (loopback only)
 from = "console@example.com"
-to = ["owner@example.com"]
+# to = ["owner@example.com"]         # default: every user's email
 # user = "console@example.com"
 # password_file = "~/.config/hgl-ai/console/smtp.password"
 ```

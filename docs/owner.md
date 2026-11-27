@@ -50,26 +50,41 @@ live telemetry. GitHub stays the record (PROTO-1).
 - **OWN-6 — Sign-in.** The console listens on a configured address (loopback or a
   tailnet address, never a public interface) over HTTPS, at a stable host name, which
   passkeys need. Users sign in with a passkey (WebAuthn). A user's first sign-in, and
-  adding a passkey for a new device, goes through GitHub or Sign in with Apple; the
-  console then registers the passkey. Only users the console's configuration lists
-  (`[console] users`: GitHub logins, Apple account emails) are let in; the host owner
-  edits that list. The OAuth client secrets live in files of mode 0600 beside the
+  adding a passkey for a new device, goes through GitHub, Sign in with Apple or Google;
+  the console then registers the passkey. Only users the console's configuration lists
+  (`[console] users`) are let in; the host owner edits that list. The OAuth client secrets live in files of mode 0600 beside the
   configuration, never in the repository. Every owner message records which user sent it.
   - HTTPS is the console's own (`tls_cert`, `tls_key`) or a local TLS proxy's in front of
     plain HTTP on loopback (`tailscale serve`); `[console] url` is the origin either way.
   - Sessions: random ids in HMAC-signed cookies (HttpOnly, Secure, SameSite=Strict),
     `session_ttl` (7 d), held in memory: a restart signs everyone out. A form post needs
     the console's `Origin` and the session's CSRF token.
+  - A user is keyed by email: `{ email, handle, github, apple, google }`. Google signs
+    in by its verified email and Apple by the email in its `id_token` (a private relay
+    address needs `apple`); both default to `email`. GitHub signs in by `github` (a
+    login), else by the account's verified emails (`user:email`) for a user without one.
+    An identity matching no user, or two, is refused. The kinds never mix: a `github:`
+    login, an `apple:` email and a `google:` email are three identities.
+  - Google is OpenID Connect with PKCE, `state` and `nonce`. Google's and Apple's
+    `id_token`s are checked against their published keys (JWKS, cached for their
+    `max-age`), then issuer, audience, expiry, nonce and `email_verified`.
   - The OAuth flow cookie is `SameSite=None` (Apple returns by a cross-site form post)
-    and only names a pending flow. Apple's `id_token` comes from its token endpoint over
-    TLS: its issuer, audience, expiry, nonce and verified email are checked.
+    and only names a pending flow.
   - Passkeys: `<data_dir>/console/passkeys.json` (mode 0600), with the cookie key.
 - **OWN-9 — Notifications.** A new `p1` question notifies at once; `p2` questions are
   batched into one notification per hour; `p3` questions and status reports show only
   in the console. Channels are tried in the configured order and the first that
   accepts is used: a phone push (an ntfy topic) or a Slack incoming webhook, then
   email as the last resort. A notification carries the title, priority and a link to
-  the thread, never the context. The hourly batch is held in memory.
+  the thread, never the context. An email channel without `to` goes to every user's
+  `email`.
+- **OWN-10 — Handles.** Each user signs the owner's words with a handle of their own
+  choosing (`handle`, 1 to 31 letters, digits, spaces or `-_.'`, unique ignoring case
+  and repeated spaces; shorter reads better). Every owner event records it; owner notes
+  carry it (`by`), the console shows `This Dude, 27 Nov 14:05`, the prompt says
+  `This Dude (owner) says:`, and `decisions.log` names it. An agent quoting an owner
+  decision on GitHub writes the handle and date, then the words:
+  `This Dude, 2026-11-27: "..."`.
 
 ## 3. Telemetry
 

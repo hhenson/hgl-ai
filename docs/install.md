@@ -101,30 +101,53 @@ own hub user `console`.
    `hub.example.ts.net`. Either a local TLS proxy in front of plain HTTP on loopback:
 
    ```sh
-   hgl-ai server install --console-url https://hub.example.ts.net --console-user hhenson
+   hgl-ai server install --console-url https://hub.example.ts.net \
+       --console-user "owner@example.com=This Dude"
    tailscale serve --bg --https=443 http://127.0.0.1:8443
    ```
 
    or the console's own certificate (`tailscale cert hub.example.ts.net`, or any CA),
    with `listen` on the tailnet address and `tls_cert`, `tls_key` in `[console]`.
    Never listen on `0.0.0.0` or a public interface.
-2. **Users.** `[console] users`: GitHub logins and Apple account emails that may sign
-   in. Edit the list, then restart the console service.
+2. **Users.** `[console] users`, one entry per person, keyed by email:
+
+   ```toml
+   users = [
+     { email = "owner@example.com", handle = "This Dude", github = "<login>",
+       apple = "<relay>@privaterelay.appleid.com" },
+     { email = "second@example.com", handle = "Two" },   # Apple and Google by this email
+   ]
+   ```
+
+   `handle` is the name the user signs with (OWN-10). `apple` and `google` default to
+   `email`; set `apple` when Apple hides the address behind a relay. Without `github`,
+   a GitHub account whose verified emails include `email` signs in as the user. Edit
+   the list, then restart the console service; `doctor` fails on the earlier forms
+   (`"hhenson"`, `{ id, handle }`) and names the email to add.
 3. **GitHub OAuth app** (github.com → Settings → Developer settings → OAuth Apps → New):
    homepage `https://<name>`, callback `https://<name>/auth/github/callback`. Put the
    client id in `[console.github] client_id` and the client secret in
-   `~/.config/hgl-ai/console/github.secret` (mode 0600).
+   `~/.config/hgl-ai/console/github.secret` (mode 0600). The console asks for
+   `user:email` (read-only) to match a user without a `github` login.
 4. **Sign in with Apple** (developer.apple.com → Identifiers): an App ID with Sign in
    with Apple, a Services ID for the console with domain `<name>` and return URL
    `https://<name>/auth/apple/callback`, and a key with Sign in with Apple. Put the
    Services ID, team id and key id in `[console.apple]`, the `.p8` key in
-   `~/.config/hgl-ai/console/apple.p8` (mode 0600). One of GitHub or Apple is enough.
-5. **Notifications** (`[[console.notify]]`, tried in order): an ntfy topic URL (a
+   `~/.config/hgl-ai/console/apple.p8` (mode 0600).
+5. **Google** (console.cloud.google.com): a project; APIs & Services → OAuth consent
+   screen (External or Internal, scopes `openid` and `email`, the users as test users
+   while it is in testing); Credentials → Create credentials → OAuth client ID → Web
+   application, authorised redirect URI `https://<name>/auth/google/callback`. Put the
+   client id in `[console.google] client_id` and the client secret in
+   `~/.config/hgl-ai/console/google.secret` (mode 0600).
+
+   One of GitHub, Apple or Google is enough.
+6. **Notifications** (`[[console.notify]]`, tried in order): an ntfy topic URL (a
    hard-to-guess topic, or a token in `token_file`), a Slack incoming webhook URL in
-   `webhook_file`, SMTP as the last resort. Secrets in mode-0600 files.
-6. `hgl-ai doctor`, then open `https://<name>/signin`: GitHub or Apple once, then
-   register a passkey; later sign-ins use the passkey. A new device: GitHub or Apple
-   again.
+   `webhook_file`, SMTP as the last resort (without `to`, every user's `email`).
+   Secrets in mode-0600 files.
+7. `hgl-ai doctor`, then open `https://<name>/signin`: a provider once, then register a
+   passkey; later sign-ins use the passkey. A new device: a provider again.
 
 Seats on the hub host run as the console's user and can read its credential
 (`doctor` warns): run them elsewhere, or the console as another OS user.

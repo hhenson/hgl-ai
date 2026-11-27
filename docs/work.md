@@ -18,7 +18,8 @@ Roles and gates are in `docs/roles.md`; notes and worktrees in `docs/protocol.md
   oldest first. `After #N` waits until #N is closed; `Start when …` waits for that.
 - **WORK-4 — Who wrote it.** Agent comments start with their runtime tag (`[codex]`,
   `[claude]`, `[agy]`) and, for a seat, its name (`[codex] (w2)`). An untagged comment
-  is the owner's, and the owner's word decides.
+  is the owner's, and the owner's word decides. An agent quoting the owner writes the
+  handle and date, then the words: `This Dude, 2026-11-27: "..."` (OWN-10).
 
 ## 2. A task
 

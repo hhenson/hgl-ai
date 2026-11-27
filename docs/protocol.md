@@ -12,7 +12,8 @@ Status: proposed. Open decisions are issues in this repository.
   decides something lives only on the bus.
 - **PROTO-3 — No fabricated owner words.** A note is agent traffic. It never
   states an owner decision unless it quotes the GitHub record that holds it. The one
-  exception is a note from `owner`, which only the console can send (OWN-5).
+  exception is a note from `owner`, which only the console can send (OWN-5); quote it
+  by its handle and date (OWN-10).
 
 ## 2. Access
 
@@ -111,7 +112,8 @@ before hub users takes one shared token until it moves.
   receiver accepts sender `owner` on that subject only, and only sender `owner` there;
   anything else is terminated as malformed. An owner note is an `answer` (to the
   asker of a question) or a `note` (an owner message; conversations go to the
-  controller), and its body names the thread and the signed-in user.
+  controller), and its body names the thread and the signed-in user. `by` carries the
+  writer's handle (OWN-10); only an owner note has one.
 
 ## 5. Worktrees
 
