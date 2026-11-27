@@ -600,7 +600,9 @@ dependencies = [
  "futures",
  "hgl-ai-config",
  "hgl-ai-proto",
+ "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -609,6 +611,11 @@ dependencies = [
 [[package]]
 name = "hgl-ai-cap"
 version = "0.1.0"
+dependencies = [
+ "libc",
+ "tempfile",
+ "thiserror 2.0.21",
+]
 
 [[package]]
 name = "hgl-ai-config"
@@ -628,6 +635,20 @@ version = "0.1.0"
 [[package]]
 name = "hgl-ai-install"
 version = "0.1.0"
+dependencies = [
+ "async-nats",
+ "hex",
+ "hgl-ai-bus",
+ "hgl-ai-config",
+ "hgl-ai-proto",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "toml",
+]
 
 [[package]]
 name = "hgl-ai-proto"
