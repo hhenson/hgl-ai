@@ -419,6 +419,7 @@ fn ensure_user(
 pub struct UserAdded {
     /// The credential written, unless the user was added by its public key.
     pub cred: Option<PathBuf>,
+    /// The hub was reloaded (or restarted) with the new users.
     pub hub_restarted: bool,
 }
 
@@ -458,6 +459,10 @@ fn apply_users(
     );
     sys.write(&conf, text.as_bytes(), token::MODE)
         .map_err(io_at(&conf))?;
+    if service::reload_hub(sys, &env.expand(&srv.store_dir))? {
+        done(sys, "hub: reloaded with the new users (connections kept)");
+        return Ok(true);
+    }
     if sys.exists(&service::unit_path(env, Service::Hub)) {
         service::restart(sys, Service::Hub)?;
         done(sys, "hub: restarted with the new users");
@@ -879,7 +884,18 @@ mod tests {
         assert!(conf.contains("# build-1 (seat)"));
         assert_eq!(
             f.runs()[before..],
-            ["systemctl --user restart hgl-ai-hub.service"]
+            ["systemctl --user restart hgl-ai-hub.service"],
+            "no pid file yet: a restart"
+        );
+        // With the hub's pid file, a reload instead: connections stay.
+        let store = f.env.home.join(".local/share/hgl-ai/nats");
+        std::fs::write(crate::nats::pid_path(&store), "4242\n").unwrap();
+        let before = f.runs().len();
+        user_add(&f, "build-2", Role::Seat, None, false).unwrap();
+        assert_eq!(f.runs()[before..], ["kill -HUP 4242"]);
+        assert!(
+            f.output()
+                .contains("reloaded with the new users (connections kept)")
         );
         assert!(
             user_add(&f, "build-1", Role::Seat, None, false).is_err(),

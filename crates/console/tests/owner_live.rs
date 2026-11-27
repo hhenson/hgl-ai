@@ -60,6 +60,7 @@ fn start_hub() -> Option<Hub> {
         .unwrap()
         .port();
     let conf = dir.path().join("nats.conf");
+    std::fs::create_dir_all(dir.path().join("store")).unwrap();
     std::fs::write(
         &conf,
         render_conf(

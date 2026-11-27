@@ -38,13 +38,20 @@ pub fn render_conf(listen: &str, port: u16, store_dir: &Path, auth: &Auth) -> St
          host: {host}\n\
          port: {port}\n\
          max_payload: {MAX_PAYLOAD}\n\
+         pid_file: {pid}\n\
          \n\
          jetstream {{\n  store_dir: {store}\n}}\n\
          \n\
          {authorization}",
         host = conf_str(listen),
+        pid = conf_str(&pid_path(store_dir).display().to_string()),
         store = conf_str(&store_dir.display().to_string()),
     )
+}
+
+/// `<store_dir>/nats.pid`: where the hub writes its process id, for a reload.
+pub fn pid_path(store_dir: &Path) -> std::path::PathBuf {
+    store_dir.join("nats.pid")
 }
 
 /// The release archive for this OS and architecture.
@@ -210,6 +217,7 @@ mod tests {
 host: "192.0.2.10"
 port: 4222
 max_payload: 4MB
+pid_file: "/srv/hgl-ai/nats/nats.pid"
 
 jetstream {
   store_dir: "/srv/hgl-ai/nats"

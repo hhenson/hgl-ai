@@ -296,6 +296,23 @@ pub fn start(sys: &dyn System, s: Service) -> Result<()> {
     }
 }
 
+/// Make the running hub reread `nats.conf` (users and permissions) without dropping its
+/// connections: SIGHUP to the process in its pid file. `false` when there is no pid
+/// file (an older `nats.conf`, or the hub is down).
+pub fn reload_hub(sys: &dyn System, store_dir: &Path) -> Result<bool> {
+    let pid_file = crate::nats::pid_path(store_dir);
+    if !sys.exists(&pid_file) {
+        return Ok(false);
+    }
+    let pid = sys.read_to_string(&pid_file).map_err(io_at(&pid_file))?;
+    let pid = pid.trim();
+    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(false);
+    }
+    run_ok(sys, &Cmd::new("kill").args(["-HUP", pid]))?;
+    Ok(true)
+}
+
 /// Restart an installed service (it rereads its configuration and credential).
 pub fn restart(sys: &dyn System, s: Service) -> Result<()> {
     match sys.env().os {

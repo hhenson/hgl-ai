@@ -155,6 +155,7 @@ mod live {
             .port();
         let token = crate::token::generate().unwrap();
         let conf = d.path().join("nats.conf");
+        std::fs::create_dir_all(d.path().join("store")).unwrap();
         std::fs::write(
             &conf,
             crate::nats::render_conf(

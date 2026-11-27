@@ -24,6 +24,10 @@ struct Hub {
     _server: Server,
     url: String,
     creds: std::collections::BTreeMap<&'static str, Credential>,
+    reg: std::sync::Mutex<Registry>,
+    conf: std::path::PathBuf,
+    store: std::path::PathBuf,
+    port: u16,
 }
 
 impl Hub {
@@ -53,6 +57,7 @@ impl Hub {
             .unwrap()
             .port();
         let conf = d.path().join("nats.conf");
+        std::fs::create_dir_all(d.path().join("store")).unwrap();
         std::fs::write(
             &conf,
             render_conf(
@@ -70,6 +75,8 @@ impl Hub {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        let store = d.path().join("store");
+        let conf_path = conf.clone();
         let server = Server(child, d);
         let up = (0..200).any(|_| {
             std::thread::sleep(Duration::from_millis(50));
@@ -80,7 +87,27 @@ impl Hub {
             _server: server,
             url: format!("nats://127.0.0.1:{port}"),
             creds,
+            reg: std::sync::Mutex::new(reg),
+            conf: conf_path,
+            store,
+            port,
         })
+    }
+
+    /// Rewrite `nats.conf` from the registry and reload the hub as `server user add`
+    /// does: SIGHUP through the pid file.
+    fn reload(&self) {
+        let reg = self.reg.lock().unwrap();
+        std::fs::write(
+            &self.conf,
+            render_conf("127.0.0.1", self.port, &self.store, &Auth::Users(&reg)),
+        )
+        .unwrap();
+        let env =
+            hgl_ai_install::Env::from_process(self.conf.with_file_name("config.toml")).unwrap();
+        let sys = hgl_ai_install::RealSystem::new(env);
+        assert!(hgl_ai_install::service::reload_hub(&sys, &self.store).unwrap());
+        std::thread::sleep(Duration::from_millis(500));
     }
 
     async fn bus(&self, who: &str) -> Bus {
@@ -267,4 +294,70 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
     for d in &got {
         d.ack().await.unwrap();
     }
+}
+
+/// Adding or removing a hub user reloads the hub: connections that stay valid are kept.
+#[tokio::test]
+async fn a_reload_keeps_connections() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let Credential::Nkey { seed, .. } = hub.creds["build-1"].clone() else {
+        unreachable!()
+    };
+    let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let d2 = drops.clone();
+    let raw = async_nats::ConnectOptions::with_nkey(seed)
+        .event_callback(move |e| {
+            let d2 = d2.clone();
+            async move {
+                if matches!(e, async_nats::Event::Disconnected) {
+                    d2.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        })
+        .connect(&hub.url)
+        .await
+        .unwrap();
+    let js = async_nats::jetstream::new(raw.clone());
+    let send = |body: &'static str| {
+        let js = js.clone();
+        async move {
+            let n = Note::new(seat("w1"), seat("claude"), Kind::Note, body);
+            js.publish("hgl.notes.claude", serde_json::to_vec(&n).unwrap().into())
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+    };
+    send("before").await;
+
+    // A new user appears without a restart.
+    let text = hub
+        .reg
+        .lock()
+        .unwrap()
+        .issue("build-2", Role::Seat, false)
+        .unwrap();
+    let new = hgl_ai_bus::parse_credential(&text).unwrap();
+    assert!(
+        Bus::connect_with(&hub.url, new.clone()).await.is_err(),
+        "not yet"
+    );
+    hub.reload();
+    Bus::connect_with(&hub.url, new).await.unwrap();
+    send("after").await;
+    assert_eq!(
+        drops.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the existing connection was kept"
+    );
+
+    // A removed user is refused from then on.
+    hub.reg.lock().unwrap().remove("build-2");
+    hub.reload();
+    let text_err = Bus::connect_with(&hub.url, hgl_ai_bus::parse_credential(&text).unwrap()).await;
+    assert!(text_err.is_err(), "build-2 was removed");
+    send("still").await;
 }
