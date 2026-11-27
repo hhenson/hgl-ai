@@ -63,7 +63,7 @@ host's own file keeps only what it needs to reach the hub.
   (`docs/roles.md` §3) and puts them in the `assign` or `review` note; the bridge runs
   that task's turns with that runtime and model, among the CLIs the host has signed
   in. A host that lacks the family declines the note, and the sender reassigns it.
-  Fallback and the independence rule (ROLE-9) apply per task.
+  Fallback and the independence rule (ROLE-11) apply per task.
 - **FLEET-9 — A task is pinned.** The binding chosen at `assign` (runtime, model,
   effort), the seat and so the host, and the CLI session belong to the task until it
   ends. Every later note of the task (`sendback`, `approved`, `answer`, `question`) goes
@@ -73,8 +73,8 @@ host's own file keeps only what it needs to reach the hub.
   `HGL_TREES` record. A pin changes only by a named event, each starting a fresh
   session with a handover prompt (the issue, the branch and head, the last notes, what
   the previous session reported): a quota failover (PROTO-17), an escalation
-  (ROLE-13), the controller moving the task to another seat, or its host retiring.
-  Reviews are never resumed: each review is a fresh session (ROLE-5).
+  (ROLE-15), the controller moving the task to another seat, or its host retiring.
+  Reviews are never resumed: each review is a fresh session (ROLE-6).
 
 - **FLEET-8 — Settled with the owner.** The fleet's shape (workers and reviewers per
   host, where each role runs, the model mix) is worked out with the controller through

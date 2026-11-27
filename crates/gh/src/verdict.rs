@@ -1,4 +1,4 @@
-//! `gh approve` and `gh sendback`: the controller's verdict on one exact head (ROLE-7). The
+//! `gh approve` and `gh sendback`: the controller's verdict on one exact head (ROLE-9). The
 //! verdict is refused when the pull request has moved; otherwise it is posted as one GitHub
 //! comment (PROTO-1: the record) and then sent as an `approved` or `sendback` note to the
 //! author's seat.

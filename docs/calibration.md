@@ -137,7 +137,7 @@ review missed.
 | Build agent, mechanical | Sol 6.2 high | Hydrogen high | — |
 
 The GitHub review bot is a GPT model: for a change a GPT model wrote it is not the independent
-review ROLE-9 needs, and a Neon or Carbon receipt is the gate.
+review ROLE-11 needs, and a Neon or Carbon receipt is the gate.
 
 Opus implements where it was strong: cross-cutting refactors (t3: 4/4 at high and xhigh alike)
 and tooling (most of hgl-ai was written by Opus agents and held up under Carbon's and the GPT

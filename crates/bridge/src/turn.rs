@@ -318,7 +318,7 @@ impl<B: BusApi> Bridge<B> {
             Ok(r) => r,
             Err(e) => return Outcome::PrepFailed(format!("seat binding: {e}")),
         };
-        // The task's authors (ROLE-9): every family whose turns run in an implementor
+        // The task's authors (ROLE-11): every family whose turns run in an implementor
         // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
         let mut file = file;
         if let (Some(f), Target::Tree { review: false, .. }) = (file.as_mut(), &job.target)

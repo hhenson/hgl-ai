@@ -1,4 +1,4 @@
-//! `gh pins sync`: raise the wrapper's submodule pins (ROLE-10). A pin follows a repository's
+//! `gh pins sync`: raise the wrapper's submodule pins (ROLE-12). A pin follows a repository's
 //! `main`, or the commit a submodule path holds in another pin's new commit (the wrapper pins
 //! the specification and core the compiler builds against, not their own `main`).
 //!
@@ -333,7 +333,7 @@ pub async fn sync<G: Gh>(
     };
     let lo = LandOpts {
         // Made by the tool, not an agent: no author family for a review receipt to differ
-        // from (ROLE-9); the review bot and the checks still gate it.
+        // from (ROLE-11); the review bot and the checks still gate it.
         gate: gate::Opts {
             tool_made: true,
             ..gate::Opts::default()

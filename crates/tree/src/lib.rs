@@ -108,7 +108,7 @@ pub struct TaskFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
     /// Model families whose turns ran in this tree (implementor trees): the task's authors,
-    /// which a review's family must differ from (ROLE-9).
+    /// which a review's family must differ from (ROLE-11).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub families: Vec<hgl_ai_proto::Family>,
 }
@@ -351,7 +351,7 @@ impl Trees {
         let src_os = src.as_os_str();
         if local {
             // Another seat of this host may still have the branch checked out (the task
-            // moved to this seat, ROLE-13): share it rather than fail.
+            // moved to this seat, ROLE-15): share it rather than fail.
             let mut args: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref(), "add".as_ref()];
             if let Some(other) = self.checked_out_at(clone, &branch)? {
                 tracing::warn!(%branch, other = %other.display(), "the branch is checked out in another tree of this host; sharing it");

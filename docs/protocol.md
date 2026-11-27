@@ -78,7 +78,7 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
     refusal with no binding left to move to (every 10 min), a tree that cannot
     be prepared yet (from 60 s, doubling to 16 min; the controller is told once),
     `HGL_ENDED` that cannot be read or written (every 15 s), the gates
-    (ROLE-16, ROLE-17), a turn lock another process holds.
+    (ROLE-18, ROLE-19), a turn lock another process holds.
   - *Real failure* (a crash, a memory or time limit, a turn that could not be
     started this time): counted per note in `<data_dir>/bridge/failures/<seat>.json`
     and naked with a 15 s delay. At the fifth the bridge sends `term` and a
@@ -169,12 +169,12 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
 - **PROTO-17 — Failover.** A seat may list fallback bindings. A quota refusal
   is known from the CLI's structured output (an error event or result and its
   status), never from text on stderr. On one, the bridge holds the notes and
-  moves the seat to its next binding whose family keeps ROLE-9 for the refused
+  moves the seat to its next binding whose family keeps ROLE-11 for the refused
   turn's task: a review keeps its family; an implementor's task keeps a live
   reviewer family that is none of its authors' (the families its turns ran on).
   It tells the controller, and returns the seat to its primary after
   `limits.failover_cooldown` (default 1 h). With no such binding, the notes stay
-  held (PROTO-8). The merge gate checks ROLE-9 again (PROTO-19).
+  held (PROTO-8). The merge gate checks ROLE-11 again (PROTO-19).
 
 ## 7. Receipts
 

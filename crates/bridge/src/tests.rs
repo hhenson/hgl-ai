@@ -1571,7 +1571,7 @@ async fn a_failed_over_seat_returns_to_its_primary_after_the_cool_down() {
             .len(),
         1
     );
-    // Both families worked on the task: its authors (ROLE-9).
+    // Both families worked on the task: its authors (ROLE-11).
     let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-7")).unwrap();
     assert_eq!(tf.families, [Family::Gpt, Family::Claude]);
     let rec = h.bus.trees()["build-1.w1.demo-7"].clone();
@@ -1579,7 +1579,7 @@ async fn a_failed_over_seat_returns_to_its_primary_after_the_cool_down() {
     stop(tx, j).await;
 }
 
-/// A failover that would leave the task no reviewer of another family (ROLE-9) is not
+/// A failover that would leave the task no reviewer of another family (ROLE-11) is not
 /// taken: the seat holds its notes instead.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_failover_that_breaks_role_9_is_not_taken() {

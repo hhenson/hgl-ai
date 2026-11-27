@@ -110,7 +110,7 @@ pub fn author_seats(
     out
 }
 
-/// The task's author families (ROLE-9): the families recorded in the implementor trees of
+/// The task's author families (ROLE-11): the families recorded in the implementor trees of
 /// `repo` registered for this branch or issue (`HGL_TREES`, written by the bridges).
 pub fn author_families(trees: &[TreeRecord], repo: &str, branch: &str, issue: u64) -> Vec<Family> {
     let mut out: Vec<Family> = trees

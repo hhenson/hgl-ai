@@ -1,4 +1,4 @@
-//! `hgl-ai cap`: run a command tree under a memory and time cap (docs/roles.md ROLE-15).
+//! `hgl-ai cap`: run a command tree under a memory and time cap (docs/roles.md ROLE-17).
 
 use std::ffi::OsString;
 use std::time::Duration;
