@@ -63,4 +63,3 @@ pub fn exit_code_for(e: &anyhow::Error) -> i32 {
     }
     EXIT_FAIL
 }
-
