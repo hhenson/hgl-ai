@@ -1,0 +1,25 @@
+{
+ "total_count": 2,
+ "workflow_runs": [
+  {
+   "id": 101,
+   "name": "CI",
+   "head_sha": "7777777777777777777777777777777777777777",
+   "event": "push",
+   "status": "completed",
+   "conclusion": "success",
+   "run_attempt": 1,
+   "html_url": "https://github.com/o/alpha/actions/runs/101"
+  },
+  {
+   "id": 102,
+   "name": "Release bundles",
+   "head_sha": "7777777777777777777777777777777777777777",
+   "event": "push",
+   "status": "completed",
+   "conclusion": "success",
+   "run_attempt": 1,
+   "html_url": "https://github.com/o/alpha/actions/runs/102"
+  }
+ ]
+}

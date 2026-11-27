@@ -1,0 +1,49 @@
+# frozen_string_literal: true
+
+# Installs the hgl-ai command line from its release archives.
+# Rendered by `hgl-ai gh tap formula` from packaging/hgl-ai.rb.tmpl in {{repo}}.
+class HglAi < Formula
+  desc "Coordination tooling for a mixed fleet of coding agents"
+  homepage "https://github.com/{{repo}}"
+  version "{{version}}"
+  license "MIT"
+
+  on_macos do
+    on_arm do
+      url "{{url:aarch64-apple-darwin}}"
+      sha256 "{{sha256:aarch64-apple-darwin}}"
+    end
+    on_intel do
+      url "{{url:x86_64-apple-darwin}}"
+      sha256 "{{sha256:x86_64-apple-darwin}}"
+    end
+  end
+
+  on_linux do
+    on_arm do
+      url "{{url:aarch64-unknown-linux-musl}}"
+      sha256 "{{sha256:aarch64-unknown-linux-musl}}"
+    end
+    on_intel do
+      url "{{url:x86_64-unknown-linux-musl}}"
+      sha256 "{{sha256:x86_64-unknown-linux-musl}}"
+    end
+  end
+
+  def install
+    bin.install "hgl-ai"
+  end
+
+  def caveats
+    <<~EOS
+      On the one host that runs the hub (it installs nats-server when it is missing):
+        hgl-ai server install
+      On every host, the hub's too:
+        hgl-ai client install --hub nats://<hub>:4222 --token-file <token> --host <label>
+    EOS
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/hgl-ai --version")
+  end
+end

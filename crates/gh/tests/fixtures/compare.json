@@ -1,0 +1,13 @@
+{
+ "ahead_by": 2,
+ "behind_by": 0,
+ "status": "ahead",
+ "files": [
+  {
+   "filename": "crates/x/src/lib.rs"
+  },
+  {
+   "filename": "Cargo.lock"
+  }
+ ]
+}

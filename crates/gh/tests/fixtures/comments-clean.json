@@ -1,0 +1,46 @@
+[
+ {
+  "id": 1,
+  "user": {
+   "login": "octo",
+   "type": "User"
+  },
+  "body": "[codex] (worker 5) @codex review\n\nRound 1 on exact head `1f461fa77bba922fe81383df4c475feb58b7c233`.",
+  "created_at": "2026-01-01T05:28:52Z",
+  "updated_at": "2026-01-01T05:28:52Z",
+  "html_url": "https://github.com/o/r/pull/7#issuecomment-1"
+ },
+ {
+  "id": 2,
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "<!-- codex-pull-request-review-summary -->\n<!-- codex-review-state:v1 {\"code_review\":{\"commit_sha\":\"1f461fa77bba922fe81383df4c475feb58b7c233\",\"has_any_findings\":false,\"has_unresolved_findings\":false,\"status\":\"completed\"},\"security_review\":{\"commit_sha\":null,\"has_any_findings\":null,\"has_unresolved_findings\":null,\"status\":null}} -->\n\n<details>\n<summary><strong>Codex Review Summary</strong></summary>\n\nThis comment shows the latest Codex review activity on this pull request.\n</details>\n",
+  "created_at": "2026-01-01T05:29:01Z",
+  "updated_at": "2026-01-01T05:42:31Z",
+  "html_url": "https://github.com/o/r/pull/7#issuecomment-2"
+ },
+ {
+  "id": 3,
+  "user": {
+   "login": "chatgpt-codex-connector[bot]",
+   "type": "Bot"
+  },
+  "body": "<!-- codex-review-receipt:v1 -->\n\nCodex Review: Didn't find any major issues. Bravo.\n\n**Reviewed commit:** `1f461fa77b`\n\n<details> <summary>About Codex in GitHub</summary>\n</details>\n",
+  "created_at": "2026-01-01T05:31:01Z",
+  "updated_at": "2026-01-01T05:31:01Z",
+  "html_url": "https://github.com/o/r/pull/7#issuecomment-3"
+ },
+ {
+  "id": 4,
+  "user": {
+   "login": "octo",
+   "type": "User"
+  },
+  "body": "[claude] Approved at 1f461fa7.",
+  "created_at": "2026-01-01T05:57:35Z",
+  "updated_at": "2026-01-01T05:57:35Z",
+  "html_url": "https://github.com/o/r/pull/7#issuecomment-4"
+ }
+]

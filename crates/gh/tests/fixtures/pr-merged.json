@@ -1,0 +1,22 @@
+{
+ "number": 7,
+ "state": "closed",
+ "merged": true,
+ "mergeable": null,
+ "mergeable_state": "unknown",
+ "draft": false,
+ "title": "Format patterns through helpers",
+ "html_url": "https://github.com/o/alpha/pull/7",
+ "user": {
+  "login": "octo"
+ },
+ "head": {
+  "sha": "1f461fa77bba922fe81383df4c475feb58b7c233",
+  "ref": "codex/980-format-patterns"
+ },
+ "base": {
+  "sha": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+  "ref": "main"
+ },
+ "merge_commit_sha": "01e99ea5e46457bac035ca8a2699b6b6575b32ed"
+}
