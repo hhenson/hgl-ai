@@ -1,0 +1,9 @@
+[package]
+name = "hgl-ai-tree"
+description = "Worktree layout and lifecycle owned by the bridge"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]

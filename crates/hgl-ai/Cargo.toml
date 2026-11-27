@@ -1,0 +1,28 @@
+[package]
+name = "hgl-ai"
+description = "Coordination tooling for a mixed fleet of coding agents"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "hgl-ai"
+path = "src/main.rs"
+
+[dependencies]
+hgl-ai-proto.workspace = true
+hgl-ai-config.workspace = true
+anyhow.workspace = true
+clap.workspace = true
+hgl-ai-bus.workspace = true
+hgl-ai-cap.workspace = true
+hgl-ai-tree.workspace = true
+hgl-ai-bridge.workspace = true
+hgl-ai-install.workspace = true
+hgl-ai-gh.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

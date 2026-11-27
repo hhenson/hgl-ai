@@ -1,160 +1,186 @@
-# Communication Protocol Specification
+# Protocol
 
-This document specifies the wire protocol, NATS JetStream topology, shared state keys, and gate receipts used by `hgl-ai` participants across hosts.
+Status: proposed. Open decisions are issues in this repository.
 
----
+## 1. Records
 
-## 1. System of Record vs. Coordination Bus
+- **PROTO-1 — GitHub is the record.** Issues, pull requests, reviews, checks
+  and merges live on GitHub. A `ready`, `blocked`, `sendback`, `approved` or
+  `landed` note also gets one GitHub comment, posted once by its sender.
+- **PROTO-2 — The bus is transport.** NATS JetStream carries notes and shared
+  state between agents and hosts. History is bounded (14 days); nothing that
+  decides something lives only on the bus.
+- **PROTO-3 — No fabricated owner words.** A note is agent traffic. It never
+  states an owner decision unless it quotes the GitHub record that holds it.
 
-1. **GitHub is the durable record.** Issues, pull requests, review threads, status checks, formal approvals, and merges live on GitHub.
-2. **NATS JetStream is the low-latency coordination plane.** Agents exchange notes and read shared PR/branch snapshots over JetStream so no participant polls GitHub repeatedly for peer updates.
-3. **Single-write GitHub mirroring.** Transitions that belong on the public record (`ready`, `blocked`, `sendback`, `approved`, `landed`) still post their single comment or review action on GitHub once, emitted by the sender of the note. Routine `question`, `answer`, and operational `note` messages stay on the bus unless they establish an agreed decision.
+## 2. Access
 
----
+- **PROTO-4 — One command-line tool.** Every participant uses the `hgl-ai`
+  binary. There is no MCP server: agents run `hgl-ai` through their shell
+  tool and learn it from one installed skill (`skill/SKILL.md`). Output is
+  terse text by default, `--json` on request.
+- **PROTO-5 — Delivery by the bridge.** An idle agent costs nothing. The
+  bridge holds the agent's inbox, starts one headless turn per batch of notes,
+  and puts the notes in the turn's prompt. Agents never poll.
+- **PROTO-6 — Interactive seats.** A seat run by a person-facing session (the
+  controller) waits with `hgl-ai note wait SEAT`, which blocks until a note
+  arrives, prints it and acknowledges it.
 
-## 2. Transport & JetStream Topology
+```sh
+hgl-ai note send --to claude --issue 980 --kind ready --body-file ready.md
+hgl-ai note wait claude          # blocks; prints the next notes
+hgl-ai state get prs
+hgl-ai tree list --stale
+```
 
-All participants connect to a single `nats-server -js` endpoint (TCP port `4222` by convention) over an authenticated link (WireGuard/Tailscale or OpenSSH port-forward, plus token or NKey credentials).
+## 3. Transport
 
-### 2.1 Stream: `HGL_NOTES`
+All participants connect to one `nats-server -js` hub over an authenticated
+link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
 
-| Parameter | Value | Purpose |
+| Primitive | Name | Settings |
 | --- | --- | --- |
-| Subjects | `hgl.notes.>` | Unicast (`hgl.notes.<agent>`) and broadcast (`hgl.notes.all`) |
-| Storage | `File` | Survives broker restarts |
-| Retention | `Limits` (`max_age = 14d`) | Bounded history; GitHub retains permanent records |
-| Deduplication | `duplicate_window = 24h` | Idempotent retries and imports via `Nats-Msg-Id` header |
+| Stream | `HGL_NOTES`, subjects `hgl.notes.>` | file storage, `max_age` 14 d, dedup window 24 h |
+| Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>` and `hgl.notes.all`; explicit ack; `ack_wait` 300 s; `max_deliver` 5 |
+| State | KV `HGL_STATE` | file storage, history 5 |
+| Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
+| Trees | KV `HGL_TREES` | file storage, history 1 |
 
-Valid `<agent>` tokens match `^[a-z0-9][a-z0-9_-]{0,31}$` (wildcards `*`, `>`, and `.` are rejected).
+- **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
+  broadcast address. A seat is a logical address; the runtime and model bound
+  to it can change (§6) without peers noticing.
+- **PROTO-8 — Ack after the turn.** The bridge sends `in_progress` every 60 s
+  while a turn runs, `ack` after a clean exit, and `nak` with a 15 s delay on a
+  crash, a memory or time limit, or a provider quota refusal.
+- **PROTO-9 — Idempotent sends.** Each note carries a `Nats-Msg-Id` of
+  `<sender>-<created_at>-<sha256(body)[0:12]>`, so a retried send is dropped.
 
-### 2.2 Durable Inbox Consumers: `inbox-<agent>`
-
-Each logical participant (`claude`, `coord`, `desk`, `w1`..`wN`, and named reviewers) reads from a durable explicit-ack pull consumer:
-
-- **`filter_subjects`**: `["hgl.notes.<agent>", "hgl.notes.all"]`
-- **`ack_policy`**: `Explicit`
-- **`ack_wait`**: `300s`
-- **`max_deliver`**: `5`
-
-**Delivery contract for worker bridges:**
-1. A worker bridge blocks on `fetch()` without consuming LLM tokens while idle.
-2. While a turn executes (which may span 5–20 minutes during builds or regression sets), the bridge sends `msg.in_progress()` every `60s` to reset `ack_wait`.
-3. `msg.ack()` is sent **only** after the agent turn exits cleanly.
-4. On crash, OOM kill (`memcap` status `137`/`143`), or provider quota error, the bridge sends `msg.nak(delay=15s)` so the note is redelivered rather than dropped.
-
----
-
-## 3. Note Envelope & Kinds
-
-### 3.1 JSON Payload (`hgl.notes.<recipient>`)
+## 4. Notes
 
 ```json
 {
+  "v": 1,
   "created_at": "20261127T041100Z",
   "sender": "w4",
   "recipient": "claude",
+  "repo": "hgl-compiler",
   "issue": 980,
   "kind": "ready",
-  "body": "[codex] Ready: hgl-compiler#980 at 8a5c3d264c2edbbdaa61530d810bff276c3eebba\n\n..."
+  "head": "8a5c3d264c2edbbdaa61530d810bff276c3eebba",
+  "body": "[codex] Ready: hgl-compiler#980 at 8a5c3d26 ..."
 }
 ```
 
-Upon publication, JetStream assigns a monotonic stream sequence number (`seq`), which serves as the immutable **bus receipt ID** referenced in controller logs and audits.
+- **PROTO-10 — Revisions are exact.** A note about a pull request revision
+  carries its full 40-character `head`. Any verdict applies to that head only.
+- **PROTO-11 — Body.** UTF-8 Markdown. First line names runtime and action,
+  for example `[codex] Ready: ...` or `[claude] Approved: ...`.
 
-### 3.2 Body Convention
-
-- UTF-8 Markdown, newline-terminated.
-- First line identifies the runtime/role and action summary, e.g. `[codex] Ready: ...`, `[codex] (coordinator) ...`, `[codex] Desk sets: ...`, or `[claude] ...`.
-- Any note referencing a pull request revision **must** state the full 40-character commit SHA (or unambiguous 8+ char prefix paired with the full SHA in Ready/gate notes).
-
-### 3.3 Allowed `kind` Values
-
-| `kind` | Typical Sender → Recipient | Meaning |
+| Kind | From → to | Meaning |
 | --- | --- | --- |
-| `ready` | `wN` → `claude` (observed by `desk`) | PR is open/updated at an exact `HEAD` SHA with author checks passing; ready for gates. |
-| `blocked` | `wN` / `desk` / `reviewer` → `claude` | Cannot proceed due to an unresolved spec question, external dependency, or environment refusal. |
-| `question` | Any → `claude` / `coord` / `wN` | Clarification request requiring no GitHub comment churn. |
-| `answer` | `claude` / `coord` → requester | Direct reply to a `question`. |
-| `sendback` | `claude` → `wN` (cc `coord`) | Returns a PR at a specific `HEAD` SHA with reproducible findings or failing gate evidence. |
-| `approved` | `claude` → `wN` / `coord` | Formal controller sign-off for an exact `HEAD` SHA on a verified `main` base. |
-| `landed` | `claude` → `wN` / `all` | Announces PR merge and new `main` SHA; **mandatory trigger** for worktree and scratch cleanup. |
-| `done` | `wN` / `reviewer` / `coord` → `claude` | Non-PR bounded assignment (audit, probe, cleanup, release check) is complete. |
-| `note` | Any → Any / `all` | Operational fact: desk set receipt, urgent CI/bot failure alert, `hold` notice, or `drain` instruction. |
+| `assign` | controller or triage → seat | Take this issue. Carries `repo`, `issue`, optional `base`. The bridge creates the worktree first (§5). |
+| `ready` | implementor → controller | Pull request at `head` passes the author's checks. |
+| `blocked` | any → controller | Cannot proceed; states the question or dependency. |
+| `question` / `answer` | any ↔ any | Clarification; no GitHub comment unless it settles something. |
+| `review` | controller → reviewer | Review `repo#issue` at `head`. The bridge creates a review worktree. |
+| `receipt` | reviewer or desk → controller | Gate result at `head` (§7). |
+| `sendback` | controller → implementor | Findings at `head`; fix with new commits. |
+| `approved` | controller → implementor | Sign-off for `head` on a verified `main`. |
+| `landed` | controller → seat, `all` | Merged; carries the merge commit. The bridge removes the issue's worktrees (§5). |
+| `closed` | controller → seat | Closed unmerged or superseded; same removal as `landed`. |
+| `done` | any → controller | A bounded non-PR assignment finished, or a cleanup receipt. |
+| `note` | any → any | Operational fact: an alert, a `hold`, a `drain`. |
 
----
+## 5. Worktrees
 
-## 4. Shared Key-Value Buckets
+- **PROTO-12 — The bridge owns worktrees.** On `assign` or `review` the
+  bridge creates `<work_root>/<seat>/<repo>-<issue>/` with the checkout in
+  `src/`, a scratch `tmp/` and a `build/` directory, and starts the agent's
+  turn there with `TMPDIR`, `CARGO_TARGET_DIR` and `HGL_AI_TASK_DIR` pointing
+  inside it. Nothing of a task goes to `/tmp`.
+- **PROTO-13 — Every tree is registered** in `HGL_TREES` under
+  `<host>.<seat>.<repo>-<issue>` with its path, branch, creation time and
+  last measured size.
+- **PROTO-14 — Removal is the bridge's.** On `landed` or `closed` for an
+  issue, the bridge stops any turn in that task, saves uncommitted changes as
+  a patch under `<work_root>/salvage/` if there are any, removes the worktree
+  and its branch, deletes the task directory, deregisters it, and sends a
+  `done` cleanup receipt to the controller. Agents do not remove trees.
+- **PROTO-15 — Leftovers are visible.** `hgl-ai tree list --stale` lists
+  trees whose issue is closed or that are older than `stale_after` (default
+  3 days). The bridge posts that list and the disk use of `work_root` to the
+  controller daily.
 
-### 4.1 `HGL_STATE` (`Storage = File`, `history = 5`)
+## 6. Seats and failover
 
-Atomic, revisioned cluster-wide state keys (`^[a-zA-Z0-9_./=-]{1,64}$`). Writing an empty value purges the key.
+- **PROTO-16 — Binding.** A seat binds a role to a runtime (`claude`, `codex`
+  or `agy`) and a model on one host, in that host's configuration. Its record
+  in `HGL_HOSTS` advertises role, runtime, model family and memory budget.
+- **PROTO-17 — Failover.** A seat may list fallback bindings. On a quota
+  refusal the bridge naks the note and moves the seat to its next binding.
+  The independence rule (`docs/roles.md`, ROLE-9) still applies after the move.
 
-| Key | Writer | Schema & Semantics |
-| --- | --- | --- |
-| `main` | Controller (`claude`) | Plaintext lines recording `updated <UTC>`, full `main` SHAs of `hgl-compiler`, `hgl_spec`, `hgl_core`, and current `hgl-project` submodule pins. Rewritten after every merge. |
-| `prs` | Coordinator (`coord`) | Header `# read <UTCTIME>` and `# cost <N> remaining <N> resetAt <ISO>`, followed by tab-separated rows:<br>`REPO  NUMBER  HEAD  draft\|open  BOT  UNRESOLVED  CHECKS  UPDATED`<br>• `BOT`: `clean` \| `findings` \| `running` \| `none` \| `limit`<br>• `CHECKS`: `pass` \| `fail` \| `pending` \| `none`<br>Refreshed at most every 5 minutes. Controller acts from this snapshot unless >15 minutes old. |
-| `landed.log` | Controller (`claude`) | One line per merged PR: `<UTCTIME>  <REPO>  <PR>  <MERGE_SHA>`. |
-| `hold` | Coordinator / Controller | Present only while GitHub API rate limit is exhausted; value states the reset UTC timestamp. While present, **all deferrable GitHub API calls must pause**. Purged once reset passes. |
-| `mode` | Controller (`claude`) | Optional fleet directive: `normal` (default) or `drain` (finish active work only; claim no new issues; idle on completion). |
+## 7. Receipts
 
-### 4.2 `HGL_HOSTS` (`Storage = Memory`, `ttl = 120s`)
+- **PROTO-18 — Desk receipt.** Facts only: exit code and report location.
 
-Each `hgl-bridge` daemon writes its host record every `30s` under `<sanitized-hostname>`:
+  `[desk] Sets: hgl-compiler#<PR> at <HEAD8> on main <MAIN8>, exit <CODE>: <report>`
 
-```json
-{
-  "hostname": "worker-linux-02",
-  "agents": ["w3", "w4", "reviewer_types"],
-  "memcap_gb": 64,
-  "updated_at": "20261127T083000Z"
-}
-```
+  | Exit | Meaning |
+  | --- | --- |
+  | 0 | Sets ran; difference report written |
+  | 3 | `head` does not merge onto `main` |
+  | 4 | Build failed |
+  | 5 | Another desk run holds the lock |
+  | 6 | Not enough free disk; stopped |
 
-If a host disconnects or loses power, JetStream automatically expires its key after `120s`.
-
----
-
-## 5. Gate Receipt Formats
-
-### 5.1 Desk Regression Receipt
-
-Produced by `desk` for each `ready` compiler PR at exact `HEAD` merged onto current `main`:
-
-- **Note summary line:**
-  `[codex] Desk sets: #<PR> at <HEAD8> on main <MAIN8>, exit <CODE>: <artifact-ref>`
-- **Exit codes:**
-  - `0` — sets completed and diff report written
-  - `3` — `HEAD` does not merge cleanly onto `main`
-  - `4` — build failure
-  - `5` — another desk run holds the lock (wait/retry)
-  - `6` — insufficient free disk (<170 GB; stop immediately)
-
-### 5.2 Independent Review Receipt (JSON)
-
-Produced by an independent reviewer agent for exact `(repo, pr, head)`:
+- **PROTO-19 — Review receipt.** JSON in the body of a `receipt` note:
 
 ```json
 {
   "repo": "hgl-compiler",
   "pr": 919,
   "head": "451063637974dbc2c0ce9847fac3c5d97f8a04be",
-  "reviewer": "type_positions",
+  "main": "6f7b07a09c5fd1fca77376285de7ebf3c9d97981",
+  "reviewer": "r1",
+  "family": "claude",
+  "model": "claude-opus-5-5",
   "verdict": "clean",
-  "evidence": "Merged cleanly onto main <sha>. Tested N bounded positive/negative programs and M native assertions...",
-  "limitations": "Linux C++ target only; stress suite covered by desk gate."
+  "evidence": "Merged onto main. 34 programs: 21 accept, 13 reject ...",
+  "limitations": "Linux C++ target only."
 }
 ```
 
-`verdict` is strictly `"clean"` or `"findings"`.
+  `verdict` is `clean` or `findings`. `family` is the model's vendor family
+  (`claude`, `gpt`, `gemini`); the controller checks it against the author's.
 
----
+## 8. Shared state
 
-## 6. MCP Tool Surface (`hgl-mcp`)
+`HGL_STATE` keys match `^[a-zA-Z0-9_./=-]{1,64}$`. An empty value deletes.
 
-Interactive agents (`agy`, `codex`, `claude`) access the protocol through 5 `stdio` MCP tools backed by `$NATS_URL`:
+| Key | Writer | Content |
+| --- | --- | --- |
+| `main` | controller | `updated <UTC>`, then `<repo> main <sha>` lines and the wrapper's pins. Rewritten after each merge. |
+| `prs` | coordinator service | `# read <UTC>`, `# cost <n> remaining <n> resetAt <ISO>`, then rows `REPO NUMBER HEAD draft\|open BOT UNRESOLVED CHECKS UPDATED`. At most every 5 min; stale after 15 min. |
+| `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha>` per merge. |
+| `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
+| `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
 
-1. `post_note(sender, recipient, issue, kind, body)` → publishes to `HGL_NOTES`, returns `{ seq, duplicate, ... }`.
-2. `poll_inbox(recipient, limit=20)` → fetches and acknowledges up to `limit` notes from `inbox-<recipient>`.
-3. `get_state(key)` → returns `{ key, value, revision }` or `null` from `HGL_STATE`.
-4. `put_state(key, value)` → writes key in `HGL_STATE` (or purges when `value == ""`).
-5. `list_hosts()` → returns active host records from `HGL_HOSTS`.
+`BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
+`pass`, `fail`, `pending` or `none`.
+
+## 9. Host record
+
+Each bridge writes `HGL_HOSTS/<host>` every 30 s:
+
+```json
+{
+  "host": "build-1",
+  "seats": [{"seat": "w3", "role": "implementor", "runtime": "codex", "family": "gpt", "model": "gpt-6.1-sol"}],
+  "memcap_gb": 64,
+  "work_root_free_gb": 812,
+  "updated_at": "20261127T083000Z"
+}
+```
+
+`host` is a configured label, never a network name or address.

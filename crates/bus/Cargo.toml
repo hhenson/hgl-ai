@@ -1,0 +1,18 @@
+[package]
+name = "hgl-ai-bus"
+description = "NATS JetStream access for hgl-ai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hgl-ai-proto.workspace = true
+hgl-ai-config.workspace = true
+async-nats.workspace = true
+tokio.workspace = true
+futures.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes = "1"
