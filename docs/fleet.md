@@ -42,6 +42,15 @@ given its part. A host's own file keeps only what it needs to reach the hub.
   in. A host that lacks the family declines the note, and the sender reassigns it.
   Fallback and the independence rule (ROLE-9) apply per task.
 
+- **FLEET-8 — Settled with the owner.** The fleet's shape (workers and reviewers per
+  host, where each role runs, the model mix) is worked out with the controller through
+  the owner channel (`docs/owner.md`). The controller proposes a breakdown as a
+  question: the hosts' registrations and load as context, options with their trade-offs,
+  a suggestion. On the owner's answer it applies the plan with the `fleet` commands and
+  logs it in `decisions.log`. A new host's registration, a host going quiet, or a
+  subscription running out raises such a question. The owner may also set the plan
+  directly in the console.
+
 ## 3. Configuration on the hub
 
 KV `HGL_FLEET`:
