@@ -330,6 +330,30 @@ fn builder_runs_a_remote_build_through_the_hub() {
         e["end"].as_u64().unwrap() as usize,
     );
     assert!(String::from_utf8_lossy(&log[a..b]).starts_with("main.c:3:5: error:"));
+    // The builder's host reads the range as the summary says (Carbon's second review of
+    // #12, finding 4), and with --log-dir naming the run's own directory.
+    let range = format!("{a}-{b}");
+    let o = hub.run(&["build", "log", &id, "compile", "--bytes", &range]);
+    assert!(
+        String::from_utf8_lossy(&o.stdout).starts_with("main.c:3:5: error:"),
+        "{}",
+        text(&o)
+    );
+    let o = hub.run(&[
+        "build",
+        "log",
+        &id,
+        "compile",
+        "--bytes",
+        &range,
+        "--log-dir",
+        log_dir.to_str().unwrap(),
+    ]);
+    assert!(
+        String::from_utf8_lossy(&o.stdout).starts_with("main.c:3:5: error:"),
+        "{}",
+        text(&o)
+    );
 
     // Cleanup is part of done: no checkout left, the clone kept.
     let work = hub.dir.0.join("work/builder");

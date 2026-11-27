@@ -711,14 +711,24 @@ async fn wait_remote(
 
 /// A local run's directory: --log-dir, the task's, or this host's.
 fn find_local(id: &str, arg: Option<PathBuf>, cfg: Option<&Config>) -> Option<PathBuf> {
-    let mut roots = Vec::new();
-    roots.extend(arg);
-    roots.extend(task_dir().map(|t| t.join("build-logs")));
-    roots.push(data_dir(cfg).join("build-logs"));
-    roots
-        .into_iter()
-        .map(|r| r.join(id))
-        .find(|d| d.join(store::STATUS_FILE).is_file() || d.join("pid").is_file())
+    let found = |d: &Path| d.join(store::STATUS_FILE).is_file() || d.join("pid").is_file();
+    let mut dirs = Vec::new();
+    if let Some(a) = arg {
+        // A root of runs, or the run's own directory (a summary's `log_dir`).
+        if a.file_name().is_some_and(|n| n == id) {
+            dirs.push(a.clone());
+        }
+        dirs.push(a.join(id));
+    }
+    dirs.extend(task_dir().map(|t| t.join("build-logs").join(id)));
+    dirs.push(data_dir(cfg).join("build-logs").join(id));
+    // This host's builders keep theirs under `<work_root>/builder/logs/<label>/`.
+    if let Some(root) = cfg.and_then(|c| c.work_root().ok())
+        && let Ok(rd) = std::fs::read_dir(root.join("builder").join("logs"))
+    {
+        dirs.extend(rd.flatten().map(|e| e.path().join(id)));
+    }
+    dirs.into_iter().find(|d| found(d))
 }
 
 /// The local status, marked stopped when its process is gone before the end.
