@@ -50,6 +50,14 @@ enum Command {
     Cap(cmd::cap::Args),
     /// GitHub services and gates.
     Gh(cmd::gh::Args),
+    /// Ask the owner a question; prints its id.
+    Ask(Box<cmd::owner::AskArgs>),
+    /// Owner threads: list, show, reply, withdraw.
+    Thread(cmd::owner::ThreadArgs),
+    /// Status reports for the owner.
+    Status(cmd::owner::StatusArgs),
+    /// The controller's decision log.
+    Decision(cmd::owner::DecisionArgs),
 }
 
 #[tokio::main]
@@ -81,6 +89,10 @@ async fn main() {
         Command::Tree(a) => cmd::tree::run(&ctx, a).await,
         Command::Cap(a) => cmd::cap::run(&ctx, a).await,
         Command::Gh(a) => cmd::gh::run(&ctx, a).await,
+        Command::Ask(a) => cmd::owner::ask(&ctx, *a).await,
+        Command::Thread(a) => cmd::owner::thread(&ctx, a).await,
+        Command::Status(a) => cmd::owner::status(&ctx, a).await,
+        Command::Decision(a) => cmd::owner::decision(&ctx, a).await,
     };
     let code = match res {
         Ok(code) => code,

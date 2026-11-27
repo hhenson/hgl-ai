@@ -623,6 +623,7 @@ dependencies = [
  "hgl-ai-config",
  "hgl-ai-gh",
  "hgl-ai-install",
+ "hgl-ai-owner",
  "hgl-ai-proto",
  "hgl-ai-tree",
  "serde_json",

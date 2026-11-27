@@ -128,6 +128,12 @@ async fn send(ctx: &Ctx, a: SendArgs) -> anyhow::Result<i32> {
         }
         (None, None) => unreachable!("clap requires a body"),
     };
+    if a.from.is_reserved() {
+        bail!(
+            "--from {}: `owner` and `console` speak only through the console (docs/owner.md, OWN-5)",
+            a.from
+        );
+    }
     let mut note = Note::new(a.from, a.to, a.kind, body);
     note.repo = a.repo;
     note.issue = a.issue.unwrap_or(0);

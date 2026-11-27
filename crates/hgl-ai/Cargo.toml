@@ -21,6 +21,7 @@ hgl-ai-tree.workspace = true
 hgl-ai-bridge.workspace = true
 hgl-ai-install.workspace = true
 hgl-ai-gh.workspace = true
+hgl-ai-owner.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
 serde_json.workspace = true

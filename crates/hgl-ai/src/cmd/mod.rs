@@ -8,6 +8,7 @@ pub mod client;
 pub mod doctor;
 pub mod gh;
 pub mod note;
+pub mod owner;
 pub mod seat;
 pub mod server;
 pub mod state;

@@ -113,6 +113,13 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
             ", created {} (seq {seq}, delivery {delivered}) ---",
             n.created_at
         );
+        if n.sender.is_owner() {
+            s.push_str(
+                "(The owner's words, through the console: the hub accepts sender `owner` only \
+                 there. A ruling reaches the record when you post it once on its issue, \
+                 quoting it and naming the thread.)\n",
+            );
+        }
         s.push_str(&truncate(n.body.trim_end(), budget));
         s.push('\n');
     }
@@ -215,6 +222,16 @@ mod tests {
         let plain = build(&ctx(None, &s), &[(1, 1, &q)]);
         assert!(plain.contains("No task"));
         assert!(!plain.contains("State "), "hold and mode only when set");
+        assert!(!plain.contains("The owner's words"));
+        let o = Note::new(
+            Seat::owner(),
+            seat("w1"),
+            Kind::Answer,
+            "[owner] Answer: accept a",
+        );
+        let p = build(&ctx(None, &s), &[(2, 1, &o)]);
+        assert!(p.contains("answer from owner to w1"));
+        assert!(p.contains("(The owner's words, through the console"));
     }
 
     #[test]
