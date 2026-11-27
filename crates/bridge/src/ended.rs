@@ -1,8 +1,10 @@
-//! Tasks a seat saw end (`landed`, `closed`), by `repo#issue`, with the stream sequence of
-//! the ending note. Kept in `<data_dir>/bridge/ended/<seat>.json` for [`KEEP`], longer than
-//! the stream keeps notes (PROTO-2), so a note of the task sent before its end and delivered
-//! again after it (a redelivery, a seat moved between hosts) is acknowledged without a turn,
-//! across restarts. A note sent after the end (a later sequence) is new intent and runs.
+//! This host's cache of the tasks a seat saw end (`landed`, `closed`), by `repo#issue`, with
+//! the stream sequence of the ending note. The hub's `HGL_ENDED` is the record (PROTO-14), so
+//! a seat moved between hosts keeps its ends; this cache answers without the hub for ends
+//! seen here. Kept in `<data_dir>/bridge/ended/<seat>.json` for [`KEEP`], longer than the
+//! stream keeps notes (PROTO-2). A note of the task sent before its end and delivered again
+//! after it is acknowledged without a turn; one sent after the end (a later sequence) is new
+//! intent and runs.
 
 use std::collections::HashMap;
 use std::io::Write as _;

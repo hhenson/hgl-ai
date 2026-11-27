@@ -44,8 +44,8 @@ hgl-ai agent attach SEAT
 hgl-ai bridge run [--seat NAME ...]       the daemon (the user service runs this)
 
 hgl-ai note send --to SEAT --kind KIND [--repo R] [--issue N] [--head SHA] (--body TEXT | --body-file F)
-hgl-ai note wait SEAT [--timeout DUR]     block, print, ack
-hgl-ai note peek SEAT                     print without ack
+hgl-ai note wait SEAT [--timeout DUR]     block, print, ack; holds the seat lease
+hgl-ai note peek SEAT                     print without ack; holds the seat lease
 hgl-ai state get|put|del KEY [VALUE|-]
 hgl-ai hosts
 

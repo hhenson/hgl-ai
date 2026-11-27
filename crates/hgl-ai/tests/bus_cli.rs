@@ -161,7 +161,7 @@ fn notes_send_wait_peek() {
     };
     assert_eq!(
         ok(&hub.run(&["init"])),
-        "provisioned HGL_NOTES HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS\n"
+        "provisioned HGL_NOTES HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS HGL_ENDED\n"
     );
     ok(&hub.run(&["init"]));
 
@@ -286,6 +286,11 @@ fn bridged_seats_refuse_interactive_waits() {
     }
     let forced = hub.run(&["note", "wait", "w3", "--timeout", "1s", "--force"]);
     assert_eq!(forced.status.code(), Some(3), "{}", err(&forced));
+    assert!(
+        err(&forced).contains("warning: --force: receiving for seat w3 without its lease seat.w3"),
+        "{}",
+        err(&forced)
+    );
 
     // A held seat lease refuses too, with no host record (a bridge between the two).
     let lease = rt.block_on(async {
@@ -311,6 +316,79 @@ fn bridged_seats_refuse_interactive_waits() {
     rt.block_on(lease.release()).unwrap();
     let free = hub.run(&["note", "wait", "w4", "--timeout", "1s"]);
     assert_eq!(free.status.code(), Some(3), "{}", err(&free));
+}
+
+/// `note wait` holds the seat lease while it waits, and gives it up when it returns, a
+/// note or a signal ending it (PROTO-6).
+#[test]
+fn an_interactive_wait_holds_the_seat_lease() {
+    let Some(hub) = Hub::start("held") else {
+        return;
+    };
+    ok(&hub.run(&["init"]));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let bus = rt.block_on(async {
+        hgl_ai_bus::Bus::connect_url(&hub.url, Some(hub.token()))
+            .await
+            .unwrap()
+    });
+    let holder = || {
+        rt.block_on(bus.lock_get("seat.w5"))
+            .unwrap()
+            .map(|r| r.holder)
+    };
+    let spawn_wait = || {
+        hub.cmd(&["note", "wait", "w5", "--timeout", "60s"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap()
+    };
+    let held_by = |c: &Child| {
+        let want = format!("test-host pid {} (note wait)", c.id());
+        let end = Instant::now() + Duration::from_secs(20);
+        while holder().as_deref() != Some(want.as_str()) {
+            assert!(
+                Instant::now() < end,
+                "the wait took no lease: {:?}",
+                holder()
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        want
+    };
+
+    let waiting = spawn_wait();
+    let want = held_by(&waiting);
+    let refused = hub.run(&["note", "peek", "w5"]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(
+        err(&refused).contains(&format!("seat w5 is held by {want} (lease seat.w5 since")),
+        "{}",
+        err(&refused)
+    );
+    ok(&hub.run(&[
+        "note", "send", "--from", "claude", "--to", "w5", "--kind", "note", "--body", "go",
+    ]));
+    let done = waiting.wait_with_output().unwrap();
+    assert!(ok(&done).ends_with("go\n"), "{}", out(&done));
+    assert_eq!(holder(), None, "released when the wait returns");
+
+    // Interrupted, it gives the lease up too.
+    let waiting = spawn_wait();
+    held_by(&waiting);
+    let pid = waiting.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-INT", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let done = waiting.wait_with_output().unwrap();
+    assert_eq!(done.status.code(), Some(130), "{}", err(&done));
+    assert_eq!(holder(), None, "released on SIGINT");
 }
 
 #[test]

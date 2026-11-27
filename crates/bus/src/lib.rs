@@ -22,6 +22,9 @@
 //!   bucket's `max_age` expires, so a dead holder does not keep it.
 //!   [`Bus::lock_get`] names the present holder; [`Bus::lock_take_over`] takes
 //!   a lease from a holder known to be dead.
+//! - [`Bus::ended_put`] records in `HGL_ENDED` that a task ended for a seat, at
+//!   the stream sequence of the ending note; [`Bus::ended_get`] reads it back,
+//!   on any host (PROTO-14).
 //! - Every read is bounded: a note payload over [`MAX_NOTE_BYTES`] is refused
 //!   on send and terminated on receipt; buckets refuse values over
 //!   [`MAX_VALUE_BYTES`].
@@ -38,8 +41,9 @@ use async_nats::jetstream::{self, AckKind, context::Publish, kv, stream};
 use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
-    BROADCAST, HostRecord, KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES, LockRecord, Note, STREAM_NOTES,
-    SUBJECT_PREFIX, Seat, TreeRecord, utc_now_stamp,
+    BROADCAST, EndedRecord, HostRecord, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES,
+    LockRecord, Note, STREAM_NOTES, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord, ended_key,
+    utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -98,6 +102,8 @@ pub const HOSTS_TTL: Duration = Duration::from_secs(120);
 pub const TREES_HISTORY: i64 = 1;
 /// A lease in `HGL_LOCKS` expires this long after its last write (§3).
 pub const LOCKS_MAX_AGE: Duration = Duration::from_secs(30 * 60);
+/// An `HGL_ENDED` record outlives every note sent before it: the stream's `max_age` and a day.
+pub const ENDED_MAX_AGE: Duration = Duration::from_secs(NOTES_MAX_AGE.as_secs() + 86_400);
 /// Inbox `ack_wait` (§3); the bridge extends it with `in_progress` (PROTO-8).
 pub const INBOX_ACK_WAIT: Duration = Duration::from_secs(300);
 /// Inbox `max_deliver` (§3).
@@ -184,6 +190,7 @@ pub struct Bus {
     hosts: OnceCell<kv::Store>,
     trees: OnceCell<kv::Store>,
     locks: OnceCell<kv::Store>,
+    ended: OnceCell<kv::Store>,
 }
 
 impl Bus {
@@ -218,6 +225,7 @@ impl Bus {
             hosts: OnceCell::new(),
             trees: OnceCell::new(),
             locks: OnceCell::new(),
+            ended: OnceCell::new(),
         })
     }
 
@@ -285,6 +293,13 @@ impl Bus {
                 stream::StorageType::File,
                 1,
                 opts.locks_max_age,
+            ),
+            (
+                KV_ENDED,
+                "hgl-ai tasks ended per seat",
+                stream::StorageType::File,
+                1,
+                ENDED_MAX_AGE,
             ),
         ];
         for (bucket, description, storage, history, max_age) in buckets {
@@ -654,6 +669,73 @@ impl Bus {
                 acquired_at: "an unknown time".into(),
             })
         }))
+    }
+
+    /// The end of `task` for `seat` recorded in `HGL_ENDED`, if any (within the bucket's
+    /// `max_age`).
+    pub async fn ended_get(&self, seat: &Seat, task: &TaskKey) -> Result<Option<EndedRecord>> {
+        let key = ended_key(seat, task);
+        check_kv_key(&key)?;
+        let store = self.store(&self.ended, KV_ENDED).await?;
+        match live_entry(store, &key).await? {
+            Some(e) => serde_json::from_slice(&e.value)
+                .map(Some)
+                .map_err(|e| nats(&format!("reading ended task {key}"), e)),
+            None => Ok(None),
+        }
+    }
+
+    /// Record in `HGL_ENDED` that `task` ended for `seat` with the note at stream sequence
+    /// `seq` (compare-and-set: an end at a later sequence already recorded stands). Returns
+    /// the sequence recorded now.
+    pub async fn ended_put(&self, seat: &Seat, task: &TaskKey, seq: u64) -> Result<u64> {
+        let key = ended_key(seat, task);
+        check_kv_key(&key)?;
+        let store = self.store(&self.ended, KV_ENDED).await?;
+        let record = EndedRecord {
+            seq,
+            ended_at: utc_now_stamp(),
+        };
+        let value: bytes::Bytes = serde_json::to_vec(&record)
+            .map_err(|e| nats(&format!("encoding ended task {key}"), e))?
+            .into();
+        for attempt in 0..APPEND_ATTEMPTS {
+            let entry = live_entry(store, &key).await?;
+            let held = entry
+                .as_ref()
+                .and_then(|e| serde_json::from_slice::<EndedRecord>(&e.value).ok());
+            if let Some(h) = held.filter(|h| h.seq >= seq) {
+                return Ok(h.seq);
+            }
+            let done = match &entry {
+                Some(e) => store
+                    .update(&key, value.clone(), e.revision)
+                    .await
+                    .map(drop)
+                    .map_err(|e| {
+                        (
+                            e.kind() == kv::UpdateErrorKind::WrongLastRevision,
+                            e.to_string(),
+                        )
+                    }),
+                None => store
+                    .create(&key, value.clone())
+                    .await
+                    .map(drop)
+                    .map_err(|e| {
+                        (
+                            e.kind() == kv::CreateErrorKind::AlreadyExists,
+                            e.to_string(),
+                        )
+                    }),
+            };
+            match done {
+                Ok(()) => return Ok(seq),
+                Err((true, _)) => tokio::time::sleep(backoff(attempt)).await,
+                Err((false, e)) => return Err(nats(&format!("recording ended task {key}"), e)),
+            }
+        }
+        Err(BusError::Conflict { key, expected: 0 })
     }
 
     async fn store<'a>(

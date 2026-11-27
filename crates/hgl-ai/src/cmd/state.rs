@@ -2,7 +2,7 @@
 
 use anyhow::Context as _;
 use hgl_ai_bus::{Bus, BusError, MAX_VALUE_BYTES};
-use hgl_ai_proto::{HostRecord, KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES, STREAM_NOTES};
+use hgl_ai_proto::{HostRecord, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES, STREAM_NOTES};
 
 use super::note::read_bounded;
 use super::{Ctx, EXIT_FAIL, EXIT_OK, NotReady};
@@ -115,7 +115,14 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
 pub async fn init(ctx: &Ctx) -> anyhow::Result<i32> {
     let bus = connect(ctx).await?;
     bus.provision().await.context("provisioning the hub")?;
-    let names = [STREAM_NOTES, KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS];
+    let names = [
+        STREAM_NOTES,
+        KV_STATE,
+        KV_HOSTS,
+        KV_TREES,
+        KV_LOCKS,
+        KV_ENDED,
+    ];
     if ctx.json {
         println!("{}", serde_json::json!({ "provisioned": names }));
     } else {

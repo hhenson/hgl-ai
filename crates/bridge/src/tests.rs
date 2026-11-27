@@ -173,10 +173,31 @@ impl H {
         watch::Sender<bool>,
         tokio::task::JoinHandle<crate::Result<()>>,
     ) {
+        self.start_with(&self.cfg, only)
+    }
+
+    /// The configuration of another host, `host`, on the same hub: its own work root and
+    /// data directory.
+    fn other_host(&self, host: &str) -> Config {
+        let mut cfg = self.cfg.clone();
+        cfg.host = host.into();
+        cfg.paths.work_root = self.root.join(host).join("work").display().to_string();
+        cfg.paths.data_dir = self.root.join(host).join("data").display().to_string();
+        cfg
+    }
+
+    fn start_with(
+        &self,
+        cfg: &Config,
+        only: &[&str],
+    ) -> (
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<crate::Result<()>>,
+    ) {
         let trees = Trees::with(
-            Layout::new(self.work()).unwrap(),
-            &self.cfg.host,
-            &self.cfg.github,
+            Layout::new(cfg.paths.work_root.clone()).unwrap(),
+            &cfg.host,
+            &cfg.github,
             self.git.clone(),
         );
         let deps = Deps {
@@ -184,7 +205,7 @@ impl H {
             disk: self.disk.clone(),
         };
         let bridge = Bridge::new(
-            self.cfg.clone(),
+            cfg.clone(),
             self.bus.clone(),
             trees,
             deps,
@@ -512,6 +533,109 @@ async fn a_note_sent_before_its_task_ended_is_acked_without_a_turn() {
     stop(tx, j).await;
 }
 
+/// The seat moves to another host after its task ended: the hub's `HGL_ENDED` record, not
+/// the first host's cache, tells the new host the redelivered assignment is moot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_moved_to_another_host_keeps_its_ended_tasks() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let assign = note(
+        Kind::Assign,
+        "w1",
+        21,
+        "[claude] Assign: demo#21 Twenty-one",
+    );
+    let a = h.bus.push("w1", assign.clone());
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 21, "[claude] Landed: demo#21"),
+    );
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    assert_eq!(
+        h.bus.ended("w1", "demo", 21),
+        Some(l),
+        "recorded on the hub"
+    );
+    stop(tx, j).await;
+
+    let b = h.other_host("build-2");
+    let (tx, j) = h.start_with(&b, &["w1"]);
+    h.bus.redeliver("w1", a, assign.clone());
+    eventually("acked on the new host", || {
+        h.bus.events(a) == [Ev::Ack, Ev::Ack]
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.calls("codex").len(), 1, "no turn for the ended task");
+    let dir_b = h.root.join("build-2/work/w1/demo-21");
+    assert!(!dir_b.exists(), "no tree for the ended task");
+    assert!(
+        !h.root.join("build-2/data/bridge/ended/w1.json").exists(),
+        "the new host's cache had no record of it"
+    );
+    // An `assign` sent after the end starts the task again, on the new host.
+    let again = h.bus.push("w1", assign);
+    eventually("the new assign runs", || h.bus.events(again) == [Ev::Ack]).await;
+    assert_eq!(h.calls("codex").len(), 2);
+    assert!(dir_b.exists());
+    stop(tx, j).await;
+}
+
+/// Without the hub's `HGL_ENDED`, no turn starts for a task and no end is acked unrecorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ended_tasks_wait_for_the_hub() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    h.bus.ended_down(true, false);
+    let a = h.bus.push(
+        "w1",
+        note(
+            Kind::Assign,
+            "w1",
+            22,
+            "[claude] Assign: demo#22 Twenty-two",
+        ),
+    );
+    eventually("naked while the hub cannot say", || {
+        h.bus.events(a).first() == Some(&Ev::Nak(Duration::from_millis(50)))
+    })
+    .await;
+    assert!(h.calls("codex").is_empty());
+    h.bus.ended_down(false, false);
+    eventually("run once the hub answers", || {
+        h.bus.events(a).last() == Some(&Ev::Ack)
+    })
+    .await;
+    assert_eq!(h.calls("codex").len(), 1);
+
+    // The end cannot be recorded: the tree goes at once, the note is naked and retried.
+    h.bus.ended_down(false, true);
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 22, "[claude] Landed: demo#22"),
+    );
+    eventually("landed naked", || {
+        h.bus.events(l).first() == Some(&Ev::Nak(Duration::from_millis(50)))
+    })
+    .await;
+    assert!(!h.work().join("w1/demo-22").exists());
+    h.bus.ended_down(false, false);
+    eventually("landed acked once recorded", || {
+        h.bus.events(l).last() == Some(&Ev::Ack)
+    })
+    .await;
+    assert_eq!(h.bus.ended("w1", "demo", 22), Some(l));
+    assert_eq!(
+        h.bus.sent_containing("Cleanup: demo#22").len(),
+        1,
+        "one cleanup receipt"
+    );
+    stop(tx, j).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_seat_whose_lease_another_bridge_holds_is_not_served() {
     let h = harness();
@@ -558,6 +682,18 @@ async fn the_lease_of_a_crashed_bridge_of_this_host_is_taken_over() {
     );
     eventually("served at once", || h.bus.events(n) == [Ev::Ack]).await;
     let ours = format!("build-1 pid {} (bridge)", std::process::id());
+    assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours.clone()));
+    stop(tx, j).await;
+
+    // Likewise the lease of a `note wait` of this host that is gone.
+    h.bus
+        .steal_lease("seat.w1", "build-1 pid 999999999 (note wait)");
+    let (tx, j) = h.start(&["w1"]);
+    let n = h.bus.push(
+        "w1",
+        Note::new(seat("claude"), seat("w1"), Kind::Note, "again"),
+    );
+    eventually("served at once", || h.bus.events(n) == [Ev::Ack]).await;
     assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours));
     stop(tx, j).await;
 }
@@ -623,7 +759,8 @@ async fn a_lost_seat_lease_stops_the_seat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_oversized_line_then_a_hang_is_killed_and_turns_never_overlap() {
     let mut h = harness();
-    h.opts.turn_timeout = Duration::from_millis(700);
+    // Long enough for each attempt to reach its helpers on a loaded runner.
+    h.opts.turn_timeout = Duration::from_secs(2);
     let c = h.calls.display().to_string();
     h.script(
         "codex",
@@ -871,6 +1008,33 @@ async fn shutdown_stops_a_running_turn_after_the_grace_and_naks() {
         .parse()
         .unwrap();
     assert!(!alive(p));
+}
+
+/// The inbox fetcher ending under a running turn (the race behind a shutdown that left the
+/// turn running): the turn is stopped and its note naked, as at shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_inbox_fetcher_stops_the_running_turn() {
+    let h = harness();
+    let pid = h.calls.join("pid");
+    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 9, "[claude] Assign: demo#9 Nine"),
+    );
+    eventually("turn running", || pid.exists()).await;
+    h.bus.break_inbox();
+    eventually("the turn's note naked", || {
+        h.bus.events(a) == [Ev::Nak(Duration::from_millis(50))]
+    })
+    .await;
+    let p: i32 = std::fs::read_to_string(&pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    eventually("the turn stopped", || !alive(p)).await;
+    stop(tx, j).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
