@@ -371,7 +371,8 @@ pub async fn thread(State(app): AppState, h: HeaderMap, Path(id): Path<String>) 
     let Some(bus) = app.hub() else {
         return framed(&app, &s, "", "Thread", "", None).await;
     };
-    let t = match owner::show(bus, &id).await {
+    // A long thread's record leaves out its oldest messages: the page shows them all.
+    let t = match owner::show_full(bus, &id).await {
         Ok(Some(t)) => t,
         Ok(None) | Err(owner::Error::Invalid(_)) => {
             return message_page(

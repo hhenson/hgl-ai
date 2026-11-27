@@ -168,13 +168,85 @@ pub struct Thread {
     pub suggested: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub answer: Option<Answer>,
+    /// The newest messages; [`Thread::older`] more are only in `HGL_OWNER`.
     #[serde(default)]
     pub messages: Vec<Message>,
     /// The `HGL_OWNER` sequence of the last event folded in.
     pub seq: u64,
+    /// Messages left out of this record (the oldest), kept in `HGL_OWNER`.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub older: u64,
+    /// Some text of this record is shortened; `HGL_OWNER` has it whole.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cut: bool,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
+}
+
+/// A thread record's size at most, encoded: well inside the bucket's value limit.
+pub const RECORD_MAX: usize = 256 << 10;
+/// The newest messages a record keeps.
+pub const MESSAGES_KEPT: usize = 50;
+/// A message body, the context or the question in a record, at most (bytes).
+pub const TEXT_MAX: usize = 16 << 10;
+
+const SHORTENED: &str = "\n[... shortened in the record; `hgl-ai thread show` reads it whole]";
+
+/// `s` cut to at most `max` bytes on a character boundary, with a marker; whether cut.
+fn shorten(s: &mut String, max: usize) -> bool {
+    if s.len() <= max {
+        return false;
+    }
+    let mut end = max.saturating_sub(SHORTENED.len());
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push_str(SHORTENED);
+    true
 }
 
 impl Thread {
+    /// Keep the record within [`RECORD_MAX`]: long texts shortened, the newest
+    /// [`MESSAGES_KEPT`] messages, fewer if they are still too large. What is left out
+    /// stays in `HGL_OWNER`.
+    pub fn bound(&mut self) {
+        let mut cut = false;
+        cut |= shorten(&mut self.context, TEXT_MAX);
+        cut |= shorten(&mut self.question, TEXT_MAX);
+        for o in &mut self.options {
+            cut |= shorten(&mut o.line, 1024);
+        }
+        if let Some(a) = &mut self.answer {
+            cut |= shorten(&mut a.text, TEXT_MAX);
+            cut |= shorten(&mut a.note, TEXT_MAX);
+        }
+        for m in &mut self.messages {
+            cut |= shorten(&mut m.body, TEXT_MAX);
+        }
+        let drop = self.messages.len().saturating_sub(MESSAGES_KEPT);
+        if drop > 0 {
+            self.messages.drain(..drop);
+            self.older += drop as u64;
+        }
+        while !self.messages.is_empty() && self.encoded_len() > RECORD_MAX {
+            self.messages.remove(0);
+            self.older += 1;
+        }
+        self.cut |= cut;
+    }
+
+    pub fn encoded_len(&self) -> usize {
+        serde_json::to_vec(self).map_or(usize::MAX, |v| v.len())
+    }
+
+    /// Whether `HGL_OWNER` holds more of this thread than the record.
+    pub fn partial(&self) -> bool {
+        self.older > 0 || self.cut
+    }
+
     pub fn is_open(&self) -> bool {
         self.state == ThreadState::Open
     }
@@ -353,6 +425,9 @@ mod tests {
         assert_eq!(parse_issue("spec/rule-7"), None);
         assert_eq!(parse_issue("a#0"), None);
         assert!("p2".parse::<Priority>().unwrap() < Priority::P3);
+        let mut s = "é".repeat(100);
+        assert!(shorten(&mut s, 120));
+        assert!(s.len() <= 120 && s.ends_with("reads it whole]"));
         assert_eq!(signed("HPH", "20261127T140500Z"), "HPH, 27 Nov 14:05");
         assert_eq!(signed("HPH", "20260105T090000Z"), "HPH, 5 Jan 09:00");
         assert_eq!(quote_date("20261127T140500Z"), "2026-11-27");

@@ -142,7 +142,7 @@ pub async fn thread(ctx: &Ctx, a: ThreadArgs) -> anyhow::Result<i32> {
             }
         }
         ThreadCmd::Show { id } => {
-            let Some(t) = owner::show(&connect(ctx).await?, &id).await? else {
+            let Some(t) = owner::show_full(&connect(ctx).await?, &id).await? else {
                 eprintln!(
                     "hgl-ai: no thread {id} (a question just asked appears once the console has indexed it)"
                 );

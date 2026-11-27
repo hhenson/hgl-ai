@@ -280,6 +280,8 @@ pub fn fold(
                     answer: None,
                     messages: Vec::new(),
                     seq,
+                    older: 0,
+                    cut: false,
                 }
             }
             Body::Start { title, issue, body } => {
@@ -312,6 +314,8 @@ pub fn fold(
                         body: body.clone(),
                     }],
                     seq,
+                    older: 0,
+                    cut: false,
                 };
                 fx.notes.push(owner_note(
                     &t,
@@ -770,6 +774,49 @@ mod tests {
         let mut forged = start.clone();
         forged.id = "c-00000002".into();
         assert!(fold(None, &agent_subject("c-00000002"), 9, &forged, &ctl()).is_err());
+    }
+
+    /// Two 600 KiB replies and many more: the record stays within its bound; what it
+    /// leaves out is counted (and stays in the stream).
+    #[test]
+    fn records_stay_bounded() {
+        let ask = ask_event(ID);
+        let (mut t, _) = fold(None, &ask.subject(), 1, &ask, &ctl()).unwrap();
+        let big = "x".repeat(600 << 10);
+        for i in 0..2u64 {
+            let ev = Event {
+                body: Body::Message { body: big.clone() },
+                ..ask_event(ID)
+            };
+            t = fold(Some(&t), &ev.subject(), 2 + i, &ev, &ctl()).unwrap().0;
+        }
+        assert!(
+            t.encoded_len() > crate::model::RECORD_MAX,
+            "unbounded, it is too big"
+        );
+        t.bound();
+        assert!(
+            t.encoded_len() <= crate::model::RECORD_MAX,
+            "{}",
+            t.encoded_len()
+        );
+        assert!(t.cut && t.messages.len() == 2 && t.partial());
+        for i in 0..60u64 {
+            let ev = Event {
+                body: Body::Message {
+                    body: format!("m{i}"),
+                },
+                ..ask_event(ID)
+            };
+            t = fold(Some(&t), &ev.subject(), 10 + i, &ev, &ctl())
+                .unwrap()
+                .0;
+            t.bound();
+        }
+        assert_eq!(t.messages.len(), crate::model::MESSAGES_KEPT);
+        assert_eq!(t.older, 12);
+        assert_eq!(t.messages.last().unwrap().body, "m59");
+        assert!(t.encoded_len() <= crate::model::RECORD_MAX);
     }
 
     #[test]

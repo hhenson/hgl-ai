@@ -433,6 +433,8 @@ async fn sessions_and_the_p2_batch_survive_a_restart() {
         answer: None,
         messages: vec![],
         seq: 1,
+        older: 0,
+        cut: false,
     };
     assert!(hgl_ai_console::service::on_new_question(&first, &t).is_none());
     tokio::time::sleep(Duration::from_millis(500)).await;

@@ -86,28 +86,23 @@ pub struct Feed {
 }
 
 impl Feed {
-    /// Wait up to `wait` for events; return at most `max`.
-    pub async fn fetch(&mut self, max: usize, wait: Duration) -> Result<Vec<StreamMsg>> {
+    /// Wait up to `wait` for the next event. The feed holds one event in flight, so this
+    /// asks for one: a request for more would wait out `wait` for events that cannot come
+    /// before this one is acknowledged.
+    pub async fn next(&mut self, wait: Duration) -> Result<Option<StreamMsg>> {
         let mut batch = self
             .consumer
             .fetch()
-            .max_messages(max.max(1))
+            .max_messages(1)
             .expires(wait.max(Duration::from_millis(10)))
             .messages()
             .await
             .map_err(|e| nats("reading the owner feed", e))?;
-        let mut out = Vec::new();
-        while let Some(m) = batch.next().await {
-            match m {
-                Ok(m) => out.push(to_msg(m, true)?),
-                Err(e) if !out.is_empty() => {
-                    tracing::warn!("owner feed read stopped early: {e}");
-                    break;
-                }
-                Err(e) => return Err(nats("reading the owner feed", e)),
-            }
+        match batch.next().await {
+            Some(Ok(m)) => Ok(Some(to_msg(m, true)?)),
+            Some(Err(e)) => Err(nats("reading the owner feed", e)),
+            None => Ok(None),
         }
-        Ok(out)
     }
 }
 

@@ -179,6 +179,37 @@ pub async fn show(bus: &Bus, id: &str) -> Result<Option<Thread>> {
     Ok(bus.thread_get::<Thread>(id).await?.map(|(t, _)| t))
 }
 
+/// The whole thread, every message and every word, folded again from its events in
+/// `HGL_OWNER` (a record leaves out the oldest messages of a long thread). `None` when
+/// the console has not indexed it.
+pub async fn show_full(bus: &Bus, id: &str) -> Result<Option<Thread>> {
+    let Some(rec) = show(bus, id).await? else {
+        return Ok(None);
+    };
+    if !rec.partial() {
+        return Ok(Some(rec));
+    }
+    let controller = Seat::new(rec.seat.clone()).map_err(|e| invalid(e.to_string()))?;
+    let msgs = bus
+        .history(
+            STREAM_OWNER,
+            &format!("hgl.*.thread.{id}"),
+            chrono::DateTime::UNIX_EPOCH,
+            100_000,
+        )
+        .await?;
+    let mut t: Option<Thread> = None;
+    for m in &msgs {
+        let Ok(ev) = serde_json::from_slice::<Event>(&m.payload) else {
+            continue;
+        };
+        if let Ok((next, _)) = fold(t.as_ref(), &m.subject, m.seq, &ev, &controller) {
+            t = Some(next);
+        }
+    }
+    Ok(t.or(Some(rec)))
+}
+
 /// The owner's event in a thread, stamped with the signed-in `user` and their `handle`
 /// (OWN-10): the console's hub user alone may publish it (OWN-5, OWN-6). Returns the
 /// stream sequence.
@@ -268,7 +299,7 @@ pub async fn apply(bus: &Bus, controller: &Seat, msg: &StreamMsg) -> Result<Appl
     };
     for _ in 0..8 {
         let rec = bus.thread_get::<Thread>(id).await?;
-        let (t, fx) = match fold(
+        let (mut t, fx) = match fold(
             rec.as_ref().map(|(t, _)| t),
             &msg.subject,
             msg.seq,
@@ -286,6 +317,8 @@ pub async fn apply(bus: &Bus, controller: &Seat, msg: &StreamMsg) -> Result<Appl
         if let Some(line) = &fx.decision {
             decision_once(bus, line).await?;
         }
+        // The record stays within the bucket's limit; the stream keeps every word.
+        t.bound();
         match bus
             .thread_put(id, &t, rec.as_ref().map_or(0, |(_, r)| *r))
             .await
@@ -427,6 +460,8 @@ mod tests {
             answer: None,
             messages: vec![],
             seq: 1,
+            older: 0,
+            cut: false,
         };
         let v = by_urgency(vec![
             t("q-00000001", Some(Priority::P3), ThreadState::Open, "1"),

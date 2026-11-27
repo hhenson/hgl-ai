@@ -147,7 +147,7 @@ pub async fn fold_batch(
     feed: &mut hgl_ai_bus::Feed,
     wait: Duration,
 ) -> hgl_ai_owner::Result<usize> {
-    let msgs = feed.fetch(32, wait).await?;
+    let msgs: Vec<_> = feed.next(wait).await?.into_iter().collect();
     for (i, m) in msgs.iter().enumerate() {
         #[cfg(test)]
         let applied = match tests::FAIL_ONCE.compare_exchange(
@@ -479,6 +479,73 @@ pub(crate) mod tests {
         Some((s, format!("nats://127.0.0.1:{port}"), token))
     }
 
+    /// A thread past the bucket's value limit: two 600 KiB replies fold, the record stays
+    /// bounded, later events still fold, and the whole thread reads back from the stream.
+    #[tokio::test]
+    async fn a_long_thread_does_not_block_the_feed() {
+        let Some((_srv, url, token)) = hub() else {
+            eprintln!("skipped: nats-server is not on PATH");
+            return;
+        };
+        let bus = Bus::connect_url(&url, Some(token)).await.unwrap();
+        bus.provision().await.unwrap();
+        let d = tempfile::tempdir().unwrap();
+        let a = app(d.path());
+        let claude = Seat::new("claude").unwrap();
+        let id = owner::ask(
+            &bus,
+            &claude,
+            owner::Ask {
+                title: "Long".into(),
+                priority: Priority::P3,
+                issue: None,
+                context: String::new(),
+                question: "Q?".into(),
+                options: vec![],
+                suggested: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Two different replies: the same event twice is one (the stream drops a resend).
+        let big = "y".repeat(600 << 10);
+        owner::reply(&bus, &claude, &id, &big).await.unwrap();
+        owner::reply(&bus, &claude, &id, &"z".repeat(600 << 10))
+            .await
+            .unwrap();
+        let last = owner::reply(&bus, &claude, &id, "the end").await.unwrap();
+        let filters = vec![format!("{CONSOLE_PREFIX}.>"), format!("{OWNER_PREFIX}.>")];
+        let mut feed = bus.owner_feed(owner::FEED, filters).await.unwrap();
+        let start = std::time::Instant::now();
+        for _ in 0..20 {
+            // The service's own wait: a fetch for more than one event would sit out the
+            // whole of it each time.
+            fold_batch(&a, &bus, &mut feed, Duration::from_secs(5))
+                .await
+                .unwrap();
+            if owner::show(&bus, &id)
+                .await
+                .unwrap()
+                .is_some_and(|t| t.seq >= last)
+            {
+                break;
+            }
+        }
+        let t = owner::show(&bus, &id).await.unwrap().unwrap();
+        assert_eq!(t.seq, last, "every event folded");
+        assert!(t.cut && t.encoded_len() <= owner::model::RECORD_MAX);
+        // Four events, one in flight at a time, without waiting out each fetch.
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "{:?}",
+            start.elapsed()
+        );
+        let full = owner::show_full(&bus, &id).await.unwrap().unwrap();
+        assert_eq!(full.messages.len(), 3);
+        assert_eq!(full.messages[0].body, big, "the stream has every word");
+        assert_eq!(full.messages[2].body, "the end");
+    }
+
     /// Carbon's probe: the answer's fold fails once while the thread's next event waits.
     /// The next event is not folded first, the answer is not lost, and its ruling reaches
     /// `decisions.log`.
@@ -604,6 +671,8 @@ pub(crate) mod tests {
             answer: None,
             messages: vec![],
             seq: 1,
+            older: 0,
+            cut: false,
         }
     }
 
