@@ -287,6 +287,7 @@ async fn a_recreated_tree_keeps_the_class_from_its_record() {
             class,
             class_seq,
             seq: None,
+            handoff_seq: None,
         };
     // The task was moved from w2, where a sendback made it complex (seq 50), to w1 on
     // another host, where a later-made tree still says simple from its assign (seq 10).
@@ -413,6 +414,36 @@ async fn a_sendback_to_another_seat_moves_the_task_there_at_its_class() {
         "w2's tree is the newer"
     );
     assert_eq!(trees["build-1.w2.demo-41"].class, Some(TaskClass::Standard));
+    assert_eq!(trees["build-1.w2.demo-41"].handoff_seq, Some(s));
+    stop(tx, j).await;
+
+    // hgl-ai#44: a sendback moves the task back to w1, into its older tree, kept: that
+    // tree now holds the newest handoff, so verdicts without `--to` reach w1 again.
+    // After the startup report, whose listing would otherwise race the turn's record.
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("startup report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    let back = h.bus.push(
+        "w1",
+        note(
+            Kind::Sendback,
+            "w1",
+            41,
+            "[claude] Sent back: demo#41 at 1f461fa7",
+        ),
+    );
+    eventually("sendback to w1 acked", || h.bus.events(back) == [Ev::Ack]).await;
+    let trees = h.bus.trees();
+    let w1 = &trees["build-1.w1.demo-41"];
+    assert_eq!(
+        (w1.seq, w1.handoff_seq),
+        (Some(a), Some(back)),
+        "the kept tree keeps its seq and takes the newer handoff"
+    );
+    assert!(w1.handoff_seq > trees["build-1.w2.demo-41"].handoff_seq);
     stop(tx, j).await;
 }
 

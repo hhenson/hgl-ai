@@ -104,9 +104,34 @@ pub fn task_class(recorded: Classed, notes: &[(u64, u64, Note)], made_by: Option
     })
 }
 
+/// The stream sequence of the newest `assign` or `sendback` among these notes: a handoff
+/// that moved the task to this seat (PROTO-21).
+pub fn newest_handoff(notes: &[(u64, u64, Note)]) -> Option<u64> {
+    notes
+        .iter()
+        .filter(|(_, _, n)| matches!(n.kind, Kind::Assign | Kind::Sendback))
+        .map(|(seq, _, _)| *seq)
+        .max()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_newest_handoff_is_an_assign_or_sendback() {
+        let n = |seq, kind| classed(seq, kind, None);
+        assert_eq!(newest_handoff(&[]), None);
+        assert_eq!(
+            newest_handoff(&[
+                n(3, Kind::Assign),
+                n(9, Kind::Approved),
+                n(5, Kind::Sendback)
+            ]),
+            Some(5)
+        );
+        assert_eq!(newest_handoff(&[n(9, Kind::Question)]), None);
+    }
 
     fn classed(seq: u64, kind: Kind, class: Option<TaskClass>) -> (u64, u64, Note) {
         let s = |x: &str| hgl_ai_proto::Seat::new(x).unwrap();
@@ -462,10 +487,19 @@ impl<B: BusApi> Bridge<B> {
         // The task's authors (ROLE-11): every family whose turns run in an implementor
         // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
         if let Some(f) = file.as_mut() {
-            let author = !matches!(job.target, Target::Tree { review: true, .. })
-                && !f.families.contains(&r.family);
+            let implementor = !matches!(job.target, Target::Tree { review: true, .. });
+            let author = implementor && !f.families.contains(&r.family);
             if author {
                 f.families.push(r.family);
+            }
+            // The newest handoff this tree ran, even one reusing it after another seat's
+            // tree was made: verdicts go to that tree's seat (PROTO-21).
+            let handoff = implementor
+                .then(|| newest_handoff(&job.notes))
+                .flatten()
+                .filter(|n| f.handoff_seq.is_none_or(|h| *n > h));
+            if let Some(n) = handoff {
+                f.handoff_seq = Some(n);
             }
             let reclassed = (f.class, f.class_seq) != (class, class_seq);
             if reclassed {
@@ -473,7 +507,7 @@ impl<B: BusApi> Bridge<B> {
                 f.class = class;
                 f.class_seq = class_seq;
             }
-            if author || reclassed {
+            if author || reclassed || handoff.is_some() {
                 match hgl_ai_tree::write_task(&dir, f) {
                     Ok(()) => {
                         let d = dir.clone();

@@ -569,10 +569,14 @@ pub struct TreeRecord {
     /// The stream sequence of the note that last set `class` (PROTO-21).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_seq: Option<u64>,
-    /// The stream sequence of the note whose turn made the tree (PROTO-14): of a task's
-    /// implementor trees, the newest is its current seat, which verdicts go to (PROTO-21).
+    /// The stream sequence of the note whose turn made the tree (PROTO-14).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<u64>,
+    /// The stream sequence of the newest `assign` or `sendback` a turn in this tree ran:
+    /// of a task's implementor trees, the one with the newest (or else `seq`) is its current
+    /// seat, which verdicts go to (PROTO-21). A reused tree takes the later handoff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_seq: Option<u64>,
 }
 
 impl TreeRecord {

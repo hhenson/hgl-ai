@@ -244,11 +244,14 @@ A model's family comes from the `[models.<family>]` table that names it; an
 - A seat keeps one session per task, so context carries across that task's
   turns and is dropped when the task ends. Reviewers always start fresh.
 - The bridge runs each turn under `cap` with the seat's limit, in its own slice,
-  in the task's worktree. `codex` runs in its `workspace-write` sandbox over the
-  task directory and the clone; `claude` (`--permission-mode bypassPermissions`,
-  `--add-dir`) and `agy` (`--dangerously-skip-permissions`) run with the user's
-  own permissions. A turn that exceeds `turn_timeout` is stopped and counted as a
-  failure (PROTO-8).
+  in the task's worktree. `codex` runs under a named permission profile
+  (`default_permissions`, `permissions.hgl_task`): the disk readable, the task
+  directory and the clone writable, the network on. Not `workspace-write` with
+  `writable_roots`: that makes each root's `.git`, and a `gitdir:` pointer's
+  target, read-only, so a worktree could not commit (hgl-ai#29). `claude`
+  (`--permission-mode bypassPermissions`, `--add-dir`) and `agy`
+  (`--dangerously-skip-permissions`) run with the user's own permissions. A turn
+  that exceeds `turn_timeout` is stopped and counted as a failure (PROTO-8).
 - A quota refusal is recognised only from the runtime's structured output (error
   events and results and their status), never from stderr; the patterns live in
   the adapter, with fixtures of refusals and of ordinary failures that mention
