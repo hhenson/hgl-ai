@@ -53,13 +53,14 @@ Open decisions are issues in this repository.
     merged onto `main`, one run at a time, and sends a factual receipt. Not part of
     this repository.
   - *bridge*: delivers notes, runs agent turns, owns worktrees (protocol §5).
-  - *builder* (proposed, not implemented): runs build recipes for local and remote
-    requests and the merge queue, and returns bounded summaries (`docs/build.md`).
+  - *builder*: runs build recipes for local and remote requests (the merge queue's
+    too, once it exists), and returns bounded summaries (`docs/build.md`).
   - *merge queue* (proposed, not implemented): builds approved pull requests in
     batches on every platform and lands them (`docs/build.md` §3).
-- **ROLE-8 — Build agent** (seat `build`; proposed, not implemented). Writes and
-  repairs recipes, provisions toolchains and SDKs, diagnoses failures of the build
-  itself; never changes the code under build.
+- **ROLE-8 — Build agent** (seat role `build`). Writes and repairs recipes,
+  provisions toolchains and SDKs, diagnoses failures of the build itself; never
+  changes the code under build. Its hub user has the `build` role, the only one that
+  writes recipes (`docs/install.md`); a build that is *not run* goes to it.
 
 ## 2. Gates
 

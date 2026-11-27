@@ -223,6 +223,7 @@ string_enum!(
     /// Team roles (docs/roles.md §1).
     Role, "role", {
     Controller => "controller", Architect => "architect", Triage => "triage", Implementor => "implementor", Reviewer => "reviewer",
+    Build => "build",
 });
 
 string_enum!(
@@ -631,6 +632,12 @@ mod tests {
         assert!(check_state_key("a/b=c").is_ok());
         assert!(check_state_key("").is_err());
         assert!(check_state_key("a b").is_err());
+    }
+
+    #[test]
+    fn the_build_agent_is_a_role() {
+        // docs/roles.md ROLE-8; the skill sends not-run builds to it.
+        assert_eq!("build".parse::<Role>().unwrap().as_str(), "build");
     }
 
     #[test]
