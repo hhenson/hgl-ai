@@ -1286,6 +1286,7 @@ name = "hgl-ai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-nats",
  "chrono",
  "clap",
  "hgl-ai-bridge",

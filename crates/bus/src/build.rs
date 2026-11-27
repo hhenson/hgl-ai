@@ -154,6 +154,20 @@ impl Bus {
     /// The last note sent to `address` (an address no inbox serves, such as a build's
     /// reply address), waiting up to `wait` for one. A note that does not parse is an error.
     pub async fn reply_wait(&self, address: &Seat, wait: Duration) -> Result<Option<Note>> {
+        Ok(self
+            .reply_wait_after(address, 0, wait)
+            .await?
+            .map(|(_, n)| n))
+    }
+
+    /// [`Bus::reply_wait`] for a note after stream sequence `after` (one already read and
+    /// passed over), with its sequence; polling at the same pace either way.
+    pub async fn reply_wait_after(
+        &self,
+        address: &Seat,
+        after: u64,
+        wait: Duration,
+    ) -> Result<Option<(u64, Note)>> {
         let stream = self
             .js
             .get_stream(STREAM_NOTES)
@@ -163,11 +177,13 @@ impl Bus {
         let deadline = Instant::now().checked_add(wait);
         loop {
             match stream.get_last_raw_message_by_subject(&subject).await {
-                Ok(m) => {
+                Ok(m) if m.sequence > after => {
                     let note = super::parse_note(m.subject.as_str(), &m.payload)
                         .map_err(|r| BusError::Nats(format!("the reply to {address}: {r}")))?;
-                    return Ok(Some(note));
+                    return Ok(Some((m.sequence, note)));
                 }
+                // Already read: wait for a newer one.
+                Ok(_) => {}
                 Err(e)
                     if e.kind()
                         == async_nats::jetstream::stream::LastRawMessageErrorKind::NoMessageFound => {}

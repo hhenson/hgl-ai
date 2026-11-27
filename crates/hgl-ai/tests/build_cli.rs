@@ -152,6 +152,24 @@ impl Hub {
     fn run(&self, args: &[&str]) -> Output {
         self.cmd(args).output().unwrap()
     }
+
+    /// JetStream API requests the hub has answered so far.
+    fn api_requests(&self) -> u64 {
+        let cfg = hgl_ai_config::Config::load(&self.config).unwrap();
+        let token = std::fs::read_to_string(cfg.hub.token_file).unwrap();
+        tokio::runtime::Runtime::new().unwrap().block_on(async {
+            let c = async_nats::ConnectOptions::with_token(token.trim().to_string())
+                .connect(cfg.hub.url.as_str())
+                .await
+                .unwrap();
+            async_nats::jetstream::new(c)
+                .query_account()
+                .await
+                .unwrap()
+                .requests
+                .total
+        })
+    }
 }
 
 fn text(o: &Output) -> String {
@@ -460,6 +478,82 @@ fn builder_runs_a_remote_build_through_the_hub() {
         "{}",
         text(&o)
     );
+
+    // Waiting on the builder's own host for a build still running (Carbon's check of
+    // the round-two fixes, finding 1): the builder's run has no pid file, which is no
+    // reason to call it stopped.
+    let slow = hub.dir.0.join("slow.toml");
+    std::fs::write(
+        &slow,
+        RECIPE.replace(
+            "test -f main.c && echo prepared",
+            "sleep 2 && test -f main.c && echo prepared",
+        ),
+    )
+    .unwrap();
+    let o = hub.run(&["build", "recipe", "import", &slow.display().to_string()]);
+    assert!(o.status.success(), "{}", text(&o));
+    let o = hub
+        .cmd(&[
+            "build",
+            "run",
+            "--platform",
+            platform(),
+            "--steps",
+            "prepare",
+            "--detach",
+        ])
+        .current_dir(&seed)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let id4 = String::from_utf8_lossy(&o.stdout).trim().to_string();
+    // Once the builder has taken it (its run directory exists).
+    let status = hub
+        .dir
+        .0
+        .join("work/builder/logs/lab1")
+        .join(&id4)
+        .join("status.json");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !status.is_file() {
+        assert!(Instant::now() < deadline, "the builder did not take it");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let t0 = Instant::now();
+    let o = hub.run(&["build", "wait", &id4, "--timeout", "60s"]);
+    assert_eq!(o.status.code(), Some(0), "waited for the end\n{}", text(&o));
+    assert!(
+        t0.elapsed() >= Duration::from_millis(1500),
+        "{:?}",
+        t0.elapsed()
+    );
+    let o = hub.run(&["build", "recipe", "import", &recipe.display().to_string()]);
+    assert!(o.status.success(), "{}", text(&o));
+
+    // A stray note on a build's reply address is read once, and the wait keeps its pace
+    // (finding 2): a few hub requests a second, not thousands.
+    let stray = "20261127-230000-abcdef";
+    let o = hub.run(&[
+        "note",
+        "send",
+        "--from",
+        "w2",
+        "--to",
+        &format!("r-{stray}"),
+        "--kind",
+        "note",
+        "--body",
+        "x",
+    ]);
+    assert!(o.status.success(), "{}", text(&o));
+    let before = hub.api_requests();
+    let t0 = Instant::now();
+    let o = hub.run(&["build", "wait", stray, "--timeout", "3s"]);
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(t0.elapsed() >= Duration::from_secs(3), "{:?}", t0.elapsed());
+    let calls = hub.api_requests() - before;
+    assert!(calls < 100, "{calls} hub requests in a 3s wait");
 
     // A local run with the hub's recipe.
     let logs = hub.dir.0.join("logs");

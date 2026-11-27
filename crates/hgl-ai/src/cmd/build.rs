@@ -693,6 +693,7 @@ async fn wait_remote(
     let reply = reply_seat(id)?;
     let deadline = timeout.map(|t| Instant::now() + t);
     let mut gone = 0;
+    let mut seen = 0;
     loop {
         let left = deadline.map(|d| d.saturating_duration_since(Instant::now()));
         if left.is_some_and(|l| l.is_zero()) {
@@ -700,8 +701,9 @@ async fn wait_remote(
         }
         let step = left.unwrap_or(Duration::MAX).min(Duration::from_secs(30));
         // Only the builder's receipt of this build counts; another note on the address
-        // (a stray or a forged one) is passed over, the hub's copy standing in.
-        if let Some(n) = bus.reply_wait(&reply, step).await? {
+        // (a stray or a forged one) is passed over once, the hub's copy standing in.
+        if let Some((seq, n)) = bus.reply_wait_after(&reply, seen, step).await? {
+            seen = seq;
             match store::parse_receipt(&n, id) {
                 Ok(s) => return Ok(Some(s)),
                 Err(e) => tracing::warn!("build {id}: {e}; reading the hub's copy"),
@@ -752,22 +754,26 @@ fn find_local(id: &str, arg: Option<PathBuf>, cfg: Option<&Config>) -> Option<Pa
 }
 
 /// The local status, marked stopped when its process is gone before the end.
+/// A run of `build run` on this host keeps its process id in `pid`; a builder's runs do
+/// not (the builder service runs them), and their end is read from the hub.
+fn local_run(dir: &Path) -> bool {
+    dir.join("pid").is_file()
+}
+
 fn local_status(dir: &Path) -> Option<Summary> {
-    let s = store::read_status(dir);
+    let mut s = store::read_status(dir)?;
+    if !local_run(dir) {
+        return Some(s);
+    }
     let pid: i32 = std::fs::read_to_string(dir.join("pid"))
         .ok()
         .and_then(|p| p.trim().parse().ok())
         .unwrap_or(0);
-    match s {
-        Some(mut s) if !s.status.is_final() && !pid_alive(pid) => {
-            s.status = BuildStatus::Stopped;
-            s.reason = Some("the build's process is gone".into());
-            Some(s)
-        }
-        Some(s) => Some(s),
-        None if !pid_alive(pid) => None,
-        None => None,
+    if !s.status.is_final() && !pid_alive(pid) {
+        s.status = BuildStatus::Stopped;
+        s.reason = Some("the build's process is gone".into());
     }
+    Some(s)
 }
 
 async fn status(ctx: &Ctx, id: &str, log_dir: Option<PathBuf>) -> anyhow::Result<i32> {
@@ -802,7 +808,9 @@ async fn wait(
     check_build_id(id)?;
     let cfg = ctx.load_config().ok();
     let deadline = timeout.map(|t| Instant::now() + t);
-    if let Some(d) = find_local(id, log_dir, cfg.as_ref()) {
+    // A builder's run on this host is waited for as from anywhere: its receipt, or the
+    // hub's copy.
+    if let Some(d) = find_local(id, log_dir, cfg.as_ref()).filter(|d| local_run(d)) {
         loop {
             if let Some(s) = local_status(&d).filter(|s| s.status.is_final()) {
                 print_summary(ctx, &s);
