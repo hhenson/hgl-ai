@@ -61,8 +61,7 @@ impl App {
             .console_dir()
             .map_err(|e| Error::Config(e.to_string()))?;
         let auth = Auth::new(&console, &dir)?;
-        let controller =
-            Seat::new(cfg.github.controller.clone()).map_err(|e| Error::Config(e.to_string()))?;
+        let controller = cfg.controller().map_err(|e| Error::Config(e.to_string()))?;
         let notifier = if console.notify.is_empty() {
             None
         } else {
