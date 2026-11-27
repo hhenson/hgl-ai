@@ -13,6 +13,7 @@ worktrees, and gives agents the commands they use through one installed skill.
 - [docs/install.md](docs/install.md): hub, clients, agents.
 - [docs/work.md](docs/work.md): how a seat works an issue: labels, claiming, branches, pull requests, blocking.
 - [docs/owner.md](docs/owner.md): the owner channel (status, questions, conversations) and the console with telemetry.
+- [docs/fleet.md](docs/fleet.md): hosts register with the hub, which gives each its workers and roles.
 
 ## Install
 
