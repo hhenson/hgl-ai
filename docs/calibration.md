@@ -1,6 +1,6 @@
 # Model calibration
 
-Status: done 2026-11-27. The proposal at the end replaces the provisional tiers in `docs/roles.md` §3 once the owner agrees.
+Status: done 2026-11-27. The proposal at the end is now `docs/roles.md` §3 (agreed 2026-11-27).
 
 ## Contestants
 
@@ -128,10 +128,18 @@ review missed.
 | --- | --- | --- | --- |
 | Controller, architecture | Carbon high | Astra 6.2 high | — |
 | Triage | Astra 6.2 high | Carbon high | — |
-| Implementation, runtime and semantics | Sol 6.2 xhigh, Astra 6.2 xhigh | Neon xhigh | Terra, Hydrogen high |
+| Implementation, runtime and semantics (hgraph, the C++ runtime) | Sol 6.2 xhigh, Astra 6.2 xhigh | Neon xhigh | Opus, Terra, Hydrogen high |
 | Implementation, checker edge cases | Neon xhigh | Astra 6.2 xhigh | Terra |
+| Implementation, cross-cutting refactors (analyser, IR) | Opus high | Astra 6.2 xhigh | Terra |
+| Implementation, tooling (hgl-ai, scripts, CI) | Opus high | Sol 6.2 xhigh | — |
 | Review (gate) | Neon xhigh or Carbon high | Astra 6.2 xhigh (fast) | Opus (lenient verdicts) |
 | Review (design, code, logic) | Carbon high | Neon xhigh | — |
 | Build agent, mechanical | Sol 6.2 high | Hydrogen high | — |
 
-Opus remains useful for practical engineering and patches, but not as the only reviewer of a gate.
+The GitHub review bot is a GPT model: for a change a GPT model wrote it is not the independent
+review ROLE-11 needs, and a Neon or Carbon receipt is the gate.
+
+Opus implements where it was strong: cross-cutting refactors (t3: 4/4 at high and xhigh alike)
+and tooling (most of hgl-ai was written by Opus agents and held up under Carbon's and the GPT
+bot's reviews). Its high effort matched xhigh, so high is the default. It does not review a gate
+alone: its verdicts were lenient.

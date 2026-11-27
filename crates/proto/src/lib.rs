@@ -216,7 +216,7 @@ impl Kind {
 string_enum!(
     /// Team roles (docs/roles.md §1).
     Role, "role", {
-    Controller => "controller", Triage => "triage", Implementor => "implementor", Reviewer => "reviewer",
+    Controller => "controller", Architect => "architect", Triage => "triage", Implementor => "implementor", Reviewer => "reviewer",
 });
 
 string_enum!(
