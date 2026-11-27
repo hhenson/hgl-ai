@@ -201,8 +201,10 @@ pub struct Bus {
     js: jetstream::Context,
     url: String,
     who: String,
-    /// The hub's last permissions violation on this connection.
-    denied: Arc<Mutex<Option<String>>>,
+    /// The hub's permissions violations on this connection, newest last (a few kept).
+    denied: Arc<Mutex<Vec<String>>>,
+    /// Woken on each violation, so a refused publish fails at once.
+    denied_tick: Arc<tokio::sync::Notify>,
     state: OnceCell<kv::Store>,
     hosts: OnceCell<kv::Store>,
     trees: OnceCell<kv::Store>,
@@ -230,21 +232,29 @@ impl Bus {
     }
 
     async fn open(url: &str, cred: Option<Credential>, name: String) -> Result<Bus> {
-        let denied: Arc<Mutex<Option<String>>> = Arc::default();
+        let denied: Arc<Mutex<Vec<String>>> = Arc::default();
+        let denied_tick = Arc::new(tokio::sync::Notify::new());
         let seen = denied.clone();
+        let tick = denied_tick.clone();
         let mut opts = async_nats::ConnectOptions::new()
             .name(name)
             .connection_timeout(CONNECT_TIMEOUT)
             .event_callback(move |ev| {
                 let seen = seen.clone();
+                let tick = tick.clone();
                 async move {
                     if let async_nats::Event::ServerError(async_nats::ServerError::Other(m)) = &ev
                         && m.to_ascii_lowercase().contains("permissions violation")
                     {
                         tracing::warn!("hub: {m}");
                         if let Ok(mut d) = seen.lock() {
-                            *d = Some(m.clone());
+                            d.push(m.clone());
+                            let n = d.len();
+                            if n > 16 {
+                                d.drain(..n - 16);
+                            }
                         }
+                        tick.notify_waiters();
                     }
                 }
             });
@@ -267,6 +277,7 @@ impl Bus {
             url: url.to_string(),
             who,
             denied,
+            denied_tick,
             state: OnceCell::new(),
             hosts: OnceCell::new(),
             trees: OnceCell::new(),
@@ -281,20 +292,57 @@ impl Bus {
         &self.who
     }
 
+    /// Take a recorded violation for `subject`, if the hub reported one.
+    fn take_denied(&self, subject: &str) -> bool {
+        let Ok(mut d) = self.denied.lock() else {
+            return false;
+        };
+        let quoted = format!("\"{subject}\"");
+        match d.iter().position(|m| m.contains(&quoted)) {
+            Some(i) => {
+                d.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// `err`, unless the hub reported a permissions violation for `subject`: then
     /// [`BusError::Denied`].
     pub(crate) fn denied_or(&self, subject: &str, err: BusError) -> BusError {
-        let hit = self
-            .denied
-            .lock()
-            .ok()
-            .and_then(|mut d| d.take_if(|m| m.contains(subject)).map(|_| ()));
-        match hit {
-            Some(()) => BusError::Denied {
-                subject: subject.to_string(),
-                who: self.who.clone(),
-            },
-            None => err,
+        if self.take_denied(subject) {
+            self.denial(subject)
+        } else {
+            err
+        }
+    }
+
+    fn denial(&self, subject: &str) -> BusError {
+        BusError::Denied {
+            subject: subject.to_string(),
+            who: self.who.clone(),
+        }
+    }
+
+    /// Run a publish to `subject`, failing at once with [`BusError::Denied`] when the hub
+    /// reports a permissions violation for it, instead of waiting out the reply timeout.
+    pub(crate) async fn guarded<T>(
+        &self,
+        subject: &str,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let refused = async {
+            loop {
+                let woken = self.denied_tick.notified();
+                if self.take_denied(subject) {
+                    return;
+                }
+                woken.await;
+            }
+        };
+        tokio::select! {
+            r = fut => r.map_err(|e| self.denied_or(subject, e)),
+            () = refused => Err(self.denial(subject)),
         }
     }
 
@@ -426,12 +474,15 @@ impl Bus {
             .payload(payload.into())
             .message_id(note.msg_id());
         let ack = self
-            .js
-            .send_publish(subject.clone(), publish)
-            .await
-            .map_err(|e| self.denied_or(&subject, publish_error(&subject, e)))?
-            .await
-            .map_err(|e| self.denied_or(&subject, publish_error(&subject, e)))?;
+            .guarded(&subject, async {
+                self.js
+                    .send_publish(subject.clone(), publish)
+                    .await
+                    .map_err(|e| publish_error(&subject, e))?
+                    .await
+                    .map_err(|e| publish_error(&subject, e))
+            })
+            .await?;
         Ok(SendReceipt {
             seq: ack.sequence,
             duplicate: ack.duplicate,
@@ -508,15 +559,13 @@ impl Bus {
         check_state_key(key)?;
         check_value_size(key, value.len())?;
         let store = self.store(&self.state, KV_STATE).await?;
-        store
-            .put(key, value.as_bytes().to_vec().into())
-            .await
-            .map_err(|e| {
-                self.denied_or(
-                    &format!("$KV.{KV_STATE}.{key}"),
-                    nats(&format!("writing state {key}"), e),
-                )
-            })
+        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+            store
+                .put(key, value.as_bytes().to_vec().into())
+                .await
+                .map_err(|e| nats(&format!("writing state {key}"), e))
+        })
+        .await
     }
 
     /// Create `key` only if it is absent (a deleted key counts as absent).

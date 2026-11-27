@@ -138,12 +138,15 @@ impl Bus {
             .payload(payload.to_vec().into())
             .message_id(msg_id);
         let ack = self
-            .js
-            .send_publish(subject.to_string(), publish)
-            .await
-            .map_err(|e| self.denied_or(subject, publish_error(subject, e)))?
-            .await
-            .map_err(|e| self.denied_or(subject, publish_error(subject, e)))?;
+            .guarded(subject, async {
+                self.js
+                    .send_publish(subject.to_string(), publish)
+                    .await
+                    .map_err(|e| publish_error(subject, e))?
+                    .await
+                    .map_err(|e| publish_error(subject, e))
+            })
+            .await?;
         Ok(SendReceipt {
             seq: ack.sequence,
             duplicate: ack.duplicate,
@@ -253,23 +256,27 @@ impl Bus {
             key: id.to_string(),
             expected: expected_revision,
         };
-        if expected_revision == 0 {
-            store
-                .create(id, value.into())
-                .await
-                .map_err(|e| match e.kind() {
-                    async_nats::jetstream::kv::CreateErrorKind::AlreadyExists => conflict(),
-                    _ => self.denied_or(&format!("$KV.{KV_THREADS}.{id}"), nats("writing", e)),
-                })
-        } else {
-            store
-                .update(id, value.into(), expected_revision)
-                .await
-                .map_err(|e| match e.kind() {
-                    async_nats::jetstream::kv::UpdateErrorKind::WrongLastRevision => conflict(),
-                    _ => self.denied_or(&format!("$KV.{KV_THREADS}.{id}"), nats("writing", e)),
-                })
-        }
+        let subject = format!("$KV.{KV_THREADS}.{id}");
+        self.guarded(&subject, async {
+            if expected_revision == 0 {
+                store
+                    .create(id, value.into())
+                    .await
+                    .map_err(|e| match e.kind() {
+                        async_nats::jetstream::kv::CreateErrorKind::AlreadyExists => conflict(),
+                        _ => nats(&format!("writing thread {id}"), e),
+                    })
+            } else {
+                store
+                    .update(id, value.into(), expected_revision)
+                    .await
+                    .map_err(|e| match e.kind() {
+                        async_nats::jetstream::kv::UpdateErrorKind::WrongLastRevision => conflict(),
+                        _ => nats(&format!("writing thread {id}"), e),
+                    })
+            }
+        })
+        .await
     }
 
     /// Every thread record, ordered by id.
@@ -281,9 +288,11 @@ impl Bus {
     /// Write `HGL_METRICS/<repo>.<date>` (the coordinator's daily sample).
     pub async fn metrics_put(&self, s: &MetricsSample) -> Result<()> {
         let store = self.store(&self.metrics, KV_METRICS).await?;
-        put_json(store, &s.key(), s)
-            .await
-            .map_err(|e| self.denied_or(&format!("$KV.{KV_METRICS}.{}", s.key()), e))
+        self.guarded(
+            &format!("$KV.{KV_METRICS}.{}", s.key()),
+            put_json(store, &s.key(), s),
+        )
+        .await
     }
 
     /// Every metrics sample, ordered by key (repository, then day).

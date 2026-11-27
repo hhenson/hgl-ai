@@ -12,16 +12,23 @@ pub enum Service {
     Hub,
     Bridge,
     Coord,
+    Console,
 }
 
 impl Service {
-    pub const ALL: [Service; 3] = [Service::Hub, Service::Bridge, Service::Coord];
+    pub const ALL: [Service; 4] = [
+        Service::Hub,
+        Service::Bridge,
+        Service::Coord,
+        Service::Console,
+    ];
 
     pub fn short(self) -> &'static str {
         match self {
             Service::Hub => "hub",
             Service::Bridge => "bridge",
             Service::Coord => "coord",
+            Service::Console => "console",
         }
     }
     /// `hgl-ai-<short>.service`
@@ -37,6 +44,7 @@ impl Service {
             Service::Hub => "hgl-ai hub (NATS JetStream)",
             Service::Bridge => "hgl-ai bridge",
             Service::Coord => "hgl-ai coordinator",
+            Service::Console => "hgl-ai owner console",
         }
     }
 }
@@ -63,13 +71,14 @@ impl Spec {
         }
     }
 
-    /// `hgl-ai bridge run` or `hgl-ai gh coord run`, with the install-time `PATH`
-    /// (agent CLIs, `git`, `gh`) and the configuration in use.
+    /// `hgl-ai bridge run`, `hgl-ai gh coord run` or `hgl-ai console run`, with the
+    /// install-time `PATH` (agent CLIs, `git`, `gh`) and the configuration in use.
     pub fn hgl_ai(service: Service, sys: &dyn System, data_dir: &Path) -> Spec {
         let env = sys.env();
         let exe = env.service_exe(sys);
         let args = match service {
             Service::Coord => vec!["gh", "coord", "run"],
+            Service::Console => vec!["console", "run"],
             _ => vec!["bridge", "run"],
         };
         Spec {
@@ -85,6 +94,19 @@ impl Spec {
             args: args.into_iter().map(String::from).collect(),
             log: log_path(data_dir, service),
         }
+    }
+}
+
+impl Spec {
+    /// The service connects to the hub as its own hub user (`HGL_AI_HUB_CREDENTIAL`).
+    pub fn with_credential(mut self, cred: Option<&Path>) -> Spec {
+        if let Some(c) = cred {
+            self.env.push((
+                hgl_ai_config::CREDENTIAL_ENV.to_string(),
+                c.display().to_string(),
+            ));
+        }
+        self
     }
 }
 
@@ -270,6 +292,21 @@ pub fn start(sys: &dyn System, s: Service) -> Result<()> {
                 )?;
             }
             run_ok(sys, &Cmd::new("launchctl").args(["kickstart", &target])).map(drop)
+        }
+    }
+}
+
+/// Restart an installed service (it rereads its configuration and credential).
+pub fn restart(sys: &dyn System, s: Service) -> Result<()> {
+    match sys.env().os {
+        Os::Linux => run_ok(sys, &systemctl(&["restart", &s.unit()])).map(drop),
+        Os::MacOs => {
+            let (_, target) = launchd_target(sys, s)?;
+            run_ok(
+                sys,
+                &Cmd::new("launchctl").args(["kickstart", "-k", &target]),
+            )
+            .map(drop)
         }
     }
 }

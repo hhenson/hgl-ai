@@ -1209,10 +1209,12 @@ name = "hgl-ai-install"
 version = "0.1.0"
 dependencies = [
  "async-nats",
+ "futures",
  "hex",
  "hgl-ai-bus",
  "hgl-ai-config",
  "hgl-ai-proto",
+ "nkeys",
  "serde",
  "serde_json",
  "sha2 0.10.9",

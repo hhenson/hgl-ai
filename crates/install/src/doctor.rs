@@ -196,19 +196,26 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
     if let Some(c) = &cfg {
         let tp = env.expand(&c.hub.token_file);
         let shown = &c.hub.token_file;
-        out.push(match token::read(sys, &tp) {
+        let cred = token::read_credential(sys, &tp);
+        let what = match &cred {
+            Ok(Some(c)) => c.describe(),
+            _ => String::new(),
+        };
+        out.push(match &cred {
             Ok(None) => Check::fail(
                 "token",
                 format!("no {shown}"),
-                format!("copy the hub token there, then {reinstall}"),
+                format!("copy the hub credential there, then {reinstall}"),
             ),
             Err(e) => Check::fail(
                 "token",
                 e.to_string(),
-                format!("copy the hub token to {shown}"),
+                format!("copy the hub credential to {shown}"),
             ),
             Ok(Some(_)) => match sys.mode(&tp) {
-                Ok(m) if token::mode_ok(m) => Check::ok("token", format!("{shown} (mode {m:o})")),
+                Ok(m) if token::mode_ok(m) => {
+                    Check::ok("token", format!("{shown} ({what}, mode {m:o})"))
+                }
                 Ok(m) => Check::fail(
                     "token",
                     format!("{shown} has mode {m:o}"),
@@ -216,6 +223,31 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 ),
                 Err(e) => Check::fail("token", e.to_string(), format!("`chmod 600 {shown}`")),
             },
+        });
+        let token_mode = c
+            .server
+            .as_ref()
+            .is_some_and(|s| s.auth == hgl_ai_config::HubAuth::Token)
+            || matches!(&cred, Ok(Some(c)) if c.is_token());
+        out.push(if token_mode {
+            Check::warn(
+                "hub auth",
+                "single shared token: any client can publish as the owner (OWN-5)",
+                "give each client its own hub user: docs/install.md, Hub users",
+            )
+        } else {
+            let n = c.server.as_ref().map(|_| {
+                crate::users::Registry::load(sys, &env.expand(&c.paths.data_dir))
+                    .map(|r| r.users.len())
+                    .unwrap_or(0)
+            });
+            Check::ok(
+                "hub auth",
+                match n {
+                    Some(n) => format!("hub users ({n} registered)"),
+                    None => "hub user".to_string(),
+                },
+            )
         });
         out.push(match hub.health(c).await {
             Err(e) => Check::fail(
@@ -276,6 +308,10 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         if c.server.is_some() {
             svcs.push((Service::Hub, "`hgl-ai server install`".into()));
             svcs.push((Service::Coord, "`hgl-ai server install`".into()));
+            svcs.push((
+                Service::Console,
+                "`hgl-ai server install --console-url https://<stable name>`".into(),
+            ));
         }
         for (s, install) in svcs {
             let name = format!("service {}", s.short());
@@ -289,8 +325,23 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 State::NotInstalled if s == Service::Coord => {
                     Check::new(name, Level::Warn, "not installed on this hub host", None)
                 }
+                State::NotInstalled if s == Service::Console => Check::warn(
+                    name,
+                    "not installed on this hub host; the owner has no console",
+                    install,
+                ),
                 State::NotInstalled => Check::fail(name, "not installed", install),
             });
+        }
+        if service::state(sys, Service::Console) != State::NotInstalled && !c.seats.is_empty() {
+            out.push(Check::warn(
+                "console credential",
+                format!(
+                    "{} seats run on this host as the console's user; their agents can read its                      hub credential and speak as the owner",
+                    c.seats.len()
+                ),
+                "run seats on other hosts, or the console as another user (docs/install.md)",
+            ));
         }
         if let Ok(Some(on)) = service::linger(sys, false) {
             out.push(if on {
@@ -408,7 +459,17 @@ mod tests {
         .unwrap()
         .seats;
         crate::save_config(&f, &f.env, &cfg).unwrap();
-        crate::sys::write_atomic(&home.join(".config/hgl-ai/hub.token"), b"t\n", 0o600).unwrap();
+        let cred = hgl_ai_bus::Credential::render_nkey(
+            "build-1",
+            "seat",
+            &nkeys::KeyPair::new_user().seed().unwrap(),
+        );
+        crate::sys::write_atomic(
+            &home.join(".config/hgl-ai/hub.token"),
+            cred.as_bytes(),
+            0o600,
+        )
+        .unwrap();
         std::fs::create_dir_all(home.join("hgl-ai/work")).unwrap();
         for rt in [Runtime::Claude, Runtime::Codex] {
             skill::install(&f, rt).unwrap();
@@ -453,6 +514,29 @@ mod tests {
                 .any(|c| c.name == "work_root" && c.detail.contains("500 GB free"))
         );
         assert!(f.runs().is_empty(), "doctor changes nothing");
+        let auth = cs.iter().find(|c| c.name == "hub auth").unwrap();
+        assert_eq!(auth.detail, "hub user");
+        assert!(
+            cs.iter()
+                .any(|c| c.name == "token" && c.detail.contains("hub user build-1 (seat)"))
+        );
+    }
+
+    #[tokio::test]
+    async fn warns_on_a_shared_token() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        crate::sys::write_atomic(
+            &f.env.home.join(".config/hgl-ai/hub.token"),
+            b"c0ffee\n",
+            0o600,
+        )
+        .unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        let auth = cs.iter().find(|c| c.name == "hub auth").unwrap();
+        assert_eq!(auth.level, Level::Warn);
+        assert!(auth.detail.contains("publish as the owner"), "{auth:?}");
+        assert!(!any_fail(&cs));
     }
 
     #[cfg(unix)]

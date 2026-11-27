@@ -3,13 +3,14 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use hgl_ai_config::Config;
+use hgl_ai_config::{Config, HubAuth};
 
 use crate::hub::Hub;
 use crate::nats::{self, NatsSource};
 use crate::service::{self, Service, Spec, State};
 use crate::sys::System;
 use crate::token::{self, TokenAction};
+use crate::users::{self, Registry, Role};
 use crate::{Error, HUB_WAIT_SECS, Result, done, io_at, load_config, other, save_config};
 
 /// The default host label of a fresh hub configuration.
@@ -23,8 +24,18 @@ pub struct ServerOpts {
     pub port: Option<u16>,
     pub store: Option<String>,
     pub rotate_token: bool,
+    /// Give each client its own hub user (a new hub always does; an older token hub
+    /// moves to users with this).
+    pub users: bool,
     /// Also install the coordinator service (`hgl-ai gh coord run`).
     pub coord: bool,
+    /// Also install the console service (`hgl-ai console run`) when `[console]` is set.
+    pub console: bool,
+    /// Write `[console]` with this origin (`https://<stable name>`).
+    pub console_url: Option<String>,
+    pub console_listen: Option<String>,
+    /// GitHub logins and Apple emails added to `[console] users`.
+    pub console_users: Vec<String>,
     /// Run `loginctl enable-linger` (Linux).
     pub linger: bool,
     /// Where the pinned `nats-server` release is downloaded from.
@@ -41,7 +52,12 @@ impl Default for ServerOpts {
             port: None,
             store: None,
             rotate_token: false,
+            users: false,
             coord: true,
+            console: true,
+            console_url: None,
+            console_listen: None,
+            console_users: Vec::new(),
             linger: false,
             release_base: nats::RELEASE_BASE.into(),
             wait: Duration::from_secs(HUB_WAIT_SECS),
@@ -93,8 +109,9 @@ fn wait_port(sys: &dyn System, host: &str, port: u16, wait: Duration) -> bool {
     }
 }
 
-/// Install `nats-server`, its configuration, the token and the hub service;
-/// start it, provision the stream and buckets, and print the client command.
+/// Install `nats-server`, its configuration, the clients' credentials and the hub
+/// service; start it, provision the stream and buckets, install the coordinator and
+/// console services, and print the client command.
 pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result<Config> {
     let env = sys.env();
     let existing = load_config(sys, env)?;
@@ -114,8 +131,24 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
     if let Some(s) = &o.store {
         srv.store_dir = env.contract(&absolute(env.expand(s)));
     }
+    if o.users {
+        srv.auth = HubAuth::Users;
+    }
     cfg.hub.url = local_url(&srv.listen, srv.port);
     cfg.server = Some(srv.clone());
+    if let Some(url) = &o.console_url {
+        let mut c = cfg.console.clone().unwrap_or_default();
+        c.url = url.clone();
+        if let Some(l) = &o.console_listen {
+            c.listen = l.clone();
+        }
+        for u in &o.console_users {
+            if !c.users.contains(u) {
+                c.users.push(u.clone());
+            }
+        }
+        cfg.console = Some(c);
+    }
     cfg.validate()?;
 
     let data_dir = env.expand(&cfg.paths.data_dir);
@@ -130,19 +163,77 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
     };
     sys.say(&format!("nats-server: {} ({how})", nats_bin.display()));
 
-    let (tok, action) = token::ensure(sys, &token_path, o.rotate_token)?;
     let shown = env.contract(&token_path);
-    match action {
-        TokenAction::Kept => sys.say(&format!("token: {shown} (kept)")),
-        TokenAction::Created => sys.say(&format!("token: {shown} (new, mode 600)")),
-        TokenAction::Rotated => sys.say(&format!(
-            "token: {shown} (rotated; every client needs the new file and a rerun of `hgl-ai client install`)"
-        )),
-    }
+    let conf = data_dir.join("nats.conf");
+    // The credentials the hub's own services use, and whether this host's client
+    // credential changed (its bridge then restarts).
+    let mut creds = ServiceCreds::default();
+    let text = match srv.auth {
+        HubAuth::Token => {
+            let (tok, action) = token::ensure(sys, &token_path, o.rotate_token)?;
+            match action {
+                TokenAction::Kept => sys.say(&format!("token: {shown} (kept)")),
+                TokenAction::Created => sys.say(&format!("token: {shown} (new, mode 600)")),
+                TokenAction::Rotated => sys.say(&format!(
+                    "token: {shown} (rotated; every client needs the new file and a rerun of `hgl-ai client install`)"
+                )),
+            }
+            sys.say(
+                "auth: single shared token; any client can publish as the owner. \
+                 `hgl-ai server install --users` gives each client its own hub user (docs/install.md)",
+            );
+            nats::render_conf(&srv.listen, srv.port, &store, &nats::Auth::Token(&tok))
+        }
+        HubAuth::Users => {
+            let mut reg = Registry::load(sys, &data_dir)?;
+            let cdir = env.config_dir();
+            let admin = format!("{}-admin", cfg.host);
+            creds.admin = Some(ensure_user(
+                sys,
+                &mut reg,
+                &admin,
+                Role::Admin,
+                &users::cred_path(&cdir, &admin),
+            )?);
+            // This host's own client: its seat credential in `hub.token_file`.
+            creds.client_changed =
+                ensure_user_at(sys, &mut reg, &cfg.host, Role::Seat, &token_path)?;
+            if creds.client_changed {
+                sys.say(&format!(
+                    "credential: {shown} (hub user {}, seat)",
+                    cfg.host
+                ));
+            }
+            if o.coord {
+                let n = format!("{}-coord", cfg.host);
+                creds.coord = Some(ensure_user(
+                    sys,
+                    &mut reg,
+                    &n,
+                    Role::Coord,
+                    &users::cred_path(&cdir, &n),
+                )?);
+            }
+            if o.console {
+                creds.console = Some(ensure_user(
+                    sys,
+                    &mut reg,
+                    CONSOLE_USER,
+                    Role::Console,
+                    &users::cred_path(&cdir, CONSOLE_USER),
+                )?);
+            }
+            reg.save(sys, &data_dir)?;
+            sys.say(&format!(
+                "auth: {} hub users ({})",
+                reg.users.len(),
+                env.contract(&users::registry_path(&data_dir))
+            ));
+            nats::render_conf(&srv.listen, srv.port, &store, &nats::Auth::Users(&reg))
+        }
+    };
 
     sys.mkdir(&store).map_err(io_at(&store))?;
-    let conf = data_dir.join("nats.conf");
-    let text = nats::render_conf(&srv.listen, srv.port, &store, &tok);
     sys.write(&conf, text.as_bytes(), token::MODE)
         .map_err(io_at(&conf))?;
     sys.say(&format!("nats.conf: {}", env.contract(&conf)));
@@ -173,16 +264,42 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
             )));
         }
         sys.say(&format!("hub: answering on {host}:{}", srv.port));
-        hub.provision(&cfg).await.map_err(Error::Bus)?;
+        let mut admin_cfg = cfg.clone();
+        if let Some(a) = &creds.admin {
+            admin_cfg.hub.token_file = a.display().to_string();
+        }
+        hub.provision(&admin_cfg).await.map_err(Error::Bus)?;
         sys.say("hub: stream and buckets provisioned");
     }
 
     if o.coord {
-        service::install(sys, &Spec::hgl_ai(Service::Coord, sys, &data_dir))?;
+        let spec =
+            Spec::hgl_ai(Service::Coord, sys, &data_dir).with_credential(creds.coord.as_deref());
+        service::install(sys, &spec)?;
         done(
             sys,
             &format!("service: {} started", service_name(sys, Service::Coord)),
         );
+    }
+    if o.console {
+        if cfg.console.is_some() {
+            let spec = Spec::hgl_ai(Service::Console, sys, &data_dir)
+                .with_credential(creds.console.as_deref());
+            service::install(sys, &spec)?;
+            done(
+                sys,
+                &format!("service: {} started", service_name(sys, Service::Console)),
+            );
+        } else {
+            sys.say(
+                "console: not installed: no [console] in the configuration; rerun with \
+                 --console-url https://<stable name> --console-user <login> (docs/install.md)",
+            );
+        }
+    }
+    if creds.client_changed && sys.exists(&service::unit_path(env, Service::Bridge)) {
+        service::restart(sys, Service::Bridge)?;
+        done(sys, "service: bridge restarted with the new credential");
     }
     if let Some(l) = service::linger_line(service::linger(sys, o.linger)?) {
         sys.say(&l);
@@ -194,24 +311,197 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
         "  hgl-ai client install --hub {} --token-file {shown} --host {}",
         cfg.hub.url, cfg.host
     ));
-    sys.say(&format!(
-        "On each other host, after copying {shown} there (same path, mode 600) by hand or a secret manager:"
-    ));
     let remote = if unspecified(&srv.listen) {
         "<hub-address>".to_string()
     } else {
         url_host(&srv.listen)
     };
-    sys.say(&format!(
-        "  hgl-ai client install --hub nats://{remote}:{} --token-file {shown} --host <label>",
-        srv.port
-    ));
+    match srv.auth {
+        HubAuth::Token => {
+            sys.say(&format!(
+                "On each other host, after copying {shown} there (same path, mode 600) by hand or a secret manager:"
+            ));
+            sys.say(&format!(
+                "  hgl-ai client install --hub nats://{remote}:{} --token-file {shown} --host <label>",
+                srv.port
+            ));
+        }
+        HubAuth::Users => {
+            sys.say(
+                "For each other host, here: `hgl-ai server user add <label> --role seat`; copy the",
+            );
+            sys.say("credential it names to that host (mode 600) by hand or a secret manager, then there:");
+            sys.say(&format!(
+                "  hgl-ai client install --hub nats://{remote}:{} --token-file <credential> --host <label>",
+                srv.port
+            ));
+        }
+    }
     if unspecified(&srv.listen) {
         sys.say("  (the hub listens on every address; use the one other hosts reach, such as a tailnet address)");
     } else if host == "127.0.0.1" || host == "::1" || host == "localhost" {
         sys.say("  (the hub listens on loopback only: other hosts need an SSH forward, or reinstall with --listen <tailnet address>)");
     }
     Ok(cfg)
+}
+
+/// The hub user name of the console.
+pub const CONSOLE_USER: &str = "console";
+
+#[derive(Default)]
+struct ServiceCreds {
+    admin: Option<PathBuf>,
+    coord: Option<PathBuf>,
+    console: Option<PathBuf>,
+    client_changed: bool,
+}
+
+/// The NKey public key of a credential file, if it holds a hub user.
+fn cred_key(sys: &dyn System, path: &Path) -> Option<String> {
+    match token::read_credential(sys, path).ok()?? {
+        hgl_ai_bus::Credential::Nkey { seed, .. } => nkeys::KeyPair::from_seed(&seed)
+            .ok()
+            .map(|k| k.public_key()),
+        hgl_ai_bus::Credential::Token(_) => None,
+    }
+}
+
+/// Keep `name` when the registry and the credential at `path` agree, else issue a key and
+/// write the credential there. Returns whether it wrote one.
+fn ensure_user_at(
+    sys: &dyn System,
+    reg: &mut Registry,
+    name: &str,
+    role: Role,
+    path: &Path,
+) -> Result<bool> {
+    let current = reg
+        .get(name)
+        .filter(|u| u.role == role)
+        .map(|u| u.nkey.clone());
+    if current.is_some() && current == cred_key(sys, path) {
+        return Ok(false);
+    }
+    let text = reg.issue(name, role, true)?;
+    users::write_cred(sys, path, &text)?;
+    Ok(true)
+}
+
+fn ensure_user(
+    sys: &dyn System,
+    reg: &mut Registry,
+    name: &str,
+    role: Role,
+    path: &Path,
+) -> Result<PathBuf> {
+    if ensure_user_at(sys, reg, name, role, path)? {
+        sys.say(&format!(
+            "credential: {} (hub user {name}, {role})",
+            sys.env().contract(path)
+        ));
+    }
+    Ok(path.to_path_buf())
+}
+
+/// What `server user add` did.
+pub struct UserAdded {
+    pub cred: PathBuf,
+    pub hub_restarted: bool,
+}
+
+fn hub_config(sys: &dyn System) -> Result<(Config, hgl_ai_config::Server)> {
+    let cfg = load_config(sys, sys.env())?
+        .ok_or_else(|| other("no configuration; run `hgl-ai server install` on the hub host"))?;
+    let srv = cfg
+        .server
+        .clone()
+        .ok_or_else(|| other("this host runs no hub; run this on the hub host"))?;
+    Ok((cfg, srv))
+}
+
+/// Rewrite `nats.conf` from the registry and restart the hub when it is installed. Only
+/// in users mode; a token hub keeps its file. Returns whether the hub restarted.
+fn apply_users(
+    sys: &dyn System,
+    cfg: &Config,
+    srv: &hgl_ai_config::Server,
+    reg: &Registry,
+) -> Result<bool> {
+    if srv.auth != HubAuth::Users {
+        sys.say(
+            "auth: the hub still takes its single shared token; `hgl-ai server install --users` \
+             switches it to hub users (docs/install.md)",
+        );
+        return Ok(false);
+    }
+    let env = sys.env();
+    let data_dir = env.expand(&cfg.paths.data_dir);
+    let conf = data_dir.join("nats.conf");
+    let text = nats::render_conf(
+        &srv.listen,
+        srv.port,
+        &env.expand(&srv.store_dir),
+        &nats::Auth::Users(reg),
+    );
+    sys.write(&conf, text.as_bytes(), token::MODE)
+        .map_err(io_at(&conf))?;
+    if sys.exists(&service::unit_path(env, Service::Hub)) {
+        service::restart(sys, Service::Hub)?;
+        done(sys, "hub: restarted with the new users");
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+/// `hgl-ai server user add NAME --role ROLE`: a hub user and its credential file (mode
+/// 0600) under `<config_dir>/hub-users/`, to be copied to its host.
+pub fn user_add(sys: &dyn System, name: &str, role: Role, rotate: bool) -> Result<UserAdded> {
+    let (cfg, srv) = hub_config(sys)?;
+    let env = sys.env();
+    let data_dir = env.expand(&cfg.paths.data_dir);
+    let mut reg = Registry::load(sys, &data_dir)?;
+    let text = reg.issue(name, role, rotate)?;
+    let cred = users::cred_path(&env.config_dir(), name);
+    users::write_cred(sys, &cred, &text)?;
+    reg.save(sys, &data_dir)?;
+    let shown = env.contract(&cred);
+    sys.say(&format!(
+        "credential: {shown} (hub user {name}, {role}, mode 600)"
+    ));
+    let hub_restarted = apply_users(sys, &cfg, &srv, &reg)?;
+    if role == Role::Seat {
+        sys.say(&format!(
+            "copy {shown} to host {name}, then there: hgl-ai client install --hub <hub url> --token-file <copied file> --host {name}"
+        ));
+    }
+    Ok(UserAdded {
+        cred,
+        hub_restarted,
+    })
+}
+
+/// `hgl-ai server user remove NAME`: the hub refuses its credential from then on.
+pub fn user_remove(sys: &dyn System, name: &str) -> Result<bool> {
+    let (cfg, srv) = hub_config(sys)?;
+    let env = sys.env();
+    let data_dir = env.expand(&cfg.paths.data_dir);
+    let mut reg = Registry::load(sys, &data_dir)?;
+    if !reg.remove(name) {
+        return Ok(false);
+    }
+    reg.save(sys, &data_dir)?;
+    let cred = users::cred_path(&env.config_dir(), name);
+    sys.remove_file(&cred).map_err(io_at(&cred))?;
+    sys.say(&format!("removed hub user {name}"));
+    apply_users(sys, &cfg, &srv, &reg)?;
+    Ok(true)
+}
+
+/// The registered hub users.
+pub fn user_list(sys: &dyn System) -> Result<Vec<users::User>> {
+    let (cfg, _) = hub_config(sys)?;
+    let data_dir = sys.env().expand(&cfg.paths.data_dir);
+    Ok(Registry::load(sys, &data_dir)?.users)
 }
 
 fn service_name(sys: &dyn System, s: Service) -> String {
@@ -223,7 +513,7 @@ fn service_name(sys: &dyn System, s: Service) -> String {
 
 /// The hub's services that are installed on this host, hub first.
 fn installed(sys: &dyn System) -> Vec<Service> {
-    [Service::Hub, Service::Coord]
+    [Service::Hub, Service::Coord, Service::Console]
         .into_iter()
         .filter(|&s| sys.exists(&service::unit_path(sys.env(), s)))
         .collect()
@@ -259,14 +549,14 @@ pub fn status(sys: &dyn System) -> Result<bool> {
         return Ok(false);
     };
     let mut up = true;
-    for s in [Service::Hub, Service::Coord] {
+    for s in [Service::Hub, Service::Coord, Service::Console] {
         let st = service::state(sys, s);
         let text = match st {
             State::Running => "running",
             State::Stopped => "stopped",
             State::NotInstalled => "not installed",
         };
-        up &= st == State::Running || (s == Service::Coord && st == State::NotInstalled);
+        up &= st == State::Running || (s != Service::Hub && st == State::NotInstalled);
         sys.say(&format!("{}: {text}", s.short()));
     }
     let host = connect_host(&srv.listen);
@@ -289,7 +579,7 @@ pub fn uninstall(sys: &dyn System, purge: bool) -> Result<()> {
         cfg.as_ref()
             .map_or("~/.local/share/hgl-ai", |c| c.paths.data_dir.as_str()),
     );
-    for s in [Service::Coord, Service::Hub] {
+    for s in [Service::Console, Service::Coord, Service::Hub] {
         if sys.exists(&service::unit_path(env, s)) {
             service::uninstall(sys, s)?;
             sys.say(&format!("{}: removed", s.short()));
@@ -314,6 +604,10 @@ pub fn uninstall(sys: &dyn System, purge: bool) -> Result<()> {
         remove_tree(sys, &store)?;
         let ours = data_dir.join("bin/nats-server");
         sys.remove_file(&ours).map_err(io_at(&ours))?;
+        let reg = users::registry_path(&data_dir);
+        sys.remove_file(&reg).map_err(io_at(&reg))?;
+        let creds = env.config_dir().join("hub-users");
+        remove_tree(sys, &creds)?;
         sys.say(&format!(
             "purged the JetStream store {}",
             env.contract(&store)
@@ -375,38 +669,76 @@ mod tests {
         assert_eq!(cfg.hub.url, "nats://192.0.2.10:4222");
         let saved = load_config(&f, &f.env).unwrap().unwrap();
         assert_eq!(saved, cfg);
-        assert_eq!(saved.server.as_ref().unwrap().listen, "192.0.2.10");
+        let srv = saved.server.as_ref().unwrap();
+        assert_eq!(srv.listen, "192.0.2.10");
+        assert_eq!(srv.auth, HubAuth::Users, "a new hub has a user per client");
 
+        // This host's own client is hub user `hub` (seat), in hub.token.
         let tok_path = home.join(".config/hgl-ai/hub.token");
-        let tok = token::read(&f, &tok_path).unwrap().unwrap();
-        assert_eq!(tok.len(), 64);
+        let c = token::read_credential(&f, &tok_path).unwrap().unwrap();
+        assert_eq!(c.describe(), "hub user hub (seat)");
         assert_eq!(f.mode(&tok_path).unwrap(), 0o600);
-        let conf_path = home.join(".local/share/hgl-ai/nats.conf");
+        let creds = home.join(".config/hgl-ai/hub-users");
+        for n in ["hub-admin", "hub-coord", "console"] {
+            assert_eq!(
+                f.mode(&creds.join(format!("{n}.cred"))).unwrap(),
+                0o600,
+                "{n}"
+            );
+        }
+        assert_eq!(f.mode(&creds).unwrap(), 0o700);
+        let data = home.join(".local/share/hgl-ai");
+        let reg = Registry::load(&f, &data).unwrap();
+        let names: Vec<_> = reg
+            .users
+            .iter()
+            .map(|u| (u.name.as_str(), u.role))
+            .collect();
+        assert_eq!(
+            names,
+            [
+                ("console", Role::Console),
+                ("hub", Role::Seat),
+                ("hub-admin", Role::Admin),
+                ("hub-coord", Role::Coord)
+            ]
+        );
+        let conf_path = data.join("nats.conf");
         let conf = std::fs::read_to_string(&conf_path).unwrap();
-        assert!(conf.contains(&format!("token: \"{tok}\"")));
-        assert!(conf.contains(&format!(
-            "store_dir: \"{}\"",
-            home.join(".local/share/hgl-ai/nats").display()
-        )));
+        assert!(!conf.contains("token:"), "{conf}");
+        for u in &reg.users {
+            assert!(conf.contains(&u.nkey), "{}", u.name);
+        }
+        assert!(conf.contains("deny = [\"hgl.owner.>\", \"hgl.notes.owner.>\""));
         assert_eq!(f.mode(&conf_path).unwrap(), 0o600);
+        // Provisioning ran as the admin user.
+        assert_eq!(*hub.calls.borrow(), ["provision"]);
+        assert_eq!(
+            hub.creds.borrow()[0],
+            creds.join("hub-admin.cred").display().to_string()
+        );
 
-        let hub_unit =
-            std::fs::read_to_string(home.join(".config/systemd/user/hgl-ai-hub.service")).unwrap();
-        assert!(hub_unit.contains(&format!(
+        let unit = |n: &str| {
+            std::fs::read_to_string(home.join(format!(".config/systemd/user/hgl-ai-{n}.service")))
+                .unwrap()
+        };
+        assert!(unit("hub").contains(&format!(
             "ExecStart=/usr/bin/nats-server -c {}",
             conf_path.display()
         )));
-        let coord_unit =
-            std::fs::read_to_string(home.join(".config/systemd/user/hgl-ai-coord.service"))
-                .unwrap();
-        assert!(coord_unit.contains("hgl-ai gh coord run"));
-        assert_eq!(*hub.calls.borrow(), ["provision"]);
-        let runs = f.runs();
-        assert_eq!(
-            runs.iter().filter(|r| r.contains("daemon-reload")).count(),
-            2
+        let coord = unit("coord");
+        assert!(coord.contains("hgl-ai gh coord run"));
+        assert!(coord.contains(&format!(
+            "Environment=\"HGL_AI_HUB_CREDENTIAL={}\"",
+            creds.join("hub-coord.cred").display()
+        )));
+        assert!(
+            !home
+                .join(".config/systemd/user/hgl-ai-console.service")
+                .exists(),
+            "no [console], no console service"
         );
-        assert!(runs.contains(&"systemctl --user restart hgl-ai-hub.service".to_string()));
+        let runs = f.runs();
         let hub_at = runs
             .iter()
             .position(|r| r.ends_with("restart hgl-ai-hub.service"))
@@ -418,19 +750,169 @@ mod tests {
         assert!(hub_at < coord_at, "coordinator starts after the hub");
 
         let out = f.output();
-        assert!(!out.contains(&tok), "the token is never printed");
-        assert!(out.contains("hgl-ai client install --hub nats://192.0.2.10:4222 --token-file ~/.config/hgl-ai/hub.token --host <label>"));
-        assert!(out.contains("lingering: on"));
+        for p in [&tok_path, &creds.join("hub-admin.cred")] {
+            let text = std::fs::read_to_string(p).unwrap();
+            let seed = text.lines().find(|l| l.starts_with("seed")).unwrap();
+            assert!(!out.contains(&seed[8..]), "a seed is never printed");
+        }
+        assert!(out.contains("hgl-ai client install --hub nats://192.0.2.10:4222 --token-file ~/.config/hgl-ai/hub.token --host hub"));
+        assert!(out.contains("hgl-ai server user add <label> --role seat"));
+        assert!(out.contains("console: not installed"));
 
-        // Reinstall keeps the token.
+        // Reinstall keeps every key.
         install(&f, &hub, &ServerOpts::default()).await.unwrap();
-        assert_eq!(token::read(&f, &tok_path).unwrap().unwrap(), tok);
-        assert!(f.output().contains("(kept)"));
+        assert_eq!(Registry::load(&f, &data).unwrap(), reg);
+        assert_eq!(token::read_credential(&f, &tok_path).unwrap().unwrap(), c);
         let again = load_config(&f, &f.env).unwrap().unwrap();
         assert_eq!(
             again.server.unwrap().listen,
             "192.0.2.10",
             "existing [server] is the default"
+        );
+    }
+
+    /// A hub installed before hub users keeps its shared token, and moves with `--users`.
+    #[tokio::test]
+    async fn token_hub_keeps_working_then_migrates() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux);
+        let home = f.env.home.clone();
+        std::fs::create_dir_all(home.join(".config/hgl-ai")).unwrap();
+        std::fs::write(
+            home.join(".config/hgl-ai/config.toml"),
+            "host = \"hub\"\n[server]\nlisten = \"192.0.2.10\"\nport = 4222\nstore_dir = \"~/.local/share/hgl-ai/nats\"\nnats_version = \"2.15.3\"\n",
+        )
+        .unwrap();
+        let hub = FakeHub::up();
+        let cfg = install(&f, &hub, &ServerOpts::default()).await.unwrap();
+        assert_eq!(cfg.server.as_ref().unwrap().auth, HubAuth::Token);
+        let tok_path = home.join(".config/hgl-ai/hub.token");
+        let tok = token::read(&f, &tok_path).unwrap().unwrap();
+        assert_eq!(tok.len(), 64);
+        let conf_path = home.join(".local/share/hgl-ai/nats.conf");
+        let conf = std::fs::read_to_string(&conf_path).unwrap();
+        assert!(conf.contains(&format!("token: \"{tok}\"")));
+        let out = f.output();
+        assert!(!out.contains(&tok), "the token is never printed");
+        assert!(out.contains("any client can publish as the owner"));
+        assert!(out.contains("hgl-ai client install --hub nats://192.0.2.10:4222 --token-file ~/.config/hgl-ai/hub.token --host <label>"));
+        assert!(
+            !std::fs::read_to_string(home.join(".config/systemd/user/hgl-ai-coord.service"))
+                .unwrap()
+                .contains("HGL_AI_HUB_CREDENTIAL"),
+            "token mode: the coordinator uses hub.token"
+        );
+        install(&f, &hub, &ServerOpts::default()).await.unwrap();
+        assert_eq!(token::read(&f, &tok_path).unwrap().unwrap(), tok, "kept");
+
+        // Migrate; this host's bridge is installed and gets the new credential.
+        std::fs::write(home.join(".config/systemd/user/hgl-ai-bridge.service"), "").unwrap();
+        let o = ServerOpts {
+            users: true,
+            ..ServerOpts::default()
+        };
+        let cfg = install(&f, &hub, &o).await.unwrap();
+        assert_eq!(cfg.server.unwrap().auth, HubAuth::Users);
+        let c = token::read_credential(&f, &tok_path).unwrap().unwrap();
+        assert_eq!(c.describe(), "hub user hub (seat)");
+        assert!(
+            !std::fs::read_to_string(&conf_path)
+                .unwrap()
+                .contains("token:")
+        );
+        assert!(
+            f.runs()
+                .contains(&"systemctl --user restart hgl-ai-bridge.service".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn users_are_added_and_removed() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux);
+        install(&f, &FakeHub::up(), &ServerOpts::default())
+            .await
+            .unwrap();
+        let before = f.runs().len();
+        let added = user_add(&f, "build-1", Role::Seat, false).unwrap();
+        assert!(added.hub_restarted);
+        assert_eq!(f.mode(&added.cred).unwrap(), 0o600);
+        let c = token::read_credential(&f, &added.cred).unwrap().unwrap();
+        assert_eq!(c.describe(), "hub user build-1 (seat)");
+        let conf =
+            std::fs::read_to_string(f.env.home.join(".local/share/hgl-ai/nats.conf")).unwrap();
+        assert!(conf.contains("# build-1 (seat)"));
+        assert_eq!(
+            f.runs()[before..],
+            ["systemctl --user restart hgl-ai-hub.service"]
+        );
+        assert!(
+            user_add(&f, "build-1", Role::Seat, false).is_err(),
+            "exists"
+        );
+        let key = user_list(&f)
+            .unwrap()
+            .into_iter()
+            .find(|u| u.name == "build-1")
+            .unwrap()
+            .nkey;
+        user_add(&f, "build-1", Role::Seat, true).unwrap();
+        let rotated = user_list(&f)
+            .unwrap()
+            .into_iter()
+            .find(|u| u.name == "build-1")
+            .unwrap()
+            .nkey;
+        assert_ne!(key, rotated);
+        assert!(user_remove(&f, "build-1").unwrap());
+        assert!(!added.cred.exists());
+        assert!(!user_remove(&f, "build-1").unwrap());
+        let conf =
+            std::fs::read_to_string(f.env.home.join(".local/share/hgl-ai/nats.conf")).unwrap();
+        assert!(!conf.contains("build-1"));
+
+        let g = fake(&d.path().join("other"), Os::Linux);
+        assert!(
+            user_add(&g, "x", Role::Seat, false).is_err(),
+            "not a hub host"
+        );
+    }
+
+    #[tokio::test]
+    async fn console_service_with_its_own_user() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux);
+        let o = ServerOpts {
+            console_url: Some("https://hub.example.com".into()),
+            console_users: vec!["hhenson".into()],
+            ..ServerOpts::default()
+        };
+        let cfg = install(&f, &FakeHub::up(), &o).await.unwrap();
+        let c = cfg.console.unwrap();
+        assert_eq!(
+            (c.url.as_str(), c.users.as_slice()),
+            ("https://hub.example.com", &["hhenson".to_string()][..])
+        );
+        let home = &f.env.home;
+        let unit =
+            std::fs::read_to_string(home.join(".config/systemd/user/hgl-ai-console.service"))
+                .unwrap();
+        assert!(unit.contains("hgl-ai console run"), "{unit}");
+        assert!(unit.contains(&format!(
+            "Environment=\"HGL_AI_HUB_CREDENTIAL={}\"",
+            home.join(".config/hgl-ai/hub-users/console.cred").display()
+        )));
+        let o = ServerOpts {
+            console: false,
+            ..ServerOpts::default()
+        };
+        let d2 = tempfile::tempdir().unwrap();
+        let g = fake(d2.path(), Os::Linux);
+        install(&g, &FakeHub::up(), &o).await.unwrap();
+        let reg = Registry::load(&g, &g.env.home.join(".local/share/hgl-ai")).unwrap();
+        assert!(
+            reg.get(CONSOLE_USER).is_none(),
+            "--no-console: no console user"
         );
     }
 

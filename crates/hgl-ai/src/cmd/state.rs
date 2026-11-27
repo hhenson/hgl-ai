@@ -2,7 +2,10 @@
 
 use anyhow::Context as _;
 use hgl_ai_bus::{Bus, BusError, MAX_VALUE_BYTES};
-use hgl_ai_proto::{HostRecord, KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES, STREAM_NOTES};
+use hgl_ai_proto::{
+    HostRecord, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES, STREAM_NOTES,
+    STREAM_OWNER,
+};
 
 use super::note::read_bounded;
 use super::{Ctx, EXIT_FAIL, EXIT_OK, NotReady};
@@ -114,8 +117,27 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
 
 pub async fn init(ctx: &Ctx) -> anyhow::Result<i32> {
     let bus = connect(ctx).await?;
-    bus.provision().await.context("provisioning the hub")?;
-    let names = [STREAM_NOTES, KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS];
+    let who = bus.who().to_string();
+    bus.provision().await.with_context(|| {
+        if who.ends_with("(admin)") || who == "shared token" {
+            "provisioning the hub".to_string()
+        } else {
+            format!(
+                "provisioning the hub as {who}: it takes an admin hub user, \
+                 `HGL_AI_HUB_CREDENTIAL=~/.config/hgl-ai/hub-users/<hub>-admin.cred hgl-ai init`"
+            )
+        }
+    })?;
+    let names = [
+        STREAM_NOTES,
+        STREAM_OWNER,
+        KV_STATE,
+        KV_HOSTS,
+        KV_TREES,
+        KV_LOCKS,
+        KV_THREADS,
+        KV_METRICS,
+    ];
     if ctx.json {
         println!("{}", serde_json::json!({ "provisioned": names }));
     } else {

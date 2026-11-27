@@ -19,8 +19,20 @@ fn conf_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', r"\\").replace('"', "\\\""))
 }
 
-/// `<data_dir>/nats.conf`: listen address, JetStream store, token authorization.
-pub fn render_conf(listen: &str, port: u16, store_dir: &Path, token: &str) -> String {
+/// How clients authenticate: one shared token (the single-token mode of older installs)
+/// or a hub user per client (OWN-5).
+#[derive(Debug, Clone, Copy)]
+pub enum Auth<'a> {
+    Token(&'a str),
+    Users(&'a crate::users::Registry),
+}
+
+/// `<data_dir>/nats.conf`: listen address, JetStream store, authorization.
+pub fn render_conf(listen: &str, port: u16, store_dir: &Path, auth: &Auth) -> String {
+    let authorization = match auth {
+        Auth::Token(t) => format!("authorization {{\n  token: {}\n}}\n", conf_str(t)),
+        Auth::Users(reg) => crate::users::render_authorization(reg),
+    };
     format!(
         "# hgl-ai hub, written by `hgl-ai server install`; reinstalling rewrites it.\n\
          host: {host}\n\
@@ -29,10 +41,9 @@ pub fn render_conf(listen: &str, port: u16, store_dir: &Path, token: &str) -> St
          \n\
          jetstream {{\n  store_dir: {store}\n}}\n\
          \n\
-         authorization {{\n  token: {token}\n}}\n",
+         {authorization}",
         host = conf_str(listen),
         store = conf_str(&store_dir.display().to_string()),
-        token = conf_str(token),
     )
 }
 
@@ -187,7 +198,12 @@ mod tests {
 
     #[test]
     fn conf_golden() {
-        let c = render_conf("192.0.2.10", 4222, Path::new("/srv/hgl-ai/nats"), "abc123");
+        let c = render_conf(
+            "192.0.2.10",
+            4222,
+            Path::new("/srv/hgl-ai/nats"),
+            &Auth::Token("abc123"),
+        );
         assert_eq!(
             c,
             r#"# hgl-ai hub, written by `hgl-ai server install`; reinstalling rewrites it.
@@ -204,7 +220,10 @@ authorization {
 }
 "#
         );
-        assert!(render_conf("::", 1, Path::new(r#"/a"b"#), "t").contains(r#"store_dir: "/a\"b""#));
+        assert!(
+            render_conf("::", 1, Path::new(r#"/a"b"#), &Auth::Token("t"))
+                .contains(r#"store_dir: "/a\"b""#)
+        );
     }
 
     /// The rendered file is a valid `nats-server` configuration (when one is installed).
@@ -219,7 +238,12 @@ authorization {
         let p = d.path().join("nats.conf");
         std::fs::write(
             &p,
-            render_conf("127.0.0.1", 4222, &d.path().join("store"), &"ab".repeat(32)),
+            render_conf(
+                "127.0.0.1",
+                4222,
+                &d.path().join("store"),
+                &Auth::Token(&"ab".repeat(32)),
+            ),
         )
         .unwrap();
         let o = std::process::Command::new(bin)

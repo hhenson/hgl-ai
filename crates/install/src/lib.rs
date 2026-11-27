@@ -16,6 +16,7 @@ pub mod service;
 pub mod skill;
 pub mod sys;
 pub mod token;
+pub mod users;
 
 use std::path::{Path, PathBuf};
 

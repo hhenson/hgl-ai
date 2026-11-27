@@ -321,6 +321,24 @@ pub struct Server {
     pub port: u16,
     pub store_dir: String,
     pub nats_version: String,
+    /// How clients authenticate. A configuration from before hub users is `token`.
+    #[serde(default = "HubAuth::legacy")]
+    pub auth: HubAuth,
+}
+
+/// `users`: a hub user per client with its role's permissions (OWN-5); `token`: one
+/// shared token, every client alike (older installs; `doctor` warns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HubAuth {
+    Users,
+    Token,
+}
+
+impl HubAuth {
+    fn legacy() -> Self {
+        HubAuth::Token
+    }
 }
 
 impl Default for Server {
@@ -330,6 +348,7 @@ impl Default for Server {
             port: 4222,
             store_dir: "~/.local/share/hgl-ai/nats".into(),
             nats_version: "2.15.3".into(),
+            auth: HubAuth::Users,
         }
     }
 }
@@ -692,6 +711,22 @@ model = "claude-opus-5-5-high"
             let c: Config = toml::from_str(&t).unwrap();
             assert!(c.validate().is_err(), "{name}");
         }
+    }
+
+    #[test]
+    fn hub_auth_defaults() {
+        let old = "host = \"h\"\n[server]\nlisten = \"127.0.0.1\"\nport = 4222\nstore_dir = \"s\"\nnats_version = \"2.15.3\"\n";
+        let c: Config = toml::from_str(old).unwrap();
+        assert_eq!(
+            c.server.unwrap().auth,
+            HubAuth::Token,
+            "an older hub keeps its token"
+        );
+        assert_eq!(
+            Server::default().auth,
+            HubAuth::Users,
+            "a new hub has users"
+        );
     }
 
     #[test]
