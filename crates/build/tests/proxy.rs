@@ -670,6 +670,13 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         "retried after the reconnect: {s:?}"
     );
     assert!(w.jobs().is_empty(), "{:?}", w.jobs());
+    // The retry checked out in a directory of its own, which no stale cleanup of the
+    // first attempt can remove (Carbon's second review of #12, finding 5).
+    let log = std::fs::read_to_string(w.state.join("log")).unwrap();
+    assert!(
+        log.contains("jobs/20261127-090000-bbbbbb-r1/src"),
+        "the retry reused the first attempt's directory"
+    );
 
     // A redelivered job whose result was saved before the crash: published, not rebuilt.
     let saved = w.root.join("work/builder/logs/win1/20261127-090000-dddddd");

@@ -73,6 +73,10 @@ pub struct Lane {
     probe: Mutex<Probe>,
     /// Workspaces whose cleanup waits for the remote to come back.
     stale: Mutex<Vec<Workspace>>,
+    /// One stale cleanup pass at a time.
+    stale_pass: tokio::sync::Mutex<()>,
+    /// Job directories of builds running now; no cleanup touches them.
+    live: Mutex<std::collections::BTreeSet<String>>,
     /// This host's id (`<data_dir>/host-id`), in the lease's holder.
     pub host_id: String,
 }
@@ -99,6 +103,8 @@ impl Lane {
             gate: Mutex::new(Gate::Active),
             probe: Mutex::new(Probe::default()),
             stale: Mutex::new(Vec::new()),
+            stale_pass: tokio::sync::Mutex::new(()),
+            live: Mutex::new(std::collections::BTreeSet::new()),
             host_id: String::new(),
         }
     }
@@ -561,10 +567,22 @@ async fn read_gate(bus: &Bus, label: &str) -> Gate {
     }
 }
 
+/// Remove the workspaces whose cleanup waited for the remote, one pass at a time (the
+/// heartbeat and a retrying job both call this), never one a job is using.
 async fn retry_stale(lane: &Arc<Lane>) {
+    let _one = lane.stale_pass.lock().await;
     let stale: Vec<Workspace> =
         std::mem::take(&mut *lane.stale.lock().unwrap_or_else(|e| e.into_inner()));
     for ws in stale {
+        let live = ws.job.as_ref().is_some_and(|j| {
+            lane.live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(j)
+        });
+        if live {
+            continue;
+        }
         let ex = lane.exec.clone();
         let w = ws.clone();
         if blocking(move || ex.cleanup(&w)).await.is_err() {
@@ -647,9 +665,23 @@ async fn run_job(
         if cancel.is_cancelled() {
             return None;
         }
-        let (ex, c) = (lane.exec.clone(), checkout.clone());
+        // A retry checks out in a directory of its own (`<id>-r1`): the first attempt's
+        // may still be waiting for its cleanup.
+        let mut c = checkout.clone();
+        if retried {
+            c.id = format!("{}-r1", job.id);
+        }
+        let ex = lane.exec.clone();
         let ws = match blocking(move || ex.prepare(&c)).await {
-            Ok(ws) => ws,
+            Ok(ws) => {
+                if let Some(j) = &ws.job {
+                    lane.live
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(j.clone());
+                }
+                ws
+            }
             Err(Prep::NotRun(r)) => return Some(driver::not_run(s0, r)),
             Err(Prep::Unreachable(r)) => {
                 if retried {
@@ -695,6 +727,12 @@ async fn run_job(
         .await;
         let _ = fwd.await;
         // Cleanup is part of done.
+        if let Some(j) = &ws.job {
+            lane.live
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(j);
+        }
         let (ex, w) = (lane.exec.clone(), ws.clone());
         if let Err(e) = blocking(move || ex.cleanup(&w)).await {
             tracing::warn!(builder = %lane.label, "cleaning up {}: {e:?}; retrying when the remote answers", job.id);
