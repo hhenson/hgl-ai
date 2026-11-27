@@ -135,6 +135,19 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
     let mut lease = seat_bus.lock_acquire("seat.w1", "build-1").await.unwrap();
     lease.refresh().await.unwrap();
     assert!(lease.release().await.unwrap());
+    // A seat's bridge opens and works its inbox (consumer, pull, progress, ack, nak).
+    let mut inbox = seat_bus.inbox(&seat("w9")).await.unwrap();
+    seat_bus
+        .send(&Note::new(seat("w1"), seat("w9"), Kind::Note, "to w9"))
+        .await
+        .unwrap();
+    let got = inbox.fetch(5, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(got.len(), 1);
+    got[0].in_progress().await.unwrap();
+    got[0].nak(Duration::ZERO).await.unwrap();
+    let again = inbox.fetch(5, Duration::from_secs(5)).await.unwrap();
+    assert_eq!(again[0].delivered, 2);
+    again[0].ack().await.unwrap();
     seat_bus
         .publish_event("hgl.console.status", b"{}", "s-1")
         .await
