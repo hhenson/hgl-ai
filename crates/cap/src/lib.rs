@@ -6,7 +6,9 @@
 //!   in a transient scope, `systemd-run --user --scope -p MemoryMax=SIZE
 //!   -p MemorySwapMax=0 -p OOMPolicy=stop`, so the whole tree shares one
 //!   limit. At the limit the kernel kills the largest process and systemd
-//!   stops the rest; the kill count and peak come from the scope's cgroup.
+//!   stops the rest; the kill count and peak come from the scope's cgroup. A
+//!   SIGKILL death at the peak counts as the limit too, for a kill the
+//!   counters do not show yet.
 //! - [`Method::Rlimit`] (macOS, a sandbox, a bare ssh command): every process
 //!   gets an address-space limit of SIZE (`setrlimit(RLIMIT_AS)`), and a
 //!   watchdog kills the tree when its sampled resident total passes SIZE.
@@ -295,6 +297,7 @@ done < /proc/self/cgroup
 {
   echo "rc $rc"
   cat "$cg/memory.events" 2>/dev/null
+  { while IFS= read -r line; do echo "local $line"; done < "$cg/memory.events.local"; } 2>/dev/null
   printf 'peak '
   cat "$cg/memory.peak" 2>/dev/null || echo
 } >> "$r"
@@ -496,7 +499,8 @@ pub struct CapOutcome {
     pub stopped: bool,
     /// KILL was needed after TERM and the grace.
     pub killed: bool,
-    /// Processes killed for memory: by the kernel (scope) or the watchdog (rlimit).
+    /// Processes killed for memory: by the kernel (scope) or the watchdog (rlimit). In a
+    /// scope it is 0 when the limit is known only from a SIGKILL at the peak.
     pub oom_kills: u64,
     /// Peak memory of the tree, when measured: the cgroup's `memory.peak`, or the
     /// watchdog's highest sample.
@@ -516,9 +520,14 @@ impl CapOutcome {
         let size = format_size(spec.mem_bytes);
         if self.memory_limit {
             out.push(match self.method {
-                Method::Scope => format!(
+                Method::Scope if self.oom_kills > 0 => format!(
                     "{PREFIX}: the {size} memory limit was reached; the kernel killed {} process(es) of this command (exit status {})",
                     self.oom_kills, self.status
+                ),
+                Method::Scope => format!(
+                    "{PREFIX}: the {size} memory limit was reached; the kernel killed this command at a peak of {} (exit status {})",
+                    self.peak_bytes.map(format_size).unwrap_or_else(|| "unknown".into()),
+                    self.status
                 ),
                 Method::Rlimit => format!(
                     "{PREFIX}: the {size} memory limit was reached (sampled resident total {}); killed {} process(es) of this command (exit status {})",
@@ -688,11 +697,11 @@ impl CapChild {
             let text = read_limited(file.path(), SMALL_READ).unwrap_or_default();
             let r = parse_report(&text);
             outcome.started = r.started;
-            if r.oom_kills > 0 {
+            outcome.peak_bytes = r.peak;
+            if scope_memory_limit(&r, &outcome, self.spec.mem_bytes) {
                 outcome.memory_limit = true;
                 outcome.oom_kills = r.oom_kills;
             }
-            outcome.peak_bytes = r.peak;
         }
         outcome.status = final_status(&outcome);
         Ok(outcome)
@@ -722,24 +731,54 @@ fn status_code(s: ExitStatus) -> i32 {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Report {
     started: bool,
+    /// Processes the kernel killed for memory: `oom_kill`, the larger of `memory.events`
+    /// and `memory.events.local`.
     oom_kills: u64,
+    /// `oom_group_kill`, likewise.
+    group_kills: u64,
     peak: Option<u64>,
 }
 
 /// Parse what the scope's inner shell wrote: `started`, `rc N`, the cgroup's
-/// `memory.events` lines and `peak N`.
+/// `memory.events` lines, the same of `memory.events.local` prefixed `local `, and
+/// `peak N`.
 fn parse_report(text: &str) -> Report {
     let mut r = Report::default();
     for line in text.lines() {
+        let line = line.strip_prefix("local ").unwrap_or(line);
         let (k, v) = line.split_once(' ').unwrap_or((line, ""));
+        let n = || v.trim().parse::<u64>().unwrap_or(0);
         match k {
             "started" => r.started = true,
-            "oom_kill" => r.oom_kills = v.trim().parse().unwrap_or(0),
+            "oom_kill" => r.oom_kills = r.oom_kills.max(n()),
+            "oom_group_kill" => r.group_kills = r.group_kills.max(n()),
             "peak" => r.peak = v.trim().parse().ok(),
             _ => {}
         }
     }
     r
+}
+
+/// How far below the limit a peak may be and still count as reaching it: the kernel
+/// charges and fails in pages and huge pages, so `memory.peak` of a tree killed at the
+/// limit can sit just under `MemoryMax`.
+fn peak_slack(limit: u64) -> u64 {
+    (limit / 100).clamp(2 << 20, 64 << 20)
+}
+
+/// Whether a scope run reached its memory limit: the kernel counted an OOM kill (of a
+/// process or a group), or the command died of SIGKILL, not sent by the cap, with its
+/// peak at the limit (the kill is counted in `memory.events` after the victim is
+/// signalled, so the inner shell can read the counters before the count lands).
+fn scope_memory_limit(r: &Report, o: &CapOutcome, limit: u64) -> bool {
+    if r.oom_kills > 0 || r.group_kills > 0 {
+        return true;
+    }
+    let killed_by_us = o.time_limit || o.stopped;
+    o.command_status == STATUS_KILL
+        && !killed_by_us
+        && r.peak
+            .is_some_and(|p| p.saturating_add(peak_slack(limit)) >= limit)
 }
 
 fn cgroup_of(pid: &str) -> Option<String> {
@@ -1037,6 +1076,7 @@ mod tests {
             Report {
                 started: true,
                 oom_kills: 1,
+                group_kills: 0,
                 peak: Some(100 << 20)
             }
         );
@@ -1045,10 +1085,65 @@ mod tests {
             Report {
                 started: true,
                 oom_kills: 0,
+                group_kills: 0,
                 peak: None
             }
         );
         assert_eq!(parse_report(""), Report::default());
+        let text = "started\nrc 137\noom_kill 0\noom_group_kill 0\nlocal oom_kill 2\nlocal oom_group_kill 1\npeak 5\n";
+        assert_eq!(
+            parse_report(text),
+            Report {
+                started: true,
+                oom_kills: 2,
+                group_kills: 1,
+                peak: Some(5)
+            }
+        );
+    }
+
+    #[test]
+    fn a_kill_at_the_peak_is_the_memory_limit() {
+        let limit = 100 << 20;
+        // The runner's case: KILL at exactly the limit, no `oom_kill` counted yet.
+        let at = Report {
+            started: true,
+            peak: Some(limit),
+            ..Report::default()
+        };
+        assert!(scope_memory_limit(&at, &outcome(137), limit));
+        let near = Report {
+            peak: Some(limit - (1 << 20)),
+            ..at
+        };
+        assert!(scope_memory_limit(&near, &outcome(137), limit));
+        let low = Report {
+            peak: Some(limit / 2),
+            ..Report::default()
+        };
+        assert!(!scope_memory_limit(&low, &outcome(137), limit));
+        assert!(!scope_memory_limit(&at, &outcome(0), limit));
+        assert!(!scope_memory_limit(&at, &outcome(143), limit));
+        let timed = CapOutcome {
+            time_limit: true,
+            ..outcome(137)
+        };
+        assert!(
+            !scope_memory_limit(&at, &timed, limit),
+            "the cap's own KILL"
+        );
+        let no_peak = Report {
+            peak: None,
+            ..Report::default()
+        };
+        assert!(!scope_memory_limit(&no_peak, &outcome(137), limit));
+        let group = Report {
+            group_kills: 1,
+            ..Report::default()
+        };
+        assert!(scope_memory_limit(&group, &outcome(0), limit));
+        assert_eq!(peak_slack(100 << 20), 2 << 20);
+        assert_eq!(peak_slack(64 << 30), 64 << 20);
     }
 
     fn outcome(command_status: i32) -> CapOutcome {
@@ -1106,6 +1201,18 @@ mod tests {
             mem.report(&spec),
             [
                 "hgl-ai cap: the 100M memory limit was reached; the kernel killed 2 process(es) of this command (exit status 137)"
+            ]
+        );
+        let at_peak = CapOutcome {
+            memory_limit: true,
+            peak_bytes: Some(100 << 20),
+            status: 137,
+            ..outcome(137)
+        };
+        assert_eq!(
+            at_peak.report(&spec),
+            [
+                "hgl-ai cap: the 100M memory limit was reached; the kernel killed this command at a peak of 100M (exit status 137)"
             ]
         );
         let time = CapOutcome {
