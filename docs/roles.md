@@ -64,12 +64,14 @@ Families: `claude` (Claude Code, or Claude models through Antigravity),
 
 | Tier | claude | gpt | gemini |
 | --- | --- | --- | --- |
-| frontier | `claude-opus-5-5` | `gpt-6.1-sol` | `gemini-4-carbon` |
-| balanced | `claude-sonnet-5-5` | `gpt-6.1-sol` at `medium` | `gemini-4-argon` |
+| frontier | `claude-opus-5-5` | `gpt-6.1-sol` | `gemini-4-neon` |
+| balanced | `claude-sonnet-5-5` | `gpt-6.1-sol` at `medium` | `gemini-4-hydrogen` |
 | fast | `claude-haiku-5-5` | `gpt-6-luna` | `gemini-3.8-flash` |
 
-The Gemini column is unmeasured; see the tracking issue. Concrete slugs live
-in configuration (`[models]`), so a new release changes one file.
+The Gemini column is provisional until `docs/calibration.md` has results.
+`gemini-4-carbon` (close to Claude Fable) is trialled for controller and
+triage. Concrete slugs live in configuration (`[models]`), so a new release
+changes one file.
 
 | Work | Tier, effort | Primary family | Alternate |
 | --- | --- | --- | --- |

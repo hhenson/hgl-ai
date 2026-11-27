@@ -255,7 +255,7 @@ pub fn default_models() -> BTreeMap<Family, TierModels> {
         (Family::Gpt, m("gpt-6.1-sol", "gpt-6.1-sol", "gpt-6-luna")),
         (
             Family::Gemini,
-            m("gemini-4-carbon", "gemini-4-argon", "gemini-3.8-flash"),
+            m("gemini-4-neon", "gemini-4-hydrogen", "gemini-3.8-flash"),
         ),
     ])
 }

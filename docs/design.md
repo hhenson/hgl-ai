@@ -103,8 +103,8 @@ balanced = "gpt-6.1-sol"
 fast = "gpt-6-luna"
 
 [models.gemini]
-frontier = "gemini-4-carbon"
-balanced = "gemini-4-argon"
+frontier = "gemini-4-neon"
+balanced = "gemini-4-hydrogen"
 fast = "gemini-3.8-flash"
 
 [[seat]]
