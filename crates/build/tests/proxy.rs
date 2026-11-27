@@ -783,3 +783,47 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     );
     assert_eq!(s.status, BuildStatus::Queued, "not the partial aggregate");
 }
+
+/// Carbon's second review of #12, finding 6: a session that dies with its master is a
+/// drop even when the master is back before the proxy looks (here a supervisor
+/// reconnects while the step's session ends).
+#[test]
+fn a_session_lost_with_its_master_is_a_drop_after_a_quick_reconnect() {
+    let w = World::new();
+    let conn = w.conn();
+    conn.connect().unwrap();
+    let ex = Ssh::new(
+        Platform::Windows,
+        Dialect::Posix,
+        w.remote.to_str().unwrap(),
+        BTreeMap::new(),
+        conn.clone(),
+    );
+    let ws = ex.prepare(&w.checkout("20261127-150000-aaaaaa")).unwrap();
+    let (state, c2) = (w.state.clone(), conn.clone());
+    let t = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(700));
+        let pid = std::fs::read_to_string(state.join("master")).unwrap();
+        Command::new("kill").arg(pid.trim()).status().unwrap();
+        while state.join("master").exists() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // A new master before the step's session notices.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while c2.connect().is_err() {
+            assert!(Instant::now() < deadline);
+        }
+        let now = std::fs::read_to_string(state.join("master")).unwrap();
+        assert_ne!(now.trim(), pid.trim(), "a new master");
+    });
+    let r = ex.run_step(
+        &ws,
+        &step("long", "sleep 5", Duration::from_secs(60)),
+        &w.root.join("long.log"),
+        &Cancel::default(),
+    );
+    t.join().unwrap();
+    assert!(r.unreachable, "a drop, not a failure: {r:?}");
+    ex.cleanup(&ws).unwrap();
+    conn.close();
+}

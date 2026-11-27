@@ -348,6 +348,9 @@ pub struct Conn {
     /// `false` for a borrower (`build shell`): it uses the proxy's master when there is
     /// one and never starts or stops it.
     owned: bool,
+    /// Counts masters started and drops seen: a session that began under another
+    /// generation lost its master, even if a new one answers now.
+    generation: std::sync::atomic::AtomicU64,
     state: Mutex<ConnState>,
     reachable: tokio::sync::watch::Sender<bool>,
 }
@@ -380,6 +383,7 @@ impl Conn {
             socket,
             dialect,
             owned: true,
+            generation: std::sync::atomic::AtomicU64::new(0),
             state: Mutex::new(ConnState {
                 master: None,
                 reachable: false,
@@ -424,7 +428,7 @@ impl Conn {
             "ControlMaster=no".into(),
             "BatchMode=yes".into(),
             "ConnectTimeout=15".into(),
-            "ServerAliveInterval=15".into(),
+            "ServerAliveInterval=5".into(),
             "ServerAliveCountMax=3".into(),
         ] {
             v.push("-o".into());
@@ -497,8 +501,30 @@ impl Conn {
         self.reachable.send_replace(reachable);
     }
 
+    /// The master generation now; see [`Conn::lost_since`].
+    pub fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// A session begun at generation `g` ended with ssh's own failure (255): it lost its
+    /// connection if the master changed since (a reconnect may already answer) or the
+    /// remote does not answer now.
+    pub fn lost_since(&self, g: u64) -> bool {
+        self.generation() != g || (self.owned && !self.master_alive()) || !self.answers()
+    }
+
+    fn master_alive(&self) -> bool {
+        let mut s = self.lock();
+        match s.master.as_mut() {
+            Some(c) => matches!(c.try_wait(), Ok(None)),
+            None => false,
+        }
+    }
+
     /// Mark the remote unreachable (a command saw the connection drop).
     pub fn mark_down(&self, reason: impl Into<String>) {
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.set(false, Some(reason.into()));
     }
 
@@ -544,7 +570,7 @@ impl Conn {
             "ControlPersist=no".into(),
             "BatchMode=yes".into(),
             "ConnectTimeout=15".into(),
-            "ServerAliveInterval=15".into(),
+            "ServerAliveInterval=5".into(),
             "ServerAliveCountMax=3".into(),
         ] {
             c.arg("-o").arg(o);
@@ -556,6 +582,8 @@ impl Conn {
             .stderr(log);
         let child = c.spawn().map_err(|e| format!("starting ssh: {e}"))?;
         self.lock().master = Some(child);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let deadline = Instant::now() + Duration::from_secs(20);
         loop {
             let exited = {
@@ -748,15 +776,23 @@ impl Ssh {
     }
 
     fn exec_line(&self, cmdline: &str, timeout: Duration) -> Result<Out, HostError> {
+        let g = self.conn.generation();
         let (status, out, err) = self
             .conn
             .run(cmdline, None, timeout)
             .map_err(|e| HostError::Failed(format!("running ssh: {e}")))?;
         match status {
+            // A command that never ended: the connection, unless the remote answers.
+            None if !self.conn.answers() => {
+                let why = format!("no answer within {timeout:?}");
+                self.conn.mark_down(why.clone());
+                self.kick.notify_one();
+                Err(HostError::Unreachable(why))
+            }
             None => Err(HostError::Failed(format!(
                 "a remote command took longer than {timeout:?}"
             ))),
-            Some(SSH_FAILED) if !self.conn.answers() => {
+            Some(SSH_FAILED) if self.conn.lost_since(g) => {
                 let why = last_line(&err);
                 self.conn.mark_down(why.clone());
                 self.kick.notify_one();
@@ -984,6 +1020,7 @@ impl Executor for Ssh {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        let generation = self.conn.generation();
         let mut child = match c.spawn() {
             Ok(c) => c,
             Err(e) => {
@@ -1078,7 +1115,8 @@ impl Executor for Ssh {
             }
         }
         // Ask at once whether the session dropped, before the remote can come back.
-        let dropped = killing.is_none() && status == Some(SSH_FAILED) && !self.conn.answers();
+        let dropped =
+            killing.is_none() && status == Some(SSH_FAILED) && self.conn.lost_since(generation);
         if dropped {
             self.conn.mark_down("the connection dropped during a step");
             self.kick.notify_one();

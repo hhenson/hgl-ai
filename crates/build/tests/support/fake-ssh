@@ -43,12 +43,22 @@ if [ -n "$master" ]; then
   exit 255
 fi
 printf '%s\n' "$*" >> "$state/log"
+# A session runs over the master it started with: when another master has replaced it,
+# the session is gone, as with ssh's control master.
+m0=$(cat "$state/master" 2>/dev/null)
 sh -c "$*" &
 pid=$!
 while kill -0 "$pid" 2>/dev/null; do
   if [ -e "$state/down" ]; then
     echo "Connection to $alias closed by remote host." >&2
     exit 255
+  fi
+  if [ -n "$m0" ]; then
+    m=$(cat "$state/master" 2>/dev/null)
+    if [ -n "$m" ] && [ "$m" != "$m0" ]; then
+      echo "Connection to $alias closed by remote host." >&2
+      exit 255
+    fi
   fi
   sleep 0.05
 done
