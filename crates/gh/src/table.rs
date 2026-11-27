@@ -191,7 +191,8 @@ fragment R on Repository {{
     )
 }
 
-fn nodes<'a>(v: &'a Value, path: &[&str]) -> &'a [Value] {
+/// The `nodes` of the connection at `path`; none when absent.
+pub(crate) fn nodes<'a>(v: &'a Value, path: &[&str]) -> &'a [Value] {
     let mut v = v;
     for p in path {
         match v.get(p) {
@@ -221,19 +222,7 @@ pub fn parse_batch(
     read: &str,
 ) -> Result<(Vec<PrInfo>, RateLimit, Vec<String>)> {
     let data = v.get("data").ok_or_else(|| resp("no data"))?;
-    let rl = data.get("rateLimit").ok_or_else(|| resp("no rateLimit"))?;
-    let rate = RateLimit {
-        cost: rl.get("cost").and_then(Value::as_u64).unwrap_or(0),
-        remaining: rl
-            .get("remaining")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| resp("no rateLimit.remaining"))?,
-        reset_at: rl
-            .get("resetAt")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-    };
+    let rate = parse_rate(data)?;
     let mut out = Vec::new();
     let mut missing = Vec::new();
     for (i, repo) in repos.iter().enumerate() {
@@ -249,6 +238,23 @@ pub fn parse_batch(
         out.extend(infos);
     }
     Ok((out, rate, missing))
+}
+
+/// The `rateLimit` of a batched response's `data`.
+pub fn parse_rate(data: &Value) -> Result<RateLimit> {
+    let rl = data.get("rateLimit").ok_or_else(|| resp("no rateLimit"))?;
+    Ok(RateLimit {
+        cost: rl.get("cost").and_then(Value::as_u64).unwrap_or(0),
+        remaining: rl
+            .get("remaining")
+            .and_then(Value::as_u64)
+            .ok_or_else(|| resp("no rateLimit.remaining"))?,
+        reset_at: rl
+            .get("resetAt")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+    })
 }
 
 fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {

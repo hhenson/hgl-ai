@@ -3,16 +3,19 @@
 //! (and no round while a `hold` holds, whoever wrote it); and an immediate `note` to the
 //! controller when a `ready` or `approved` pull request gains a bot finding or a failing
 //! check between rounds. The previous table (from the bus at start, then from memory) is
-//! what a round is compared with.
+//! what a round is compared with. After the pull request round, every
+//! [`backlog::BACKLOG_EVERY`], the backlog round: `HGL_STATE/backlog` and the day's
+//! `HGL_METRICS` samples, under the same `hold`.
 
 use std::io::Write;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, TimeZone, Utc};
 use hgl_ai_bus::Bus;
 use hgl_ai_proto::{Kind, Note, utc_now_stamp};
 use serde_json::Value;
 
+use crate::backlog::{self, BACKLOG_EVERY};
 use crate::exec::{self, Gh};
 use crate::table::{self, Alert, HoldChange, PrInfo, RateLimit, Row, Table};
 use crate::{Error, Result, Settings, state, store};
@@ -23,7 +26,7 @@ pub const MIN_INTERVAL: Duration = Duration::from_secs(300);
 #[derive(Debug, Clone)]
 pub struct CoordOpts {
     pub once: bool,
-    /// Print the table and the alerts; touch no state and send nothing.
+    /// Print the table, the alerts, the backlog and the samples; touch no state and send nothing.
     pub dry_run: bool,
     pub interval: Duration,
 }
@@ -62,24 +65,16 @@ pub fn alert_note(s: &Settings, a: &Alert) -> Result<Note> {
     Ok(n)
 }
 
-/// Write a round to the hub: the table, the alerts and `hold`.
-async fn publish(
+/// Write what a round's allowance means for `hold`.
+async fn write_hold(
     b: &Bus,
-    s: &Settings,
-    t: &Table,
-    alerts: &[Alert],
+    change: &HoldChange,
     rate: &RateLimit,
     hold: Option<&str>,
-    now: DateTime<Utc>,
 ) -> Result<()> {
-    store::put_latest(b, state::KEY_PRS, &t.render()).await?;
-    for a in alerts {
-        b.send(&alert_note(s, a)?).await?;
-        tracing::info!("alert sent: {}", a.body().lines().next().unwrap_or(""));
-    }
-    match table::hold_after(rate, s.hold_below, hold, now) {
+    match change {
         HoldChange::Set(v) => {
-            store::put_latest(b, state::KEY_HOLD, &v).await?;
+            store::put_latest(b, state::KEY_HOLD, v).await?;
             tracing::warn!("GraphQL allowance {} left: hold until {v}", rate.remaining);
         }
         HoldChange::Clear => {
@@ -92,9 +87,100 @@ async fn publish(
     Ok(())
 }
 
-/// Run rounds until stopped (or once). Dry-run output goes to `out`. Fails at once when
-/// `gh` cannot run or is not signed in; a failed round or hub write is logged and the
-/// next round comes as usual.
+/// Write a round to the hub: the table, the alerts and `hold`.
+async fn publish(
+    b: &Bus,
+    s: &Settings,
+    t: &Table,
+    alerts: &[Alert],
+    rate: &RateLimit,
+    hold: Option<&str>,
+    change: &HoldChange,
+) -> Result<()> {
+    store::put_latest(b, state::KEY_PRS, &t.render()).await?;
+    for a in alerts {
+        b.send(&alert_note(s, a)?).await?;
+        tracing::info!("alert sent: {}", a.body().lines().next().unwrap_or(""));
+    }
+    write_hold(b, change, rate, hold).await
+}
+
+/// A refused round: `hold` until the reset time (written, or printed in a dry run).
+async fn on_rate_limit<G: Gh>(
+    gh: &G,
+    bus: Option<&Bus>,
+    last_rate: Option<&RateLimit>,
+    msg: &str,
+    now: DateTime<Utc>,
+    out: &mut impl Write,
+) -> String {
+    let v = table::hold_on_limit(graphql_reset(gh).await, last_rate, now);
+    tracing::warn!("rate limited ({msg}): hold until {v}");
+    match bus {
+        Some(b) => {
+            if let Err(e) = store::put_latest(b, state::KEY_HOLD, &v).await {
+                tracing::warn!("writing {}: {e}", state::KEY_HOLD);
+            }
+        }
+        None => {
+            let _ = writeln!(out, "rate limited: would hold until {v}");
+        }
+    }
+    v
+}
+
+/// The backlog round: read every repository's issues, then write `backlog` and the day's
+/// samples (or print them in a dry run). `hold` and `last_rate` follow its allowance.
+async fn backlog_round<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: Option<&Bus>,
+    hold: &mut Option<String>,
+    last_rate: &mut Option<RateLimit>,
+    out: &mut impl Write,
+) -> Result<()> {
+    let now = Utc::now();
+    let r = match backlog::read(gh, s, now).await {
+        Ok(r) => r,
+        Err(Error::RateLimited(m)) => {
+            *hold = Some(on_rate_limit(gh, bus, last_rate.as_ref(), &m, now, out).await);
+            return Err(Error::RateLimited(m));
+        }
+        Err(e) => return Err(e),
+    };
+    for m in &r.missing {
+        tracing::warn!("{}: no backlog answer for this repository", s.full(m));
+    }
+    let change = table::hold_after(&r.rate, s.hold_below, hold.as_deref(), now);
+    match bus {
+        None => {
+            let _ = out.write_all(r.dry_run().as_bytes());
+            let _ = out.flush();
+        }
+        Some(b) => {
+            backlog::publish(b, &r).await?;
+            write_hold(b, &change, &r.rate, hold.as_deref()).await?;
+            tracing::info!(
+                "backlog: {} claimable, {} samples, cost {}, {} left",
+                r.backlog.queue.len(),
+                r.samples.len(),
+                r.rate.cost,
+                r.rate.remaining
+            );
+        }
+    }
+    match change {
+        HoldChange::Set(v) => *hold = Some(v),
+        HoldChange::Clear => *hold = None,
+        HoldChange::Keep => {}
+    }
+    *last_rate = Some(r.rate);
+    Ok(())
+}
+
+/// Run rounds until stopped (or once: both rounds). Dry-run output goes to `out`. Fails at
+/// once when `gh` cannot run or is not signed in; a failed round or hub write is logged and
+/// the next round comes as usual (a failed backlog round is tried again at the next round).
 pub async fn run<G: Gh>(
     gh: &G,
     s: &Settings,
@@ -111,18 +197,22 @@ pub async fn run<G: Gh>(
             Err(e) => tracing::warn!("reading the previous table: {e}"),
         }
         eprintln!(
-            "coordinator: {} repositories of {} every {:?} into {}/{}",
+            "coordinator: {} repositories of {} every {:?} into {st}/{}, every {:?} into {st}/{} and {}",
             s.repos.len(),
             s.owner,
             o.interval,
-            hgl_ai_proto::KV_STATE,
-            state::KEY_PRS
+            state::KEY_PRS,
+            BACKLOG_EVERY,
+            state::KEY_BACKLOG,
+            hgl_ai_proto::KV_METRICS,
+            st = hgl_ai_proto::KV_STATE,
         );
     }
     let mut last_rate: Option<RateLimit> = None;
+    let mut last_backlog: Option<Instant> = None;
     loop {
         let now = Utc::now();
-        let hold = match bus {
+        let mut hold = match bus {
             Some(b) => match b.state_get(state::KEY_HOLD).await {
                 Ok(e) => e.map(|e| e.value),
                 Err(e) => {
@@ -157,6 +247,7 @@ pub async fn run<G: Gh>(
                     rows: infos.iter().map(|i| i.row.clone()).collect(),
                 };
                 let alerts = table::alerts(&prev, &infos);
+                let change = table::hold_after(&rate, s.hold_below, hold.as_deref(), now);
                 match bus {
                     None => {
                         let _ = out.write_all(t.render().as_bytes());
@@ -166,7 +257,7 @@ pub async fn run<G: Gh>(
                         let _ = out.flush();
                     }
                     Some(b) => {
-                        let res = publish(b, s, &t, &alerts, &rate, hold.as_deref(), now).await;
+                        let res = publish(b, s, &t, &alerts, &rate, hold.as_deref(), &change).await;
                         if let Err(e) = res {
                             if o.once {
                                 return Err(e);
@@ -184,20 +275,14 @@ pub async fn run<G: Gh>(
                 }
                 prev = t.rows;
                 last_rate = Some(rate);
+                match change {
+                    HoldChange::Set(v) => hold = Some(v),
+                    HoldChange::Clear => hold = None,
+                    HoldChange::Keep => {}
+                }
             }
             Err(Error::RateLimited(m)) => {
-                let v = table::hold_on_limit(graphql_reset(gh).await, last_rate.as_ref(), now);
-                tracing::warn!("rate limited ({m}): hold until {v}");
-                match bus {
-                    Some(b) => {
-                        if let Err(e) = store::put_latest(b, state::KEY_HOLD, &v).await {
-                            tracing::warn!("writing {}: {e}", state::KEY_HOLD);
-                        }
-                    }
-                    None => {
-                        let _ = writeln!(out, "rate limited: would hold until {v}");
-                    }
-                }
+                hold = Some(on_rate_limit(gh, bus, last_rate.as_ref(), &m, now, out).await);
                 if o.once {
                     return Err(Error::RateLimited(m));
                 }
@@ -205,6 +290,22 @@ pub async fn run<G: Gh>(
             Err(e @ Error::Auth(_)) => return Err(e),
             Err(e) if o.once => return Err(e),
             Err(e) => tracing::warn!("round failed: {e}"),
+        }
+        if backlog::due(last_backlog, Instant::now(), BACKLOG_EVERY) {
+            if let Some(h) = hold
+                .as_deref()
+                .filter(|h| table::hold_active(h, Utc::now()))
+            {
+                tracing::info!("hold until {}: no backlog round", h.trim());
+            } else {
+                let started = Instant::now();
+                match backlog_round(gh, s, bus, &mut hold, &mut last_rate, out).await {
+                    Ok(()) => last_backlog = Some(started),
+                    Err(e @ Error::Auth(_)) => return Err(e),
+                    Err(e) if o.once => return Err(e),
+                    Err(e) => tracing::warn!("backlog round failed: {e}"),
+                }
+            }
         }
         if o.once {
             return Ok(());
@@ -219,22 +320,32 @@ mod tests {
     use crate::exec::fake::FakeGh;
     use crate::testutil::{fixture, settings};
 
-    #[tokio::test]
-    async fn dry_run_once_prints_the_table() {
+    fn three() -> Settings {
         let mut s = settings();
         s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
-        let gh = crate::exec::ReadOnly(
-            FakeGh::default()
-                .on("auth status", "")
-                .on("graphql", &fixture("coord-batch.json")),
-        );
-        let o = CoordOpts {
-            once: true,
-            dry_run: true,
-            interval: MIN_INTERVAL,
-        };
+        s
+    }
+
+    const ONCE_DRY: CoordOpts = CoordOpts {
+        once: true,
+        dry_run: true,
+        interval: MIN_INTERVAL,
+    };
+
+    /// GitHub answering both rounds: the backlog query first, then any other query.
+    fn both(prs: &str) -> FakeGh {
+        FakeGh::default()
+            .on("auth status", "")
+            .on("query Backlog", &fixture("backlog-batch.json"))
+            .on("graphql", prs)
+    }
+
+    #[tokio::test]
+    async fn dry_run_once_prints_the_table() {
+        let s = three();
+        let gh = crate::exec::ReadOnly(both(&fixture("coord-batch.json")));
         let mut out = Vec::new();
-        run(&gh, &s, None, &o, &mut out).await.unwrap();
+        run(&gh, &s, None, &ONCE_DRY, &mut out).await.unwrap();
         let text = String::from_utf8(out).unwrap();
         let want = Table::parse(&fixture("coord-batch.prs"));
         let got = Table::parse(&text);
@@ -257,6 +368,111 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn dry_run_once_prints_the_backlog_and_samples() {
+        let s = three();
+        let gh = crate::exec::ReadOnly(both(&fixture("coord-batch.json")));
+        let mut out = Vec::new();
+        run(&gh, &s, None, &ONCE_DRY, &mut out).await.unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let calls = gh.0.calls();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(calls[2].contains("query=query Backlog("), "{}", calls[2]);
+        let today = Utc::now().format("%Y-%m-%d").to_string();
+        assert!(
+            calls[2].contains(&format!(
+                "-f opened1=repo:hhenson/beta is:issue created:{today}"
+            )) && calls[2].contains(&format!(
+                "-f closed2=repo:hhenson/gamma is:issue closed:{today}"
+            )),
+            "{}",
+            calls[2]
+        );
+        let want = backlog::Backlog::parse(&fixture("backlog-batch.backlog"));
+        let got = backlog::Backlog::parse(&text);
+        assert_eq!(
+            (&got.open, &got.labels, &got.queue),
+            (&want.open, &want.labels, &want.queue)
+        );
+        let samples: Vec<&str> = text
+            .lines()
+            .filter(|l| l.starts_with("would write HGL_METRICS/"))
+            .collect();
+        assert_eq!(samples.len(), 3, "{text}");
+        let day = today.replace('-', "");
+        assert_eq!(
+            samples[1],
+            format!("would write HGL_METRICS/beta.{day}: open 5 opened 0 closed 3")
+        );
+        // The table comes first, then the backlog.
+        assert!(text.find("\tdraft\t").unwrap() < text.find("\tcodex-priority\t").unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_low_allowance_skips_the_backlog() {
+        let s = three();
+        let low = fixture("coord-batch.json")
+            .replace("\"remaining\": 4945", "\"remaining\": 40")
+            .replace("2026-01-05T12:55:49Z", "2100-01-01T00:00:00Z");
+        let gh = both(&low);
+        let mut out = Vec::new();
+        run(&gh, &s, None, &ONCE_DRY, &mut out).await.unwrap();
+        assert!(
+            !gh.calls().iter().any(|c| c.contains("query Backlog")),
+            "the pull request round set hold: {:?}",
+            gh.calls()
+        );
+        // The allowance is enough: both rounds.
+        let gh = both(&fixture("coord-batch.json"));
+        run(&gh, &s, None, &ONCE_DRY, &mut Vec::new())
+            .await
+            .unwrap();
+        assert!(gh.calls().iter().any(|c| c.contains("query Backlog")));
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_backlog_round() {
+        let s = three();
+        let gh = FakeGh::default()
+            .on("auth status", "")
+            .fail(
+                "query Backlog",
+                "gh: API rate limit exceeded for user ID 1.",
+            )
+            .on("graphql", &fixture("coord-batch.json"))
+            .on(
+                "rate_limit",
+                "{\"resources\":{\"graphql\":{\"reset\":4102444800}}}",
+            );
+        let mut out = Vec::new();
+        assert!(matches!(
+            run(&gh, &s, None, &ONCE_DRY, &mut out).await,
+            Err(Error::RateLimited(_))
+        ));
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.ends_with("rate limited: would hold until 2100-01-01T00:00:00Z\n"),
+            "{text}"
+        );
+        assert_eq!(Table::parse(&text).rows.len(), 6, "the table came first");
+    }
+
+    #[tokio::test]
+    async fn a_failed_backlog_round_fails_once() {
+        let s = three();
+        let gh = FakeGh::default()
+            .on("auth status", "")
+            .on(
+                "query Backlog",
+                "{\"errors\":[{\"message\":\"Something went wrong\"}]}",
+            )
+            .on("graphql", &fixture("coord-batch.json"));
+        let e = run(&gh, &s, None, &ONCE_DRY, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(&e, Error::Response { .. }), "{e}");
+    }
+
+    #[tokio::test]
     async fn rate_limited_round() {
         let s = settings();
         let gh = FakeGh::default()
@@ -266,14 +482,9 @@ mod tests {
                 "rate_limit",
                 "{\"resources\":{\"graphql\":{\"reset\":4102444800}}}",
             );
-        let o = CoordOpts {
-            once: true,
-            dry_run: true,
-            interval: MIN_INTERVAL,
-        };
         let mut out = Vec::new();
         assert!(matches!(
-            run(&gh, &s, None, &o, &mut out).await,
+            run(&gh, &s, None, &ONCE_DRY, &mut out).await,
             Err(Error::RateLimited(_))
         ));
         assert_eq!(

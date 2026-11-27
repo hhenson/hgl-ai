@@ -1,0 +1,141 @@
+{
+ "data": {
+  "rateLimit": {
+   "cost": 10,
+   "remaining": 4930,
+   "resetAt": "2026-01-05T12:55:49Z",
+   "limit": 5000
+  },
+  "r0": {
+   "open": {
+    "totalCount": 9
+   },
+   "labels": {
+    "nodes": [
+     { "name": "codex", "issues": { "totalCount": 4 } },
+     { "name": "codex-claimed", "issues": { "totalCount": 1 } },
+     { "name": "codex-priority", "issues": { "totalCount": 1 } },
+     { "name": "documentation", "issues": { "totalCount": 1 } },
+     { "name": "good first issue", "issues": { "totalCount": 2 } },
+     { "name": "needs-owner", "issues": { "totalCount": 0 } },
+     { "name": "wontfix", "issues": { "totalCount": 0 } }
+    ]
+   },
+   "queue": {
+    "nodes": [
+     {
+      "number": 101,
+      "title": "Fix the parser\tfor tabs",
+      "createdAt": "2026-01-01T10:00:00Z",
+      "labels": { "nodes": [ { "name": "codex" } ] }
+     },
+     {
+      "number": 102,
+      "title": "Claimed already",
+      "createdAt": "2026-01-02T09:00:00Z",
+      "labels": { "nodes": [ { "name": "codex" }, { "name": "codex-claimed" } ] }
+     },
+     {
+      "number": 105,
+      "title": "Priority work",
+      "createdAt": "2026-01-03T08:00:00Z",
+      "labels": { "nodes": [ { "name": "codex-priority" }, { "name": "codex" } ] }
+     },
+     {
+      "number": 107,
+      "title": "Document the loop",
+      "createdAt": "2026-01-04T12:00:00Z",
+      "labels": { "nodes": [ { "name": "codex" }, { "name": "documentation" } ] }
+     }
+    ]
+   }
+  },
+  "opened0": {
+   "issueCount": 2
+  },
+  "closed0": {
+   "issueCount": 1
+  },
+  "r1": {
+   "open": {
+    "totalCount": 5
+   },
+   "labels": {
+    "nodes": [
+     { "name": "bug", "issues": { "totalCount": 0 } },
+     { "name": "codex", "issues": { "totalCount": 2 } },
+     { "name": "codex-blocked", "issues": { "totalCount": 1 } },
+     { "name": "codex-priority", "issues": { "totalCount": 2 } },
+     { "name": "needs-owner", "issues": { "totalCount": 1 } }
+    ]
+   },
+   "queue": {
+    "nodes": [
+     {
+      "number": 3,
+      "title": "Opened with alpha 101",
+      "createdAt": "2026-01-01T10:00:00Z",
+      "labels": { "nodes": [ { "name": "codex" } ] }
+     },
+     {
+      "number": 4,
+      "title": "Waits on another issue",
+      "createdAt": "2026-01-02T00:00:00Z",
+      "labels": { "nodes": [ { "name": "codex" }, { "name": "codex-blocked" } ] }
+     },
+     {
+      "number": 6,
+      "title": "Waits on the owner",
+      "createdAt": "2026-01-05T00:00:00Z",
+      "labels": { "nodes": [ { "name": "codex-priority" }, { "name": "needs-owner" } ] }
+     },
+     {
+      "number": 8,
+      "title": "Priority without codex",
+      "createdAt": "2026-01-06T00:00:00Z",
+      "labels": { "nodes": [ { "name": "codex-priority" } ] }
+     }
+    ]
+   }
+  },
+  "opened1": {
+   "issueCount": 0
+  },
+  "closed1": {
+   "issueCount": 3
+  },
+  "r2": {
+   "open": {
+    "totalCount": 3
+   },
+   "labels": {
+    "nodes": [
+     { "name": "codex", "issues": { "totalCount": 2 } },
+     { "name": "codex-ready", "issues": { "totalCount": 1 } }
+    ]
+   },
+   "queue": {
+    "nodes": [
+     {
+      "number": 20,
+      "title": "Ready at a head",
+      "createdAt": "2025-12-31T23:00:00Z",
+      "labels": { "nodes": [ { "name": "codex" }, { "name": "codex-ready" } ] }
+     },
+     {
+      "number": 21,
+      "title": "Line one\r\nline two",
+      "createdAt": "2026-01-01T10:00:00Z",
+      "labels": { "nodes": [ { "name": "codex" } ] }
+     }
+    ]
+   }
+  },
+  "opened2": {
+   "issueCount": 1
+  },
+  "closed2": {
+   "issueCount": 0
+  }
+ }
+}
