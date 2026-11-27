@@ -73,7 +73,7 @@ struct WaitArgs {
     /// Most notes to print at once.
     #[arg(long, value_name = "N", default_value_t = 10)]
     max: usize,
-    /// Wait even though a bridge serves the seat.
+    /// Wait even though a bridge serves the seat or holds its lease.
     #[arg(long)]
     force: bool,
 }
@@ -83,7 +83,7 @@ struct PeekArgs {
     seat: Seat,
     #[arg(long, value_name = "N", default_value_t = 10)]
     max: usize,
-    /// Peek even though a bridge serves the seat.
+    /// Peek even though a bridge serves the seat or holds its lease.
     #[arg(long)]
     force: bool,
 }
@@ -159,11 +159,22 @@ async fn receive(
     ack: bool,
 ) -> anyhow::Result<i32> {
     let bus = Bus::connect(&ctx.load_config()?).await?;
-    if !force && let Some(host) = bus.bridge_host(seat).await? {
-        bail!(
-            "seat {seat} is served by the bridge on host {host}; a seat is served by a bridge or \
-             interactively, never both (--force to override)"
-        );
+    if !force {
+        if let Some(host) = bus.bridge_host(seat).await? {
+            bail!(
+                "seat {seat} is served by the bridge on host {host}; a seat is served by a bridge \
+                 or interactively, never both (--force to override)"
+            );
+        }
+        let key = hgl_ai_proto::seat_lock_key(seat);
+        if let Some(l) = bus.lock_get(&key).await? {
+            bail!(
+                "seat {seat} is held by {} (lease {key} since {}); a seat is served by a bridge \
+                 or interactively, never both (--force to override)",
+                l.holder,
+                l.acquired_at
+            );
+        }
     }
     let mut inbox = bus.inbox(seat).await?;
     let got = inbox.fetch(max.max(1), wait).await?;

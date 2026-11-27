@@ -20,6 +20,8 @@
 //!   one holder on any host); the holder keeps it with [`Lease::refresh`] and
 //!   gives it up with [`Lease::release`]. A lease not refreshed within the
 //!   bucket's `max_age` expires, so a dead holder does not keep it.
+//!   [`Bus::lock_get`] names the present holder; [`Bus::lock_take_over`] takes
+//!   a lease from a holder known to be dead.
 //! - Every read is bounded: a note payload over [`MAX_NOTE_BYTES`] is refused
 //!   on send and terminated on receipt; buckets refuse values over
 //!   [`MAX_VALUE_BYTES`].
@@ -592,6 +594,66 @@ impl Bus {
             }
             Err(e) => Err(nats(&format!("taking lease {name}"), e)),
         }
+    }
+
+    /// Take over the lease `name` from `stale`, a holder the caller knows is dead (a
+    /// compare-and-set at the revision it holds, so of concurrent callers one wins). Fails
+    /// with [`BusError::Held`] when someone other than `stale` holds it; a lease that went
+    /// in the meantime is taken as by [`Bus::lock_acquire`].
+    pub async fn lock_take_over(&self, name: &str, holder: &str, stale: &str) -> Result<Lease> {
+        check_kv_key(name)?;
+        let store = self.store(&self.locks, KV_LOCKS).await?;
+        let Some(entry) = live_entry(store, name).await? else {
+            return self.lock_acquire(name, holder).await;
+        };
+        let held = serde_json::from_slice::<LockRecord>(&entry.value).ok();
+        let held_by = |r: &Option<LockRecord>| BusError::Held {
+            name: name.to_string(),
+            holder: r
+                .as_ref()
+                .map_or_else(|| "another holder".to_string(), |r| r.holder.clone()),
+            since: r
+                .as_ref()
+                .map_or_else(|| "just now".to_string(), |r| r.acquired_at.clone()),
+        };
+        if held.as_ref().map(|r| r.holder.as_str()) != Some(stale) {
+            return Err(held_by(&held));
+        }
+        let record = LockRecord {
+            holder: holder.to_string(),
+            acquired_at: utc_now_stamp(),
+        };
+        let value: bytes::Bytes = serde_json::to_vec(&record)
+            .map_err(|e| nats(&format!("encoding lease {name}"), e))?
+            .into();
+        match store.update(name, value.clone(), entry.revision).await {
+            Ok(revision) => Ok(Lease {
+                store: store.clone(),
+                name: name.to_string(),
+                record,
+                value,
+                revision,
+            }),
+            Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision => {
+                let now = live_entry(store, name)
+                    .await?
+                    .and_then(|e| serde_json::from_slice::<LockRecord>(&e.value).ok());
+                Err(held_by(&now))
+            }
+            Err(e) => Err(nats(&format!("taking over lease {name}"), e)),
+        }
+    }
+
+    /// Who holds the lease `name` now, if anyone.
+    pub async fn lock_get(&self, name: &str) -> Result<Option<LockRecord>> {
+        check_kv_key(name)?;
+        let store = self.store(&self.locks, KV_LOCKS).await?;
+        Ok(live_entry(store, name).await?.map(|e| {
+            serde_json::from_slice(&e.value).unwrap_or_else(|_| LockRecord {
+                holder: "another holder".into(),
+                acquired_at: "an unknown time".into(),
+            })
+        }))
     }
 
     async fn store<'a>(

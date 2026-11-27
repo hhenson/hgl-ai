@@ -11,6 +11,7 @@ use hgl_ai_tree::Registry;
 pub trait BusApi: Registry + Send + Sync + 'static {
     type Inbox: InboxApi<Delivery = Self::Delivery>;
     type Delivery: DeliveryApi;
+    type Lease: LeaseApi;
 
     fn inbox(&self, seat: &Seat) -> impl Future<Output = Result<Self::Inbox>> + Send;
     fn send(&self, note: &Note) -> impl Future<Output = Result<()>> + Send;
@@ -19,6 +20,27 @@ pub trait BusApi: Registry + Send + Sync + 'static {
     fn host_del(&self, host: &str) -> impl Future<Output = Result<()>> + Send;
     /// The live host whose bridge serves `seat` (PROTO-6).
     fn bridge_host(&self, seat: &Seat) -> impl Future<Output = Result<Option<String>>> + Send;
+    /// Take the lease `name` in `HGL_LOCKS` (create-if-absent; `BusError::Held` when held).
+    fn lock_acquire(
+        &self,
+        name: &str,
+        holder: &str,
+    ) -> impl Future<Output = Result<Self::Lease>> + Send;
+    /// Take over the lease `name` from `stale`, a holder known to be dead.
+    fn lock_take_over(
+        &self,
+        name: &str,
+        holder: &str,
+        stale: &str,
+    ) -> impl Future<Output = Result<Self::Lease>> + Send;
+}
+
+/// A held lease: refreshed at its revision (`BusError::LeaseLost` once it is not ours),
+/// released when done.
+pub trait LeaseApi: Send + Sync + 'static {
+    fn refresh(&mut self) -> impl Future<Output = Result<()>> + Send;
+    /// `false`: it was no longer ours, so nothing was deleted.
+    fn release(self) -> impl Future<Output = Result<bool>> + Send;
 }
 
 pub trait InboxApi: Send + 'static {
@@ -42,6 +64,7 @@ pub trait DeliveryApi: Send + Sync + 'static {
 impl BusApi for hgl_ai_bus::Bus {
     type Inbox = hgl_ai_bus::Inbox;
     type Delivery = hgl_ai_bus::Delivery;
+    type Lease = hgl_ai_bus::Lease;
 
     async fn inbox(&self, seat: &Seat) -> Result<Self::Inbox> {
         hgl_ai_bus::Bus::inbox(self, seat).await
@@ -62,6 +85,21 @@ impl BusApi for hgl_ai_bus::Bus {
     }
     async fn bridge_host(&self, seat: &Seat) -> Result<Option<String>> {
         hgl_ai_bus::Bus::bridge_host(self, seat).await
+    }
+    async fn lock_acquire(&self, name: &str, holder: &str) -> Result<Self::Lease> {
+        hgl_ai_bus::Bus::lock_acquire(self, name, holder).await
+    }
+    async fn lock_take_over(&self, name: &str, holder: &str, stale: &str) -> Result<Self::Lease> {
+        hgl_ai_bus::Bus::lock_take_over(self, name, holder, stale).await
+    }
+}
+
+impl LeaseApi for hgl_ai_bus::Lease {
+    async fn refresh(&mut self) -> Result<()> {
+        hgl_ai_bus::Lease::refresh(self).await
+    }
+    async fn release(self) -> Result<bool> {
+        hgl_ai_bus::Lease::release(self).await
     }
 }
 

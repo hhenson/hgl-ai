@@ -419,6 +419,11 @@ pub fn land_lock_key(repo: &str) -> String {
     format!("lock.land.{repo}")
 }
 
+/// The seat lease of `seat` (PROTO-6): held by the one bridge, on any host, that serves it.
+pub fn seat_lock_key(seat: &Seat) -> String {
+    format!("seat.{seat}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -552,5 +557,6 @@ mod tests {
             "build-1.r1.hgl-compiler-992-review"
         );
         assert_eq!(land_lock_key("hgl-compiler"), "lock.land.hgl-compiler");
+        assert_eq!(seat_lock_key(&seat("w1")), "seat.w1");
     }
 }

@@ -85,7 +85,6 @@ fn harness() -> H {
     let mut opts = Options::from_config(&cfg);
     opts.fetch_wait = Duration::from_millis(100);
     opts.nak_delay = Duration::from_millis(50);
-    opts.gate_delay = Duration::from_secs(3600);
     opts.busy_retry = Duration::from_millis(200);
     opts.in_progress_every = Duration::from_millis(100);
     opts.heartbeat_every = Duration::from_millis(100);
@@ -404,7 +403,7 @@ async fn a_crash_naks_without_failover() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn drain_refuses_assign_and_tells_once_per_change() {
+async fn drain_holds_assign_until_the_gate_opens_and_tells_once_per_change() {
     let h = harness();
     h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
     h.bus.set_state("mode", "drain");
@@ -417,16 +416,26 @@ async fn drain_refuses_assign_and_tells_once_per_change() {
         "w1",
         note(Kind::Assign, "w1", 2, "[claude] Assign: demo#2 Two"),
     );
-    let long = Ev::Nak(Duration::from_secs(3600));
-    eventually("both naked for long", || {
-        h.bus.events(a) == [long.clone()] && h.bus.events(b) == [long.clone()]
+    eventually("both kept alive", || {
+        h.bus.progressed(a) && h.bus.progressed(b)
     })
     .await;
-    tokio::time::sleep(Duration::from_millis(300)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        h.bus.events(a).is_empty() && h.bus.events(b).is_empty(),
+        "held, neither naked (max_deliver) nor acked: {:?} {:?}",
+        h.bus.events(a),
+        h.bus.events(b)
+    );
     assert_eq!(h.bus.sent_containing("mode is drain").len(), 1);
     assert!(h.calls("codex").is_empty());
     assert!(!h.work().join("w1/demo-1").exists());
     h.bus.set_state("mode", "normal");
+    eventually("both run once the gate opens", || {
+        h.bus.events(a) == [Ev::Ack] && h.bus.events(b) == [Ev::Ack]
+    })
+    .await;
+    assert_eq!(h.calls("codex").len(), 2);
     eventually("open again", || {
         h.bus.sent_containing("taking `assign` notes again").len() == 1
     })
@@ -435,23 +444,180 @@ async fn drain_refuses_assign_and_tells_once_per_change() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn low_disk_refuses_assign() {
+async fn low_disk_holds_assign_and_shutdown_hands_it_back() {
     let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
     h.disk.0.store(crate::disk::GB, Ordering::SeqCst);
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
         note(Kind::Assign, "w1", 1, "[claude] Assign: demo#1 One"),
     );
-    eventually("naked for long", || {
-        h.bus.events(a) == [Ev::Nak(Duration::from_secs(3600))]
-    })
-    .await;
+    eventually("kept alive", || h.bus.progressed(a)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(h.bus.events(a).is_empty(), "{:?}", h.bus.events(a));
     let told = h.bus.sent_containing("below min_free_gb 200");
     assert_eq!(told.len(), 1);
     assert_eq!(told[0].sender.as_str(), "build-1");
     assert!(h.calls("codex").is_empty());
+    // A stopping bridge hands the held note back for redelivery.
     stop(tx, j).await;
+    assert_eq!(h.bus.events(a), [Ev::Nak(Duration::from_millis(50))]);
+    // Space again: the next bridge runs it.
+    h.disk.0.store(1000 * crate::disk::GB, Ordering::SeqCst);
+    let (tx, j) = h.start(&["w1"]);
+    eventually("run after the redelivery", || {
+        h.bus.events(a) == [Ev::Nak(Duration::from_millis(50)), Ev::Ack]
+    })
+    .await;
+    assert_eq!(h.calls("codex").len(), 1);
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_note_sent_before_its_task_ended_is_acked_without_a_turn() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let assign = note(Kind::Assign, "w1", 20, "[claude] Assign: demo#20 Twenty");
+    let a = h.bus.push("w1", assign.clone());
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 20, "[claude] Landed: demo#20"),
+    );
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    let dir = h.work().join("w1/demo-20");
+    assert!(!dir.exists());
+    // JetStream hands the assign out again after the end (a redelivery, a moved seat).
+    h.bus.redeliver("w1", a, assign.clone());
+    eventually("acked again", || h.bus.events(a) == [Ev::Ack, Ev::Ack]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.calls("codex").len(), 1, "no turn for the ended task");
+    assert!(!dir.exists(), "no tree for the ended task");
+    stop(tx, j).await;
+
+    // Remembered across a restart (under data_dir).
+    let (tx, j) = h.start(&["w1"]);
+    h.bus.redeliver("w1", a, assign.clone());
+    eventually("acked after the restart", || h.bus.events(a).len() == 3).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.calls("codex").len(), 1);
+    assert!(!dir.exists());
+    // An `assign` sent after the end starts the task again.
+    let again = h.bus.push("w1", assign);
+    eventually("the new assign runs", || h.bus.events(again) == [Ev::Ack]).await;
+    assert_eq!(h.calls("codex").len(), 2);
+    assert!(dir.exists());
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_whose_lease_another_bridge_holds_is_not_served() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    h.bus.steal_lease("seat.w1", "build-2 pid 9 (bridge)");
+    let (tx, j) = h.start(&["w1"]);
+    let n = h.bus.push(
+        "w1",
+        Note::new(seat("claude"), seat("w1"), Kind::Note, "hello"),
+    );
+    eventually("a heartbeat", || h.bus.last_host().is_some()).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(h.bus.events(n).is_empty(), "build-2 holds w1");
+    assert!(h.calls("codex").is_empty());
+    assert!(h.bus.last_host().unwrap().seats.is_empty());
+    assert_eq!(
+        h.bus.lease_holder("seat.w1").as_deref(),
+        Some("build-2 pid 9 (bridge)")
+    );
+    // A live process of this host named as holder (pid 1 always exists): not taken over.
+    h.bus.steal_lease("seat.w1", "build-1 pid 1 (bridge)");
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(h.bus.events(n).is_empty());
+    // The other bridge lets go: this one takes the seat.
+    h.bus.drop_lease("seat.w1");
+    eventually("served", || h.bus.events(n) == [Ev::Ack]).await;
+    let ours = format!("build-1 pid {} (bridge)", std::process::id());
+    assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours));
+    stop(tx, j).await;
+    assert_eq!(h.bus.lease_holder("seat.w1"), None, "released at shutdown");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lease_of_a_crashed_bridge_of_this_host_is_taken_over() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    // Above the largest Linux pid: no such process.
+    h.bus
+        .steal_lease("seat.w1", "build-1 pid 999999999 (bridge)");
+    let (tx, j) = h.start(&["w1"]);
+    let n = h.bus.push(
+        "w1",
+        Note::new(seat("claude"), seat("w1"), Kind::Note, "hello"),
+    );
+    eventually("served at once", || h.bus.events(n) == [Ev::Ack]).await;
+    let ours = format!("build-1 pid {} (bridge)", std::process::id());
+    assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours));
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_seat_lease_stops_the_seat() {
+    let h = harness();
+    let pid = h.calls.join("pid");
+    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 30, "[claude] Assign: demo#30 Thirty"),
+    );
+    eventually("turn running", || pid.exists()).await;
+    eventually("advertised", || {
+        h.bus.last_host().is_some_and(|r| r.seats.len() == 1)
+    })
+    .await;
+    h.bus.steal_lease("seat.w1", "build-2 pid 9 (bridge)");
+    eventually("the turn's note handed back", || {
+        h.bus.events(a) == [Ev::Nak(Duration::from_millis(50))]
+    })
+    .await;
+    let p: i32 = std::fs::read_to_string(&pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    eventually("the turn stopped", || !alive(p)).await;
+    eventually("the controller told", || {
+        !h.bus
+            .sent_containing("the seat lease seat.w1 is no longer ours")
+            .is_empty()
+    })
+    .await;
+    let told = h
+        .bus
+        .sent_containing("the seat lease seat.w1 is no longer ours");
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].recipient.as_str(), "claude");
+    assert!(
+        told[0].body.contains("stopped its running turn"),
+        "{}",
+        told[0].body
+    );
+    eventually("no longer advertised", || {
+        h.bus.last_host().is_some_and(|r| r.seats.is_empty())
+    })
+    .await;
+    // The redelivered note waits for the seat's new holder.
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert_eq!(h.calls("codex").len(), 1);
+    assert_eq!(h.bus.events(a), [Ev::Nak(Duration::from_millis(50))]);
+    stop(tx, j).await;
+    assert_eq!(
+        h.bus.lease_holder("seat.w1").as_deref(),
+        Some("build-2 pid 9 (bridge)"),
+        "the new holder's lease is left alone"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
