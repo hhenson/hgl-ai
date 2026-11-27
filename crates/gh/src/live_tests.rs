@@ -604,9 +604,11 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
     store::put_latest(&b, state::KEY_PRS, &fixture("coord-prev.prs"))
         .await
         .unwrap();
+    // The run's backlog round too (merged with the owner console's coordinator).
     let gh = || {
         FakeGh::default()
             .on("auth status", "")
+            .on("query Backlog", &fixture("backlog-batch.json"))
             .on("graphql", &fixture("coord-batch.json"))
     };
     let o = CoordOpts {
