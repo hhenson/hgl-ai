@@ -69,8 +69,24 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ClientOpts) -> Result
     cfg.validate()?;
 
     let token_src = absolute(env.expand(&o.token_file));
+    let cred = token::read_credential(sys, &token_src)?
+        .ok_or_else(|| other(format!("no credential at {}", token_src.display())))?;
+    if cred.role() == Some("console") {
+        return Err(other(
+            "that is the console's credential; a client takes a seat credential              (`hgl-ai server user add <label> --role seat`)",
+        ));
+    }
     token::copy(sys, &token_src, &token_dst)?;
-    sys.say(&format!("token: {} (mode 600)", cfg.hub.token_file));
+    sys.say(&format!(
+        "credential: {} ({}, mode 600)",
+        cfg.hub.token_file,
+        cred.describe()
+    ));
+    if cred.is_token() {
+        sys.say(
+            "auth: a shared token; any client can publish as the owner. Ask the hub for a              hub user (`hgl-ai server user add <label> --role seat`, docs/install.md)",
+        );
+    }
     save_config(sys, env, &cfg)?;
     let verb = if created { "created" } else { "updated" };
     sys.say(&format!("config: {} ({verb})", env.config_path.display()));

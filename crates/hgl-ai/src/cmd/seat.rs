@@ -48,6 +48,10 @@ struct AddArgs {
     /// RUNTIME:FAMILY:TIER, optionally :EFFORT.
     #[arg(long, value_name = "RUNTIME:FAMILY:TIER", value_parser = fallback)]
     fallback: Vec<Binding>,
+    /// A controller the bridge serves, a headless turn per batch of notes (OWN-7);
+    /// without it a controller is interactive (`agent start`, `note wait`).
+    #[arg(long)]
+    headless: bool,
 }
 
 fn fallback(s: &str) -> Result<Binding, String> {
@@ -84,6 +88,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 },
                 fallback: a.fallback,
                 memcap_gb: None,
+                headless: a.headless,
             });
             cfg.save(&path)
                 .with_context(|| format!("seat {}", a.name))?;

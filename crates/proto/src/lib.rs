@@ -22,6 +22,29 @@ pub const KV_ENDED: &str = "HGL_ENDED";
 /// The broadcast seat (PROTO-7).
 pub const BROADCAST: &str = "all";
 
+/// The owner channel (docs/owner.md §4): status reports, thread events, no age limit.
+pub const STREAM_OWNER: &str = "HGL_OWNER";
+/// One record per owner thread; only the console writes it.
+pub const KV_THREADS: &str = "HGL_THREADS";
+/// Daily samples per repository; the coordinator writes them.
+pub const KV_METRICS: &str = "HGL_METRICS";
+/// The console's own state (sign-in sessions, the pending `p2` batch); only the console
+/// reads or writes it.
+pub const KV_CONSOLE: &str = "HGL_CONSOLE";
+/// Owner words: `hgl.owner.thread.<id>`. Only the console's hub user publishes here (OWN-5).
+pub const OWNER_PREFIX: &str = "hgl.owner";
+/// Agent traffic for the owner: `hgl.console.status`, `hgl.console.thread.<id>`.
+pub const CONSOLE_PREFIX: &str = "hgl.console";
+/// Owner notes to a seat travel on `hgl.notes.owner.<seat>`, which only the console's hub
+/// user may publish; a note with sender `owner` is valid only there (OWN-5).
+pub const OWNER_NOTES_PREFIX: &str = "hgl.notes.owner";
+/// The sender of the owner's words; never a seat.
+pub const OWNER: &str = "owner";
+/// The sender of the console's own notes (`tick`); never a seat.
+pub const CONSOLE: &str = "console";
+/// Names no configured seat may take.
+pub const RESERVED_SEATS: [&str; 3] = [BROADCAST, OWNER, CONSOLE];
+
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProtoError {
     #[error("invalid seat name {0:?}: expected ^[a-z0-9][a-z0-9_-]{{0,31}}$")]
@@ -64,9 +87,28 @@ impl Seat {
     pub fn is_broadcast(&self) -> bool {
         self.0 == BROADCAST
     }
+    /// The owner's sender name (OWN-5).
+    pub fn owner() -> Self {
+        Seat(OWNER.to_string())
+    }
+    /// The console's sender name.
+    pub fn console() -> Self {
+        Seat(CONSOLE.to_string())
+    }
+    pub fn is_owner(&self) -> bool {
+        self.0 == OWNER
+    }
+    /// `all`, `owner` or `console`: an address or sender, never a configured seat.
+    pub fn is_reserved(&self) -> bool {
+        RESERVED_SEATS.contains(&self.0.as_str())
+    }
     /// `hgl.notes.<seat>`
     pub fn subject(&self) -> String {
         format!("{SUBJECT_PREFIX}.{}", self.0)
+    }
+    /// `hgl.notes.owner.<seat>`: the owner's notes to this seat (OWN-5).
+    pub fn owner_subject(&self) -> String {
+        format!("{OWNER_NOTES_PREFIX}.{}", self.0)
     }
     /// Durable consumer name `inbox-<seat>`.
     pub fn consumer(&self) -> String {
@@ -144,6 +186,7 @@ string_enum!(
     Answer => "answer", Review => "review", Receipt => "receipt", Sendback => "sendback",
     Approved => "approved", Landed => "landed", Closed => "closed", Done => "done", Note => "note",
     Build => "build",
+    Tick => "tick",
 });
 
 impl Kind {
@@ -210,6 +253,28 @@ pub fn utc_now_stamp() -> String {
     utc_stamp(chrono::Utc::now())
 }
 
+/// A compact stamp read back: exactly `YYYYMMDDTHHMMSSZ`, ASCII digits, a real time.
+pub fn parse_stamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let b = s.as_bytes();
+    let shape = b.len() == 16
+        && b[8] == b'T'
+        && b[15] == b'Z'
+        && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit);
+    if !shape {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ")
+        .ok()
+        .map(|n| n.and_utc())
+}
+
+/// Validate a compact stamp (`created_at`, an event's `at`).
+pub fn check_stamp(s: &str) -> Result<(), ProtoError> {
+    parse_stamp(s)
+        .map(drop)
+        .ok_or_else(|| ProtoError::Note(format!("time {s:?}: expected YYYYMMDDTHHMMSSZ")))
+}
+
 /// The note envelope (§4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
@@ -228,7 +293,35 @@ pub struct Note {
     /// Base branch or commit for `assign`; merge commit for `landed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// For a note from `owner`: the handle of the signed-in owner who wrote it (OWN-10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
     pub body: String,
+}
+
+/// An owner's handle (OWN-10): the name they choose to sign with, 1 to 31 characters of
+/// letters, digits, spaces and `-_.'`, without leading or trailing space.
+pub fn check_handle(h: &str) -> Result<(), ProtoError> {
+    let n = h.chars().count();
+    let ok = (1..=31).contains(&n)
+        && h.trim() == h
+        && h.chars()
+            .all(|c| c.is_alphanumeric() || " -_.'".contains(c));
+    if ok {
+        Ok(())
+    } else {
+        Err(ProtoError::Note(format!(
+            "handle {h:?}: 1 to 31 letters, digits, spaces or -_.' with no space at either end"
+        )))
+    }
+}
+
+/// Handles are the same when they match ignoring case and runs of spaces.
+pub fn handle_key(h: &str) -> String {
+    h.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 impl Note {
@@ -247,6 +340,7 @@ impl Note {
             kind,
             head: None,
             base: None,
+            by: None,
             body,
         }
     }
@@ -258,6 +352,18 @@ impl Note {
         }
         if self.sender.is_broadcast() {
             return Err(ProtoError::Note("sender cannot be `all`".into()));
+        }
+        check_stamp(&self.created_at)?;
+        if self.recipient.is_owner() || self.recipient.as_str() == CONSOLE {
+            return Err(ProtoError::Note(format!(
+                "`{}` has no inbox; ask the owner with `hgl-ai ask`",
+                self.recipient
+            )));
+        }
+        if self.sender.is_owner() && self.recipient.is_broadcast() {
+            return Err(ProtoError::Note(
+                "owner notes go to one seat, not `all`".into(),
+            ));
         }
         if let Some(h) = &self.head {
             check_head(h)?;
@@ -275,10 +381,28 @@ impl Note {
                 self.kind
             )));
         }
+        if let Some(h) = &self.by {
+            if !self.sender.is_owner() {
+                return Err(ProtoError::Note(
+                    "only an owner note names its writer (`by`)".into(),
+                ));
+            }
+            check_handle(h)?;
+        }
         if self.body.trim().is_empty() {
             return Err(ProtoError::Note("empty body".into()));
         }
         Ok(())
+    }
+
+    /// The subject the note travels on: `hgl.notes.<recipient>`, or for a note from the
+    /// owner `hgl.notes.owner.<recipient>`, which only the console may publish (OWN-5).
+    pub fn subject(&self) -> String {
+        if self.sender.is_owner() {
+            self.recipient.owner_subject()
+        } else {
+            self.recipient.subject()
+        }
     }
 
     /// `Nats-Msg-Id` for deduplication (PROTO-9): `<sender>-<created_at>-<digest>`, the
@@ -295,7 +419,11 @@ impl Note {
             self.head.as_deref(),
             self.base.as_deref(),
             Some(self.body.as_str()),
-        ] {
+        ]
+        .into_iter()
+        // `by` only when set, so notes without it keep the ids they always had.
+        .chain(self.by.as_deref().map(Some))
+        {
             // Tagged and length-prefixed: no two envelopes encode alike.
             match field {
                 None => h.update([0u8]),
@@ -424,6 +552,34 @@ pub struct LockRecord {
     pub acquired_at: String,
 }
 
+/// `HGL_METRICS/<repo>.<YYYYMMDD>`: one sample per repository and day (docs/owner.md §3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MetricsSample {
+    pub repo: String,
+    /// UTC day, `YYYYMMDD`.
+    pub date: String,
+    /// Open issues when sampled.
+    pub open: u64,
+    /// Issues opened that day.
+    pub opened: u64,
+    /// Issues closed that day.
+    pub closed: u64,
+    /// Open issues per label when sampled.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, u64>,
+    pub taken_at: String,
+}
+
+impl MetricsSample {
+    pub fn key(&self) -> String {
+        metrics_key(&self.repo, &self.date)
+    }
+}
+
+pub fn metrics_key(repo: &str, date: &str) -> String {
+    format!("{repo}.{date}")
+}
+
 /// The landing lock of `repo` (§8): one landing or release watch at a time, on any host.
 pub fn land_lock_key(repo: &str) -> String {
     format!("lock.land.{repo}")
@@ -507,6 +663,68 @@ mod tests {
 
         let b = Note::new(Seat::broadcast(), seat("w1"), Kind::Note, "x");
         assert!(b.validate().is_err());
+    }
+
+    #[test]
+    fn stamps_are_strict() {
+        assert!(parse_stamp("20261127T041100Z").is_some());
+        for bad in [
+            "aaa\u{e9}105T090000Z",
+            "20261327T041100Z",
+            "2026112T7041100Z",
+            "x",
+            "",
+        ] {
+            assert!(parse_stamp(bad).is_none(), "{bad:?}");
+        }
+        let mut n = Note::new(seat("w1"), seat("claude"), Kind::Note, "x");
+        n.created_at = "aaa\u{e9}105T090000Z".into();
+        assert!(
+            n.validate().is_err(),
+            "a note with a malformed time is refused"
+        );
+    }
+
+    #[test]
+    fn owner_notes() {
+        let mut a = Note::new(Seat::owner(), seat("claude"), Kind::Answer, "accept");
+        assert!(a.validate().is_ok());
+        assert_eq!(a.subject(), "hgl.notes.owner.claude");
+        a.recipient = Seat::broadcast();
+        assert!(a.validate().is_err(), "owner notes go to one seat");
+        let n = Note::new(seat("w1"), seat("claude"), Kind::Note, "x");
+        assert_eq!(n.subject(), "hgl.notes.claude");
+        for to in [OWNER, CONSOLE] {
+            let n = Note::new(seat("w1"), seat(to), Kind::Question, "x");
+            assert!(n.validate().is_err(), "{to} has no inbox");
+        }
+        let t = Note::new(
+            Seat::console(),
+            seat("claude"),
+            Kind::Tick,
+            "[console] Tick",
+        );
+        assert!(t.validate().is_ok());
+        let mut a = Note::new(Seat::owner(), seat("claude"), Kind::Answer, "accept");
+        let plain = a.msg_id();
+        a.by = Some("HPH".into());
+        assert!(a.validate().is_ok());
+        assert_ne!(a.msg_id(), plain, "the writer is part of the envelope");
+        for ok in ["This Dude", "H", "O'Neil-Smith Jr.", "x_y", "Zoë"] {
+            a.by = Some(ok.into());
+            assert!(a.validate().is_ok(), "{ok}");
+        }
+        for bad in ["", " Lead", "Trail ", "a\tb", "a@b", &"x".repeat(32)] {
+            a.by = Some(bad.into());
+            assert!(a.validate().is_err(), "{bad:?}");
+        }
+        assert_eq!(handle_key("This  Dude"), handle_key("this dude"));
+        let mut n = Note::new(seat("w1"), seat("claude"), Kind::Note, "x");
+        n.by = Some("HPH".into());
+        assert!(n.validate().is_err(), "only owner notes carry `by`");
+        assert!(Seat::owner().is_reserved() && Seat::broadcast().is_reserved());
+        assert!(!seat("w1").is_reserved());
+        assert_eq!(metrics_key("hgl_spec", "20261127"), "hgl_spec.20261127");
     }
 
     #[test]

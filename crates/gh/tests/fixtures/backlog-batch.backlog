@@ -1,0 +1,21 @@
+# read 20260105T120000Z
+# open alpha 9
+# open beta 5
+# open gamma 3
+# label alpha codex 4
+# label alpha codex-claimed 1
+# label alpha codex-priority 1
+# label alpha documentation 1
+# label alpha good first issue 2
+# label beta codex 2
+# label beta codex-blocked 1
+# label beta codex-priority 2
+# label beta needs-owner 1
+# label gamma codex 2
+# label gamma codex-ready 1
+alpha	105	codex-priority	20260103T080000Z	Priority work
+beta	8	codex-priority	20260106T000000Z	Priority without codex
+alpha	101	codex	20260101T100000Z	Fix the parser for tabs
+beta	3	codex	20260101T100000Z	Opened with alpha 101
+gamma	21	codex	20260101T100000Z	Line one  line two
+alpha	107	codex	20260104T120000Z	Document the loop

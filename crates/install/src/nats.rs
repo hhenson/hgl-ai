@@ -19,21 +19,39 @@ fn conf_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', r"\\").replace('"', "\\\""))
 }
 
-/// `<data_dir>/nats.conf`: listen address, JetStream store, token authorization.
-pub fn render_conf(listen: &str, port: u16, store_dir: &Path, token: &str) -> String {
+/// How clients authenticate: one shared token (the single-token mode of older installs)
+/// or a hub user per client (OWN-5).
+#[derive(Debug, Clone, Copy)]
+pub enum Auth<'a> {
+    Token(&'a str),
+    Users(&'a crate::users::Registry),
+}
+
+/// `<data_dir>/nats.conf`: listen address, JetStream store, authorization.
+pub fn render_conf(listen: &str, port: u16, store_dir: &Path, auth: &Auth) -> String {
+    let authorization = match auth {
+        Auth::Token(t) => format!("authorization {{\n  token: {}\n}}\n", conf_str(t)),
+        Auth::Users(reg) => crate::users::render_authorization(reg),
+    };
     format!(
         "# hgl-ai hub, written by `hgl-ai server install`; reinstalling rewrites it.\n\
          host: {host}\n\
          port: {port}\n\
          max_payload: {MAX_PAYLOAD}\n\
+         pid_file: {pid}\n\
          \n\
          jetstream {{\n  store_dir: {store}\n}}\n\
          \n\
-         authorization {{\n  token: {token}\n}}\n",
+         {authorization}",
         host = conf_str(listen),
+        pid = conf_str(&pid_path(store_dir).display().to_string()),
         store = conf_str(&store_dir.display().to_string()),
-        token = conf_str(token),
     )
+}
+
+/// `<store_dir>/nats.pid`: where the hub writes its process id, for a reload.
+pub fn pid_path(store_dir: &Path) -> std::path::PathBuf {
+    store_dir.join("nats.pid")
 }
 
 /// The release archive for this OS and architecture.
@@ -88,6 +106,17 @@ pub fn ensure_server(
     version: &str,
     base: &str,
 ) -> Result<(PathBuf, NatsSource)> {
+    ensure_server_with(sys, data_dir, version, base, true)
+}
+
+/// [`ensure_server`], with Homebrew only when `brew` (not for a server user).
+pub fn ensure_server_with(
+    sys: &dyn System,
+    data_dir: &Path,
+    version: &str,
+    base: &str,
+    brew: bool,
+) -> Result<(PathBuf, NatsSource)> {
     if let Some(p) = sys.which("nats-server") {
         return Ok((p, NatsSource::Path));
     }
@@ -108,7 +137,7 @@ pub fn ensure_server(
     if sys.exists(&ours) && pinned() {
         return Ok((ours, NatsSource::Release));
     }
-    if let Some(brew) = sys.which("brew") {
+    if let Some(brew) = sys.which("brew").filter(|_| brew) {
         let brew = brew.display().to_string();
         run_ok(sys, &Cmd::new(&brew).args(["install", "nats-server"]))?;
         if let Some(p) = sys.which("nats-server") {
@@ -187,13 +216,19 @@ mod tests {
 
     #[test]
     fn conf_golden() {
-        let c = render_conf("192.0.2.10", 4222, Path::new("/srv/hgl-ai/nats"), "abc123");
+        let c = render_conf(
+            "192.0.2.10",
+            4222,
+            Path::new("/srv/hgl-ai/nats"),
+            &Auth::Token("abc123"),
+        );
         assert_eq!(
             c,
             r#"# hgl-ai hub, written by `hgl-ai server install`; reinstalling rewrites it.
 host: "192.0.2.10"
 port: 4222
 max_payload: 4MB
+pid_file: "/srv/hgl-ai/nats/nats.pid"
 
 jetstream {
   store_dir: "/srv/hgl-ai/nats"
@@ -204,7 +239,10 @@ authorization {
 }
 "#
         );
-        assert!(render_conf("::", 1, Path::new(r#"/a"b"#), "t").contains(r#"store_dir: "/a\"b""#));
+        assert!(
+            render_conf("::", 1, Path::new(r#"/a"b"#), &Auth::Token("t"))
+                .contains(r#"store_dir: "/a\"b""#)
+        );
     }
 
     /// The rendered file is a valid `nats-server` configuration (when one is installed).
@@ -219,7 +257,12 @@ authorization {
         let p = d.path().join("nats.conf");
         std::fs::write(
             &p,
-            render_conf("127.0.0.1", 4222, &d.path().join("store"), &"ab".repeat(32)),
+            render_conf(
+                "127.0.0.1",
+                4222,
+                &d.path().join("store"),
+                &Auth::Token(&"ab".repeat(32)),
+            ),
         )
         .unwrap();
         let o = std::process::Command::new(bin)

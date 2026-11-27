@@ -32,6 +32,8 @@ pub trait Gh: Sync {
 pub struct GhCli {
     pub program: String,
     pub timeout: Duration,
+    /// `GH_TOKEN` for every run (`[github] token_file`), else `gh`'s own sign-in.
+    pub token: Option<String>,
 }
 
 impl Default for GhCli {
@@ -39,7 +41,37 @@ impl Default for GhCli {
         GhCli {
             program: "gh".into(),
             timeout: Duration::from_secs(90),
+            token: None,
         }
+    }
+}
+
+impl GhCli {
+    /// With the token in `path` (trimmed), refused when group or others can read it.
+    pub fn with_token_file(mut self, path: &std::path::Path) -> Result<Self> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let m = std::fs::metadata(path)
+                .map_err(|e| Error::Auth(format!("{}: {e}", path.display())))?
+                .permissions()
+                .mode();
+            if m & 0o077 != 0 {
+                return Err(Error::Auth(format!(
+                    "{}: mode {:o} is open to group or others; a token needs 0600",
+                    path.display(),
+                    m & 0o777
+                )));
+            }
+        }
+        let t = std::fs::read_to_string(path)
+            .map_err(|e| Error::Auth(format!("{}: {e}", path.display())))?;
+        let t = t.trim();
+        if t.is_empty() {
+            return Err(Error::Auth(format!("{} is empty", path.display())));
+        }
+        self.token = Some(t.to_string());
+        Ok(self)
     }
 }
 
@@ -58,6 +90,9 @@ impl Gh for GhCli {
             .env("GH_PROMPT_DISABLED", "1")
             .env("NO_COLOR", "1")
             .kill_on_drop(true);
+        if let Some(t) = &self.token {
+            cmd.env("GH_TOKEN", t);
+        }
         let mut child = cmd.spawn().map_err(|e| Error::Command {
             args: shown.clone(),
             msg: e.to_string(),

@@ -26,7 +26,7 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Cmd {
-    /// The coordinator service: the pull request table, `hold` and alerts.
+    /// The coordinator service: the pull request table, `hold`, alerts, the backlog and daily metrics.
     Coord {
         #[command(subcommand)]
         cmd: CoordCmd,
@@ -98,12 +98,12 @@ impl VerdictArgs {
 
 #[derive(clap::Subcommand)]
 enum CoordCmd {
-    /// Run rounds every interval (at least 5 minutes).
+    /// Run rounds every interval (at least 5 minutes); the backlog round every 15 minutes.
     Run {
-        /// One round, then exit.
+        /// One round of each, then exit.
         #[arg(long)]
         once: bool,
-        /// Print the table and the alerts; write no state, send nothing.
+        /// Print the table, the alerts, the backlog and the metrics samples; write no state, send nothing.
         #[arg(long)]
         dry_run: bool,
         /// Default: `github.coord_interval`.
@@ -312,7 +312,12 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     }
     let cfg = ctx.load_config()?;
     let s = Settings::from_config(&cfg)?;
-    let gh = GhCli::default();
+    let gh = match &cfg.github.token_file {
+        Some(p) => GhCli::default()
+            .with_token_file(&hgl_ai_config::expand(p)?)
+            .map_err(lift)?,
+        None => GhCli::default(),
+    };
     // Every command below reads GitHub: say so clearly when `gh` cannot.
     hgl_ai_gh::exec::check_auth(&gh).await.map_err(lift)?;
     match *args.cmd {

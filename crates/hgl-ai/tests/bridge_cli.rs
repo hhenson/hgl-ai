@@ -359,6 +359,7 @@ fn the_bridge_serves_a_seat_against_a_live_hub() {
         },
         fallback: vec![],
         memcap_gb: Some(4),
+        headless: false,
     });
     cfg.save(&p).unwrap();
     assert!(hgl(&p, &["init"]).output().unwrap().status.success());
@@ -518,6 +519,7 @@ fn two_bridges_for_one_seat_only_one_serves() {
             },
             fallback: vec![],
             memcap_gb: Some(4),
+            headless: false,
         });
         cfg.save(&p).unwrap();
         let script = format!(
@@ -650,6 +652,7 @@ fn seat_host(root: &Path, hub: &Hub, token: &Path, name: &str, body: &str) -> (P
         },
         fallback: vec![],
         memcap_gb: Some(4),
+        headless: false,
     });
     cfg.save(&p).unwrap();
     let codex = dir.join("bin/codex");

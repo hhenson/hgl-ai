@@ -5,7 +5,10 @@ use std::time::Duration;
 
 use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_config::Config;
-use hgl_ai_proto::{KV_ENDED, KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES, STREAM_NOTES};
+use hgl_ai_proto::{
+    KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES,
+    STREAM_NOTES, STREAM_OWNER,
+};
 
 pub trait Hub {
     /// Connect with the host configuration (client install).
@@ -29,22 +32,31 @@ impl Hub for BusHub {
     }
 
     /// Read-only: the bus API has no existence check that does not create, so
-    /// this looks the six objects up directly.
+    /// this looks the streams and buckets up directly.
     async fn health(&self, cfg: &Config) -> Result<Vec<String>, String> {
         let path = cfg.token_file().map_err(|e| e.to_string())?;
-        let token = std::fs::read_to_string(&path)
-            .map_err(|e| format!("reading {}: {e}", path.display()))?;
-        let client = async_nats::ConnectOptions::with_token(token.trim().to_string())
+        let opts = match hgl_ai_bus::read_credential(&path).map_err(|e| e.to_string())? {
+            Some(hgl_ai_bus::Credential::Token(t)) => async_nats::ConnectOptions::with_token(t),
+            Some(hgl_ai_bus::Credential::Nkey { seed, .. }) => {
+                async_nats::ConnectOptions::with_nkey(seed)
+            }
+            None => async_nats::ConnectOptions::new(),
+        };
+        let client = opts
             .connection_timeout(Duration::from_secs(5))
             .connect(cfg.hub.url.as_str())
             .await
             .map_err(|e| e.to_string())?;
         let js = async_nats::jetstream::new(client);
         let mut missing = Vec::new();
-        if js.get_stream(STREAM_NOTES).await.is_err() {
-            missing.push(STREAM_NOTES.to_string());
+        for s in [STREAM_NOTES, STREAM_OWNER] {
+            if js.get_stream(s).await.is_err() {
+                missing.push(s.to_string());
+            }
         }
-        for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED] {
+        for b in [
+            KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
+        ] {
             if js.get_key_value(b).await.is_err() {
                 missing.push(b.to_string());
             }
@@ -64,6 +76,8 @@ pub(crate) mod fake {
         pub reachable: bool,
         pub missing: Vec<String>,
         pub calls: RefCell<Vec<&'static str>>,
+        /// The credential file each call connected with.
+        pub creds: RefCell<Vec<String>>,
     }
 
     impl FakeHub {
@@ -72,6 +86,7 @@ pub(crate) mod fake {
                 reachable: true,
                 missing: Vec::new(),
                 calls: RefCell::new(Vec::new()),
+                creds: RefCell::new(Vec::new()),
             }
         }
         pub fn down() -> Self {
@@ -82,6 +97,7 @@ pub(crate) mod fake {
         }
         fn answer(&self, call: &'static str, cfg: &Config) -> Result<(), BusError> {
             self.calls.borrow_mut().push(call);
+            self.creds.borrow_mut().push(cfg.hub.token_file.clone());
             if self.reachable {
                 Ok(())
             } else {
@@ -140,9 +156,15 @@ mod live {
             .port();
         let token = crate::token::generate().unwrap();
         let conf = d.path().join("nats.conf");
+        std::fs::create_dir_all(d.path().join("store")).unwrap();
         std::fs::write(
             &conf,
-            crate::nats::render_conf("127.0.0.1", port, &d.path().join("store"), &token),
+            crate::nats::render_conf(
+                "127.0.0.1",
+                port,
+                &d.path().join("store"),
+                &crate::nats::Auth::Token(&token),
+            ),
         )
         .unwrap();
         let _server = Server(
@@ -171,11 +193,15 @@ mod live {
             missing,
             [
                 STREAM_NOTES,
+                STREAM_OWNER,
                 KV_STATE,
                 KV_HOSTS,
                 KV_TREES,
                 KV_LOCKS,
-                KV_ENDED
+                KV_ENDED,
+                KV_THREADS,
+                KV_METRICS,
+                KV_CONSOLE
             ]
         );
 
@@ -184,14 +210,18 @@ mod live {
             .await
             .unwrap();
         let js = async_nats::jetstream::new(client);
-        js.create_stream(async_nats::jetstream::stream::Config {
-            name: STREAM_NOTES.into(),
-            subjects: vec!["hgl.notes.>".into()],
-            ..Default::default()
-        })
-        .await
-        .unwrap();
-        for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED] {
+        for (name, subject) in [(STREAM_NOTES, "hgl.notes.>"), (STREAM_OWNER, "hgl.owner.>")] {
+            js.create_stream(async_nats::jetstream::stream::Config {
+                name: name.into(),
+                subjects: vec![subject.into()],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        for b in [
+            KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
+        ] {
             js.create_key_value(async_nats::jetstream::kv::Config {
                 bucket: b.into(),
                 ..Default::default()

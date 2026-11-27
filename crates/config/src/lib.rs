@@ -8,8 +8,13 @@ use hgl_ai_proto::{Family, Role, Runtime, Seat, Tier};
 use serde::{Deserialize, Serialize};
 
 pub mod builder;
+pub mod console;
 pub mod github;
 pub use builder::{Builder, Remote};
+pub use console::{
+    AppleOAuth, Console, GithubOAuth, GoogleOAuth, Identity, Ids, LinkedEntry, Member, Notify,
+    Person, SmtpTls, Unresolved, User,
+};
 pub use github::{Pin, ReleaseWatch, RepoGate, Tap};
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +42,9 @@ pub enum ConfigError {
 
 pub type Result<T> = std::result::Result<T, ConfigError>;
 
+/// Overrides `hub.token_file` for one process: a service that has a hub user of its own.
+pub const CREDENTIAL_ENV: &str = "HGL_AI_HUB_CREDENTIAL";
+
 /// The whole file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,8 +65,44 @@ pub struct Config {
     pub seats: Vec<SeatConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<Server>,
+    /// The owner's console (hub host only; docs/owner.md).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console: Option<Console>,
+    /// On a hub host whose server side runs as its own OS user (the client's
+    /// configuration): that user, for `server status` and `doctor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_user: Option<ServerUser>,
     #[serde(default, skip_serializing_if = "Builder::is_default")]
     pub builder: Builder,
+}
+
+/// The OS user the hub, coordinator and console run as (docs/install.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerUser {
+    pub name: String,
+    /// Its home: the server side's configuration, credentials and data.
+    pub home: String,
+    /// The console's origin, when the server side runs one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub console_url: Option<String>,
+}
+
+/// Where the hub's services are installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Units {
+    /// `systemd --user` units or launchd agents of the installing user.
+    #[default]
+    User,
+    /// System units (`User=`) or launch daemons (`UserName`) of a server user.
+    System,
+}
+
+impl Units {
+    fn is_user(&self) -> bool {
+        *self == Units::User
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -206,6 +250,10 @@ pub struct Github {
     /// Clone URL template; `{owner}` and `{repo}` are replaced.
     #[serde(default = "default_clone_url")]
     pub clone_url: String,
+    /// A GitHub token for `gh` (`GH_TOKEN`), mode 0600: the coordinator's own read-only
+    /// token when it runs as the server user. Without it, `gh`'s own sign-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<String>,
 }
 
 pub fn default_clone_url() -> String {
@@ -251,6 +299,7 @@ impl Default for Github {
             release: github::release(),
             tap: github::tap(),
             clone_url: default_clone_url(),
+            token_file: None,
         }
     }
 }
@@ -320,6 +369,10 @@ pub struct SeatConfig {
     /// Per-seat memory cap; defaults to `limits.memcap_gb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memcap_gb: Option<u64>,
+    /// A controller served by the bridge, a headless turn per batch of notes (OWN-7);
+    /// without it a controller is interactive (PROTO-6). Only for role `controller`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub headless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -329,6 +382,27 @@ pub struct Server {
     pub port: u16,
     pub store_dir: String,
     pub nats_version: String,
+    /// How clients authenticate. A configuration from before hub users is `token`.
+    #[serde(default = "HubAuth::legacy")]
+    pub auth: HubAuth,
+    /// Where the hub's services are installed.
+    #[serde(default, skip_serializing_if = "Units::is_user")]
+    pub units: Units,
+}
+
+/// `users`: a hub user per client with its role's permissions (OWN-5); `token`: one
+/// shared token, every client alike (older installs; `doctor` warns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum HubAuth {
+    Users,
+    Token,
+}
+
+impl HubAuth {
+    fn legacy() -> Self {
+        HubAuth::Token
+    }
 }
 
 impl Default for Server {
@@ -338,6 +412,8 @@ impl Default for Server {
             port: 4222,
             store_dir: "~/.local/share/hgl-ai/nats".into(),
             nats_version: "2.15.3".into(),
+            auth: HubAuth::Users,
+            units: Units::User,
         }
     }
 }
@@ -412,6 +488,8 @@ impl Config {
             models: default_models(),
             seats: Vec::new(),
             server: None,
+            console: None,
+            server_user: None,
             builder: Builder::default(),
         }
     }
@@ -480,8 +558,17 @@ impl Config {
         }
         let mut seen = std::collections::BTreeSet::new();
         for s in &self.seats {
-            if s.name.is_broadcast() {
-                return Err(ConfigError::Invalid("a seat cannot be named `all`".into()));
+            if s.name.is_reserved() {
+                return Err(ConfigError::Invalid(format!(
+                    "a seat cannot be named `{}`: `all`, `owner` and `console` are reserved",
+                    s.name
+                )));
+            }
+            if s.headless && s.role != Role::Controller {
+                return Err(ConfigError::Invalid(format!(
+                    "seat {}: `headless` is for a controller; the bridge serves every other seat",
+                    s.name
+                )));
             }
             if !seen.insert(s.name.clone()) {
                 return Err(ConfigError::Invalid(format!(
@@ -496,6 +583,9 @@ impl Config {
         }
         self.controller()?;
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
+        if let Some(c) = &self.console {
+            c.validate().map_err(ConfigError::Invalid)?;
+        }
         builder::validate(&self.builder, &self.host).map_err(ConfigError::Invalid)?;
         for d in [
             &self.limits.stale_after,
@@ -559,8 +649,10 @@ impl Config {
     pub fn controller(&self) -> Result<Seat> {
         let invalid = |why: String| ConfigError::Invalid(format!("github.controller: {why}"));
         let s = Seat::new(self.github.controller.clone()).map_err(|e| invalid(e.to_string()))?;
-        if s.is_broadcast() {
-            return Err(invalid("not `all`; name one seat".into()));
+        if s.is_reserved() {
+            return Err(invalid(
+                "not `all`, `owner` or `console`; name one seat".into(),
+            ));
         }
         Ok(s)
     }
@@ -571,8 +663,17 @@ impl Config {
     pub fn data_dir(&self) -> Result<PathBuf> {
         expand(&self.paths.data_dir)
     }
+    /// The hub credential this process connects with: `HGL_AI_HUB_CREDENTIAL` when set (the
+    /// coordinator and console services each get their own hub user), else `hub.token_file`.
     pub fn token_file(&self) -> Result<PathBuf> {
-        expand(&self.hub.token_file)
+        match std::env::var_os(CREDENTIAL_ENV) {
+            Some(p) if !p.is_empty() => expand(&p.to_string_lossy()),
+            _ => expand(&self.hub.token_file),
+        }
+    }
+    /// `<data_dir>/console`: the console's passkeys and cookie key.
+    pub fn console_dir(&self) -> Result<PathBuf> {
+        Ok(self.data_dir()?.join("console"))
     }
     /// `<data_dir>/seats/<seat>.lock`: exclusively `flock`ed by whoever serves the seat,
     /// the bridge or an interactive session, never both.
@@ -721,10 +822,47 @@ model = "claude-opus-5-5-high"
         c.github.controller = "boss".into();
         assert_eq!(c.controller().unwrap().as_str(), "boss");
         assert!(c.validate().is_ok());
-        for bad in ["all", "Not A Seat"] {
+        for bad in ["all", "owner", "console", "Not A Seat"] {
             c.github.controller = bad.into();
             assert!(c.validate().is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn headless_is_for_a_controller() {
+        let t = "host = \"h\"\n[[seat]]\nname = \"w1\"\nrole = \"implementor\"\nruntime = \"codex\"\ntier = \"fast\"\nheadless = true\n";
+        let c: Config = toml::from_str(t).unwrap();
+        assert!(c.validate().is_err());
+        let c: Config = toml::from_str(&t.replace("implementor", "controller")).unwrap();
+        c.validate().unwrap();
+        assert!(c.seats[0].headless);
+    }
+
+    #[test]
+    fn reserved_seat_names() {
+        for name in ["all", "owner", "console"] {
+            let t = format!(
+                "host = \"h\"\n[[seat]]\nname = \"{name}\"\nrole = \"reviewer\"\nruntime = \"codex\"\ntier = \"fast\"\n"
+            );
+            let c: Config = toml::from_str(&t).unwrap();
+            assert!(c.validate().is_err(), "{name}");
+        }
+    }
+
+    #[test]
+    fn hub_auth_defaults() {
+        let old = "host = \"h\"\n[server]\nlisten = \"127.0.0.1\"\nport = 4222\nstore_dir = \"s\"\nnats_version = \"2.15.3\"\n";
+        let c: Config = toml::from_str(old).unwrap();
+        assert_eq!(
+            c.server.unwrap().auth,
+            HubAuth::Token,
+            "an older hub keeps its token"
+        );
+        assert_eq!(
+            Server::default().auth,
+            HubAuth::Users,
+            "a new hub has users"
+        );
     }
 
     #[test]

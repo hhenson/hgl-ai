@@ -12,14 +12,16 @@ pub enum Service {
     Hub,
     Bridge,
     Coord,
+    Console,
     Builder,
 }
 
 impl Service {
-    pub const ALL: [Service; 4] = [
+    pub const ALL: [Service; 5] = [
         Service::Hub,
         Service::Bridge,
         Service::Coord,
+        Service::Console,
         Service::Builder,
     ];
 
@@ -28,6 +30,7 @@ impl Service {
             Service::Hub => "hub",
             Service::Bridge => "bridge",
             Service::Coord => "coord",
+            Service::Console => "console",
             Service::Builder => "builder",
         }
     }
@@ -44,6 +47,7 @@ impl Service {
             Service::Hub => "hgl-ai hub (NATS JetStream)",
             Service::Bridge => "hgl-ai bridge",
             Service::Coord => "hgl-ai coordinator",
+            Service::Console => "hgl-ai owner console",
             Service::Builder => "hgl-ai builder",
         }
     }
@@ -71,13 +75,14 @@ impl Spec {
         }
     }
 
-    /// `hgl-ai bridge run` or `hgl-ai gh coord run`, with the install-time `PATH`
-    /// (agent CLIs, `git`, `gh`) and the configuration in use.
+    /// `hgl-ai bridge run`, `hgl-ai gh coord run` or `hgl-ai console run`, with the
+    /// install-time `PATH` (agent CLIs, `git`, `gh`) and the configuration in use.
     pub fn hgl_ai(service: Service, sys: &dyn System, data_dir: &Path) -> Spec {
         let env = sys.env();
         let exe = env.service_exe(sys);
         let args = match service {
             Service::Coord => vec!["gh", "coord", "run"],
+            Service::Console => vec!["console", "run"],
             Service::Builder => vec!["builder", "run"],
             _ => vec!["bridge", "run"],
         };
@@ -93,6 +98,103 @@ impl Spec {
             program: exe,
             args: args.into_iter().map(String::from).collect(),
             log: log_path(data_dir, service),
+        }
+    }
+}
+
+impl Spec {
+    /// The service connects to the hub as its own hub user (`HGL_AI_HUB_CREDENTIAL`).
+    pub fn with_credential(mut self, cred: Option<&Path>) -> Spec {
+        if let Some(c) = cred {
+            self.env.push((
+                hgl_ai_config::CREDENTIAL_ENV.to_string(),
+                c.display().to_string(),
+            ));
+        }
+        self
+    }
+}
+
+/// A system unit (`/etc/systemd/system`) or launch daemon (`/Library/LaunchDaemons`):
+/// the server side run as its own OS user (docs/install.md).
+pub fn system_unit_path(os: Os, s: Service) -> PathBuf {
+    match os {
+        Os::Linux => PathBuf::from("/etc/systemd/system").join(s.unit()),
+        Os::MacOs => PathBuf::from("/Library/LaunchDaemons").join(format!("{}.plist", s.label())),
+    }
+}
+
+/// A system unit that runs `spec` as `user` (and `group`) with `HOME=home`.
+pub fn render_systemd_system(spec: &Spec, user: &str, group: &str, home: &Path) -> String {
+    let user_unit = render_systemd(spec);
+    let mut s = String::new();
+    for line in user_unit.lines() {
+        match line {
+            "[Service]" => {
+                s.push_str("[Service]\n");
+                s.push_str(&format!("User={user}\nGroup={group}\nUMask=0077\n"));
+                s.push_str(&format!("Environment=\"HOME={}\"\n", home.display()));
+            }
+            "[Unit]" => s.push_str("[Unit]\nAfter=network-online.target\n"),
+            "WantedBy=default.target" => s.push_str("WantedBy=multi-user.target\n"),
+            l => {
+                s.push_str(l);
+                s.push('\n');
+            }
+        }
+    }
+    // `Description=` follows `[Unit]` after the ordering line.
+    s
+}
+
+/// A launch daemon that runs `spec` as `user` with `HOME=home`.
+pub fn render_launchd_daemon(spec: &Spec, user: &str, home: &Path) -> String {
+    let mut sp = spec.clone();
+    sp.env
+        .insert(0, ("HOME".into(), home.display().to_string()));
+    let agent = render_launchd(&sp);
+    agent.replacen(
+        "  <key>ProgramArguments</key>",
+        &format!(
+            "  <key>UserName</key>\n  <string>{}</string>\n  <key>Umask</key>\n  <integer>63</integer>\n  <key>ProgramArguments</key>",
+            xml(user)
+        ),
+        1,
+    )
+}
+
+/// A system service's state, read without privilege.
+pub fn system_state(sys: &dyn System, s: Service) -> State {
+    match sys.env().os {
+        Os::Linux => {
+            let Ok(o) = sys.query(&Cmd::new("systemctl").args([
+                "show",
+                "-p",
+                "LoadState,ActiveState",
+                &s.unit(),
+            ])) else {
+                return State::NotInstalled;
+            };
+            let loaded = o.stdout.lines().any(|l| l.trim() == "LoadState=loaded");
+            let active = o.stdout.lines().any(|l| l.trim() == "ActiveState=active");
+            match (loaded, active) {
+                (false, _) => State::NotInstalled,
+                (true, true) => State::Running,
+                (true, false) => State::Stopped,
+            }
+        }
+        Os::MacOs => {
+            let target = format!("system/{}", s.label());
+            match sys.query(&Cmd::new("launchctl").args(["print", &target])) {
+                Ok(o) if o.ok() => {
+                    if o.stdout.lines().any(|l| l.trim() == "state = running") {
+                        State::Running
+                    } else {
+                        State::Stopped
+                    }
+                }
+                _ => State::NotInstalled,
+            }
         }
     }
 }
@@ -279,6 +381,48 @@ pub fn start(sys: &dyn System, s: Service) -> Result<()> {
                 )?;
             }
             run_ok(sys, &Cmd::new("launchctl").args(["kickstart", &target])).map(drop)
+        }
+    }
+}
+
+/// Make the running hub reread `nats.conf` (users and permissions) without dropping its
+/// connections: SIGHUP to the process in its pid file. `false` when there is no pid
+/// file (an older `nats.conf`, or the hub is down).
+pub fn reload_hub(sys: &dyn System, store_dir: &Path) -> Result<bool> {
+    let pid_file = crate::nats::pid_path(store_dir);
+    if !sys.exists(&pid_file) {
+        return Ok(false);
+    }
+    let pid = sys.read_to_string(&pid_file).map_err(io_at(&pid_file))?;
+    let pid = pid.trim();
+    if pid.is_empty() || !pid.chars().all(|c| c.is_ascii_digit()) {
+        return Ok(false);
+    }
+    // A stale pid file (the hub stopped): no such process, or another program now.
+    let alive = sys
+        .query(&Cmd::new("ps").args(["-p", pid, "-o", "comm="]))
+        .is_ok_and(|o| o.ok() && o.stdout.trim().ends_with("nats-server"));
+    if !alive {
+        return Ok(false);
+    }
+    match sys.run(&Cmd::new("kill").args(["-HUP", pid])) {
+        Ok(o) if o.ok() => Ok(true),
+        // It went between the two.
+        _ => Ok(false),
+    }
+}
+
+/// Restart an installed service (it rereads its configuration and credential).
+pub fn restart(sys: &dyn System, s: Service) -> Result<()> {
+    match sys.env().os {
+        Os::Linux => run_ok(sys, &systemctl(&["restart", &s.unit()])).map(drop),
+        Os::MacOs => {
+            let (_, target) = launchd_target(sys, s)?;
+            run_ok(
+                sys,
+                &Cmd::new("launchctl").args(["kickstart", "-k", &target]),
+            )
+            .map(drop)
         }
     }
 }

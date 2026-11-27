@@ -12,7 +12,9 @@ this repository.
   state between agents and hosts. History is bounded (14 days); nothing that
   decides something lives only on the bus.
 - **PROTO-3 — No fabricated owner words.** A note is agent traffic. It never
-  states an owner decision unless it quotes the GitHub record that holds it.
+  states an owner decision unless it quotes the GitHub record that holds it. The one
+  exception is a note from `owner`, which only the console can send (OWN-5); quote it
+  by its handle and date (OWN-10).
 
 ## 2. Access
 
@@ -24,8 +26,10 @@ this repository.
   bridge holds the agent's inbox, starts one headless turn per batch of notes,
   and puts the notes in the turn's prompt. Agents never poll.
 - **PROTO-6 — Interactive seats.** A seat run by a person-facing session (the
-  controller) waits with `hgl-ai note wait SEAT`, which blocks until a note
-  arrives, prints it and acknowledges it. A seat is served by a bridge or
+  controller, by default) waits with `hgl-ai note wait SEAT`, which blocks until a
+  note arrives, prints it and acknowledges it. A controller seat with
+  `headless = true` is served by the bridge instead, a turn per batch of notes
+  (OWN-7); `bridge run` serves every other seat without being told. A seat is served by a bridge or
   interactively, never both: `note wait` and `note peek` refuse a seat that a
   live `HGL_HOSTS` record lists, unless given `--force`. On one host, whoever
   serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`: the bridge,
@@ -56,12 +60,15 @@ hgl-ai tree list --stale
 ## 3. Transport
 
 All participants connect to one `nats-server -js` hub over an authenticated
-link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
+link (tailnet, WireGuard or an SSH forward). Each client is its own hub user, an
+NKey with its role's permissions (docs/install.md, Hub users); a hub installed
+before hub users takes one shared token until it moves.
 
 | Primitive | Name | Settings |
 | --- | --- | --- |
 | Stream | `HGL_NOTES`, subjects `hgl.notes.>` | file storage, `max_age` 14 d, dedup window 24 h |
-| Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>` and `hgl.notes.all`; explicit ack; `ack_wait` 300 s; `max_deliver` unlimited (PROTO-8) |
+| Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>`, `hgl.notes.all` and `hgl.notes.owner.<seat>`; explicit ack; `ack_wait` 300 s; `max_deliver` unlimited (PROTO-8) |
+| Owner | stream `HGL_OWNER`, KV `HGL_THREADS`, KV `HGL_METRICS`, KV `HGL_CONSOLE` | docs/owner.md §4 |
 | State | KV `HGL_STATE` | file storage, history 5 |
 | Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
 | Trees | KV `HGL_TREES` | file storage, history 1 |
@@ -70,7 +77,8 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
 | Builds | KV `HGL_BUILD` | file storage, history 64: `recipe.<repo>` (TOML), `run.<id>` (summary JSON; newest 1000 kept) |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
-  broadcast address. A seat is a logical address; the runtime and model bound
+  broadcast address. `owner` and `console` are senders, never seats: no seat takes
+  `all`, `owner` or `console`, and no note goes to `owner` or `console`. A seat is a logical address; the runtime and model bound
   to it can change (§6) without peers noticing.
 - **PROTO-8 — Ack after the turn.** The bridge sends `in_progress` every 60 s
   while a turn runs or a note is held, and `ack` after a clean exit. JetStream
@@ -129,6 +137,15 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
 | `done` | any → controller | A bounded non-PR assignment finished, or a cleanup receipt. |
 | `note` | any → any | Operational fact: an alert, a `hold`, a `drain`. |
 | `build` | any → `builder-<label>` | Build `repo` at `head` (optionally merged onto `base`); the body is the job JSON (`docs/build.md`). The builder answers with a `receipt`. |
+| `tick` | console → controller | A status report is due (`[console] status_every`). |
+
+- **PROTO-20 — Owner notes.** A note with sender `owner` travels on
+  `hgl.notes.owner.<recipient>`, which only the console's hub user may publish. The
+  receiver accepts sender `owner` on that subject only, and only sender `owner` there;
+  anything else is terminated as malformed. An owner note is an `answer` (to the
+  asker of a question) or a `note` (an owner message; conversations go to the
+  controller), and its body names the thread and the signed-in user. `by` carries the
+  writer's handle (OWN-10); only an owner note has one.
 
 ## 5. Worktrees
 
@@ -218,7 +235,7 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
   the note. The authors' families are those the bridges record in the task's
   implementor trees (`families` in `task.json` and `HGL_TREES`).
 
-- **PROTO-20 — Build receipt.** A builder answers a `build` job with a `receipt` from
+- **PROTO-21 — Build receipt.** A builder answers a `build` job with a `receipt` from
   `builder-<label>` at the job's `head`, to the job's `reply_to` (`r-<id>`, an address no
   inbox serves; the sender reads the last note on `hgl.notes.r-<id>`) and to its `notify`
   seat. The body is the build summary as JSON (`docs/build.md` BUILD-4):
@@ -246,6 +263,8 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
 | `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha>` per merge. |
 | `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
+| `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
+| `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
 | `verdict.<repo>.<pr>.<name>` | local build hosts | `<head> <main> pass\|fail ...`: a local build verdict the gate reads where `[github.gate.<repo>] verdicts` names it. |

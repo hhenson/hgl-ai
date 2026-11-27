@@ -27,7 +27,7 @@ Proposed, not implemented:
 brew install hhenson/hgraph/hgl-ai
 ```
 
-From source (Rust 1.88 or later):
+From source (Rust 1.89 or later):
 
 ```sh
 cargo install --path crates/hgl-ai
@@ -41,16 +41,19 @@ On the hub host:
 hgl-ai server install --listen <tailnet-address>
 ```
 
-It prints the `client install` command. Copy the token file it names to each
-host (mode 0600), then on every host, the hub too:
+It prints the `client install` command. For each other host, make its hub user
+there (`hgl-ai server user add build-1 --role seat`) and copy the credential it
+names to that host (mode 0600). Then on every host (on the hub, the token file
+is `~/.config/hgl-ai/hub.token`, already written):
 
 ```sh
-hgl-ai client install --hub nats://<hub>:4222 --token-file ~/.config/hgl-ai/hub.token --host build-1
+hgl-ai client install --hub nats://<hub>:4222 --token-file ~/build-1.cred --host build-1
 hgl-ai seat add w1 --role implementor --runtime codex --tier frontier --effort high
 hgl-ai doctor
 ```
 
-An interactive seat, such as the controller:
+An interactive seat, such as the controller (the default; `seat add --headless`
+lets the bridge serve a controller instead, docs/owner.md OWN-7):
 
 ```sh
 hgl-ai agent start claude
@@ -70,7 +73,10 @@ Every install command takes `--dry-run`.
 | `crates/tree` | Task worktrees: layout, create, salvage, remove. |
 | `crates/bridge` | Seat loops, runtime adapters, heartbeats, failover. |
 | `crates/install` | Hub and client installers, user services, skill, agent sessions, `doctor`. |
-| `crates/gh` | Coordinator, merge gate, landing, pins, releases. |
+| `crates/gh` | Coordinator, merge gate, landing, pins, releases, backlog, metrics. |
+| `crates/owner` | Owner channel: threads, events, status reports, decision log. |
+| `crates/notify` | Owner notifications: ntfy, Slack, email. |
+| `crates/console` | The owner's web console: sign-in, threads, telemetry. |
 | `crates/build` | Build recipes, parsers, summaries, executors, the builder service. |
 | `crates/hgl-ai` | The command line. |
 
