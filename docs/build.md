@@ -91,6 +91,10 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
     to merge onto). The builder checks it out in `<work_root>/builder/jobs/<id>/` from its
     clone in `clones/<repo>` (submodules too), runs the recipe, and removes the checkout
     (cleanup is part of done). One build at a time unless `[builder] concurrency = N`.
+    One process serves a builder: it holds a `flock` on this host and the lease
+    `HGL_LOCKS/builder.<label>` before it cleans, connects or takes a job, and stops on
+    losing the lease; a second `builder run` refuses to start. Checkouts and removals
+    on one shared clone take turns.
   - The receipt (the summary JSON) goes to `r-<id>`, which the sender reads from the
     stream, and to `--notify SEAT`. The step logs stay on the builder's host.
   - `hgl-ai builder drain|retire|resume LABEL` sets `HGL_STATE/builder.<label>`;

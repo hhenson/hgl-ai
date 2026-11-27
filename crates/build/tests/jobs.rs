@@ -86,7 +86,9 @@ struct Rig {
     bus: Arc<Bus>,
     heads: [String; 2],
     stop: tokio::sync::watch::Sender<bool>,
-    svc: tokio::task::JoinHandle<Result<(), service::ServiceError>>,
+    svc: Option<tokio::task::JoinHandle<Result<(), service::ServiceError>>>,
+    cfg: hgl_ai_config::Config,
+    settings: Settings,
 }
 
 impl Rig {
@@ -124,15 +126,17 @@ impl Rig {
             heartbeat: Duration::from_millis(300),
         };
         let (stop, rx) = tokio::sync::watch::channel(false);
-        let svc = tokio::spawn(service::serve(bus.clone(), lanes, settings, rx));
+        let svc = tokio::spawn(service::serve(bus.clone(), lanes, settings.clone(), rx));
         Some(Rig {
+            cfg,
+            settings,
             _nats: n,
             _tmp: tmp,
             root,
             bus,
             heads: [heads[0].clone(), heads[1].clone()],
             stop,
-            svc,
+            svc: Some(svc),
         })
     }
 
@@ -191,13 +195,38 @@ impl Rig {
             .map(|m| m.sequence)
     }
 
-    async fn stop(self) {
-        self.stop.send(true).unwrap();
-        tokio::time::timeout(Duration::from_secs(60), self.svc)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+    /// Another builder service with this one's configuration (a second `builder run`).
+    fn second(
+        &self,
+    ) -> (
+        tokio::sync::watch::Sender<bool>,
+        tokio::task::JoinHandle<Result<(), service::ServiceError>>,
+    ) {
+        let lanes = service::lanes(&self.cfg, PathBuf::from("ssh")).unwrap();
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        let h = tokio::spawn(service::serve(
+            self.bus.clone(),
+            lanes,
+            self.settings.clone(),
+            rx,
+        ));
+        (tx, h)
+    }
+
+    /// Stop the builder service; the hub stays.
+    async fn halt(&mut self) {
+        let _ = self.stop.send(true);
+        if let Some(svc) = self.svc.take() {
+            tokio::time::timeout(Duration::from_secs(60), svc)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    async fn stop(mut self) {
+        self.halt().await;
     }
 }
 
@@ -274,5 +303,88 @@ async fn a_finished_id_is_not_replayed_for_another_request() {
     );
     let kept = store::run_get(&r.bus, &first.id).await.unwrap().unwrap();
     assert_eq!(kept.head.as_deref(), Some(r.heads[0].as_str()));
+    r.stop().await;
+}
+
+/// Finding 5: a second builder for the same label (a second `builder run`) refuses to
+/// start, and its startup cleanup never touches the running build's checkout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_builder_per_label() {
+    let Some(r) = Rig::start().await else { return };
+    let slow = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"sleep 3 && test -f f.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
+    store::recipe_put(&r.bus, slow, None).await.unwrap();
+    let job = r.job("20261127-130000-aaaaaa", &r.heads[0]);
+    r.send(&job).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let running = store::run_get(&r.bus, &job.id)
+            .await
+            .unwrap()
+            .is_some_and(|s| s.steps.iter().any(|x| x.status.as_str() == "running"));
+        if running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the step did not start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let (tx, second) = r.second();
+    let ended = tokio::time::timeout(Duration::from_secs(15), second).await;
+    let _ = tx.send(true);
+    let err = match ended {
+        Ok(Ok(Err(e))) => e.to_string(),
+        other => panic!("the second builder did not refuse: {other:?}"),
+    };
+    assert!(err.contains("lab1"), "{err}");
+    assert_eq!(r.receipt(&job.id).await.status, BuildStatus::Pass);
+    r.stop().await;
+}
+
+/// Finding 5 across hosts: a lease another host holds keeps this one out; one a gone
+/// builder of this host left is taken over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_hub_lease_names_the_builder() {
+    let Some(mut r) = Rig::start().await else {
+        return;
+    };
+    r.halt().await;
+    assert!(
+        r.bus.lock_get("builder.lab1").await.unwrap().is_none(),
+        "released at the end"
+    );
+    let other = r
+        .bus
+        .lock_acquire("builder.lab1", "lab9 builder 4242")
+        .await
+        .unwrap();
+    let (tx, svc) = r.second();
+    let err = match tokio::time::timeout(Duration::from_secs(15), svc).await {
+        Ok(Ok(Err(e))) => e.to_string(),
+        other => panic!("served beside another host's builder: {other:?}"),
+    };
+    let _ = tx.send(true);
+    assert!(err.contains("served by lab9 builder 4242"), "{err}");
+    assert!(other.release().await.unwrap());
+    // A builder of this host that died left its lease: taken over.
+    let _gone = r
+        .bus
+        .lock_acquire("builder.lab1", "lab1 builder 999999")
+        .await
+        .unwrap();
+    let (tx, svc) = r.second();
+    let ok = r.job("20261127-130000-bbbbbb", &r.heads[0]);
+    r.send(&ok).await;
+    assert_eq!(r.receipt(&ok.id).await.status, BuildStatus::Pass);
+    let held = r.bus.lock_get("builder.lab1").await.unwrap().unwrap();
+    assert!(
+        held.holder
+            .starts_with(&format!("lab1 builder {}", std::process::id())),
+        "{held:?}"
+    );
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(60), svc)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
     r.stop().await;
 }

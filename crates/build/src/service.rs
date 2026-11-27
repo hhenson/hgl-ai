@@ -44,6 +44,11 @@ impl Gate {
     }
 }
 
+/// `HGL_LOCKS/builder.<label>`: held by the one process that serves the builder.
+pub fn lease_key(label: &str) -> String {
+    format!("builder.{label}")
+}
+
 /// `HGL_STATE/builder.<label>`: `drain` or `retire` a builder (empty: active).
 pub fn gate_key(label: &str) -> String {
     format!("builder.{label}")
@@ -205,8 +210,63 @@ async fn lane_loop(
     bus: Arc<Bus>,
     lane: Arc<Lane>,
     settings: Settings,
-    mut shutdown: watch::Receiver<bool>,
+    outer: watch::Receiver<bool>,
 ) -> Result<(), ServiceError> {
+    // One builder per label, before anything is cleaned, connected or fetched: a `flock`
+    // on this host and the hub lease `HGL_LOCKS/builder.<label>` across hosts.
+    let lock_path = lane.logs.with_extension("lock");
+    let _flock = match crate::lock::FileLock::try_lock(&lock_path) {
+        Ok(Some(l)) => l,
+        Ok(None) => {
+            return Err(ServiceError::Other(format!(
+                "builder {} already runs on this host (it holds {})",
+                lane.label,
+                lock_path.display()
+            )));
+        }
+        Err(e) => {
+            return Err(ServiceError::Other(format!(
+                "builder {}: locking {}: {e}",
+                lane.label,
+                lock_path.display()
+            )));
+        }
+    };
+    let host = lane.proxy.clone().unwrap_or_else(|| lane.label.clone());
+    let lease_name = lease_key(&lane.label);
+    let holder = format!("{host} builder {}", std::process::id());
+    let lease = match bus.lock_acquire(&lease_name, &holder).await {
+        Ok(l) => l,
+        // A builder of this host that is gone: this process holds the host's lock.
+        Err(hgl_ai_bus::BusError::Held { holder: old, .. })
+            if old.starts_with(&format!("{host} builder ")) =>
+        {
+            bus.lock_take_over(&lease_name, &holder, &old).await?
+        }
+        Err(hgl_ai_bus::BusError::Held {
+            holder: old, since, ..
+        }) => {
+            return Err(ServiceError::Other(format!(
+                "builder {} is served by {old} since {since}",
+                lane.label
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let lease = Arc::new(tokio::sync::Mutex::new(Some(lease)));
+    // Stops this lane: the service's shutdown, or the lease lost.
+    let (stop_tx, mut shutdown) = watch::channel(false);
+    let forward = {
+        let (mut outer, tx) = (outer, stop_tx.clone());
+        tokio::spawn(async move {
+            while !*outer.borrow() {
+                if outer.changed().await.is_err() {
+                    break;
+                }
+            }
+            let _ = tx.send(true);
+        })
+    };
     let (conn_stop_tx, conn_stop) = watch::channel(false);
     let supervisor = match (&lane.conn, &lane.kick) {
         (Some(c), Some(k)) => Some(tokio::spawn(ssh::supervise(
@@ -219,11 +279,13 @@ async fn lane_loop(
     };
     // Heartbeat: gate, probe, record.
     let hb = {
-        let (bus, lane, settings, mut stop) = (
+        let (bus, lane, settings, mut stop, lease, stop_tx) = (
             bus.clone(),
             lane.clone(),
             settings.clone(),
             shutdown.clone(),
+            lease.clone(),
+            stop_tx.clone(),
         );
         tokio::spawn(async move {
             let mut beat = 0u32;
@@ -253,6 +315,16 @@ async fn lane_loop(
                 }
                 was_reachable = reachable;
                 beat = beat.wrapping_add(1);
+                if let Some(l) = lease.lock().await.as_mut()
+                    && let Err(e) = l.refresh().await
+                {
+                    if matches!(e, hgl_ai_bus::BusError::LeaseLost { .. }) {
+                        tracing::error!(builder = %lane.label, "{e}; stopping this builder");
+                        let _ = stop_tx.send(true);
+                        break;
+                    }
+                    tracing::warn!(builder = %lane.label, "refreshing the lease: {e}");
+                }
                 let res = if gate == Gate::Retired && lane.busy() == 0 {
                     bus.builder_del(&lane.label).await
                 } else {
@@ -392,6 +464,10 @@ async fn lane_loop(
     if let Err(e) = bus.builder_del(&lane.label).await {
         tracing::warn!(builder = %lane.label, "removing the builder record: {e}");
     }
+    if let Some(l) = lease.lock().await.take() {
+        let _ = l.release().await;
+    }
+    forward.abort();
     Ok(())
 }
 

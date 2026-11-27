@@ -274,7 +274,8 @@ before hub users takes one shared token until it moves.
 
 `HGL_LOCKS` holds leases, `{"holder", "acquired_at"}`, created only if absent,
 rewritten every minute while held, deleted by their holder; one not rewritten
-within `max_age` expires. `lock.land.<repo>` is the landing lock: `gh land`,
+within `max_age` expires. `builder.<label>` is held by the one process serving that builder (`docs/build.md`).
+`lock.land.<repo>` is the landing lock: `gh land`,
 `gh merge-if-clean` and `gh release watch` hold it from before the gate until
 the merge, `landed.log`, `main` and the `landed` notes are done.
 
