@@ -89,13 +89,96 @@ struct Rig {
     svc: Option<tokio::task::JoinHandle<Result<(), service::ServiceError>>>,
     cfg: hgl_ai_config::Config,
     settings: Settings,
+    /// Cuts the service's connection to the hub (a partition).
+    cut: Option<Arc<std::sync::atomic::AtomicBool>>,
+}
+
+type Before =
+    Box<dyn Fn(&Arc<Bus>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>;
+
+#[derive(Default)]
+struct Opts {
+    locks_max_age: Option<Duration>,
+    proxy: bool,
+    remote: bool,
+    /// Runs on the hub before the service starts.
+    before: Option<Before>,
+}
+
+fn fake_ssh() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ssh")
+}
+
+/// A TCP proxy to the hub at `url`; setting the flag drops everything both ways while the
+/// connections stay open, as a partition does.
+async fn tcp_proxy(url: &str) -> (String, Arc<std::sync::atomic::AtomicBool>) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let target = url.trim_start_matches("nats://").to_string();
+    let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = l.local_addr().unwrap().port();
+    let cut = Arc::new(AtomicBool::new(false));
+    let c = cut.clone();
+    tokio::spawn(async move {
+        while let Ok((inbound, _)) = l.accept().await {
+            let Ok(outbound) = tokio::net::TcpStream::connect(&target).await else {
+                continue;
+            };
+            let (ri, wi) = inbound.into_split();
+            let (ro, wo) = outbound.into_split();
+            for (mut r, mut w) in [
+                (
+                    Box::new(ri) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box::new(wo) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                ),
+                (
+                    Box::new(ro) as Box<dyn tokio::io::AsyncRead + Unpin + Send>,
+                    Box::new(wi) as Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
+                ),
+            ] {
+                let c = c.clone();
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 64 << 10];
+                    loop {
+                        let n = match r.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => n,
+                        };
+                        if !c.load(Ordering::SeqCst) && w.write_all(&buf[..n]).await.is_err() {
+                            break;
+                        }
+                    }
+                });
+            }
+        }
+    });
+    (format!("nats://127.0.0.1:{port}"), cut)
 }
 
 impl Rig {
     async fn start() -> Option<Rig> {
+        Rig::start_with(Opts::default()).await
+    }
+
+    async fn start_with(o: Opts) -> Option<Rig> {
         let n = nats()?;
         let bus = Arc::new(Bus::connect_url(&n.2, Some(n.3.clone())).await.unwrap());
-        bus.provision().await.unwrap();
+        bus.provision_with(hgl_ai_bus::ProvisionOptions {
+            locks_max_age: o.locks_max_age.unwrap_or(hgl_ai_bus::LOCKS_MAX_AGE),
+        })
+        .await
+        .unwrap();
+        // The service's own connection, through a proxy the test can cut.
+        let (svc_bus, cut) = match o.proxy {
+            false => (bus.clone(), None),
+            true => {
+                let (url, cut) = tcp_proxy(&n.2).await;
+                (
+                    Arc::new(Bus::connect_url(&url, Some(n.3.clone())).await.unwrap()),
+                    Some(cut),
+                )
+            }
+        };
         let tmp = tempfile::Builder::new().prefix("hbr").tempdir().unwrap();
         let root = tmp.path().to_path_buf();
         let bare = root.join("origin.git");
@@ -118,7 +201,22 @@ impl Rig {
         cfg.paths.work_root = root.join("work").display().to_string();
         cfg.paths.data_dir = root.join("data").display().to_string();
         cfg.builder.toolchains = vec!["git".into()];
-        let lanes = service::lanes(&cfg, PathBuf::from("ssh")).unwrap();
+        if o.remote {
+            let state = root.join("winbox");
+            std::fs::create_dir_all(&state).unwrap();
+            cfg.builder.remote.push(
+                toml::from_str(&format!(
+                    "platform = \"windows\"\nssh = \"{}\"\nwork_dir = \"{}\"\nshell = \"sh\"\nlabel = \"win1\"\n",
+                    state.display(),
+                    root.join("remote").display()
+                ))
+                .unwrap(),
+            );
+        }
+        if let Some(f) = &o.before {
+            f(&bus).await;
+        }
+        let lanes = service::lanes(&cfg, fake_ssh()).unwrap();
         let origin = bare.display().to_string();
         let settings = Settings {
             clone_url: Arc::new(move |_| origin.clone()),
@@ -126,8 +224,9 @@ impl Rig {
             heartbeat: Duration::from_millis(300),
         };
         let (stop, rx) = tokio::sync::watch::channel(false);
-        let svc = tokio::spawn(service::serve(bus.clone(), lanes, settings.clone(), rx));
+        let svc = tokio::spawn(service::serve(svc_bus, lanes, settings.clone(), rx));
         Some(Rig {
+            cut,
             cfg,
             settings,
             _nats: n,
@@ -353,7 +452,10 @@ async fn the_hub_lease_names_the_builder() {
     );
     let other = r
         .bus
-        .lock_acquire("builder.lab1", "lab9 builder 4242")
+        .lock_acquire(
+            "builder.lab1",
+            "lab9 pid 4242 (builder) id 0011223344556677",
+        )
         .await
         .unwrap();
     let (tx, svc) = r.second();
@@ -362,12 +464,16 @@ async fn the_hub_lease_names_the_builder() {
         other => panic!("served beside another host's builder: {other:?}"),
     };
     let _ = tx.send(true);
-    assert!(err.contains("served by lab9 builder 4242"), "{err}");
+    assert!(err.contains("served by lab9 pid 4242 (builder)"), "{err}");
     assert!(other.release().await.unwrap());
     // A builder of this host that died left its lease: taken over.
+    let id = hgl_ai_bridge::holder::host_id(&r.root.join("data"));
     let _gone = r
         .bus
-        .lock_acquire("builder.lab1", "lab1 builder 999999")
+        .lock_acquire(
+            "builder.lab1",
+            &format!("lab1 pid 999999 (builder) id {id}"),
+        )
         .await
         .unwrap();
     let (tx, svc) = r.second();
@@ -376,8 +482,10 @@ async fn the_hub_lease_names_the_builder() {
     assert_eq!(r.receipt(&ok.id).await.status, BuildStatus::Pass);
     let held = r.bus.lock_get("builder.lab1").await.unwrap().unwrap();
     assert!(
-        held.holder
-            .starts_with(&format!("lab1 builder {}", std::process::id())),
+        held.holder.starts_with(&format!(
+            "lab1 pid {} (builder) id {id}",
+            std::process::id()
+        )),
         "{held:?}"
     );
     tx.send(true).unwrap();
@@ -387,4 +495,140 @@ async fn the_hub_lease_names_the_builder() {
         .unwrap()
         .unwrap();
     r.stop().await;
+}
+
+/// Carbon's second review, finding 2: a lane that loses its lease takes the process down
+/// with an error, so the service manager restarts it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_lease_ends_the_service_with_an_error() {
+    let Some(mut r) = Rig::start().await else {
+        return;
+    };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let held = loop {
+        if let Some(h) = r.bus.lock_get("builder.lab1").await.unwrap() {
+            break h.holder;
+        }
+        assert!(Instant::now() < deadline, "no lease");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    };
+    let _thief = r
+        .bus
+        .lock_take_over("builder.lab1", "lab9 pid 1 (builder) id 00000000", &held)
+        .await
+        .unwrap();
+    let svc = r.svc.take().unwrap();
+    match tokio::time::timeout(Duration::from_secs(15), svc).await {
+        Ok(Ok(Err(e))) => assert!(e.to_string().contains("lease"), "{e}"),
+        other => panic!("the service went on, or ended clean: {other:?}"),
+    }
+}
+
+/// Finding 2: one lane that cannot serve (its lease held elsewhere) ends the whole
+/// service, the other lane with it, instead of leaving it dead beside a running one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lane_that_cannot_serve_ends_the_service() {
+    let before: Before = Box::new(|bus: &Arc<Bus>| {
+        let bus = bus.clone();
+        Box::pin(async move {
+            let l = bus
+                .lock_acquire("builder.win1", "lab9 pid 1 (builder) id 00000000")
+                .await
+                .unwrap();
+            std::mem::forget(l);
+        })
+    });
+    let Some(mut r) = Rig::start_with(Opts {
+        remote: true,
+        before: Some(before),
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let svc = r.svc.take().unwrap();
+    match tokio::time::timeout(Duration::from_secs(15), svc).await {
+        Ok(Ok(Err(e))) => assert!(e.to_string().contains("win1"), "{e}"),
+        other => panic!("the service went on with a dead lane: {other:?}"),
+    }
+}
+
+/// Carbon's second review, finding 3: two hosts that share a label by mistake have
+/// different host ids; neither takes the other's lease.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_shared_label_on_another_host_is_not_taken_over() {
+    let Some(r) = Rig::start().await else { return };
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while r.bus.lock_get("builder.lab1").await.unwrap().is_none() {
+        assert!(Instant::now() < deadline, "no lease");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    // Another machine: its own work root and data directory (so its own host id).
+    let mut cfg = r.cfg.clone();
+    cfg.paths.work_root = r.root.join("other-work").display().to_string();
+    cfg.paths.data_dir = r.root.join("other-data").display().to_string();
+    let lanes = service::lanes(&cfg, fake_ssh()).unwrap();
+    let (tx, rx) = tokio::sync::watch::channel(false);
+    let svc = tokio::spawn(service::serve(r.bus.clone(), lanes, r.settings.clone(), rx));
+    let ended = tokio::time::timeout(Duration::from_secs(15), svc).await;
+    let _ = tx.send(true);
+    match ended {
+        Ok(Ok(Err(e))) => assert!(e.to_string().contains("served by"), "{e}"),
+        other => panic!("took the other host's lease: {other:?}"),
+    }
+    let ok = r.job("20261127-140000-aaaaaa", &r.heads[0]);
+    r.send(&ok).await;
+    assert_eq!(
+        r.receipt(&ok.id).await.status,
+        BuildStatus::Pass,
+        "the first serves on"
+    );
+    r.stop().await;
+}
+
+/// Finding 3: cut off from the hub, a builder stops before its lease can expire and
+/// another take it: no refresh confirmed for half the bucket's `max_age` ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_partitioned_builder_stops_before_its_lease_expires() {
+    let Some(mut r) = Rig::start_with(Opts {
+        locks_max_age: Some(Duration::from_secs(4)),
+        proxy: true,
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let slow = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"sleep 30\"\nmemcap_gb = 1\ntime = \"2m\"\n";
+    store::recipe_put(&r.bus, slow, None).await.unwrap();
+    let job = r.job("20261127-140000-bbbbbb", &r.heads[0]);
+    r.send(&job).await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let running = store::run_get(&r.bus, &job.id)
+            .await
+            .unwrap()
+            .is_some_and(|s| s.steps.iter().any(|x| x.status.as_str() == "running"));
+        if running {
+            break;
+        }
+        assert!(Instant::now() < deadline, "the step did not start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    r.cut
+        .as_ref()
+        .unwrap()
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let cut_at = Instant::now();
+    let svc = r.svc.take().unwrap();
+    match tokio::time::timeout(Duration::from_secs(25), svc).await {
+        Ok(Ok(Err(e))) => assert!(e.to_string().contains("not refreshed"), "{e}"),
+        other => panic!("a partitioned builder went on: {other:?}"),
+    }
+    assert!(
+        cut_at.elapsed() < Duration::from_secs(25),
+        "{:?}",
+        cut_at.elapsed()
+    );
 }

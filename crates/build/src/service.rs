@@ -73,6 +73,8 @@ pub struct Lane {
     probe: Mutex<Probe>,
     /// Workspaces whose cleanup waits for the remote to come back.
     stale: Mutex<Vec<Workspace>>,
+    /// This host's id (`<data_dir>/host-id`), in the lease's holder.
+    pub host_id: String,
 }
 
 impl Lane {
@@ -97,7 +99,13 @@ impl Lane {
             gate: Mutex::new(Gate::Active),
             probe: Mutex::new(Probe::default()),
             stale: Mutex::new(Vec::new()),
+            host_id: String::new(),
         }
+    }
+
+    pub fn with_host_id(mut self, id: String) -> Lane {
+        self.host_id = id;
+        self
     }
 
     /// A lane for a remote driven over `conn` by the proxy `proxy`.
@@ -167,25 +175,39 @@ pub async fn serve(
     settings: Settings,
     shutdown: watch::Receiver<bool>,
 ) -> Result<(), ServiceError> {
-    let mut tasks = Vec::new();
+    // One lane that cannot serve ends them all, with its error, so that the service
+    // manager restarts the whole builder (no lane left dead beside the others).
+    let (stop_all, all_rx) = watch::channel(false);
+    let forward = {
+        let (mut outer, tx) = (shutdown, stop_all.clone());
+        tokio::spawn(async move {
+            while !*outer.borrow() {
+                if outer.changed().await.is_err() {
+                    break;
+                }
+            }
+            let _ = tx.send(true);
+        })
+    };
+    let mut tasks = tokio::task::JoinSet::new();
     for lane in lanes {
-        let (bus, settings, shutdown) = (bus.clone(), settings.clone(), shutdown.clone());
-        tasks.push(tokio::spawn(async move {
-            lane_loop(bus, lane, settings, shutdown).await
-        }));
+        let (bus, settings, rx) = (bus.clone(), settings.clone(), all_rx.clone());
+        tasks.spawn(async move { lane_loop(bus, lane, settings, rx).await });
     }
     let mut first_err = None;
-    for t in tasks {
-        match t.await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                first_err.get_or_insert(e);
-            }
-            Err(e) => {
-                first_err.get_or_insert(ServiceError::Other(format!("a lane stopped: {e}")));
-            }
+    while let Some(t) = tasks.join_next().await {
+        let err = match t {
+            Ok(Ok(())) => continue,
+            Ok(Err(e)) => e,
+            Err(e) => ServiceError::Other(format!("a lane stopped: {e}")),
+        };
+        if first_err.is_none() {
+            tracing::error!("{err}; stopping every lane");
+            let _ = stop_all.send(true);
+            first_err = Some(err);
         }
     }
+    forward.abort();
     match first_err {
         Some(e) => Err(e),
         None => Ok(()),
@@ -234,12 +256,14 @@ async fn lane_loop(
     };
     let host = lane.proxy.clone().unwrap_or_else(|| lane.label.clone());
     let lease_name = lease_key(&lane.label);
-    let holder = format!("{host} builder {}", std::process::id());
+    // `<host> pid <pid> (builder) id <host-id>` (PROTO-6): a host that shares the label
+    // by mistake has another id and is never taken over.
+    let holder = hgl_ai_bridge::holder::holder(&host, &lane.host_id, "builder");
     let lease = match bus.lock_acquire(&lease_name, &holder).await {
         Ok(l) => l,
         // A builder of this host that is gone: this process holds the host's lock.
         Err(hgl_ai_bus::BusError::Held { holder: old, .. })
-            if old.starts_with(&format!("{host} builder ")) =>
+            if hgl_ai_bridge::holder::dead_own(&old, &host, &lane.host_id) =>
         {
             bus.lock_take_over(&lease_name, &holder, &old).await?
         }
@@ -253,7 +277,20 @@ async fn lane_loop(
         }
         Err(e) => return Err(e.into()),
     };
+    // Refreshed on its own cadence; stopping the lane when it is lost, or when no refresh
+    // has been confirmed for half the bucket's `max_age` (a partition: it could expire and
+    // another builder take the label while this one still builds).
+    let max_age = bus
+        .locks_max_age()
+        .await
+        .unwrap_or(hgl_ai_bus::LOCKS_MAX_AGE);
+    let every = settings
+        .heartbeat
+        .min(max_age / 6)
+        .max(Duration::from_millis(50));
+    let deadline = max_age / 2;
     let lease = Arc::new(tokio::sync::Mutex::new(Some(lease)));
+    let lost: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Stops this lane: the service's shutdown, or the lease lost.
     let (stop_tx, mut shutdown) = watch::channel(false);
     let forward = {
@@ -265,6 +302,47 @@ async fn lane_loop(
                 }
             }
             let _ = tx.send(true);
+        })
+    };
+    let refresher = {
+        let (lease, lost, stop_tx, mut stop, label) = (
+            lease.clone(),
+            lost.clone(),
+            stop_tx.clone(),
+            shutdown.clone(),
+            lane.label.clone(),
+        );
+        tokio::spawn(async move {
+            let mut ok_at = std::time::Instant::now();
+            loop {
+                tokio::select! {
+                    _ = tokio::time::sleep(every) => {}
+                    _ = stop.changed() => break,
+                }
+                let mut g = lease.lock().await;
+                let Some(l) = g.as_mut() else { break };
+                let why = match tokio::time::timeout(every, l.refresh()).await {
+                    Ok(Ok(())) => {
+                        ok_at = std::time::Instant::now();
+                        continue;
+                    }
+                    Ok(Err(e @ hgl_ai_bus::BusError::LeaseLost { .. })) => Some(e.to_string()),
+                    Ok(Err(e)) => (ok_at.elapsed() >= deadline)
+                        .then(|| format!("was not refreshed for {:?} ({e})", ok_at.elapsed())),
+                    Err(_) => (ok_at.elapsed() >= deadline).then(|| {
+                        format!("was not refreshed for {:?} (no answer)", ok_at.elapsed())
+                    }),
+                };
+                if let Some(why) = why {
+                    tracing::error!(builder = %label, "the lease {why}; stopping this builder");
+                    // Not ours any more: nothing to release.
+                    g.take();
+                    *lost.lock().unwrap_or_else(|e| e.into_inner()) = Some(why);
+                    let _ = stop_tx.send(true);
+                    break;
+                }
+                tracing::warn!(builder = %label, "refreshing the lease: no confirmation for {:?} of {deadline:?}", ok_at.elapsed());
+            }
         })
     };
     let (conn_stop_tx, conn_stop) = watch::channel(false);
@@ -279,13 +357,11 @@ async fn lane_loop(
     };
     // Heartbeat: gate, probe, record.
     let hb = {
-        let (bus, lane, settings, mut stop, lease, stop_tx) = (
+        let (bus, lane, settings, mut stop) = (
             bus.clone(),
             lane.clone(),
             settings.clone(),
             shutdown.clone(),
-            lease.clone(),
-            stop_tx.clone(),
         );
         tokio::spawn(async move {
             let mut beat = 0u32;
@@ -315,16 +391,6 @@ async fn lane_loop(
                 }
                 was_reachable = reachable;
                 beat = beat.wrapping_add(1);
-                if let Some(l) = lease.lock().await.as_mut()
-                    && let Err(e) = l.refresh().await
-                {
-                    if matches!(e, hgl_ai_bus::BusError::LeaseLost { .. }) {
-                        tracing::error!(builder = %lane.label, "{e}; stopping this builder");
-                        let _ = stop_tx.send(true);
-                        break;
-                    }
-                    tracing::warn!(builder = %lane.label, "refreshing the lease: {e}");
-                }
                 let res = if gate == Gate::Retired && lane.busy() == 0 {
                     bus.builder_del(&lane.label).await
                 } else {
@@ -435,11 +501,13 @@ async fn lane_loop(
                     None => false,
                 };
                 keep.abort();
+                // Bounded: a lane stopping for a partition must not wait on the hub.
+                let bounded = Duration::from_secs(10);
                 if published {
-                    let _ = d.ack().await;
+                    let _ = tokio::time::timeout(bounded, d.ack()).await;
                 } else {
                     // Stopped by a shutdown: back to the inbox.
-                    let _ = d.nak(Duration::from_secs(15)).await;
+                    let _ = tokio::time::timeout(bounded, d.nak(Duration::from_secs(15))).await;
                 }
                 running
                     .lock()
@@ -461,13 +529,24 @@ async fn lane_loop(
     if let Some(s) = supervisor {
         let _ = s.await;
     }
-    if let Err(e) = bus.builder_del(&lane.label).await {
-        tracing::warn!(builder = %lane.label, "removing the builder record: {e}");
+    refresher.abort();
+    // Bounded: the hub may not answer (a partition ended this lane).
+    let bounded = Duration::from_secs(10);
+    match tokio::time::timeout(bounded, bus.builder_del(&lane.label)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::warn!(builder = %lane.label, "removing the builder record: {e}"),
+        Err(_) => tracing::warn!(builder = %lane.label, "removing the builder record: no answer"),
     }
     if let Some(l) = lease.lock().await.take() {
-        let _ = l.release().await;
+        let _ = tokio::time::timeout(bounded, l.release()).await;
     }
     forward.abort();
+    if let Some(why) = lost.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Err(ServiceError::Other(format!(
+            "builder {}: the lease {why}",
+            lane.label
+        )));
+    }
     Ok(())
 }
 
@@ -803,6 +882,7 @@ pub fn lanes(
     let data_dir = cfg.data_dir().map_err(|e| err(&e))?;
     let root = work_root.join("builder");
     let logs = root.join("logs");
+    let host_id = hgl_ai_bridge::holder::host_id(&data_dir);
     let mut out = Vec::new();
     if cfg.builder.local {
         let exec = crate::exec::local::Local::new(
@@ -810,13 +890,16 @@ pub fn lanes(
             cfg.builder.sdk.clone(),
             hgl_ai_tree::Git::default(),
         );
-        out.push(Arc::new(Lane::new(
-            cfg.host.clone(),
-            builder_inbox(&cfg.host).map_err(|e| err(&e))?,
-            Arc::new(exec),
-            cfg.builder.concurrency,
-            logs.join(&cfg.host),
-        )));
+        out.push(Arc::new(
+            Lane::new(
+                cfg.host.clone(),
+                builder_inbox(&cfg.host).map_err(|e| err(&e))?,
+                Arc::new(exec),
+                cfg.builder.concurrency,
+                logs.join(&cfg.host),
+            )
+            .with_host_id(host_id.clone()),
+        ));
     }
     for r in &cfg.builder.remote {
         let label = r.label(&cfg.host);
@@ -846,7 +929,8 @@ pub fn lanes(
                 r.concurrency,
                 logs.join(&label),
             )
-            .remote(&cfg.host, conn, kick),
+            .remote(&cfg.host, conn, kick)
+            .with_host_id(host_id.clone()),
         ));
     }
     if out.is_empty() {

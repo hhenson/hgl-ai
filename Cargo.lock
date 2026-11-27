@@ -1334,6 +1334,7 @@ dependencies = [
  "async-nats",
  "base64 0.22.1",
  "chrono",
+ "hgl-ai-bridge",
  "hgl-ai-bus",
  "hgl-ai-cap",
  "hgl-ai-config",

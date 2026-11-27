@@ -97,9 +97,12 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
     clone in `clones/<repo>` (submodules too), runs the recipe, and removes the checkout
     (cleanup is part of done). One build at a time unless `[builder] concurrency = N`.
     One process serves a builder: it holds a `flock` on this host and the lease
-    `HGL_LOCKS/builder.<label>` before it cleans, connects or takes a job, and stops on
-    losing the lease; a second `builder run` refuses to start. Checkouts and removals
-    on one shared clone take turns.
+    `HGL_LOCKS/builder.<label>` (holder `<host> pid <pid> (builder) id <host-id>`, taken
+    over as PROTO-6 says) before it cleans, connects or takes a job; a second `builder
+    run` refuses to start. A lease lost, or not confirmed for half the bucket's
+    `max_age`, or any lane that cannot serve, ends the whole service with an error, and
+    the service manager restarts it. Checkouts and removals on one shared clone take
+    turns.
   - The receipt (the summary JSON) goes to `r-<id>`, which the sender reads from the
     stream, and to `--notify SEAT`. The step logs stay on the builder's host.
   - `hgl-ai builder drain|retire|resume LABEL` sets `HGL_STATE/builder.<label>`;
