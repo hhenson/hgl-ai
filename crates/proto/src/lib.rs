@@ -392,6 +392,9 @@ pub struct TreeRecord {
     pub created_at: String,
     #[serde(default)]
     pub size_bytes: u64,
+    /// Model families whose turns ran in an implementor tree: the task's authors (ROLE-9).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub families: Vec<Family>,
 }
 
 impl TreeRecord {

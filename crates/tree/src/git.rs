@@ -52,11 +52,21 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.output_env(cwd, args, &[])
+    }
+
+    /// [`Git::output`] with extra environment (`GIT_INDEX_FILE`, ...).
+    pub fn output_env<I, S>(&self, cwd: &Path, args: I, env: &[(&str, &OsStr)]) -> Result<Out>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
         let out = Command::new(&self.program)
             .args(&args)
             .current_dir(cwd)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .envs(env.iter().map(|(k, v)| (k, v)))
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
@@ -76,8 +86,17 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
+        self.run_env(cwd, args, &[])
+    }
+
+    /// [`Git::run`] with extra environment.
+    pub fn run_env<I, S>(&self, cwd: &Path, args: I, env: &[(&str, &OsStr)]) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let out = self.output(cwd, &args)?;
+        let out = self.output_env(cwd, &args, env)?;
         if out.ok {
             Ok(out.stdout)
         } else {
