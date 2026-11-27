@@ -13,6 +13,7 @@
 //! | [`pins`] | `gh pins sync`: the wrapper's submodule pins |
 //! | [`release`] | `gh release watch`: every workflow run on a commit |
 //! | [`tap`] | `gh tap release`, `gh tap formula`: the Homebrew tap |
+//! | [`verdict`] | `gh approve`, `gh sendback`: the controller's verdict on an exact head |
 
 pub mod bot;
 pub mod coord;
@@ -23,8 +24,10 @@ pub mod lock;
 pub mod pins;
 pub mod release;
 pub mod state;
+pub mod store;
 pub mod table;
 pub mod tap;
+pub mod verdict;
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -40,6 +43,12 @@ pub enum Error {
     Command { args: String, msg: String },
     #[error("GitHub API rate limit reached: {0}")]
     RateLimited(String),
+    /// Another landing holds the repository's lock: try again later.
+    #[error("{0}")]
+    Locked(String),
+    /// `gh` is missing or not signed in; waiting does not change it.
+    #[error("{0}")]
+    Auth(String),
     #[error("unexpected GitHub response from {what}: {msg}")]
     Response { what: String, msg: String },
     #[error("{0}")]
@@ -201,6 +210,9 @@ impl Settings {
         self.data_dir.join("gh").join(format!("land-{repo}.lock"))
     }
 }
+
+#[cfg(test)]
+mod live_tests;
 
 #[cfg(test)]
 pub(crate) mod testutil {

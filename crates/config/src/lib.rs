@@ -119,38 +119,71 @@ pub struct Github {
     pub wrapper: String,
     // GitHub services and gates (crates/gh); see `github.rs` for each key.
     /// Login of the review bot, without a `[bot]` suffix.
-    #[serde(default = "github::review_bot", skip_serializing_if = "github::is_review_bot")]
+    #[serde(
+        default = "github::review_bot",
+        skip_serializing_if = "github::is_review_bot"
+    )]
     pub review_bot: String,
     /// Seat that gets the coordinator's alerts and sends `landed` notes.
-    #[serde(default = "github::controller", skip_serializing_if = "github::is_controller")]
+    #[serde(
+        default = "github::controller",
+        skip_serializing_if = "github::is_controller"
+    )]
     pub controller: String,
     /// Sender seat of the coordinator's notes.
-    #[serde(default = "github::coord_seat", skip_serializing_if = "github::is_coord_seat")]
+    #[serde(
+        default = "github::coord_seat",
+        skip_serializing_if = "github::is_coord_seat"
+    )]
     pub coord_seat: String,
-    #[serde(default = "github::coord_interval", skip_serializing_if = "github::is_coord_interval")]
+    #[serde(
+        default = "github::coord_interval",
+        skip_serializing_if = "github::is_coord_interval"
+    )]
     pub coord_interval: String,
     /// GraphQL allowance at or below which the coordinator writes `hold`.
-    #[serde(default = "github::hold_below", skip_serializing_if = "github::is_hold_below")]
+    #[serde(
+        default = "github::hold_below",
+        skip_serializing_if = "github::is_hold_below"
+    )]
     pub hold_below: u64,
     /// Path prefixes where a move of `main` brings every pull request up to date first.
-    #[serde(default = "github::global_paths", skip_serializing_if = "github::is_global_paths")]
+    #[serde(
+        default = "github::global_paths",
+        skip_serializing_if = "github::is_global_paths"
+    )]
     pub global_paths: Vec<String>,
     /// Regular expressions over changed file names that block a merge.
-    #[serde(default = "github::hygiene_files", skip_serializing_if = "github::is_hygiene_files")]
+    #[serde(
+        default = "github::hygiene_files",
+        skip_serializing_if = "github::is_hygiene_files"
+    )]
     pub hygiene_files: Vec<String>,
     /// Regular expressions over added lines that block a merge.
-    #[serde(default = "github::hygiene_lines", skip_serializing_if = "github::is_hygiene_lines")]
+    #[serde(
+        default = "github::hygiene_lines",
+        skip_serializing_if = "github::is_hygiene_lines"
+    )]
     pub hygiene_lines: Vec<String>,
     #[serde(default = "github::gates", skip_serializing_if = "github::is_gates")]
     pub gate: BTreeMap<String, RepoGate>,
     #[serde(default = "github::pins", skip_serializing_if = "github::is_pins")]
     pub pins: Vec<Pin>,
     /// Title and branch (after `branch_prefix`) of a pin pull request; `{sha8}` is replaced.
-    #[serde(default = "github::pin_title", skip_serializing_if = "github::is_pin_title")]
+    #[serde(
+        default = "github::pin_title",
+        skip_serializing_if = "github::is_pin_title"
+    )]
     pub pin_title: String,
-    #[serde(default = "github::pin_branch", skip_serializing_if = "github::is_pin_branch")]
+    #[serde(
+        default = "github::pin_branch",
+        skip_serializing_if = "github::is_pin_branch"
+    )]
     pub pin_branch: String,
-    #[serde(default = "github::release", skip_serializing_if = "github::is_release")]
+    #[serde(
+        default = "github::release",
+        skip_serializing_if = "github::is_release"
+    )]
     pub release: ReleaseWatch,
     #[serde(default = "github::tap", skip_serializing_if = "github::is_tap")]
     pub tap: Tap,
@@ -391,7 +424,12 @@ impl Config {
             }
         }
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
-        for d in [&self.limits.stale_after, &self.limits.turn_timeout, &self.github.coord_interval, &self.github.release.timeout] {
+        for d in [
+            &self.limits.stale_after,
+            &self.limits.turn_timeout,
+            &self.github.coord_interval,
+            &self.github.release.timeout,
+        ] {
             parse_duration(d).ok_or_else(|| ConfigError::Invalid(format!("duration {d:?}")))?;
         }
         Ok(())
@@ -599,7 +637,10 @@ model = "claude-opus-5-5-high"
         assert_eq!(c.github.review_bot, "chatgpt-codex-connector");
         assert_eq!(c.github.gate["hgl-compiler"].verdicts.len(), 3);
         let text = toml::to_string_pretty(&c).unwrap();
-        assert!(!text.contains("review_bot") && !text.contains("pins"), "{text}");
+        assert!(
+            !text.contains("review_bot") && !text.contains("pins"),
+            "{text}"
+        );
 
         let t = r#"
 host = "h"
@@ -632,7 +673,12 @@ anchor = "x"
         let mut bad = c.clone();
         bad.github.pins[1].from = Some("s".into());
         assert!(bad.validate().is_err(), "from must name a pin with a repo");
-        bad.github.pins[1] = Pin { path: "s".into(), repo: Some("x".into()), from: Some("a".into()), submodule: None };
+        bad.github.pins[1] = Pin {
+            path: "s".into(),
+            repo: Some("x".into()),
+            from: Some("a".into()),
+            submodule: None,
+        };
         assert!(bad.validate().is_err());
         let unknown = "host = \"h\"\n[github]\nowner=\"o\"\nrepos=[]\nbranch_prefix=\"\"\nwrapper=\"w\"\nbogus=1\n";
         assert!(toml::from_str::<Config>(unknown).is_err());

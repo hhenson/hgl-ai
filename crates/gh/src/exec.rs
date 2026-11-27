@@ -128,6 +128,7 @@ pub fn is_read_only(args: &[String]) -> bool {
                 None => !has_fields,
             }
         }
+        Some(&"auth") => a.get(1) == Some(&"status"),
         Some(&"run") => matches!(a.get(1), Some(&"download") | Some(&"view") | Some(&"list")),
         Some(&"release") => matches!(a.get(1), Some(&"download") | Some(&"view") | Some(&"list")),
         _ => false,
@@ -164,6 +165,32 @@ pub fn is_rate_limit_text(t: &str) -> bool {
     t.contains("rate limit") || t.contains("rate_limited") || t.contains("submitted too quickly")
 }
 
+/// Whether a failed run's message says the credentials are missing or refused.
+pub fn is_auth_text(t: &str) -> bool {
+    let t = t.to_ascii_lowercase();
+    t.contains("http 401") || t.contains("bad credentials") || t.contains("gh auth login")
+}
+
+/// Fail clearly unless `gh` runs and is signed in to github.com.
+pub async fn check_auth<G: Gh>(gh: &G) -> Result<()> {
+    let args = s(&["auth", "status", "--hostname", "github.com"]);
+    let out = match gh.exec(args, None).await {
+        Ok(o) => o,
+        Err(e) => {
+            return Err(Error::Auth(format!(
+                "cannot run the GitHub CLI `gh` ({e}); install it and run `gh auth login`"
+            )));
+        }
+    };
+    if out.ok {
+        return Ok(());
+    }
+    let why = first_lines(&format!("{}\n{}", out.stderr, out.stdout));
+    Err(Error::Auth(format!(
+        "`gh` is not signed in to github.com for this user ({why}); run `gh auth login` or set GH_TOKEN"
+    )))
+}
+
 /// Run and return standard output, failing on a non-zero exit.
 pub async fn text<G: Gh>(gh: &G, args: Vec<String>) -> Result<String> {
     text_in(gh, args, None).await
@@ -178,6 +205,11 @@ async fn text_in<G: Gh>(gh: &G, args: Vec<String>, stdin: Option<Vec<u8>>) -> Re
     let msg = first_lines(&format!("{}\n{}", out.stderr, out.stdout));
     if is_rate_limit_text(&msg) {
         return Err(Error::RateLimited(msg));
+    }
+    if is_auth_text(&msg) {
+        return Err(Error::Auth(format!(
+            "`gh {shown}`: {msg}; run `gh auth login` or set GH_TOKEN"
+        )));
     }
     Err(Error::Command { args: shown, msg })
 }
@@ -291,6 +323,12 @@ pub async fn graphql<G: Gh>(
             "{}\n{}",
             out.stderr, out.stdout
         ))));
+    }
+    if !out.ok && is_auth_text(&out.stderr) {
+        return Err(Error::Auth(format!(
+            "GraphQL: {}; run `gh auth login` or set GH_TOKEN",
+            first_lines(&out.stderr)
+        )));
     }
     if !out.ok || !errors.is_empty() || pages.is_empty() {
         let msg = if errors.is_empty() {
@@ -444,6 +482,13 @@ mod tests {
         ));
         assert!(is_rate_limit_text("{\"type\":\"RATE_LIMITED\"}"));
         assert!(!is_rate_limit_text("HTTP 404: Not Found"));
+        assert!(is_auth_text("gh: Bad credentials (HTTP 401)"));
+        assert!(is_auth_text(
+            "To get started with GitHub CLI, please run:  gh auth login"
+        ));
+        assert!(!is_auth_text("HTTP 404: Not Found"));
+        assert!(is_read_only(&a("auth status --hostname github.com")));
+        assert!(!is_read_only(&a("auth login")));
     }
 
     #[tokio::test]
@@ -461,6 +506,18 @@ mod tests {
             .unwrap();
         assert_eq!(ok[0]["data"]["x"], 1);
         assert!(gh.calls()[1].contains("-f a=b"));
+        let signed_out = fake::FakeGh::default().fail(
+            "auth status",
+            "You are not logged into any GitHub hosts. To log in, run: gh auth login",
+        );
+        assert!(
+            matches!(check_auth(&signed_out).await, Err(Error::Auth(m)) if m.contains("not signed in"))
+        );
+        assert!(
+            check_auth(&fake::FakeGh::default().on("auth status", ""))
+                .await
+                .is_ok()
+        );
         let ro = ReadOnly(fake::FakeGh::default().on("", "{}"));
         assert!(
             write(&ro, "PUT", "repos/o/r/pulls/1/merge", &[])

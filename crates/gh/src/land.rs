@@ -14,8 +14,8 @@ use crate::bot::{Comment, ready_signers};
 use crate::exec::{self, Gh};
 use crate::gate::{self, Kind, Opts, Outcome};
 use crate::lock::Lock;
-use crate::table::hold_active;
-use crate::{Error, Result, Settings, pins, short, state};
+use crate::table::{self, TableWord, hold_active};
+use crate::{Error, Result, Settings, pins, short, state, store};
 
 #[derive(Debug, Clone)]
 pub struct LandOpts {
@@ -67,6 +67,56 @@ pub struct Landing {
     pub after: Vec<String>,
 }
 
+/// Wait on the shared table until it says the pull request can land, before any GitHub
+/// call (the shell `land-when-ready`). `Some` is a decision without GitHub: the bot's limit.
+async fn wait_for_table(
+    bus: &Bus,
+    repo: &str,
+    number: u64,
+    head: &str,
+    triaged: bool,
+    deadline: Instant,
+) -> Result<Option<Outcome>> {
+    let mut shown = String::new();
+    loop {
+        let text = bus.state_get(state::KEY_PRS).await?.map(|e| e.value);
+        match table::table_word(
+            text.as_deref(),
+            repo,
+            number,
+            head,
+            triaged,
+            chrono::Utc::now(),
+        ) {
+            TableWord::Ask(_) => return Ok(None),
+            TableWord::Limit => {
+                let line =
+                    format!("{repo} #{number}: the review bot reports its usage limit BOTLIMIT");
+                return Ok(Some(Outcome {
+                    kind: Kind::BotLimit,
+                    line,
+                    retry: false,
+                    merge_commit: None,
+                    head: head.to_string(),
+                }));
+            }
+            TableWord::NotYet(why) => {
+                if Instant::now() + TABLE_POLL >= deadline {
+                    return Ok(None);
+                }
+                if why != shown {
+                    eprintln!("{repo} #{number}: the table says not yet ({why}); waiting");
+                    shown = why;
+                }
+                tokio::time::sleep(TABLE_POLL).await;
+            }
+        }
+    }
+}
+
+/// How often the shared table is read while it says not yet (it costs no GitHub call).
+const TABLE_POLL: Duration = Duration::from_secs(60);
+
 /// Wait while `HGL_STATE/hold` holds (ROLE-17), but not past `deadline`.
 async fn wait_for_hold(bus: &Bus, deadline: Instant) -> Result<()> {
     loop {
@@ -98,6 +148,13 @@ pub async fn land<G: Gh>(
     hgl_ai_proto::check_head(head)?;
     let lock = Lock::acquire(&s.lock_path(repo), o.lock_wait).await?;
     let deadline = Instant::now() + o.timeout;
+    if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
+    {
+        return Ok(Landing {
+            outcome,
+            after: Vec::new(),
+        });
+    }
     let mut shown = String::new();
     let outcome = loop {
         wait_for_hold(bus, deadline).await?;
@@ -285,13 +342,8 @@ pub async fn record<G: Gh>(
     number: u64,
     merge: &str,
 ) -> Result<String> {
-    let stamp = utc_now_stamp();
-    let prev = bus.state_get(state::KEY_LANDED).await?.map(|e| e.value);
-    let log = state::append_landed(
-        prev.as_deref(),
-        &state::landed_line(&stamp, repo, number, merge),
-    );
-    bus.state_put(state::KEY_LANDED, &log).await?;
+    let line = state::landed_line(&utc_now_stamp(), repo, number, merge);
+    store::append_bounded(bus, state::KEY_LANDED, &line, state::LANDED_KEEP).await?;
     refresh_main(gh, s, bus).await?;
     Ok(format!(
         "recorded {repo} #{number} at {} in {} and {}",
@@ -327,13 +379,13 @@ pub async fn main_text<G: Gh>(gh: &G, s: &Settings) -> Result<String> {
 
 pub async fn refresh_main<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<()> {
     let text = main_text(gh, s).await?;
-    bus.state_put(state::KEY_MAIN, &text).await?;
+    store::put_latest(bus, state::KEY_MAIN, &text).await?;
     Ok(())
 }
 
 /// The author's seats: the trees registry, the branch name, or the `Ready` comment's signer
 /// (a seat some host advertises).
-async fn author_seats<G: Gh>(
+pub(crate) async fn author_seats<G: Gh>(
     gh: &G,
     s: &Settings,
     bus: &Bus,

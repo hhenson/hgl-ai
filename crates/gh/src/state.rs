@@ -12,26 +12,12 @@ pub const KEY_MAIN: &str = "main";
 pub const KEY_LANDED: &str = "landed.log";
 pub const KEY_PRS: &str = "prs";
 pub const KEY_HOLD: &str = "hold";
-/// Lines of `landed.log` kept: a bus value stays far below the NATS payload limit.
+/// Lines of `landed.log` kept: far below the bus's 1 MiB value limit; GitHub holds the rest.
 pub const LANDED_KEEP: usize = 2000;
 
 /// `<UTC> <repo> #<pr> <merge sha>`
 pub fn landed_line(stamp: &str, repo: &str, pr: u64, merge: &str) -> String {
     format!("{stamp} {repo} #{pr} {merge}")
-}
-
-/// `landed.log` with one more line, keeping the last [`LANDED_KEEP`].
-pub fn append_landed(prev: Option<&str>, line: &str) -> String {
-    let mut lines: Vec<&str> = prev
-        .unwrap_or("")
-        .lines()
-        .filter(|l| !l.trim().is_empty())
-        .collect();
-    lines.push(line);
-    let from = lines.len().saturating_sub(LANDED_KEEP);
-    let mut s = lines[from..].join("\n");
-    s.push('\n');
-    s
 }
 
 /// `updated <UTC>`, `<repo> main <sha>` per repository, then `<wrapper> pins <path> <sha>`.
@@ -154,12 +140,7 @@ mod tests {
     fn landed_log() {
         let l = landed_line("20260105T120000Z", "alpha", 12, &"c".repeat(40));
         assert_eq!(l, format!("20260105T120000Z alpha #12 {}", "c".repeat(40)));
-        assert_eq!(append_landed(None, "a"), "a\n");
-        assert_eq!(append_landed(Some("x\ny\n"), "z"), "x\ny\nz\n");
-        let long: String = (0..LANDED_KEEP + 5).map(|i| format!("l{i}\n")).collect();
-        let s = append_landed(Some(&long), "new");
-        assert_eq!(s.lines().count(), LANDED_KEEP);
-        assert!(s.starts_with("l6\n") && s.ends_with("new\n"));
+        assert!(crate::store::newest_lines(&"x\n".repeat(LANDED_KEEP + 1), LANDED_KEEP).is_some());
     }
 
     #[test]

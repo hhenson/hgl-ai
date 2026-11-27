@@ -15,7 +15,7 @@ use serde_json::Value;
 
 use crate::exec::{self, Gh};
 use crate::table::{self, Alert, HoldChange, PrInfo, RateLimit, Row, Table};
-use crate::{Error, Result, Settings, state};
+use crate::{Error, Result, Settings, state, store};
 
 /// The shortest interval between rounds (docs/protocol.md §8).
 pub const MIN_INTERVAL: Duration = Duration::from_secs(300);
@@ -62,7 +62,39 @@ pub fn alert_note(s: &Settings, a: &Alert) -> Result<Note> {
     Ok(n)
 }
 
-/// Run rounds until stopped (or once). Dry-run output goes to `out`.
+/// Write a round to the hub: the table, the alerts and `hold`.
+async fn publish(
+    b: &Bus,
+    s: &Settings,
+    t: &Table,
+    alerts: &[Alert],
+    rate: &RateLimit,
+    hold: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<()> {
+    store::put_latest(b, state::KEY_PRS, &t.render()).await?;
+    for a in alerts {
+        b.send(&alert_note(s, a)?).await?;
+        tracing::info!("alert sent: {}", a.body().lines().next().unwrap_or(""));
+    }
+    match table::hold_after(rate, s.hold_below, hold, now) {
+        HoldChange::Set(v) => {
+            store::put_latest(b, state::KEY_HOLD, &v).await?;
+            tracing::warn!("GraphQL allowance {} left: hold until {v}", rate.remaining);
+        }
+        HoldChange::Clear => {
+            if store::clear_if(b, state::KEY_HOLD, hold.unwrap_or_default()).await? {
+                tracing::info!("hold cleared");
+            }
+        }
+        HoldChange::Keep => {}
+    }
+    Ok(())
+}
+
+/// Run rounds until stopped (or once). Dry-run output goes to `out`. Fails at once when
+/// `gh` cannot run or is not signed in; a failed round or hub write is logged and the
+/// next round comes as usual.
 pub async fn run<G: Gh>(
     gh: &G,
     s: &Settings,
@@ -70,20 +102,34 @@ pub async fn run<G: Gh>(
     o: &CoordOpts,
     out: &mut impl Write,
 ) -> Result<()> {
+    exec::check_auth(gh).await?;
     let bus = if o.dry_run { None } else { bus };
-    let mut prev: Vec<Row> = match bus {
-        Some(b) => b
-            .state_get(state::KEY_PRS)
-            .await?
-            .map(|e| Table::parse(&e.value).rows)
-            .unwrap_or_default(),
-        None => Vec::new(),
-    };
+    let mut prev: Vec<Row> = Vec::new();
+    if let Some(b) = bus {
+        match b.state_get(state::KEY_PRS).await {
+            Ok(e) => prev = e.map(|e| Table::parse(&e.value).rows).unwrap_or_default(),
+            Err(e) => tracing::warn!("reading the previous table: {e}"),
+        }
+        eprintln!(
+            "coordinator: {} repositories of {} every {:?} into {}/{}",
+            s.repos.len(),
+            s.owner,
+            o.interval,
+            hgl_ai_proto::KV_STATE,
+            state::KEY_PRS
+        );
+    }
     let mut last_rate: Option<RateLimit> = None;
     loop {
         let now = Utc::now();
         let hold = match bus {
-            Some(b) => b.state_get(state::KEY_HOLD).await?.map(|e| e.value),
+            Some(b) => match b.state_get(state::KEY_HOLD).await {
+                Ok(e) => e.map(|e| e.value),
+                Err(e) => {
+                    tracing::warn!("reading {}: {e}", state::KEY_HOLD);
+                    None
+                }
+            },
             None => None,
         };
         if let Some(h) = hold.as_deref().filter(|h| table::hold_active(h, now)) {
@@ -120,24 +166,19 @@ pub async fn run<G: Gh>(
                         let _ = out.flush();
                     }
                     Some(b) => {
-                        b.state_put(state::KEY_PRS, &t.render()).await?;
-                        for a in &alerts {
-                            b.send(&alert_note(s, a)?).await?;
-                            tracing::info!("alert sent: {}", a.body().lines().next().unwrap_or(""));
-                        }
-                        match table::hold_after(&rate, s.hold_below, hold.as_deref(), now) {
-                            HoldChange::Set(v) => {
-                                b.state_put(state::KEY_HOLD, &v).await?;
-                                tracing::warn!(
-                                    "GraphQL allowance {} left: hold until {v}",
-                                    rate.remaining
-                                );
+                        let res = publish(b, s, &t, &alerts, &rate, hold.as_deref(), now).await;
+                        if let Err(e) = res {
+                            if o.once {
+                                return Err(e);
                             }
-                            HoldChange::Clear => {
-                                b.state_del(state::KEY_HOLD).await?;
-                                tracing::info!("hold cleared");
-                            }
-                            HoldChange::Keep => {}
+                            tracing::warn!("writing the round to the hub: {e}");
+                        } else {
+                            tracing::info!(
+                                "{} open pull requests, cost {}, {} left",
+                                t.rows.len(),
+                                rate.cost,
+                                rate.remaining
+                            );
                         }
                     }
                 }
@@ -149,7 +190,9 @@ pub async fn run<G: Gh>(
                 tracing::warn!("rate limited ({m}): hold until {v}");
                 match bus {
                     Some(b) => {
-                        b.state_put(state::KEY_HOLD, &v).await?;
+                        if let Err(e) = store::put_latest(b, state::KEY_HOLD, &v).await {
+                            tracing::warn!("writing {}: {e}", state::KEY_HOLD);
+                        }
                     }
                     None => {
                         let _ = writeln!(out, "rate limited: would hold until {v}");
@@ -159,6 +202,7 @@ pub async fn run<G: Gh>(
                     return Err(Error::RateLimited(m));
                 }
             }
+            Err(e @ Error::Auth(_)) => return Err(e),
             Err(e) if o.once => return Err(e),
             Err(e) => tracing::warn!("round failed: {e}"),
         }
@@ -179,8 +223,11 @@ mod tests {
     async fn dry_run_once_prints_the_table() {
         let mut s = settings();
         s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
-        let gh =
-            crate::exec::ReadOnly(FakeGh::default().on("graphql", &fixture("coord-batch.json")));
+        let gh = crate::exec::ReadOnly(
+            FakeGh::default()
+                .on("auth status", "")
+                .on("graphql", &fixture("coord-batch.json")),
+        );
         let o = CoordOpts {
             once: true,
             dry_run: true,
@@ -202,7 +249,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert_eq!(got.rate, want.rate);
-        let call = &gh.0.calls()[0];
+        let call = &gh.0.calls()[1];
         assert!(
             call.contains("-f owner=hhenson") && call.contains("-f r2=gamma"),
             "{call}"
@@ -213,6 +260,7 @@ mod tests {
     async fn rate_limited_round() {
         let s = settings();
         let gh = FakeGh::default()
+            .on("auth status", "")
             .fail("graphql", "gh: API rate limit exceeded for user ID 1.")
             .on(
                 "rate_limit",
@@ -232,6 +280,23 @@ mod tests {
             String::from_utf8(out).unwrap(),
             "rate limited: would hold until 2100-01-01T00:00:00Z\n"
         );
+    }
+
+    #[tokio::test]
+    async fn signed_out_gh_fails_first() {
+        let s = settings();
+        let gh = FakeGh::default().fail("auth status", "You are not logged into any GitHub hosts.");
+        let o = CoordOpts {
+            once: false,
+            dry_run: true,
+            interval: MIN_INTERVAL,
+        };
+        let e = run(&gh, &s, None, &o, &mut Vec::new()).await.unwrap_err();
+        assert!(
+            matches!(&e, Error::Auth(m) if m.contains("gh auth login")),
+            "{e}"
+        );
+        assert_eq!(gh.calls().len(), 1);
     }
 
     #[test]

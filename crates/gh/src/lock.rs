@@ -55,8 +55,8 @@ impl Lock {
                 });
             }
             if start.elapsed() >= wait {
-                return Err(Error::Invalid(format!(
-                    "could not take the landing lock {} in {wait:?}",
+                return Err(Error::Locked(format!(
+                    "another landing holds {} (waited {wait:?})",
                     path.display()
                 )));
             }

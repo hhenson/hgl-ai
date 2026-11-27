@@ -448,6 +448,65 @@ pub fn alerts(prev: &[Row], now: &[PrInfo]) -> Vec<Alert> {
     out
 }
 
+/// A table older than this is not used to decide anything (docs/protocol.md §8).
+pub const STALE_AFTER: chrono::Duration = chrono::Duration::minutes(15);
+
+/// What a fresh table says about landing one pull request at one head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TableWord {
+    /// Read GitHub: the table is stale, has no row for it, names another head, or says it
+    /// can land.
+    Ask(String),
+    /// The review bot reports its usage limit.
+    Limit,
+    /// Not yet: no GitHub call is worth making.
+    NotYet(String),
+}
+
+/// The rule of the shell `land-when-ready`: land when the table shows no unresolved thread,
+/// no failed check and the bot clean (or the findings triaged).
+pub fn table_word(
+    text: Option<&str>,
+    repo: &str,
+    number: u64,
+    head: &str,
+    triaged: bool,
+    now: DateTime<Utc>,
+) -> TableWord {
+    let Some(text) = text else {
+        return TableWord::Ask("no table".into());
+    };
+    let t = Table::parse(text);
+    match parse_time(&t.read) {
+        Some(read) if now - read <= STALE_AFTER => {}
+        _ => return TableWord::Ask("the table is stale".into()),
+    }
+    let Some(r) = t.rows.iter().find(|r| r.repo == repo && r.number == number) else {
+        return TableWord::Ask("no row for it".into());
+    };
+    if r.bot == BotState::Limit {
+        return TableWord::Limit;
+    }
+    if r.head != head {
+        return TableWord::Ask(format!("the table shows head {}", short(&r.head)));
+    }
+    let mut why = Vec::new();
+    if r.unresolved != 0 {
+        why.push(format!("{} unresolved", r.unresolved));
+    }
+    if r.checks == Checks::Fail {
+        why.push("a check failed".to_string());
+    }
+    if r.bot != BotState::Clean && !triaged {
+        why.push(format!("bot {}", r.bot.as_str()));
+    }
+    if why.is_empty() {
+        TableWord::Ask("the table says it can land".into())
+    } else {
+        TableWord::NotYet(why.join(", "))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -562,6 +621,57 @@ mod tests {
         );
         assert_eq!(hold_on_limit(None, Some(&low), now), "2026-01-05T12:55:49Z");
         assert_eq!(hold_on_limit(None, None, now), "2026-01-05T13:00:00Z");
+    }
+
+    #[test]
+    fn landing_from_the_table() {
+        let text = fixture("coord-batch.prs");
+        let now = at("2026-01-05T12:05:00Z");
+        let h = |c: &str| c.repeat(40);
+        let w = |n: u64, head: &str, triaged: bool| {
+            table_word(Some(&text), "alpha", n, head, triaged, now)
+        };
+        assert_eq!(
+            w(11, &h("1"), false),
+            TableWord::NotYet("2 unresolved, bot findings".into())
+        );
+        assert_eq!(
+            w(12, &h("2"), false),
+            TableWord::NotYet("a check failed".into())
+        );
+        assert_eq!(
+            w(13, &h("3"), true),
+            TableWord::NotYet("1 unresolved".into())
+        );
+        assert!(
+            matches!(w(14, &h("4"), false), TableWord::NotYet(_)),
+            "a draft has no review"
+        );
+        assert!(
+            matches!(w(12, &h("9"), false), TableWord::Ask(_)),
+            "another head"
+        );
+        assert!(matches!(w(99, &h("9"), false), TableWord::Ask(_)), "no row");
+        assert_eq!(
+            table_word(Some(&text), "beta", 3, &"a3".repeat(20), false, now),
+            TableWord::Limit
+        );
+        let late = at("2026-01-05T12:20:01Z");
+        assert!(
+            matches!(
+                table_word(Some(&text), "alpha", 11, &h("1"), false, late),
+                TableWord::Ask(_)
+            ),
+            "stale"
+        );
+        assert!(matches!(
+            table_word(None, "alpha", 11, &h("1"), false, now),
+            TableWord::Ask(_)
+        ));
+        let ready = text.replace("open\tclean\t0\tfail", "open\tclean\t0\tpass");
+        assert!(
+            matches!(table_word(Some(&ready), "alpha", 12, &h("2"), false, now), TableWord::Ask(w) if w.contains("can land"))
+        );
     }
 
     #[test]

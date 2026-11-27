@@ -8,7 +8,7 @@ use hgl_ai_bus::Bus;
 use hgl_ai_gh::exec::{GhCli, ReadOnly};
 use hgl_ai_gh::gate::{Kind, Opts};
 use hgl_ai_gh::land::{LandOpts, Landing};
-use hgl_ai_gh::{Settings, coord, land, pins, release, tap};
+use hgl_ai_gh::{Settings, coord, land, pins, release, tap, verdict};
 use hgl_ai_proto::Seat;
 
 use super::{Ctx, EXIT_OK, NotReady};
@@ -50,6 +50,49 @@ enum Cmd {
         #[command(subcommand)]
         cmd: TapCmd,
     },
+    /// Approve an exact head: one GitHub comment, then an `approved` note to the author.
+    Approve(VerdictArgs),
+    /// Send findings back on an exact head: one GitHub comment, then a `sendback` note.
+    Sendback(VerdictArgs),
+}
+
+#[derive(clap::Args)]
+#[group(id = "text", required = true, multiple = false, args = ["body", "body_file"])]
+struct VerdictArgs {
+    repo: String,
+    pr: u64,
+    /// The full 40-character head the verdict is for.
+    head: String,
+    /// Seat to send to (default: the author's, from the trees, branch or Ready comment).
+    #[arg(long = "to")]
+    to: Vec<Seat>,
+    /// The task's issue (default: the one in the branch name, else PR).
+    #[arg(long)]
+    issue: Option<u64>,
+    #[arg(long)]
+    body: Option<String>,
+    /// A file with the body; `-` reads standard input.
+    #[arg(long)]
+    body_file: Option<PathBuf>,
+    /// Send the note only (the comment is already on GitHub).
+    #[arg(long)]
+    no_comment: bool,
+    #[arg(long)]
+    dry_run: bool,
+}
+
+impl VerdictArgs {
+    fn body(&self) -> anyhow::Result<String> {
+        match (&self.body, &self.body_file) {
+            (Some(b), _) => Ok(b.clone()),
+            (None, Some(p)) if p.as_os_str() == "-" => {
+                Ok(std::io::read_to_string(std::io::stdin())?)
+            }
+            (None, Some(p)) => std::fs::read_to_string(p)
+                .map_err(|e| anyhow::anyhow!("reading {}: {e}", p.display())),
+            (None, None) => anyhow::bail!("give --body or --body-file"),
+        }
+    }
 }
 
 #[derive(clap::Subcommand)]
@@ -223,25 +266,16 @@ enum TapCmd {
     },
 }
 
-fn init_tracing() {
-    let filter =
-        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into());
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_writer(std::io::stderr)
-        .try_init();
-}
-
 /// A bus error stays a bus error, so an unreachable hub exits 10.
 fn lift(e: hgl_ai_gh::Error) -> anyhow::Error {
     match e {
         hgl_ai_gh::Error::Bus(b) => b.into(),
+        hgl_ai_gh::Error::Locked(m) => NotReady(m).into(),
         other => other.into(),
     }
 }
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
-    init_tracing();
     if let Cmd::Tap {
         cmd:
             TapCmd::Formula {
@@ -264,6 +298,8 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     let cfg = ctx.load_config()?;
     let s = Settings::from_config(&cfg)?;
     let gh = GhCli::default();
+    // Every command below reads GitHub: say so clearly when `gh` cannot.
+    hgl_ai_gh::exec::check_auth(&gh).await.map_err(lift)?;
     match *args.cmd {
         Cmd::Coord {
             cmd:
@@ -423,6 +459,39 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
         Cmd::Tap {
             cmd: TapCmd::Formula { .. },
         } => unreachable!("handled before the configuration is read"),
+        Cmd::Approve(a) => verdict(&cfg, &s, gh, a, hgl_ai_proto::Kind::Approved).await,
+        Cmd::Sendback(a) => verdict(&cfg, &s, gh, a, hgl_ai_proto::Kind::Sendback).await,
+    }
+}
+
+async fn verdict(
+    cfg: &hgl_ai_config::Config,
+    s: &Settings,
+    gh: GhCli,
+    a: VerdictArgs,
+    kind: hgl_ai_proto::Kind,
+) -> anyhow::Result<i32> {
+    let o = verdict::VerdictOpts {
+        kind,
+        to: a.to.clone(),
+        issue: a.issue,
+        body: a.body()?,
+        comment: !a.no_comment,
+        dry_run: a.dry_run,
+    };
+    let r = if a.dry_run {
+        verdict::verdict(&ReadOnly(gh), s, None, &a.repo, a.pr, &a.head, &o).await
+    } else {
+        let bus = Bus::connect(cfg).await?;
+        verdict::verdict(&gh, s, Some(&bus), &a.repo, a.pr, &a.head, &o).await
+    }
+    .map_err(lift)?;
+    match r {
+        verdict::VerdictOutcome::Sent(l) | verdict::VerdictOutcome::Would(l) => {
+            println!("{l}");
+            Ok(EXIT_OK)
+        }
+        verdict::VerdictOutcome::Refused(l) => Err(NotReady(l).into()),
     }
 }
 
