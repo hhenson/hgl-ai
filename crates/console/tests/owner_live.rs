@@ -222,11 +222,18 @@ async fn ask_answer_converse_and_refuse_forgery() {
     let n = &ans[0].note;
     assert!(n.sender.is_owner());
     assert_eq!((n.repo.as_deref(), n.issue), (Some("hgl-compiler"), 980));
+    assert_eq!(n.by.as_deref(), Some("This Dude"));
     assert!(
-        n.body
-            .contains("accept a: The first (note: keep it simple) [by github:hhenson"),
+        n.body.starts_with("[owner] Answer from This Dude:")
+            && n.body
+                .contains("accept a: The first (note: keep it simple) [This Dude, ")
+            && n.body.contains("`This Dude, 20"),
         "{}",
         n.body
+    );
+    assert_eq!(
+        t.answer.as_ref().unwrap().handle.as_deref(),
+        Some("This Dude")
     );
     for d in &got {
         d.ack().await.unwrap();
@@ -234,7 +241,7 @@ async fn ask_answer_converse_and_refuse_forgery() {
     let log = owner::decisions_tail(&seat_bus, 5).await.unwrap();
     assert!(
         log.iter()
-            .any(|l| l.contains(&id) && l.contains("owner (github:hhenson): accept a")),
+            .any(|l| l.contains(&id) && l.contains("This Dude (github:hhenson): accept a")),
         "{log:?}"
     );
 
@@ -263,6 +270,7 @@ async fn ask_answer_converse_and_refuse_forgery() {
         id: id2.clone(),
         sender: "owner".into(),
         user: Some("github:hhenson".into()),
+        handle: Some("HPH".into()),
         at: hgl_ai_proto::utc_now_stamp(),
         body: Body::Answer {
             choice: hgl_ai_owner::Choice::Reject,
@@ -336,7 +344,9 @@ async fn ask_answer_converse_and_refuse_forgery() {
     .await;
     let page = b.get(&loc).await.text().await.unwrap();
     assert!(
-        page.contains("Thursday, after #980 lands.") && page.contains("owner (github:hhenson)")
+        page.contains("Thursday, after #980 lands.")
+            && page.contains("This Dude, ")
+            && page.contains(" (owner)")
     );
     let page = b
         .get("/conversations?q=release&state=open")

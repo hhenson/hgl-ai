@@ -114,10 +114,16 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
             n.created_at
         );
         if n.sender.is_owner() {
-            s.push_str(
-                "(The owner's words, through the console: the hub accepts sender `owner` only \
-                 there. A ruling reaches the record when you post it once on its issue, \
-                 quoting it and naming the thread.)\n",
+            let who = match &n.by {
+                Some(h) => format!("{h} (owner) says"),
+                None => "The owner says".to_string(),
+            };
+            let _ = writeln!(
+                s,
+                "{who}, through the console (the hub accepts sender `owner` only there). \
+                 Post a ruling once on its issue as `{}, <date>: \"<their words>\"`, naming \
+                 the thread (OWN-4, OWN-10):",
+                n.by.as_deref().unwrap_or("owner")
             );
         }
         s.push_str(&truncate(n.body.trim_end(), budget));
@@ -222,16 +228,22 @@ mod tests {
         let plain = build(&ctx(None, &s), &[(1, 1, &q)]);
         assert!(plain.contains("No task"));
         assert!(!plain.contains("State "), "hold and mode only when set");
-        assert!(!plain.contains("The owner's words"));
-        let o = Note::new(
+        assert!(!plain.contains("(owner) says") && !plain.contains("The owner says"));
+        let mut o = Note::new(
             Seat::owner(),
             seat("w1"),
             Kind::Answer,
             "[owner] Answer: accept a",
         );
+        o.by = Some("HPH".into());
         let p = build(&ctx(None, &s), &[(2, 1, &o)]);
         assert!(p.contains("answer from owner to w1"));
-        assert!(p.contains("(The owner's words, through the console"));
+        assert!(p.contains("HPH (owner) says, through the console"), "{p}");
+        assert!(p.contains("`HPH, <date>: \"<their words>\"`"));
+        assert!(!p.contains("The owner says"));
+        o.by = None;
+        let p = build(&ctx(None, &s), &[(2, 1, &o)]);
+        assert!(p.contains("The owner says, through the console"));
     }
 
     #[test]

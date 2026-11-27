@@ -93,8 +93,11 @@ pub struct Answer {
     pub text: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub note: String,
-    /// The signed-in user who answered (`github:<login>`, `apple:<email>`).
+    /// The signed-in user who answered (`github:<login>`, `apple:<email>`, `google:<email>`).
     pub user: String,
+    /// Their handle (OWN-10), when `[console] users` gives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     pub at: String,
 }
 
@@ -106,8 +109,52 @@ pub struct Message {
     /// For the owner's messages, the signed-in user.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// For the owner's messages, the user's handle (OWN-10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     pub at: String,
     pub body: String,
+}
+
+impl Message {
+    /// `HPH, 27 Nov 14:05` for the owner's words; the seat and time for an agent's.
+    pub fn signature(&self) -> String {
+        match (&self.handle, &self.user) {
+            (Some(h), _) => signed(h, &self.at),
+            (None, Some(u)) => signed(u, &self.at),
+            (None, None) => signed(&self.sender, &self.at),
+        }
+    }
+}
+
+const MONTHS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+/// `<who>, 27 Nov 14:05` from a compact UTC stamp (OWN-10).
+pub fn signed(who: &str, stamp: &str) -> String {
+    let b = stamp.as_bytes();
+    let short = if b.len() == 16 && b[8] == b'T' {
+        let m: usize = stamp[4..6].parse().unwrap_or(0);
+        let day = stamp[6..8].trim_start_matches('0');
+        match MONTHS.get(m.wrapping_sub(1)) {
+            Some(mon) => format!("{day} {mon} {}:{}", &stamp[9..11], &stamp[11..13]),
+            None => stamp.to_string(),
+        }
+    } else {
+        stamp.to_string()
+    };
+    format!("{who}, {short}")
+}
+
+/// `2026-11-27` from a compact UTC stamp: the date an agent quotes with a handle.
+pub fn quote_date(stamp: &str) -> String {
+    match stamp.get(0..8) {
+        Some(d) if d.chars().all(|c| c.is_ascii_digit()) => {
+            format!("{}-{}-{}", &d[0..4], &d[4..6], &d[6..8])
+        }
+        _ => stamp.to_string(),
+    }
 }
 
 /// `HGL_THREADS/<id>`
@@ -210,11 +257,12 @@ impl Thread {
             s.push_str(&format!("\nAnswer: {}\n", self.answer_text(a)));
         }
         for m in &self.messages {
-            let who = match &m.user {
-                Some(u) => format!("{} ({u})", m.sender),
-                None => m.sender.clone(),
+            let who = if m.sender == hgl_ai_proto::OWNER {
+                format!("{} (owner)", m.signature())
+            } else {
+                m.signature()
             };
-            s.push_str(&format!("\n[{}] {who}:\n{}\n", m.at, m.body.trim_end()));
+            s.push_str(&format!("\n{who}:\n{}\n", m.body.trim_end()));
         }
         s
     }
@@ -233,7 +281,8 @@ impl Thread {
         if !a.note.trim().is_empty() {
             s.push_str(&format!(" (note: {})", a.note.trim()));
         }
-        s.push_str(&format!(" [by {} at {}]", a.user, a.at));
+        let who = a.handle.as_deref().unwrap_or(&a.user);
+        s.push_str(&format!(" [{}]", signed(who, &a.at)));
         s
     }
 }
@@ -319,5 +368,8 @@ mod tests {
         assert_eq!(parse_issue("spec/rule-7"), None);
         assert_eq!(parse_issue("a#0"), None);
         assert!("p2".parse::<Priority>().unwrap() < Priority::P3);
+        assert_eq!(signed("HPH", "20261127T140500Z"), "HPH, 27 Nov 14:05");
+        assert_eq!(signed("HPH", "20260105T090000Z"), "HPH, 5 Jan 09:00");
+        assert_eq!(quote_date("20261127T140500Z"), "2026-11-27");
     }
 }

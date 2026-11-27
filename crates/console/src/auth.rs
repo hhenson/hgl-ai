@@ -76,12 +76,15 @@ pub struct Session {
 pub enum Provider {
     Github,
     Apple,
+    Google,
 }
 
 struct Flow {
     provider: Provider,
     binding: String,
     nonce: String,
+    /// PKCE `code_verifier` (Google).
+    verifier: String,
     started: Instant,
 }
 
@@ -176,6 +179,7 @@ pub struct Auth {
     enrolments: Mutex<HashMap<String, Enrolment>>,
     logins: Mutex<HashMap<String, (PasskeyAuthentication, Instant)>>,
     http: reqwest::Client,
+    jwks: crate::jwt::JwksCache,
 }
 
 impl Auth {
@@ -228,6 +232,7 @@ impl Auth {
             enrolments: Mutex::default(),
             logins: Mutex::default(),
             http,
+            jwks: crate::jwt::JwksCache::default(),
         })
     }
 
@@ -240,6 +245,14 @@ impl Auth {
     }
     pub fn has_apple(&self) -> bool {
         self.console.apple.is_some()
+    }
+    pub fn has_google(&self) -> bool {
+        self.console.google.is_some()
+    }
+
+    /// The handle that signs `identity`'s words (OWN-10), if `[console] users` gives one.
+    pub fn handle_of(&self, identity: &Identity) -> Option<String> {
+        self.console.handle_of(identity)
     }
 
     // ---- cookies ----
@@ -366,6 +379,7 @@ impl Auth {
         match p {
             Provider::Github => format!("{}/auth/github/callback", self.origin),
             Provider::Apple => format!("{}/auth/apple/callback", self.origin),
+            Provider::Google => format!("{}/auth/google/callback", self.origin),
         }
     }
 
@@ -376,6 +390,7 @@ impl Auth {
         let state = random_hex();
         let binding = random_hex();
         let nonce = random_hex();
+        let verifier = b64(&hex::decode(random_hex()).expect("hex"));
         let redirect = self.redirect_uri(p);
         let url = match p {
             Provider::Github => {
@@ -411,6 +426,28 @@ impl Auth {
                     .append_pair("nonce", &nonce);
                 u.to_string()
             }
+            Provider::Google => {
+                let g = self
+                    .console
+                    .google
+                    .as_ref()
+                    .ok_or_else(|| bad("Google sign-in is not configured"))?;
+                let mut u =
+                    Url::parse(&g.authorize_url).map_err(|e| AuthError::Setup(e.to_string()))?;
+                use sha2::Digest as _;
+                let challenge = b64(&Sha256::digest(verifier.as_bytes()));
+                u.query_pairs_mut()
+                    .append_pair("client_id", &g.client_id)
+                    .append_pair("redirect_uri", &redirect)
+                    .append_pair("response_type", "code")
+                    .append_pair("scope", "openid email")
+                    .append_pair("state", &state)
+                    .append_pair("nonce", &nonce)
+                    .append_pair("code_challenge", &challenge)
+                    .append_pair("code_challenge_method", "S256")
+                    .append_pair("prompt", "select_account");
+                u.to_string()
+            }
         };
         self.flows.lock().expect("flows").insert(
             state,
@@ -418,6 +455,7 @@ impl Auth {
                 provider: p,
                 binding: binding.clone(),
                 nonce,
+                verifier,
                 started: Instant::now(),
             },
         );
@@ -490,16 +528,111 @@ impl Auth {
             .map_err(|e| AuthError::Setup(format!("{}: {e}", a.key_file)))?;
         read_secret(&expand(&a.key_file))?;
         let secret = apple_client_secret(a, &key, chrono::Utc::now().timestamp())?;
-        let email = apple_email(
-            &self.http,
-            a,
-            &secret,
-            code,
-            &self.redirect_uri(Provider::Apple),
-            &flow.nonce,
+        let t = token_reply(
+            self.http
+                .post(&a.token_url)
+                .header("Accept", "application/json")
+                .form(&[
+                    ("client_id", a.client_id.as_str()),
+                    ("client_secret", secret.as_str()),
+                    ("code", code),
+                    ("grant_type", "authorization_code"),
+                    ("redirect_uri", &self.redirect_uri(Provider::Apple)),
+                ])
+                .send()
+                .await,
+            "Apple",
         )
         .await?;
+        let email = self
+            .id_token_email(
+                "Apple",
+                &t,
+                &a.jwks_url,
+                &[APPLE_ISSUER],
+                &a.client_id,
+                &flow.nonce,
+            )
+            .await?;
         self.allowed(Identity::Apple(email))
+    }
+
+    /// Google's callback: the account email behind `code` (OpenID Connect, PKCE).
+    pub async fn google_callback(
+        &self,
+        code: &str,
+        state: &str,
+        binding: Option<&str>,
+    ) -> Result<Identity, AuthError> {
+        let flow = self.take_flow(Provider::Google, state, binding)?;
+        let g = self
+            .console
+            .google
+            .as_ref()
+            .ok_or_else(|| bad("Google sign-in is not configured"))?;
+        let secret = read_secret(&expand(&g.secret_file))?;
+        let t = token_reply(
+            self.http
+                .post(&g.token_url)
+                .header("Accept", "application/json")
+                .form(&[
+                    ("client_id", g.client_id.as_str()),
+                    ("client_secret", secret.as_str()),
+                    ("code", code),
+                    ("code_verifier", flow.verifier.as_str()),
+                    ("grant_type", "authorization_code"),
+                    ("redirect_uri", &self.redirect_uri(Provider::Google)),
+                ])
+                .send()
+                .await,
+            "Google",
+        )
+        .await?;
+        let email = self
+            .id_token_email(
+                "Google",
+                &t,
+                &g.jwks_url,
+                &GOOGLE_ISSUERS,
+                &g.client_id,
+                &flow.nonce,
+            )
+            .await?;
+        self.allowed(Identity::Google(email))
+    }
+
+    /// The verified email of a token reply's `id_token`: its signature against the
+    /// provider's published keys, then issuer, audience, expiry, nonce, `email_verified`.
+    async fn id_token_email(
+        &self,
+        who: &str,
+        t: &TokenReply,
+        jwks_url: &str,
+        issuers: &[&str],
+        audience: &str,
+        nonce: &str,
+    ) -> Result<String, AuthError> {
+        let idt = t
+            .id_token
+            .clone()
+            .ok_or_else(|| AuthError::Provider(format!("{who}: {}", t.failure())))?;
+        let p = |m: String| AuthError::Provider(format!("{who}: {m}"));
+        let keys = self
+            .jwks
+            .keys(&self.http, jwks_url, crate::jwt::kid(&idt).as_deref())
+            .await
+            .map_err(p)?;
+        let claims = crate::jwt::verify(&idt, &keys).map_err(p)?;
+        crate::jwt::check(
+            &claims,
+            &crate::jwt::Expect {
+                issuers,
+                audience,
+                nonce,
+                now: chrono::Utc::now().timestamp(),
+            },
+        )
+        .map_err(p)
     }
 
     fn allowed(&self, id: Identity) -> Result<Identity, AuthError> {
@@ -818,82 +951,8 @@ pub fn apple_client_secret(a: &AppleOAuth, key_pem: &str, now: i64) -> Result<St
     Ok(format!("{signing_input}.{}", b64(&sig.to_bytes())))
 }
 
-/// Exchange an Apple code for the account's email. The `id_token` comes straight from
-/// Apple's token endpoint over TLS, so its claims are checked (issuer, audience, expiry,
-/// nonce, a verified email) and its signature is not (OpenID Connect Core §3.1.3.7).
-async fn apple_email(
-    http: &reqwest::Client,
-    a: &AppleOAuth,
-    secret: &str,
-    code: &str,
-    redirect: &str,
-    nonce: &str,
-) -> Result<String, AuthError> {
-    let t = token_reply(
-        http.post(&a.token_url)
-            .header("Accept", "application/json")
-            .form(&[
-                ("client_id", a.client_id.as_str()),
-                ("client_secret", secret),
-                ("code", code),
-                ("grant_type", "authorization_code"),
-                ("redirect_uri", redirect),
-            ])
-            .send()
-            .await,
-        "Apple",
-    )
-    .await?;
-    let idt = t
-        .id_token
-        .clone()
-        .ok_or_else(|| AuthError::Provider(format!("Apple: {}", t.failure())))?;
-    let claims = idt
-        .split('.')
-        .nth(1)
-        .and_then(|p| {
-            base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(p)
-                .ok()
-        })
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .ok_or_else(|| AuthError::Provider("Apple: an unreadable id_token".into()))?;
-    let s = |k: &str| claims.get(k).and_then(|v| v.as_str()).unwrap_or("");
-    if s("iss") != APPLE_ISSUER {
-        return Err(AuthError::Provider(
-            "Apple: id_token from another issuer".into(),
-        ));
-    }
-    let aud_ok = match claims.get("aud") {
-        Some(serde_json::Value::String(x)) => x == &a.client_id,
-        Some(serde_json::Value::Array(v)) => v.iter().any(|x| x.as_str() == Some(&a.client_id)),
-        _ => false,
-    };
-    if !aud_ok {
-        return Err(AuthError::Provider(
-            "Apple: id_token for another client".into(),
-        ));
-    }
-    let exp = claims.get("exp").and_then(|v| v.as_i64()).unwrap_or(0);
-    if exp <= chrono::Utc::now().timestamp() {
-        return Err(AuthError::Provider("Apple: the id_token expired".into()));
-    }
-    if s("nonce") != nonce {
-        return Err(AuthError::Provider(
-            "Apple: the id_token's nonce does not match".into(),
-        ));
-    }
-    let verified = match claims.get("email_verified") {
-        Some(serde_json::Value::Bool(b)) => *b,
-        Some(serde_json::Value::String(x)) => x == "true",
-        _ => false,
-    };
-    let email = s("email");
-    if email.is_empty() || !verified {
-        return Err(AuthError::Provider("Apple: no verified email".into()));
-    }
-    Ok(email.to_string())
-}
+/// The issuers of Google's `id_token`s.
+pub const GOOGLE_ISSUERS: [&str; 2] = ["https://accounts.google.com", "accounts.google.com"];
 
 #[cfg(test)]
 mod tests {
@@ -902,7 +961,7 @@ mod tests {
     fn console(dir: &Path) -> (Console, Auth) {
         let c = Console {
             url: "https://console.example.com".into(),
-            users: vec!["hhenson".into()],
+            users: vec![hgl_ai_config::User::new("github:hhenson", "HPH")],
             ..Console::default()
         };
         let a = Auth::new(&c, dir).unwrap();

@@ -270,6 +270,22 @@ async fn sign_in_with_apple() {
         .verify(format!("{}.{}", parts[0], parts[1]).as_bytes(), &sig)
         .unwrap();
 
+    // A token signed with a key Apple never published is refused.
+    let mut b = Browser::new(&base);
+    let r = b.get("/auth/apple").await;
+    let loc = webauthn_rs::prelude::Url::parse(r.headers()["location"].to_str().unwrap()).unwrap();
+    let qs: std::collections::BTreeMap<String, String> = loc.query_pairs().into_owned().collect();
+    let code = format!("good:owner@example.com:{}:badsig", qs["nonce"]);
+    let r = b
+        .post_form(
+            "/auth/apple/callback",
+            &[("code", &code), ("state", &qs["state"])],
+            None,
+        )
+        .await;
+    assert_eq!(r.status(), 502);
+    assert!(r.text().await.unwrap().contains("signature"));
+
     // A wrong nonce (a replayed id_token) is refused.
     let mut b = Browser::new(&base);
     let r = b.get("/auth/apple").await;
@@ -286,6 +302,85 @@ async fn sign_in_with_apple() {
             &[("code", "good:owner@example.com:other"), ("state", &state)],
             None,
         )
+        .await;
+    assert_eq!(r.status(), 502);
+}
+
+fn query(loc: &str) -> std::collections::BTreeMap<String, String> {
+    webauthn_rs::prelude::Url::parse(loc)
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+/// Start Google's flow; the provider will answer `code` built from what it was sent.
+async fn google(b: &mut Browser, email: &str, flag: &str) -> reqwest::Response {
+    let r = b.get("/auth/google").await;
+    assert_eq!(r.status(), 303);
+    let q = query(r.headers()["location"].to_str().unwrap());
+    assert_eq!(q["scope"], "openid email");
+    assert_eq!(q["response_type"], "code");
+    assert_eq!(q["code_challenge_method"], "S256");
+    assert_eq!(q["client_id"], GOOGLE_CLIENT);
+    let code = format!("good:{email}:{}:{}:{flag}", q["nonce"], q["code_challenge"]);
+    let code: String = webauthn_rs::prelude::Url::parse("http://x/")
+        .unwrap()
+        .query_pairs_mut()
+        .append_pair("code", &code)
+        .append_pair("state", &q["state"])
+        .finish()
+        .query()
+        .unwrap()
+        .to_string();
+    b.get(&format!("/auth/google/callback?{code}")).await
+}
+
+#[tokio::test]
+async fn sign_in_with_google() {
+    let (p, _h, base) = setup().await;
+    let mut b = Browser::new(&base);
+    let r = google(&mut b, "owner@example.com", "").await;
+    assert_eq!(r.status(), 200);
+    assert!(r.text().await.unwrap().contains("google:owner@example.com"));
+    let mut key = SoftPasskey::new(true);
+    assert_eq!(register(&mut b, &mut key).await.status(), 200);
+    let page = b.get("/").await.text().await.unwrap();
+    assert!(
+        page.contains("OW (google:owner@example.com)"),
+        "the handle is shown"
+    );
+
+    // Refused: a token signed by a key Google never published, one for another client,
+    // an unverified email, and an email not on the list.
+    for (email, flag, status, why) in [
+        ("owner@example.com", "badsig", 502, "signature"),
+        ("owner@example.com", "aud", 502, "another client"),
+        ("owner@example.com", "unverified", 502, "verified email"),
+        ("mallory@example.com", "", 403, "may not sign in"),
+    ] {
+        let mut b = Browser::new(&base);
+        let r = google(&mut b, email, flag).await;
+        assert_eq!(r.status(), status, "{flag} {email}");
+        assert!(r.text().await.unwrap().contains(why), "{why}");
+        let r = b
+            .post_json("/auth/passkey/register/start", &serde_json::json!({}))
+            .await;
+        assert_eq!(r.status(), 400, "no enrolment after a refusal");
+    }
+    // The same email through Apple is another identity: allowed only because the
+    // list names `apple:` too; Google's keys were fetched once and cached.
+    assert_eq!(p.jwks_fetches.lock().unwrap().get("google"), Some(&1));
+
+    // A PKCE verifier that does not match the challenge (a stolen code) is refused.
+    let mut b = Browser::new(&base);
+    let r = b.get("/auth/google").await;
+    let q = query(r.headers()["location"].to_str().unwrap());
+    let r = b
+        .get(&format!(
+            "/auth/google/callback?code=good:owner@example.com:{}:wrongchallenge&state={}",
+            q["nonce"], q["state"]
+        ))
         .await;
     assert_eq!(r.status(), 502);
 }

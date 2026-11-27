@@ -261,7 +261,35 @@ pub struct Note {
     /// Base branch or commit for `assign`; merge commit for `landed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// For a note from `owner`: the handle of the signed-in owner who wrote it (OWN-10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
     pub body: String,
+}
+
+/// An owner's handle (OWN-10): the name they choose to sign with, 1 to 31 characters of
+/// letters, digits, spaces and `-_.'`, without leading or trailing space.
+pub fn check_handle(h: &str) -> Result<(), ProtoError> {
+    let n = h.chars().count();
+    let ok = (1..=31).contains(&n)
+        && h.trim() == h
+        && h.chars()
+            .all(|c| c.is_alphanumeric() || " -_.'".contains(c));
+    if ok {
+        Ok(())
+    } else {
+        Err(ProtoError::Note(format!(
+            "handle {h:?}: 1 to 31 letters, digits, spaces or -_.' with no space at either end"
+        )))
+    }
+}
+
+/// Handles are the same when they match ignoring case and runs of spaces.
+pub fn handle_key(h: &str) -> String {
+    h.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
 }
 
 impl Note {
@@ -280,6 +308,7 @@ impl Note {
             kind,
             head: None,
             base: None,
+            by: None,
             body,
         }
     }
@@ -319,6 +348,14 @@ impl Note {
                 self.kind
             )));
         }
+        if let Some(h) = &self.by {
+            if !self.sender.is_owner() {
+                return Err(ProtoError::Note(
+                    "only an owner note names its writer (`by`)".into(),
+                ));
+            }
+            check_handle(h)?;
+        }
         if self.body.trim().is_empty() {
             return Err(ProtoError::Note("empty body".into()));
         }
@@ -349,7 +386,11 @@ impl Note {
             self.head.as_deref(),
             self.base.as_deref(),
             Some(self.body.as_str()),
-        ] {
+        ]
+        .into_iter()
+        // `by` only when set, so notes without it keep the ids they always had.
+        .chain(self.by.as_deref().map(Some))
+        {
             // Tagged and length-prefixed: no two envelopes encode alike.
             match field {
                 None => h.update([0u8]),
@@ -592,6 +633,23 @@ mod tests {
             "[console] Tick",
         );
         assert!(t.validate().is_ok());
+        let mut a = Note::new(Seat::owner(), seat("claude"), Kind::Answer, "accept");
+        let plain = a.msg_id();
+        a.by = Some("HPH".into());
+        assert!(a.validate().is_ok());
+        assert_ne!(a.msg_id(), plain, "the writer is part of the envelope");
+        for ok in ["This Dude", "H", "O'Neil-Smith Jr.", "x_y", "Zoë"] {
+            a.by = Some(ok.into());
+            assert!(a.validate().is_ok(), "{ok}");
+        }
+        for bad in ["", " Lead", "Trail ", "a\tb", "a@b", &"x".repeat(32)] {
+            a.by = Some(bad.into());
+            assert!(a.validate().is_err(), "{bad:?}");
+        }
+        assert_eq!(handle_key("This  Dude"), handle_key("this dude"));
+        let mut n = Note::new(seat("w1"), seat("claude"), Kind::Note, "x");
+        n.by = Some("HPH".into());
+        assert!(n.validate().is_err(), "only owner notes carry `by`");
         assert!(Seat::owner().is_reserved() && Seat::broadcast().is_reserved());
         assert!(!seat("w1").is_reserved());
         assert_eq!(metrics_key("hgl_spec", "20261127"), "hgl_spec.20261127");

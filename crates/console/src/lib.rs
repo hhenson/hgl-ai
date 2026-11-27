@@ -8,6 +8,7 @@
 
 pub mod auth;
 mod html;
+pub mod jwt;
 mod pages;
 pub mod service;
 pub mod telemetry;
@@ -152,6 +153,8 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/auth/github/callback", get(pages::github_callback))
         .route("/auth/apple", get(pages::apple_start))
         .route("/auth/apple/callback", post(pages::apple_callback))
+        .route("/auth/google", get(pages::google_start))
+        .route("/auth/google/callback", get(pages::google_callback))
         .route("/auth/passkey/register/start", post(pages::register_start))
         .route(
             "/auth/passkey/register/finish",

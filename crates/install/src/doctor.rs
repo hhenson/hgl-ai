@@ -169,21 +169,46 @@ fn secret_check(sys: &dyn System, name: &str, shown: &str) -> Check {
 /// `[console]`: who can sign in, how, and the secrets beside the configuration.
 fn console_checks(sys: &dyn System, c: &hgl_ai_config::Console) -> Vec<Check> {
     let mut out = Vec::new();
+    let missing = c.missing_handles();
     out.push(if c.users.is_empty() {
         Check::warn(
             "console users",
             "nobody may sign in",
-            "add GitHub logins or Apple emails to [console] users",
+            "add `{ id = \"github:<login>\", handle = \"<initials>\" }` to [console] users",
+        )
+    } else if !missing.is_empty() {
+        Check::warn(
+            "console users",
+            format!(
+                "no handle for {}: their words are signed by identity",
+                missing.join(", ")
+            ),
+            "write each as `{ id = \"...\", handle = \"<initials>\" }` (OWN-10)",
         )
     } else {
-        Check::ok("console users", c.users.join(", "))
+        let owners = c.owners().unwrap_or_default();
+        let names: Vec<String> = owners
+            .iter()
+            .map(|o| {
+                let ids: Vec<String> = o.ids.iter().map(ToString::to_string).collect();
+                format!(
+                    "{} ({})",
+                    o.handle.as_deref().unwrap_or("?"),
+                    ids.join(", ")
+                )
+            })
+            .collect();
+        Check::ok("console users", names.join("; "))
     });
-    if c.github.is_none() && c.apple.is_none() {
+    if c.github.is_none() && c.apple.is_none() && c.google.is_none() {
         out.push(Check::warn(
             "console sign-in",
-            "no GitHub or Apple app: a first sign-in or a new device cannot enrol a passkey",
-            "set [console.github] or [console.apple] (docs/install.md)",
+            "no GitHub, Apple or Google app: a first sign-in or a new device cannot enrol a passkey",
+            "set [console.github], [console.apple] or [console.google] (docs/install.md)",
         ));
+    }
+    if let Some(g) = &c.google {
+        out.push(secret_check(sys, "console google", &g.secret_file));
     }
     if let Some(g) = &c.github {
         out.push(secret_check(sys, "console github", &g.secret_file));
@@ -639,7 +664,18 @@ mod tests {
                 .find(|c| c.name == n)
                 .unwrap_or_else(|| panic!("{n}"))
         };
-        assert_eq!(get("console users").level, Level::Warn);
+        assert_eq!(get("console users").level, Level::Warn, "nobody");
+        let mut with_old = cfg.clone();
+        with_old.console.as_mut().unwrap().users = vec![
+            hgl_ai_config::User::Plain("hhenson".into()),
+            hgl_ai_config::User::new("google:o@example.com", "OW"),
+        ];
+        crate::save_config(&f, &f.env, &with_old).unwrap();
+        let cs2 = run(&f, &FakeHub::up()).await;
+        let users = cs2.iter().find(|c| c.name == "console users").unwrap();
+        assert_eq!(users.level, Level::Warn);
+        assert!(users.detail.contains("no handle for hhenson"), "{users:?}");
+        crate::save_config(&f, &f.env, &cfg).unwrap();
         assert_eq!(get("console github").level, Level::Fail);
         assert!(
             get("console github")

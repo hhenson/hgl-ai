@@ -9,7 +9,10 @@ use serde::{Deserialize, Serialize};
 
 pub mod console;
 pub mod github;
-pub use console::{AppleOAuth, Console, GithubOAuth, Identity, Notify, SmtpTls};
+pub use console::{
+    AppleOAuth, Console, GithubOAuth, GoogleOAuth, Identity, Ids, Notify, Owner, OwnerEntry,
+    SmtpTls, User,
+};
 pub use github::{Pin, ReleaseWatch, RepoGate, Tap};
 
 #[derive(Debug, thiserror::Error)]

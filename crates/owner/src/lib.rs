@@ -63,6 +63,7 @@ fn agent_event(sender: &Seat, id: &str, body: Body) -> Event {
         id: id.to_string(),
         sender: sender.to_string(),
         user: None,
+        handle: None,
         at: utc_now_stamp(),
         body,
     }
@@ -178,9 +179,16 @@ pub async fn show(bus: &Bus, id: &str) -> Result<Option<Thread>> {
     Ok(bus.thread_get::<Thread>(id).await?.map(|(t, _)| t))
 }
 
-/// The owner's event in a thread, stamped with the signed-in `user`: the console's
-/// hub user alone may publish it (OWN-5, OWN-6). Returns the stream sequence.
-pub async fn owner_event(bus: &Bus, id: &str, user: &str, body: Body) -> Result<u64> {
+/// The owner's event in a thread, stamped with the signed-in `user` and their `handle`
+/// (OWN-10): the console's hub user alone may publish it (OWN-5, OWN-6). Returns the
+/// stream sequence.
+pub async fn owner_event(
+    bus: &Bus,
+    id: &str,
+    user: &str,
+    handle: Option<&str>,
+    body: Body,
+) -> Result<u64> {
     check_id(id).map_err(Error::Invalid)?;
     if body.origin() != Origin::Owner {
         return Err(invalid("not an owner event"));
@@ -190,6 +198,7 @@ pub async fn owner_event(bus: &Bus, id: &str, user: &str, body: Body) -> Result<
         id: id.to_string(),
         sender: hgl_ai_proto::OWNER.to_string(),
         user: Some(user.to_string()),
+        handle: handle.map(String::from),
         at: utc_now_stamp(),
         body,
     };
@@ -200,6 +209,7 @@ pub async fn owner_event(bus: &Bus, id: &str, user: &str, body: Body) -> Result<
 pub async fn start_conversation(
     bus: &Bus,
     user: &str,
+    handle: Option<&str>,
     title: &str,
     issue: Option<String>,
     body: &str,
@@ -214,6 +224,7 @@ pub async fn start_conversation(
         bus,
         &id,
         user,
+        handle,
         Body::Start {
             title: title.trim().to_string(),
             issue,

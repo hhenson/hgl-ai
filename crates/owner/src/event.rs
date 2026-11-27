@@ -146,6 +146,9 @@ pub struct Event {
     /// For the owner's events, the signed-in user (OWN-6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+    /// For the owner's events, that user's handle (OWN-10).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     pub at: String,
     #[serde(flatten)]
     pub body: Body,
@@ -233,7 +236,22 @@ pub fn fold(
         }
         Origin::Owner => {}
     }
+    if let Some(h) = &ev.handle {
+        if origin != Origin::Owner {
+            return Err(refuse("only the owner's events carry a handle"));
+        }
+        hgl_ai_proto::check_handle(h).map_err(|e| refuse(e.to_string()))?;
+    }
     let user = || ev.user.clone().unwrap_or_else(|| "unknown".into());
+    let handle = || ev.handle.clone();
+    // Who signs the owner's words: the handle, else the signed-in identity.
+    let who = ev.handle.clone().unwrap_or_else(user);
+    let quote = |id: &str| {
+        format!(
+            "Quote it on the owning issue as `{who}, {}: \"...\"`, naming {id} (OWN-4, OWN-10).",
+            crate::model::quote_date(&ev.at)
+        )
+    };
     let mut fx = Effects::default();
 
     let Some(old) = rec else {
@@ -288,6 +306,7 @@ pub fn fold(
                     messages: vec![Message {
                         sender: hgl_ai_proto::OWNER.into(),
                         user: Some(user()),
+                        handle: handle(),
                         at: ev.at.clone(),
                         body: body.clone(),
                     }],
@@ -297,14 +316,14 @@ pub fn fold(
                     &t,
                     controller,
                     Kind::Note,
-                    &ev.at,
+                    ev,
                     format!(
-                        "[owner] Conversation {}: {}\n\n{}\n\nFrom {} through the console. Reply with `hgl-ai thread reply {}`.",
+                        "[owner] Conversation from {who}: {} {}\n\n{}\n\nReply with `hgl-ai thread reply {}`. {}",
                         t.id,
                         t.title,
                         body.trim_end(),
-                        user(),
-                        t.id
+                        t.id,
+                        quote(&t.id)
                     ),
                 )?);
                 t
@@ -331,6 +350,7 @@ pub fn fold(
             t.messages.push(Message {
                 sender: ev.sender.clone(),
                 user: None,
+                handle: None,
                 at: ev.at.clone(),
                 body: body.clone(),
             });
@@ -348,6 +368,7 @@ pub fn fold(
             t.messages.push(Message {
                 sender: ev.sender.clone(),
                 user: None,
+                handle: None,
                 at: ev.at.clone(),
                 body: why,
             });
@@ -392,6 +413,7 @@ pub fn fold(
                 },
                 note: note.clone(),
                 user: user(),
+                handle: handle(),
                 at: ev.at.clone(),
             };
             let said = t.answer_text(&a);
@@ -400,6 +422,7 @@ pub fn fold(
             t.messages.push(Message {
                 sender: hgl_ai_proto::OWNER.into(),
                 user: Some(user()),
+                handle: handle(),
                 at: ev.at.clone(),
                 body: format!("Answer: {said}"),
             });
@@ -408,18 +431,18 @@ pub fn fold(
                 &t,
                 &to,
                 Kind::Answer,
-                &ev.at,
+                ev,
                 format!(
-                    "[owner] Answer: {} {} ({}): {said}\n\nQuestion: {}\n\nPost a ruling once on the owning issue, quoting these words and naming {} (OWN-4).",
+                    "[owner] Answer from {who}: {} {} ({}): {said}\n\nQuestion: {}\n\nPost the ruling once on the owning issue. {}",
                     t.id,
                     t.title,
                     t.issue.as_deref().unwrap_or("no issue"),
                     t.question.trim(),
-                    t.id
+                    quote(&t.id)
                 ),
             )?);
             fx.decision = Some(format!(
-                "{} {} {} owner ({}): {said}",
+                "{} {} {} {who} ({}): {said}",
                 ev.at,
                 t.id,
                 t.issue.as_deref().unwrap_or("-"),
@@ -433,6 +456,7 @@ pub fn fold(
             t.messages.push(Message {
                 sender: hgl_ai_proto::OWNER.into(),
                 user: Some(user()),
+                handle: handle(),
                 at: ev.at.clone(),
                 body: body.clone(),
             });
@@ -446,14 +470,14 @@ pub fn fold(
                 &t,
                 &to,
                 Kind::Note,
-                &ev.at,
+                ev,
                 format!(
-                    "[owner] Message in {} {}:\n\n{}\n\nFrom {} through the console. Reply with `hgl-ai thread reply {}`.",
+                    "[owner] Message from {who} in {} {}:\n\n{}\n\nReply with `hgl-ai thread reply {}`. {}",
                     t.id,
                     t.title,
                     body.trim_end(),
-                    user(),
-                    t.id
+                    t.id,
+                    quote(&t.id)
                 ),
             )?);
         }
@@ -462,16 +486,31 @@ pub fn fold(
                 return Err(refuse("only an open conversation is closed"));
             }
             t.state = ThreadState::Closed;
+            t.messages.push(Message {
+                sender: hgl_ai_proto::OWNER.into(),
+                user: Some(user()),
+                handle: handle(),
+                at: ev.at.clone(),
+                body: "closed".into(),
+            });
         }
     }
     Ok((t, fx))
 }
 
-/// An owner note: sender `owner`, so it travels on `hgl.notes.owner.<seat>`; created at
-/// the event's time, so a refold makes the same note and the hub drops the resend.
-fn owner_note(t: &Thread, to: &Seat, kind: Kind, at: &str, body: String) -> Result<Note, Refused> {
+/// An owner note: sender `owner`, so it travels on `hgl.notes.owner.<seat>`, and `by`
+/// the writer's handle (OWN-10); created at the event's time, so a refold makes the same
+/// note and the hub drops the resend.
+fn owner_note(
+    t: &Thread,
+    to: &Seat,
+    kind: Kind,
+    ev: &Event,
+    body: String,
+) -> Result<Note, Refused> {
     let mut n = Note::new(Seat::owner(), to.clone(), kind, body);
-    n.created_at = at.to_string();
+    n.created_at = ev.at.clone();
+    n.by = ev.handle.clone();
     if let Some((repo, issue)) = t.repo_issue() {
         n.repo = Some(repo);
         n.issue = issue;
@@ -494,6 +533,7 @@ mod tests {
             id: id.into(),
             sender: "claude".into(),
             user: None,
+            handle: None,
             at: "20261127T100000Z".into(),
             body: Body::Ask(Ask {
                 title: "Pick the lowering rule".into(),
@@ -516,6 +556,7 @@ mod tests {
             id: id.into(),
             sender: "owner".into(),
             user: Some("github:hhenson".into()),
+            handle: Some("HPH".into()),
             at: "20261127T110000Z".into(),
             body,
         }
@@ -550,12 +591,20 @@ mod tests {
         );
         assert_eq!(n.subject(), "hgl.notes.owner.claude");
         assert_eq!((n.repo.as_deref(), n.issue), (Some("hgl-compiler"), 980));
-        assert!(n.body.starts_with("[owner] Answer: q-0123abcd Pick the lowering rule (hgl-compiler#980): accept a: The first (note: keep it simple) [by github:hhenson"), "{}", n.body);
+        assert!(
+            n.body.starts_with("[owner] Answer from HPH: q-0123abcd Pick the lowering rule (hgl-compiler#980): accept a: The first (note: keep it simple) [HPH, 27 Nov 11:00]"),
+            "{}",
+            n.body
+        );
+        assert!(n.body.contains("`HPH, 2026-11-27: \"...\"`"), "{}", n.body);
+        assert_eq!(n.by.as_deref(), Some("HPH"));
+        assert_eq!(t2.answer.as_ref().unwrap().handle.as_deref(), Some("HPH"));
+        assert_eq!(t2.messages.last().unwrap().signature(), "HPH, 27 Nov 11:00");
         assert_eq!(n.created_at, "20261127T110000Z");
         assert!(
             fx.decision
                 .unwrap()
-                .contains("q-0123abcd hgl-compiler#980 owner (github:hhenson): accept a")
+                .contains("q-0123abcd hgl-compiler#980 HPH (github:hhenson): accept a")
         );
 
         // Refolding the same event is refused; a second answer too.
@@ -636,11 +685,19 @@ mod tests {
         );
         assert_eq!(fx.notes[0].recipient.as_str(), "claude");
         assert_eq!(fx.notes[0].kind, Kind::Note);
+        assert_eq!(fx.notes[0].by.as_deref(), Some("HPH"), "start");
+        assert!(
+            fx.notes[0]
+                .body
+                .starts_with("[owner] Conversation from HPH: c-00000001 Release timing")
+        );
+        assert_eq!(t.messages[0].handle.as_deref(), Some("HPH"));
         let reply = Event {
             v: EVENT_VERSION,
             id: "c-00000001".into(),
             sender: "claude".into(),
             user: None,
+            handle: None,
             at: "20261127T120000Z".into(),
             body: Body::Message {
                 body: "Thursday, after #980 lands.".into(),
@@ -657,9 +714,57 @@ mod tests {
         );
         let (t, fx) = fold(Some(&t), &more.subject(), 7, &more, &ctl()).unwrap();
         assert_eq!(fx.notes[0].recipient.as_str(), "claude");
+        assert_eq!(fx.notes[0].by.as_deref(), Some("HPH"), "message");
+        assert!(
+            fx.notes[0]
+                .body
+                .starts_with("[owner] Message from HPH in c-00000001")
+        );
+        assert_eq!(t.messages.last().unwrap().handle.as_deref(), Some("HPH"));
+        assert!(
+            t.render().contains("HPH, 27 Nov 11:00 (owner):\nGood."),
+            "{}",
+            t.render()
+        );
         let close = owner("c-00000001", Body::Close);
         let (t, _) = fold(Some(&t), &close.subject(), 8, &close, &ctl()).unwrap();
         assert_eq!(t.state, ThreadState::Closed);
+        assert_eq!(
+            t.messages.last().unwrap().handle.as_deref(),
+            Some("HPH"),
+            "close"
+        );
+        // Without a handle (a user in the older form), the identity signs.
+        let mut plain = owner(
+            "c-00000003",
+            Body::Start {
+                title: "t".into(),
+                issue: None,
+                body: "b".into(),
+            },
+        );
+        plain.handle = None;
+        let (_, fx) = fold(None, &plain.subject(), 9, &plain, &ctl()).unwrap();
+        assert_eq!(fx.notes[0].by, None);
+        assert!(
+            fx.notes[0]
+                .body
+                .starts_with("[owner] Conversation from github:hhenson:")
+        );
+        // A handle is checked, and only the owner's events carry one.
+        let mut bad = owner(
+            "c-00000004",
+            Body::Start {
+                title: "t".into(),
+                issue: None,
+                body: "b".into(),
+            },
+        );
+        bad.handle = Some("H@P".into());
+        assert!(fold(None, &bad.subject(), 10, &bad, &ctl()).is_err());
+        let mut agent = reply.clone();
+        agent.handle = Some("HPH".into());
+        assert!(fold(Some(&t), &agent.subject(), 11, &agent, &ctl()).is_err());
         // An agent cannot start a conversation in the owner's name.
         let mut forged = start.clone();
         forged.id = "c-00000002".into();

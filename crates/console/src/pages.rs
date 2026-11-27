@@ -105,7 +105,10 @@ async fn framed(
     body: &str,
     banner: Option<String>,
 ) -> Response {
-    let user = s.identity.to_string();
+    let user = match app.auth.handle_of(&s.identity) {
+        Some(h) => format!("{h} ({})", s.identity),
+        None => s.identity.to_string(),
+    };
     let nav = Nav {
         user: &user,
         csrf: &s.csrf,
@@ -352,7 +355,17 @@ pub async fn start(State(app): AppState, h: HeaderMap, Form(f): Form<StartForm>)
         return hub_down();
     };
     let issue = Some(f.issue.trim().to_string()).filter(|i| !i.is_empty());
-    match owner::start_conversation(bus, &s.identity.to_string(), &f.title, issue, &f.body).await {
+    let handle = app.auth.handle_of(&s.identity);
+    match owner::start_conversation(
+        bus,
+        &s.identity.to_string(),
+        handle.as_deref(),
+        &f.title,
+        issue,
+        &f.body,
+    )
+    .await
+    {
         Ok((id, seq)) => {
             let _ = owner::wait_folded(bus, &id, seq, FOLD_WAIT).await;
             Redirect::to(&format!("/t/{id}")).into_response()
@@ -419,15 +432,16 @@ pub async fn thread(State(app): AppState, h: HeaderMap, Path(id): Path<String>) 
     if !t.messages.is_empty() {
         body.push_str("<h2>Messages</h2><ol class=\"messages\">");
         for m in &t.messages {
-            let who = match &m.user {
-                Some(u) => format!("{} ({})", m.sender, u),
-                None => m.sender.clone(),
+            // `This Dude, 27 Nov 14:05` (OWN-10); an agent's messages by seat.
+            let who = if m.sender == hgl_ai_proto::OWNER {
+                format!("{} (owner)", m.signature())
+            } else {
+                m.signature()
             };
             let _ = write!(
                 body,
-                "<li><p class=\"meta\">{} · {}</p>{}</li>",
+                "<li><p class=\"meta\">{}</p>{}</li>",
                 esc(&who),
-                time(&m.at),
                 text_block(&m.body)
             );
         }
@@ -530,7 +544,8 @@ async fn send_owner(app: &App, s: &Session, id: &str, body: Body) -> Response {
             None,
         );
     }
-    match owner::owner_event(bus, id, &s.identity.to_string(), body).await {
+    let handle = app.auth.handle_of(&s.identity);
+    match owner::owner_event(bus, id, &s.identity.to_string(), handle.as_deref(), body).await {
         Ok(seq) => {
             let after = owner::wait_folded(bus, id, seq, FOLD_WAIT)
                 .await
@@ -684,8 +699,11 @@ pub async fn signin(State(app): AppState, h: HeaderMap) -> Response {
     if app.auth.has_apple() {
         body.push_str("<li><a class=\"button\" href=\"/auth/apple\">Sign in with Apple</a></li>");
     }
-    if !app.auth.has_github() && !app.auth.has_apple() {
-        body.push_str("<li>No provider is configured: set <code>[console.github]</code> or <code>[console.apple]</code>.</li>");
+    if app.auth.has_google() {
+        body.push_str("<li><a class=\"button\" href=\"/auth/google\">Sign in with Google</a></li>");
+    }
+    if !app.auth.has_github() && !app.auth.has_apple() && !app.auth.has_google() {
+        body.push_str("<li>No provider is configured: set <code>[console.github]</code>, <code>[console.apple]</code> or <code>[console.google]</code>.</li>");
     }
     body.push_str("</ul>");
     Html(page("Sign in", None, None, &body)).into_response()
@@ -714,6 +732,29 @@ pub async fn github_start(State(app): AppState) -> Response {
 
 pub async fn apple_start(State(app): AppState) -> Response {
     oauth_start(&app, Provider::Apple)
+}
+
+pub async fn google_start(State(app): AppState) -> Response {
+    oauth_start(&app, Provider::Google)
+}
+
+pub async fn google_callback(
+    State(app): AppState,
+    h: HeaderMap,
+    Query(q): Query<Callback>,
+) -> Response {
+    if !q.error.is_empty() {
+        return auth_failure(AuthError::Bad(format!("Google: {}", q.error)));
+    }
+    let binding = app.auth.cookie(cookies(&h), FLOW_COOKIE);
+    match app
+        .auth
+        .google_callback(&q.code, &q.state, binding.as_deref())
+        .await
+    {
+        Ok(id) => enrol_page(&app, id),
+        Err(e) => auth_failure(e),
+    }
 }
 
 fn auth_failure(e: AuthError) -> Response {

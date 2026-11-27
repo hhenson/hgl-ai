@@ -13,7 +13,7 @@ use axum::extract::{Form, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use base64::Engine as _;
-use hgl_ai_config::{AppleOAuth, Config, Console, GithubOAuth};
+use hgl_ai_config::{AppleOAuth, Config, Console, GithubOAuth, GoogleOAuth, Ids, OwnerEntry, User};
 use hgl_ai_console::App;
 use webauthn_authenticator_rs::WebauthnAuthenticator as _;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
@@ -21,6 +21,7 @@ use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, 
 
 pub const ORIGIN: &str = "https://console.example.com";
 pub const APPLE_CLIENT: &str = "com.example.console";
+pub const GOOGLE_CLIENT: &str = "0123-example.apps.googleusercontent.com";
 
 pub fn write_secret(p: &Path, text: &str) {
     std::fs::write(p, text).unwrap();
@@ -32,17 +33,110 @@ fn b64(d: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(d)
 }
 
-/// Mock GitHub and Apple: token and user endpoints.
+/// Mock GitHub, Apple and Google: token, user and signing-key endpoints.
 pub struct Providers {
     pub addr: SocketAddr,
     /// The Apple client secrets the token endpoint received.
     pub apple_secrets: Arc<Mutex<Vec<String>>>,
     pub apple_key: p256::ecdsa::VerifyingKey,
+    /// How often each provider's keys were fetched.
+    pub jwks_fetches: Arc<Mutex<BTreeMap<String, u32>>>,
 }
 
 #[derive(Clone)]
 struct Mock {
     apple_secrets: Arc<Mutex<Vec<String>>>,
+    /// The provider's signing key (ES256) and a key nobody published.
+    signer: Arc<p256::ecdsa::SigningKey>,
+    stranger: Arc<p256::ecdsa::SigningKey>,
+    jwks_fetches: Arc<Mutex<BTreeMap<String, u32>>>,
+}
+
+fn ec_key() -> p256::ecdsa::SigningKey {
+    loop {
+        let mut b = [0u8; 32];
+        use std::io::Read as _;
+        std::fs::File::open("/dev/urandom")
+            .unwrap()
+            .read_exact(&mut b)
+            .unwrap();
+        if let Ok(k) = p256::ecdsa::SigningKey::from_slice(&b) {
+            return k;
+        }
+    }
+}
+
+/// An ES256 JWT signed with `key` under `kid`.
+fn es256(key: &p256::ecdsa::SigningKey, kid: &str, claims: &serde_json::Value) -> String {
+    use p256::ecdsa::signature::Signer as _;
+    let head = b64(serde_json::json!({ "alg": "ES256", "kid": kid })
+        .to_string()
+        .as_bytes());
+    let si = format!("{head}.{}", b64(claims.to_string().as_bytes()));
+    let sig: p256::ecdsa::Signature = key.sign(si.as_bytes());
+    format!("{si}.{}", b64(&sig.to_bytes()))
+}
+
+fn jwks_of(key: &p256::ecdsa::SigningKey) -> serde_json::Value {
+    let point = key.verifying_key().to_sec1_point(false);
+    let p = point.as_bytes();
+    serde_json::json!({ "keys": [{
+        "kty": "EC", "crv": "P-256", "alg": "ES256", "use": "sig", "kid": "mock-ec",
+        "x": b64(&p[1..33]), "y": b64(&p[33..65]),
+    }]})
+}
+
+async fn jwks(
+    State(m): State<Mock>,
+    axum::extract::Path(who): axum::extract::Path<String>,
+) -> impl axum::response::IntoResponse {
+    *m.jwks_fetches.lock().unwrap().entry(who).or_default() += 1;
+    (
+        [("cache-control", "public, max-age=300")],
+        axum::Json(jwks_of(&m.signer)),
+    )
+}
+
+/// Google's token endpoint. The test puts what it wants in the code:
+/// `good:<email>:<nonce>:<code_challenge>[:badsig|aud|unverified]`.
+async fn google_token(
+    State(m): State<Mock>,
+    Form(f): Form<BTreeMap<String, String>>,
+) -> axum::Json<serde_json::Value> {
+    use sha2::Digest as _;
+    let g = |k: &str| f.get(k).cloned().unwrap_or_default();
+    let code = g("code");
+    let parts: Vec<&str> = code.split(':').collect();
+    let pkce_ok =
+        parts.len() >= 4 && b64(&sha2::Sha256::digest(g("code_verifier").as_bytes())) == parts[3];
+    if parts[0] != "good"
+        || !pkce_ok
+        || g("client_secret") != "google-secret"
+        || g("client_id") != GOOGLE_CLIENT
+        || g("grant_type") != "authorization_code"
+        || g("redirect_uri") != "https://console.example.com/auth/google/callback"
+    {
+        return axum::Json(serde_json::json!({ "error": "invalid_grant" }));
+    }
+    let flag = parts.get(4).copied().unwrap_or("");
+    let claims = serde_json::json!({
+        "iss": "https://accounts.google.com",
+        "aud": if flag == "aud" { "someone-else.apps.googleusercontent.com" } else { GOOGLE_CLIENT },
+        "sub": "1234567890",
+        "iat": chrono::Utc::now().timestamp(),
+        "exp": chrono::Utc::now().timestamp() + 600,
+        "nonce": parts[2],
+        "email": parts[1],
+        "email_verified": flag != "unverified",
+    });
+    let key = if flag == "badsig" {
+        &m.stranger
+    } else {
+        &m.signer
+    };
+    axum::Json(
+        serde_json::json!({ "id_token": es256(key, "mock-ec", &claims), "access_token": "a" }),
+    )
 }
 
 async fn gh_token(Form(f): Form<BTreeMap<String, String>>) -> axum::Json<serde_json::Value> {
@@ -77,10 +171,10 @@ async fn apple_token(
         .lock()
         .unwrap()
         .push(f.get("client_secret").cloned().unwrap_or_default());
-    // The test puts the email and nonce in the code: `good:<email>:<nonce>`.
+    // The test puts the email and nonce in the code: `good:<email>:<nonce>[:badsig]`.
     let code = f.get("code").cloned().unwrap_or_default();
-    let parts: Vec<&str> = code.splitn(3, ':').collect();
-    if parts.len() != 3 || parts[0] != "good" {
+    let parts: Vec<&str> = code.split(':').collect();
+    if parts.len() < 3 || parts[0] != "good" {
         return axum::Json(serde_json::json!({ "error": "invalid_grant" }));
     }
     let claims = serde_json::json!({
@@ -91,23 +185,30 @@ async fn apple_token(
         "email": parts[1],
         "email_verified": "true",
     });
-    let idt = format!(
-        "{}.{}.sig",
-        b64(b"{\"alg\":\"RS256\"}"),
-        b64(claims.to_string().as_bytes())
-    );
-    axum::Json(serde_json::json!({ "id_token": idt, "access_token": "a" }))
+    let key = if parts.get(3) == Some(&"badsig") {
+        &m.stranger
+    } else {
+        &m.signer
+    };
+    axum::Json(
+        serde_json::json!({ "id_token": es256(key, "mock-ec", &claims), "access_token": "a" }),
+    )
 }
 
 impl Providers {
     pub async fn start(apple_key: p256::ecdsa::VerifyingKey) -> Providers {
         let m = Mock {
             apple_secrets: Arc::default(),
+            signer: Arc::new(ec_key()),
+            stranger: Arc::new(ec_key()),
+            jwks_fetches: Arc::default(),
         };
         let app = Router::new()
             .route("/login/oauth/access_token", post(gh_token))
             .route("/user", get(gh_user))
             .route("/auth/token", post(apple_token))
+            .route("/google/token", post(google_token))
+            .route("/keys/{who}", get(jwks))
             .with_state(m.clone());
         let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = l.local_addr().unwrap();
@@ -116,6 +217,7 @@ impl Providers {
             addr,
             apple_secrets: m.apple_secrets,
             apple_key,
+            jwks_fetches: m.jwks_fetches,
         }
     }
 }
@@ -159,15 +261,33 @@ impl Harness {
         apple.key_file = p8.display().to_string();
         apple.authorize_url = format!("{base}/auth/authorize");
         apple.token_url = format!("{base}/auth/token");
+        apple.jwks_url = format!("{base}/keys/apple");
+        let g_secret = dir.path().join("google.secret");
+        write_secret(&g_secret, "google-secret\n");
+        let mut google = GoogleOAuth::new(GOOGLE_CLIENT);
+        google.secret_file = g_secret.display().to_string();
+        google.authorize_url = format!("{base}/google/auth");
+        google.token_url = format!("{base}/google/token");
+        google.jwks_url = format!("{base}/keys/google");
         let mut cfg = Config::new("hub");
         cfg.paths.data_dir = dir.path().join("data").display().to_string();
         cfg.paths.work_root = dir.path().join("work").display().to_string();
         cfg.console = Some(Console {
             listen: "127.0.0.1:8443".into(),
             url: ORIGIN.into(),
-            users: vec!["hhenson".into(), "owner@example.com".into()],
+            users: vec![
+                User::new("github:hhenson", "This Dude"),
+                User::Owner(OwnerEntry {
+                    id: Ids::Many(vec![
+                        "apple:owner@example.com".into(),
+                        "google:owner@example.com".into(),
+                    ]),
+                    handle: "OW".into(),
+                }),
+            ],
             github: Some(github),
             apple: Some(apple),
+            google: Some(google),
             ..Console::default()
         });
         Harness { dir, cfg }
