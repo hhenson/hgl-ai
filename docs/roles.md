@@ -26,8 +26,9 @@ Open decisions are issues in this repository.
   and `landed.log`.
 - **ROLE-3 — Triage** (seat `triage`). Owns intake: labels and slices new
   issues, folds duplicates, keeps the claimable backlog ordered, and batches
-  questions for the owner into one labelled list. Writes no code. Workers
-  claim only what triage labelled ready.
+  questions for the owner into one labelled list. Gives every task its class
+  (simple, standard or complex, §3), which picks the model that does it. Writes no
+  code. Workers claim only what triage labelled ready.
 - **ROLE-4 — Architect** (seat `architect`). Works with the owner, through the owner
   channel (`docs/owner.md`), to expand features and to engineer refactoring and design
   cleanup: makes the code more efficient and the design simpler. Writes the design
@@ -110,6 +111,7 @@ Assignment agreed with the owner, 2026-11-27 (HPH: "lets use that for now"), fro
 | Triage | Astra 6.2 high | Carbon high | — |
 | Specification design (rules, their reasoning, the questions for the owner) | Fable | Opus high | — |
 | Specification text | Fable, Opus high or Astra 6.2 high | — | — |
+| Simple tasks: document restructuring, renames, label sweeps, moving code without changing what it does | Terra high or Hydrogen high | Sonnet high | — |
 | Implementation, runtime and semantics (hgraph, the C++ runtime) | Sol 6.2 xhigh, Astra 6.2 xhigh | Neon xhigh | Opus, Terra, Hydrogen high |
 | Implementation, checker edge cases | Neon xhigh | Astra 6.2 xhigh | Terra |
 | Implementation, cross-cutting refactors (analyser, IR) | Opus high | Astra 6.2 xhigh | Terra |
@@ -119,14 +121,27 @@ Assignment agreed with the owner, 2026-11-27 (HPH: "lets use that for now"), fro
 | Build agent, mechanical | Sol 6.2 high | Hydrogen high | — |
 | Coordinator, bridge, builder, merge queue | no model | — | — |
 
+Triage classes each task when it labels it ready, and the `assign` note carries the class
+(HPH, 2026-11-27: simple refactoring goes to a light model, and triage allocates the level):
+
+- **simple**: changes no behaviour and no rule; any outcome is checked by a diff read or the
+  existing tests (a document reorganised, a rename, a label sweep, code moved unchanged).
+  The simple-tasks row.
+- **standard**: a bounded change of behaviour in one area. The row for its kind of work.
+- **complex**: crosses areas or changes a design (an analyser or IR refactor, a P-F child).
+  The row for its kind, at its first choice and xhigh where the row allows.
+
+A task whose work turns out to change behaviour is reclassed by its seat with a `blocked`
+note; triage reassigns it. ROLE-15 moves a class up after two sendbacks.
+
 The gate's reviewer is never of the author's family (ROLE-11). The GitHub review bot is
 a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the gate.
 
 - **ROLE-14 — Spread by subscription.** The table spreads work over the three
   subscriptions (GPT implements runtime work, Claude refactors and tooling, Gemini
   reviews and checker work); when one runs out, its rows move to their second choice.
-- **ROLE-15 — Escalate once.** A balanced or fast seat whose work is sent back
-  twice for the same finding moves that task to the frontier tier.
+- **ROLE-15 — Escalate once.** A task whose work is sent back twice for the same
+  finding moves up a class (simple to standard, standard to complex).
 - **ROLE-16 — Record the model.** `ready` notes and receipts name the family
   and model that did the work, so ROLE-11 can be checked.
 
