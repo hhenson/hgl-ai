@@ -86,7 +86,9 @@ Families: `claude` (Claude Code, or Claude models through Antigravity),
 | balanced | `claude-sonnet-5-5` | `gpt-6.2-sol` | `gemini-4-hydrogen` |
 | fast | `claude-haiku-5-5` | `gpt-6-luna` | `gemini-3.8-flash` |
 
-`gemini-4-carbon` (close to Claude Fable) is used for control, architecture and
+`claude-fable-5-2` (Fable) develops the specification (HPH, 2026-11-27: "specs largely
+developed by claude Fable and written by Fable or Opus or Astra"); it was not part of the
+calibration. `gemini-4-carbon` (close to Fable) is used for control, architecture and
 design review. Concrete slugs live in configuration (`[models]`), so a new release
 changes one file.
 
@@ -97,7 +99,8 @@ Assignment agreed with the owner, 2026-11-27 (HPH: "lets use that for now"), fro
 | --- | --- | --- | --- |
 | Controller, architecture | Carbon high | Astra 6.2 high | — |
 | Triage | Astra 6.2 high | Carbon high | — |
-| Specification text | Carbon high | Opus high | — |
+| Specification design (rules, their reasoning, the questions for the owner) | Fable | Opus high | — |
+| Specification text | Fable, Opus high or Astra 6.2 high | — | — |
 | Implementation, runtime and semantics (hgraph, the C++ runtime) | Sol 6.2 xhigh, Astra 6.2 xhigh | Neon xhigh | Opus, Terra, Hydrogen high |
 | Implementation, checker edge cases | Neon xhigh | Astra 6.2 xhigh | Terra |
 | Implementation, cross-cutting refactors (analyser, IR) | Opus high | Astra 6.2 xhigh | Terra |
