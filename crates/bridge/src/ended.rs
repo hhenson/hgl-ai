@@ -1,8 +1,10 @@
-//! Tasks a seat saw end (`landed`, `closed`), by `repo#issue`, with the stream sequence of
-//! the ending note. Kept in `<data_dir>/bridge/ended/<seat>.json` for [`KEEP`], longer than
-//! the stream keeps notes (PROTO-2), so a note of the task sent before its end and delivered
-//! again after it (a redelivery, a seat moved between hosts) is acknowledged without a turn,
-//! across restarts. A note sent after the end (a later sequence) is new intent and runs.
+//! This host's cache of the tasks a seat saw end (`landed`, `closed`), by `repo#issue`, with
+//! the stream sequence of the ending note. The hub's `HGL_ENDED` is the record (PROTO-14), so
+//! a seat moved between hosts keeps its ends; this cache answers without the hub for ends
+//! seen here. Kept in `<data_dir>/bridge/ended/<seat>.json` for [`KEEP`], longer than the
+//! stream keeps notes (PROTO-2). A note of the task sent before its end and delivered again
+//! after it is acknowledged without a turn; one sent after the end (a later sequence) is new
+//! intent and runs.
 
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -78,9 +80,10 @@ impl EndedTasks {
         self.map.retain(|_, (_, at)| now - *at <= keep);
     }
 
-    /// Whether a note of `task` at stream sequence `seq` was sent before the task ended.
-    pub fn moot(&self, task: &TaskKey, seq: u64) -> bool {
-        self.map.get(task).is_some_and(|(end, _)| seq < *end)
+    /// The stream sequence of the note that ended `task`, if recorded here. A note of the
+    /// task with a lower one was sent before the end.
+    pub fn get(&self, task: &TaskKey) -> Option<u64> {
+        self.map.get(task).map(|(end, _)| *end)
     }
 
     /// Record that `task` ended with the note at `seq`, and save.
@@ -138,6 +141,16 @@ mod tests {
         TaskKey {
             repo: "demo".into(),
             issue: n,
+        }
+    }
+
+    trait Moot {
+        fn moot(&self, task: &TaskKey, seq: u64) -> bool;
+    }
+
+    impl Moot for EndedTasks {
+        fn moot(&self, task: &TaskKey, seq: u64) -> bool {
+            self.get(task).is_some_and(|end| seq < end)
         }
     }
 

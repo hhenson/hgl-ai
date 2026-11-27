@@ -13,8 +13,8 @@ use std::str::FromStr;
 
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::{
-    CONSOLE_PREFIX, KV_CONSOLE, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS, KV_TREES,
-    OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, SUBJECT_PREFIX,
+    CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS,
+    KV_TREES, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, SUBJECT_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 
@@ -249,7 +249,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     .map(String::from)
     .to_vec();
     let buckets = [
-        KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_THREADS, KV_METRICS,
+        KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS,
     ];
     let mut streams: Vec<String> = vec![STREAM_NOTES.to_string()];
     streams.extend(buckets.iter().map(|b| kv(b)));
@@ -272,7 +272,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         Role::Seat | Role::Coord => {
             allow.push(format!("{SUBJECT_PREFIX}.*"));
             allow.push(format!("{CONSOLE_PREFIX}.>"));
-            for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS] {
+            for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED] {
                 allow.push(format!("$KV.{b}.>"));
             }
             if role == Role::Coord {

@@ -31,9 +31,11 @@ Status: proposed. Open decisions are issues in this repository.
   live `HGL_HOSTS` record lists, unless given `--force`. On one host, whoever
   serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`.
   A bridge serves a seat only while it holds the lease `HGL_LOCKS/seat.<seat>`,
-  refreshed with its heartbeat; `note wait` and `note peek` refuse a held one.
-  A restarted bridge takes over at once a lease its own host's dead bridge held
-  (same host label, the recorded process gone); host labels are unique in a fleet.
+  refreshed with its heartbeat. `note wait` and `note peek` refuse a held one
+  and hold it themselves until they return; `--force` skips the lease, with a
+  warning. A restarted bridge takes over at once a lease that a dead bridge,
+  `note wait` or `note peek` of its own host held (same host label, the
+  recorded process gone); host labels are unique in a fleet.
 
 ```sh
 hgl-ai note send --to claude --issue 980 --kind ready --body-file ready.md
@@ -58,6 +60,7 @@ before hub users takes one shared token until it moves.
 | Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
 | Trees | KV `HGL_TREES` | file storage, history 1 |
 | Locks | KV `HGL_LOCKS` | file storage, history 1, `max_age` 30 min |
+| Ended | KV `HGL_ENDED` | file storage, history 1, `max_age` 15 d |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
   broadcast address. `owner` and `console` are senders, never seats: no seat takes
@@ -65,7 +68,10 @@ before hub users takes one shared token until it moves.
   to it can change (§6) without peers noticing.
 - **PROTO-8 — Ack after the turn.** The bridge sends `in_progress` every 60 s
   while a turn runs, `ack` after a clean exit, and `nak` with a 15 s delay on a
-  crash, a memory or time limit, or a provider quota refusal.
+  crash, a memory or time limit, or a provider quota refusal. A turn that can
+  never start (the CLI is missing, or the command line is over the system's
+  limit) is not retried: the bridge sends `term` and tells the controller which
+  notes it dropped.
 - **PROTO-9 — Idempotent sends.** Each note carries a `Nats-Msg-Id` of
   `<sender>-<created_at>-<sha256(envelope)[0:12]>` over recipient, kind, repo,
   issue, head, base and body, so a retried send is dropped and no other note is.
@@ -129,7 +135,16 @@ before hub users takes one shared token until it moves.
   issue, the bridge stops any turn in that task, saves uncommitted changes as
   a patch under `<work_root>/salvage/` if there are any, removes the worktree
   and its branch, deletes the task directory, deregisters it, and sends a
-  `done` cleanup receipt to the controller. Agents do not remove trees.
+  `done` cleanup receipt to the controller. Agents do not remove trees. Before
+  acknowledging the note it records the end in `HGL_ENDED` (§8); a note of that
+  task to that seat with a lower stream sequence is then moot, on any host, and
+  is acknowledged without a turn. A note of a task is naked while `HGL_ENDED`
+  cannot be read, an ending note while its end cannot be recorded. An ending
+  note whose end `HGL_ENDED` already holds (a redelivery) is acknowledged
+  without action. An ending note acts only on a tree made for a note with a
+  lower sequence than its own (`task.json` records it) and on that tree's turn;
+  a tree made for a later note is a restart of the task and is left alone. Of
+  the notes of a turn it stops, the later ones are naked, not acknowledged.
 - **PROTO-15 — Leftovers are visible.** `hgl-ai tree list --stale` lists
   trees whose issue is closed or that are older than `stale_after` (default
   3 days). The bridge posts that list and the disk use of `work_root` to the
@@ -200,6 +215,10 @@ rewritten every minute while held, deleted by their holder; one not rewritten
 within `max_age` expires. `lock.land.<repo>` is the landing lock: `gh land`,
 `gh merge-if-clean` and `gh release watch` hold it from before the gate until
 the merge, `landed.log`, `main` and the `landed` notes are done.
+
+`HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream
+sequence of the note that ended the task for the seat. A later end replaces an
+earlier one; a record outlives the notes stream by a day.
 
 ## 9. Host record
 

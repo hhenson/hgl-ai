@@ -629,3 +629,225 @@ fn two_bridges_for_one_seat_only_one_serves() {
     drop(daemons);
     drop(hub);
 }
+
+/// A host `name` under `root` on the hub: seat `w1` and a fake `codex` running `body`.
+/// Returns its directory and configuration file.
+fn seat_host(root: &Path, hub: &Hub, token: &Path, name: &str, body: &str) -> (PathBuf, PathBuf) {
+    let dir = root.join(name);
+    std::fs::create_dir_all(dir.join("bin")).unwrap();
+    let (mut cfg, p) = config(&dir, &hub.url, token);
+    cfg.host = name.into();
+    cfg.github.clone_url = format!("{}/{{repo}}.git", root.display());
+    cfg.seats.push(SeatConfig {
+        name: Seat::new("w1").unwrap(),
+        role: Role::Implementor,
+        binding: Binding {
+            runtime: Runtime::Codex,
+            family: None,
+            tier: Some(Tier::Fast),
+            model: None,
+            effort: None,
+        },
+        fallback: vec![],
+        memcap_gb: Some(4),
+    });
+    cfg.save(&p).unwrap();
+    let codex = dir.join("bin/codex");
+    let script = format!(
+        "#!/bin/sh\npwd >> '{}'\n{body}\n",
+        dir.join("calls").display()
+    );
+    std::fs::write(&codex, script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&codex, std::fs::Permissions::from_mode(0o755)).unwrap();
+    (dir, p)
+}
+
+/// `hgl-ai bridge run --seat w1` for the host in `dir`, logging to `dir/bridge.log`.
+fn start_bridge(root: &Path, dir: &Path, p: &Path) -> Daemon {
+    let path = format!(
+        "{}:{}",
+        dir.join("bin").display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut bridge = hgl(p, &["bridge", "run", "--seat", "w1"]);
+    isolate(&mut bridge, root);
+    let log = std::fs::File::create(dir.join("bridge.log")).unwrap();
+    Daemon(
+        bridge
+            .env("PATH", &path)
+            .env("HGL_AI_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    )
+}
+
+/// SIGTERM the bridge and wait for its clean exit.
+fn stop_bridge(mut daemon: Daemon, log: &dyn Fn() -> String) {
+    let pid = daemon.0.id().to_string();
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &pid])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let end = Instant::now() + Duration::from_secs(30);
+    let status = loop {
+        if let Some(s) = daemon.0.try_wait().unwrap() {
+            break s;
+        }
+        assert!(Instant::now() < end, "the bridge did not stop\n{}", log());
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(status.success(), "{}", log());
+}
+
+fn send_w1(p: &Path, kind: &str, issue: &str, body: &str) {
+    let o = hgl(
+        p,
+        &[
+            "note", "send", "--from", "claude", "--to", "w1", "--kind", kind, "--repo", "demo",
+            "--issue", issue, "--body", body,
+        ],
+    )
+    .output()
+    .unwrap();
+    assert!(o.status.success(), "{}", err(&o));
+}
+
+fn lines(p: &Path) -> usize {
+    std::fs::read_to_string(p).map_or(0, |c| c.lines().count())
+}
+
+/// The seat moves from host-a to host-b after its task ended there: host-b's bridge finds
+/// the end in `HGL_ENDED` and acks the redelivered assignment without a turn (PROTO-14).
+#[test]
+fn a_seat_moved_to_another_host_keeps_its_ended_tasks() {
+    let d = Scratch::new("moved");
+    let Some(hub) = Hub::start(&d.0) else { return };
+    let g = git(&d.0);
+    remote(&g, &d.0, "demo");
+    let token = d.0.join("hub.token");
+    std::fs::write(&token, format!("{}\n", hub.token)).unwrap();
+    // host-a's agent fails, so the assignment is naked for redelivery (PROTO-8).
+    let (a_dir, a_cfg) = seat_host(&d.0, &hub, &token, "host-a", "exit 1");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bridge/fixtures/codex-ok.jsonl");
+    let (b_dir, b_cfg) = seat_host(
+        &d.0,
+        &hub,
+        &token,
+        "host-b",
+        &format!("cat '{}'", fixture.display()),
+    );
+    assert!(hgl(&a_cfg, &["init"]).output().unwrap().status.success());
+    let log_of = |dir: &Path| std::fs::read_to_string(dir.join("bridge.log")).unwrap_or_default();
+    let logs = || format!("host-a:\n{}\nhost-b:\n{}", log_of(&a_dir), log_of(&b_dir));
+
+    let a = start_bridge(&d.0, &a_dir, &a_cfg);
+    send_w1(&a_cfg, "assign", "5", "[claude] Assign: demo#5 Five");
+    until("host-a ran and failed the turn", 30, &logs, || {
+        lines(&a_dir.join("calls")) == 1 && log_of(&a_dir).contains("turn ended")
+    });
+    send_w1(&a_cfg, "landed", "5", "[claude] Landed: demo#5");
+    let mut seen = String::new();
+    until("host-a's cleanup receipt reaches claude", 30, &logs, || {
+        let o = hgl(&a_cfg, &["note", "wait", "claude", "--timeout", "2s"])
+            .output()
+            .unwrap();
+        seen.push_str(&out(&o));
+        seen.contains("Cleanup: demo#5 on host-a/w1")
+    });
+    stop_bridge(a, &logs);
+
+    // host-b has no local record of the end; the redelivery comes after the nak delay.
+    let b = start_bridge(&d.0, &b_dir, &b_cfg);
+    until("host-b acks the redelivered assignment", 60, &logs, || {
+        log_of(&b_dir).contains("a note of an ended task sent before its end; acked")
+    });
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        lines(&b_dir.join("calls")),
+        0,
+        "a turn on host-b\n{}",
+        logs()
+    );
+    assert!(!b_dir.join("work/w1/demo-5").exists());
+    assert!(!b_dir.join("data/bridge/ended/w1.json").exists());
+    // A new assignment, sent after the end, runs on host-b.
+    send_w1(&b_cfg, "assign", "5", "[claude] Assign: demo#5 Five again");
+    until("host-b runs the new assignment", 30, &logs, || {
+        lines(&b_dir.join("calls")) == 1
+    });
+    stop_bridge(b, &logs);
+    drop(hub);
+}
+
+/// A bridge started while `note wait` receives for the seat does not serve it until the
+/// wait returns: the wait holds the seat lease (PROTO-6).
+#[test]
+fn a_bridge_does_not_serve_a_seat_note_wait_holds() {
+    let d = Scratch::new("held");
+    let Some(hub) = Hub::start(&d.0) else { return };
+    let g = git(&d.0);
+    remote(&g, &d.0, "demo");
+    let token = d.0.join("hub.token");
+    std::fs::write(&token, format!("{}\n", hub.token)).unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bridge/fixtures/codex-ok.jsonl");
+    let (dir, p) = seat_host(
+        &d.0,
+        &hub,
+        &token,
+        "host-a",
+        &format!("cat '{}'", fixture.display()),
+    );
+    assert!(hgl(&p, &["init"]).output().unwrap().status.success());
+    let log = || std::fs::read_to_string(dir.join("bridge.log")).unwrap_or_default();
+
+    let waiting = hgl(&p, &["note", "wait", "w1", "--timeout", "120s"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let holder = format!("host-a pid {} (note wait)", waiting.id());
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let bus = rt.block_on(async {
+        hgl_ai_bus::Bus::connect_url(&hub.url, Some(hub.token.clone()))
+            .await
+            .unwrap()
+    });
+    until("the wait holds the seat lease", 20, &log, || {
+        rt.block_on(bus.lock_get("seat.w1"))
+            .unwrap()
+            .is_some_and(|r| r.holder == holder)
+    });
+    let bridge = start_bridge(&d.0, &dir, &p);
+    until("the bridge waits on the seat lease", 20, &log, || {
+        log().contains(&format!("the seat lease seat.w1 is held by {holder}"))
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    let serving = || out(&hgl(&p, &["hosts"]).output().unwrap()).contains("w1 implementor/codex");
+    assert!(!serving(), "served while `note wait` holds the seat");
+
+    // The note goes to the wait, not to a turn; then the bridge takes the seat.
+    send_w1(
+        &p,
+        "note",
+        "5",
+        "[claude] Note: for the interactive session",
+    );
+    let done = waiting.wait_with_output().unwrap();
+    assert_eq!(done.status.code(), Some(0), "{}", err(&done));
+    assert!(out(&done).contains("for the interactive session"));
+    until("the bridge serves the seat", 60, &log, serving);
+    assert_eq!(lines(&dir.join("calls")), 0, "no turn for the note");
+    assert!(
+        !log().contains("taking over the seat lease"),
+        "released, not taken over\n{}",
+        log()
+    );
+    stop_bridge(bridge, &log);
+    drop(hub);
+}

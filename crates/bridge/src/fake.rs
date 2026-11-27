@@ -3,12 +3,12 @@
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hgl_ai_bus::{BusError, Result};
-use hgl_ai_proto::{HostRecord, Note, Seat, TreeRecord};
+use hgl_ai_proto::{HostRecord, Note, Seat, TaskKey, TreeRecord, ended_key};
 use hgl_ai_tree::Registry;
 use tokio::sync::Notify;
 
@@ -22,6 +22,7 @@ const MAX_DELIVER: u64 = 5;
 pub enum Ev {
     Ack,
     Nak(Duration),
+    Term,
     Progress,
 }
 
@@ -42,6 +43,13 @@ struct Inner {
     /// name -> (holder, revision)
     leases: Mutex<HashMap<String, (String, u64)>>,
     revision: AtomicU64,
+    /// `HGL_ENDED`: key -> seq
+    ended: Mutex<HashMap<String, u64>>,
+    /// Make the `HGL_ENDED` reads, or writes, fail.
+    ended_reads_down: AtomicBool,
+    ended_writes_down: AtomicBool,
+    /// The next inbox fetch panics.
+    inbox_broken: AtomicBool,
 }
 
 #[derive(Clone, Default)]
@@ -135,6 +143,35 @@ impl FakeBus {
     pub fn deleted_hosts(&self) -> Vec<String> {
         g(&self.0.deleted_hosts).clone()
     }
+
+    /// The end recorded in `HGL_ENDED` for `seat` and `repo#issue`.
+    pub fn ended(&self, seat: &str, repo: &str, issue: u64) -> Option<u64> {
+        let task = TaskKey {
+            repo: repo.into(),
+            issue,
+        };
+        g(&self.0.ended)
+            .get(&ended_key(&Seat::new(seat).unwrap(), &task))
+            .copied()
+    }
+
+    /// `HGL_ENDED` reads, and writes, fail (`true`) or work.
+    pub fn ended_down(&self, reads: bool, writes: bool) {
+        self.0.ended_reads_down.store(reads, Ordering::SeqCst);
+        self.0.ended_writes_down.store(writes, Ordering::SeqCst);
+    }
+
+    /// Make the next inbox fetch panic, ending the bridge's fetcher.
+    pub fn break_inbox(&self) {
+        self.0.inbox_broken.store(true, Ordering::SeqCst);
+    }
+
+    fn ended_up(&self, flag: &AtomicBool) -> Result<()> {
+        if flag.load(Ordering::SeqCst) {
+            return Err(BusError::Nats("HGL_ENDED: no responders".into()));
+        }
+        Ok(())
+    }
 }
 
 impl Registry for FakeBus {
@@ -226,6 +263,17 @@ impl BusApi for FakeBus {
             }),
         }
     }
+    async fn ended_get(&self, seat: &Seat, task: &TaskKey) -> Result<Option<u64>> {
+        self.ended_up(&self.0.ended_reads_down)?;
+        Ok(g(&self.0.ended).get(&ended_key(seat, task)).copied())
+    }
+    async fn ended_put(&self, seat: &Seat, task: &TaskKey, seq: u64) -> Result<()> {
+        self.ended_up(&self.0.ended_writes_down)?;
+        let mut e = g(&self.0.ended);
+        let v = e.entry(ended_key(seat, task)).or_insert(seq);
+        *v = (*v).max(seq);
+        Ok(())
+    }
 }
 
 pub struct FakeLease {
@@ -271,6 +319,10 @@ impl InboxApi for FakeInbox {
     async fn fetch(&mut self, max: usize, wait: Duration) -> Result<Vec<FakeDelivery>> {
         let deadline = tokio::time::Instant::now() + wait;
         loop {
+            assert!(
+                !self.bus.0.inbox_broken.swap(false, Ordering::SeqCst),
+                "the inbox broke"
+            );
             let notified = self.bus.0.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -342,6 +394,10 @@ impl DeliveryApi for FakeDelivery {
                 bus.enqueue(seat, seq, n, note);
             });
         }
+        Ok(())
+    }
+    async fn term(&self) -> Result<()> {
+        self.record(Ev::Term);
         Ok(())
     }
     async fn in_progress(&self) -> Result<()> {

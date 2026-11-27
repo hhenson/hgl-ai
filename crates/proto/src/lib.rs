@@ -18,6 +18,7 @@ pub const KV_STATE: &str = "HGL_STATE";
 pub const KV_HOSTS: &str = "HGL_HOSTS";
 pub const KV_TREES: &str = "HGL_TREES";
 pub const KV_LOCKS: &str = "HGL_LOCKS";
+pub const KV_ENDED: &str = "HGL_ENDED";
 /// The broadcast seat (PROTO-7).
 pub const BROADCAST: &str = "all";
 
@@ -557,6 +558,19 @@ pub fn seat_lock_key(seat: &Seat) -> String {
     format!("seat.{seat}")
 }
 
+/// `HGL_ENDED/<seat>.<repo>-<issue>`: a task that ended for a seat (`landed`, `closed`;
+/// PROTO-14). Notes of the task to that seat at a lower stream sequence are moot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EndedRecord {
+    /// Stream sequence of the ending note.
+    pub seq: u64,
+    pub ended_at: String,
+}
+
+pub fn ended_key(seat: &Seat, task: &TaskKey) -> String {
+    format!("{seat}.{}-{}", task.repo, task.issue)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,5 +747,6 @@ mod tests {
         );
         assert_eq!(land_lock_key("hgl-compiler"), "lock.land.hgl-compiler");
         assert_eq!(seat_lock_key(&seat("w1")), "seat.w1");
+        assert_eq!(ended_key(&seat("w1"), &t), "w1.hgl-compiler-992");
     }
 }

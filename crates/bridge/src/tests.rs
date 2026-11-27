@@ -44,6 +44,7 @@ struct Call {
     args: Vec<String>,
     cwd: String,
     env: HashMap<String, String>,
+    stdin: String,
 }
 
 fn harness() -> H {
@@ -118,12 +119,13 @@ fn harness() -> H {
 }
 
 impl H {
-    /// A fake CLI: records its args, cwd and environment, then runs `body`.
+    /// A fake CLI: records its args, cwd, environment and stdin, then runs `body` (with
+    /// `$n` its call number).
     fn script(&self, rt: &str, body: &str) {
         let c = self.calls.join(rt);
         std::fs::create_dir_all(&c).unwrap();
         let text = format!(
-            "#!/bin/sh\nC='{c}'\nn=$(cat \"$C/n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$C/n\"\nd=\"$C/$n\"; mkdir -p \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/args\"\npwd > \"$d/cwd\"\nenv > \"$d/env\"\n{body}\n",
+            "#!/bin/sh\nC='{c}'\nn=$(cat \"$C/n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$C/n\"\nd=\"$C/$n\"; mkdir -p \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/args\"\npwd > \"$d/cwd\"\nenv > \"$d/env\"\ncat > \"$d/stdin\"\n{body}\n",
             c = c.display()
         );
         let p = self.bin.join(rt);
@@ -157,7 +159,13 @@ impl H {
                             .map(|(k, v)| (k.to_string(), v.to_string()))
                     })
                     .collect();
-                Some(Call { args, cwd, env })
+                let stdin = std::fs::read_to_string(d.join("stdin")).ok()?;
+                Some(Call {
+                    args,
+                    cwd,
+                    env,
+                    stdin,
+                })
             })
             .collect()
     }
@@ -173,10 +181,31 @@ impl H {
         watch::Sender<bool>,
         tokio::task::JoinHandle<crate::Result<()>>,
     ) {
+        self.start_with(&self.cfg, only)
+    }
+
+    /// The configuration of another host, `host`, on the same hub: its own work root and
+    /// data directory.
+    fn other_host(&self, host: &str) -> Config {
+        let mut cfg = self.cfg.clone();
+        cfg.host = host.into();
+        cfg.paths.work_root = self.root.join(host).join("work").display().to_string();
+        cfg.paths.data_dir = self.root.join(host).join("data").display().to_string();
+        cfg
+    }
+
+    fn start_with(
+        &self,
+        cfg: &Config,
+        only: &[&str],
+    ) -> (
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<crate::Result<()>>,
+    ) {
         let trees = Trees::with(
-            Layout::new(self.work()).unwrap(),
-            &self.cfg.host,
-            &self.cfg.github,
+            Layout::new(cfg.paths.work_root.clone()).unwrap(),
+            &cfg.host,
+            &cfg.github,
             self.git.clone(),
         );
         let deps = Deps {
@@ -184,7 +213,7 @@ impl H {
             disk: self.disk.clone(),
         };
         let bridge = Bridge::new(
-            self.cfg.clone(),
+            cfg.clone(),
             self.bus.clone(),
             trees,
             deps,
@@ -267,10 +296,12 @@ async fn assign_then_sendback_resumes_then_landed_cleans_up() {
     assert_eq!(&c.args[..4], ["exec", "--json", "-m", "gpt-6.2-astra"]);
     assert!(!c.args.contains(&"resume".to_string()));
     assert!(
-        c.args
-            .iter()
-            .any(|a| a.contains("--- Note 1 of 1: assign from claude to w1, demo#980"))
+        c.stdin
+            .contains("--- Note 1 of 1: assign from claude to w1, demo#980"),
+        "the prompt on stdin"
     );
+    let prompts: Vec<_> = std::fs::read_dir(dir.join("prompts")).unwrap().collect();
+    assert_eq!(prompts.len(), 1, "the turn's prompt is recorded");
     assert!(h.bus.trees().contains_key("build-1.w1.demo-980"));
     let tf = hgl_ai_tree::read_task(&dir).unwrap();
     assert_eq!(tf.branch.as_deref(), Some("codex/980-fix-the-thing"));
@@ -512,6 +543,109 @@ async fn a_note_sent_before_its_task_ended_is_acked_without_a_turn() {
     stop(tx, j).await;
 }
 
+/// The seat moves to another host after its task ended: the hub's `HGL_ENDED` record, not
+/// the first host's cache, tells the new host the redelivered assignment is moot.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_moved_to_another_host_keeps_its_ended_tasks() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let assign = note(
+        Kind::Assign,
+        "w1",
+        21,
+        "[claude] Assign: demo#21 Twenty-one",
+    );
+    let a = h.bus.push("w1", assign.clone());
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 21, "[claude] Landed: demo#21"),
+    );
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    assert_eq!(
+        h.bus.ended("w1", "demo", 21),
+        Some(l),
+        "recorded on the hub"
+    );
+    stop(tx, j).await;
+
+    let b = h.other_host("build-2");
+    let (tx, j) = h.start_with(&b, &["w1"]);
+    h.bus.redeliver("w1", a, assign.clone());
+    eventually("acked on the new host", || {
+        h.bus.events(a) == [Ev::Ack, Ev::Ack]
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.calls("codex").len(), 1, "no turn for the ended task");
+    let dir_b = h.root.join("build-2/work/w1/demo-21");
+    assert!(!dir_b.exists(), "no tree for the ended task");
+    assert!(
+        !h.root.join("build-2/data/bridge/ended/w1.json").exists(),
+        "the new host's cache had no record of it"
+    );
+    // An `assign` sent after the end starts the task again, on the new host.
+    let again = h.bus.push("w1", assign);
+    eventually("the new assign runs", || h.bus.events(again) == [Ev::Ack]).await;
+    assert_eq!(h.calls("codex").len(), 2);
+    assert!(dir_b.exists());
+    stop(tx, j).await;
+}
+
+/// Without the hub's `HGL_ENDED`, no turn starts for a task and no end is acked unrecorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ended_tasks_wait_for_the_hub() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    h.bus.ended_down(true, false);
+    let a = h.bus.push(
+        "w1",
+        note(
+            Kind::Assign,
+            "w1",
+            22,
+            "[claude] Assign: demo#22 Twenty-two",
+        ),
+    );
+    eventually("naked while the hub cannot say", || {
+        h.bus.events(a).first() == Some(&Ev::Nak(Duration::from_millis(50)))
+    })
+    .await;
+    assert!(h.calls("codex").is_empty());
+    h.bus.ended_down(false, false);
+    eventually("run once the hub answers", || {
+        h.bus.events(a).last() == Some(&Ev::Ack)
+    })
+    .await;
+    assert_eq!(h.calls("codex").len(), 1);
+
+    // The end cannot be recorded: the tree goes at once, the note is naked and retried.
+    h.bus.ended_down(false, true);
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 22, "[claude] Landed: demo#22"),
+    );
+    eventually("landed naked", || {
+        h.bus.events(l).first() == Some(&Ev::Nak(Duration::from_millis(50)))
+    })
+    .await;
+    assert!(!h.work().join("w1/demo-22").exists());
+    h.bus.ended_down(false, false);
+    eventually("landed acked once recorded", || {
+        h.bus.events(l).last() == Some(&Ev::Ack)
+    })
+    .await;
+    assert_eq!(h.bus.ended("w1", "demo", 22), Some(l));
+    assert_eq!(
+        h.bus.sent_containing("Cleanup: demo#22").len(),
+        1,
+        "one cleanup receipt"
+    );
+    stop(tx, j).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_seat_whose_lease_another_bridge_holds_is_not_served() {
     let h = harness();
@@ -558,6 +692,18 @@ async fn the_lease_of_a_crashed_bridge_of_this_host_is_taken_over() {
     );
     eventually("served at once", || h.bus.events(n) == [Ev::Ack]).await;
     let ours = format!("build-1 pid {} (bridge)", std::process::id());
+    assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours.clone()));
+    stop(tx, j).await;
+
+    // Likewise the lease of a `note wait` of this host that is gone.
+    h.bus
+        .steal_lease("seat.w1", "build-1 pid 999999999 (note wait)");
+    let (tx, j) = h.start(&["w1"]);
+    let n = h.bus.push(
+        "w1",
+        Note::new(seat("claude"), seat("w1"), Kind::Note, "again"),
+    );
+    eventually("served at once", || h.bus.events(n) == [Ev::Ack]).await;
     assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours));
     stop(tx, j).await;
 }
@@ -623,7 +769,8 @@ async fn a_lost_seat_lease_stops_the_seat() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_oversized_line_then_a_hang_is_killed_and_turns_never_overlap() {
     let mut h = harness();
-    h.opts.turn_timeout = Duration::from_millis(700);
+    // Long enough for each attempt to reach its helpers on a loaded runner.
+    h.opts.turn_timeout = Duration::from_secs(2);
     let c = h.calls.display().to_string();
     h.script(
         "codex",
@@ -765,9 +912,7 @@ async fn review_runs_in_a_detached_merge_and_landed_removes_it() {
     assert_eq!(c.cwd, dir.join("src").display().to_string());
     assert_eq!(c.args[0], "-p");
     assert!(
-        c.args
-            .iter()
-            .any(|a| a.contains(&format!("review of demo#5 at {head}"))),
+        c.stdin.contains(&format!("review of demo#5 at {head}")),
         "the prompt names the reviewed head"
     );
     for pair in [
@@ -873,6 +1018,33 @@ async fn shutdown_stops_a_running_turn_after_the_grace_and_naks() {
     assert!(!alive(p));
 }
 
+/// The inbox fetcher ending under a running turn (the race behind a shutdown that left the
+/// turn running): the turn is stopped and its note naked, as at shutdown.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_inbox_fetcher_stops_the_running_turn() {
+    let h = harness();
+    let pid = h.calls.join("pid");
+    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 9, "[claude] Assign: demo#9 Nine"),
+    );
+    eventually("turn running", || pid.exists()).await;
+    h.bus.break_inbox();
+    eventually("the turn's note naked", || {
+        h.bus.events(a) == [Ev::Nak(Duration::from_millis(50))]
+    })
+    .await;
+    let p: i32 = std::fs::read_to_string(&pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    eventually("the turn stopped", || !alive(p)).await;
+    stop(tx, j).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn startup_report_and_heartbeat() {
     let h = harness();
@@ -973,4 +1145,291 @@ async fn a_seat_another_hosts_bridge_serves_is_not_served() {
         ["build-1"],
         "the host record goes at shutdown"
     );
+}
+
+/// A question to `to` whose encoded note is one byte under the bus's limit, its body full
+/// of what JSON escapes.
+fn near_limit(to: &str) -> Note {
+    let mk = |b: String| Note::new(seat("claude"), seat(to), Kind::Question, b);
+    let size = |n: &Note| serde_json::to_vec(n).unwrap().len();
+    let limit = hgl_ai_bus::MAX_NOTE_BYTES - 1;
+    let line = "a line with \"quotes\", a \\ backslash, a\ttab, é and 日本\n";
+    let per = serde_json::to_string(line).unwrap().len() - 2;
+    let mut body = line.repeat((limit - size(&mk(String::new()))) / per - 1);
+    // Padded before the last newline, which `Note::new` would otherwise add.
+    let pad = limit - size(&mk(body.clone()));
+    body.pop();
+    body.push_str(&"x".repeat(pad));
+    body.push('\n');
+    let n = mk(body);
+    assert_eq!(size(&n), limit);
+    n
+}
+
+/// A note at the bus's size limit reaches each CLI whole, on stdin: no argument carries it
+/// (Linux caps one at 128 KiB), and the turn's prompt is kept in its directory.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_note_at_the_bus_limit_reaches_each_cli_whole_on_stdin() {
+    let h = harness();
+    let mut cfg = h.cfg.clone();
+    cfg.seats.push(SeatConfig {
+        name: seat("g1"),
+        role: Role::Implementor,
+        binding: Binding {
+            runtime: Runtime::Agy,
+            family: Some(Family::Gemini),
+            tier: Some(Tier::Frontier),
+            model: None,
+            effort: None,
+        },
+        fallback: vec![],
+        memcap_gb: None,
+    });
+    cfg.validate().unwrap();
+    for rt in ["claude", "codex", "agy"] {
+        h.script(rt, &format!("cat '{}'", fixture(&format!("{rt}-ok.jsonl"))));
+    }
+    let (tx, j) = h.start_with(&cfg, &["w1", "r1", "g1"]);
+    for (s, rt) in [("w1", "codex"), ("r1", "claude"), ("g1", "agy")] {
+        let n = near_limit(s);
+        let whole = format!("---\n{}\n", n.body.trim_end());
+        let q = h.bus.push(s, n);
+        eventually("acked", || h.bus.events(q) == [Ev::Ack]).await;
+        let calls = h.calls(rt);
+        assert_eq!(calls.len(), 1, "{rt}");
+        let c = &calls[0];
+        assert!(
+            c.args.iter().all(|a| a.len() < 4096),
+            "{rt}: no argument carries the prompt"
+        );
+        let prompt = if rt == "agy" {
+            assert_eq!(c.stdin.lines().count(), 1, "one stream-json line");
+            let v: serde_json::Value = serde_json::from_str(&c.stdin).unwrap();
+            assert_eq!(v["event"], "user");
+            v["message"]["content"].as_str().unwrap().to_string()
+        } else {
+            c.stdin.clone()
+        };
+        assert!(prompt.contains(&whole), "{rt}: the note arrives whole");
+        assert!(!prompt.contains("truncated by the bridge"), "{rt}");
+        let dir = h.work().join(s).join("_inbox/prompts");
+        let recorded: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
+        assert_eq!(recorded.len(), 1, "{rt}");
+        assert!(
+            std::fs::read_to_string(recorded[0].path()).unwrap() == prompt,
+            "{rt}: the prompt recorded is the one sent"
+        );
+    }
+    stop(tx, j).await;
+}
+
+/// A CLI that is not installed: the note is dropped at once, not naked until `max_deliver`
+/// drops it, and the controller hears which.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_missing_cli_drops_the_note_once_and_tells_the_controller() {
+    let mut h = harness();
+    h.opts
+        .bins
+        .insert(Runtime::Codex, h.bin.join("missing-codex"));
+    let (tx, j) = h.start(&["w1"]);
+    let n = h.bus.push(
+        "w1",
+        Note::new(seat("claude"), seat("w1"), Kind::Note, "hello"),
+    );
+    eventually("terminated", || h.bus.events(n) == [Ev::Term]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.bus.events(n), [Ev::Term], "not retried");
+    let told = h
+        .bus
+        .sent_containing("cannot start a turn in the inbox directory");
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].recipient.as_str(), "claude");
+    for part in [
+        "missing-codex: no such executable".to_string(),
+        format!("seq {n} note from claude"),
+    ] {
+        assert!(told[0].body.contains(&part), "{part}: {}", told[0].body);
+    }
+    stop(tx, j).await;
+}
+
+/// A fake `codex` whose turns after the first write their pid to `pid` and wait for `go`.
+fn held_after_the_first(h: &H) -> (PathBuf, PathBuf) {
+    let (pid, gate) = (h.calls.join("pid"), h.calls.join("go"));
+    h.script(
+        "codex",
+        &format!(
+            "if [ \"$n\" -ge 2 ]; then echo $$ > '{p}'; while [ ! -e '{g}' ]; do sleep 0.05; done; fi\ncat '{f}'",
+            p = pid.display(),
+            g = gate.display(),
+            f = fixture("codex-ok.jsonl")
+        ),
+    );
+    (pid, gate)
+}
+
+fn pid_in(p: &std::path::Path) -> i32 {
+    std::fs::read_to_string(p).unwrap().trim().parse().unwrap()
+}
+
+/// A `landed` delivered again after its end was recorded (its ack was lost), once a newer
+/// `assign` restarted the task: acked, and the restart's turn and tree are left alone.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_redelivered_end_leaves_a_restarted_task_running() {
+    let h = harness();
+    let (pid, gate) = held_after_the_first(&h);
+    let (tx, j) = h.start(&["w1"]);
+    let assign = note(Kind::Assign, "w1", 40, "[claude] Assign: demo#40 Forty");
+    let a = h.bus.push("w1", assign.clone());
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    let landed = note(Kind::Landed, "w1", 40, "[claude] Landed: demo#40");
+    let l = h.bus.push("w1", landed.clone());
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    let dir = h.work().join("w1/demo-40");
+    assert!(!dir.exists());
+    let again = h.bus.push("w1", assign);
+    eventually("the restart runs", || pid.exists()).await;
+    assert_eq!(hgl_ai_tree::read_task(&dir).unwrap().seq, Some(again));
+
+    h.bus.redeliver("w1", l, landed);
+    eventually("acked again", || h.bus.events(l) == [Ev::Ack, Ev::Ack]).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(alive(pid_in(&pid)), "the restart's turn still runs");
+    assert!(dir.join("src").exists(), "and its tree stays");
+    assert!(h.bus.events(again).is_empty());
+    assert_eq!(h.bus.sent_containing("Cleanup: demo#40").len(), 1);
+    std::fs::write(&gate, "").unwrap();
+    eventually("the restart acked", || h.bus.events(again) == [Ev::Ack]).await;
+    assert!(dir.exists());
+    stop(tx, j).await;
+}
+
+/// A `landed` whose end could not be recorded (naked) is delivered again after a newer
+/// `assign` restarted the task: the restart is left alone, and the end is then recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_end_redelivered_before_it_was_recorded_leaves_a_restart_alone() {
+    let mut h = harness();
+    // Room for the restart to start before `max_deliver` runs out.
+    h.opts.nak_delay = Duration::from_secs(1);
+    let (pid, gate) = held_after_the_first(&h);
+    let (tx, j) = h.start(&["w1"]);
+    let assign = note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Forty-one");
+    let a = h.bus.push("w1", assign.clone());
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    h.bus.ended_down(false, true);
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 41, "[claude] Landed: demo#41"),
+    );
+    eventually("landed naked", || {
+        h.bus.events(l).first() == Some(&Ev::Nak(Duration::from_secs(1)))
+    })
+    .await;
+    let dir = h.work().join("w1/demo-41");
+    assert!(!dir.exists());
+    let again = h.bus.push("w1", assign);
+    eventually("the restart runs", || pid.exists()).await;
+    h.bus.ended_down(false, false);
+    eventually("the end recorded", || {
+        h.bus.events(l).last() == Some(&Ev::Ack)
+    })
+    .await;
+    assert_eq!(h.bus.ended("w1", "demo", 41), Some(l));
+    assert!(alive(pid_in(&pid)), "the restart's turn still runs");
+    assert!(dir.join("src").exists(), "and its tree stays");
+    assert!(h.bus.events(again).is_empty());
+    assert_eq!(h.bus.sent_containing("Cleanup: demo#41").len(), 1);
+    std::fs::write(&gate, "").unwrap();
+    eventually("the restart acked", || h.bus.events(again) == [Ev::Ack]).await;
+    stop(tx, j).await;
+}
+
+/// An end delivered late, while a newer note of the task runs in the tree made before the
+/// end: the tree goes, and the newer note is handed back and runs again, not dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_end_hands_back_the_newer_notes_of_the_turn_it_stops() {
+    let h = harness();
+    let pid = h.calls.join("pid");
+    h.script(
+        "codex",
+        &format!(
+            "if [ \"$n\" -eq 2 ]; then echo $$ > '{p}'; sleep 60; fi\ncat '{f}'",
+            p = pid.display(),
+            f = fixture("codex-ok.jsonl")
+        ),
+    );
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 50, "[claude] Assign: demo#50 Fifty"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    // Sent next, delivered after the question below.
+    let landed = note(Kind::Landed, "w1", 50, "[claude] Landed: demo#50");
+    let l = h.bus.push("nobody", landed.clone());
+    let q = h.bus.push(
+        "w1",
+        note(Kind::Question, "w1", 50, "[claude] Question: still there?"),
+    );
+    eventually("the question's turn runs", || pid.exists()).await;
+    h.bus.redeliver("w1", l, landed);
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    assert!(!h.work().join("w1/demo-50").exists());
+    eventually("the question handed back, then run again", || {
+        h.bus.events(q) == [Ev::Nak(Duration::from_millis(50)), Ev::Ack]
+    })
+    .await;
+    assert!(!alive(pid_in(&pid)));
+    let calls = h.calls("codex");
+    assert_eq!(calls.len(), 3);
+    assert_eq!(
+        calls[2].cwd,
+        h.work().join("w1/_inbox").display().to_string()
+    );
+    stop(tx, j).await;
+}
+
+/// The bridge's notes (cleanup receipts, gate changes, reports) go to the configured
+/// controller seat, `[github] controller`, and each prompt names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_bridges_notes_go_to_the_configured_controller() {
+    let mut h = harness();
+    h.cfg.github.controller = "boss".into();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the startup report", || {
+        !h.bus.sent_containing("work_root uses").is_empty()
+    })
+    .await;
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 60, "[claude] Assign: demo#60 Sixty"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    assert!(
+        h.calls("codex")[0]
+            .stdin
+            .contains("The controller is seat `boss`.")
+    );
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 60, "[claude] Landed: demo#60"),
+    );
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    h.bus.set_state("mode", "drain");
+    h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 61, "[claude] Assign: demo#61 Held"),
+    );
+    eventually("the gate change", || {
+        !h.bus.sent_containing("mode is drain").is_empty()
+    })
+    .await;
+    assert_eq!(h.bus.sent_containing("Cleanup: demo#60").len(), 1);
+    let sent = h.bus.sent();
+    assert!(sent.len() >= 3);
+    for n in &sent {
+        assert_eq!(n.recipient.as_str(), "boss", "{}", n.body);
+    }
+    stop(tx, j).await;
 }

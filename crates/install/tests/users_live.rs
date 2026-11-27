@@ -159,6 +159,12 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
     );
     seat_bus.hosts().await.unwrap();
     seat_bus.trees().await.unwrap();
+    let task = hgl_ai_proto::TaskKey {
+        repo: "alpha".into(),
+        issue: 7,
+    };
+    seat_bus.ended_put(&seat("w1"), &task, 42).await.unwrap();
+    assert!(seat_bus.ended_get(&seat("w1"), &task).await.unwrap().is_some());
     let mut lease = seat_bus.lock_acquire("seat.w1", "build-1").await.unwrap();
     lease.refresh().await.unwrap();
     assert!(lease.release().await.unwrap());
