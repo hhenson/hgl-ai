@@ -54,6 +54,14 @@ enum Command {
 
 #[tokio::main]
 async fn main() {
+    // Logs go to stderr; `HGL_AI_LOG` sets the filter (default: warnings).
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_env("HGL_AI_LOG")
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .init();
     let cli = Cli::parse();
     let ctx = cmd::Ctx {
         config_path: cli.config,
