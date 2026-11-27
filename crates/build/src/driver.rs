@@ -238,6 +238,7 @@ pub fn drive(
             env: env.clone(),
             mem_bytes: step.memcap_bytes(),
             time: step.time_limit(),
+            address_limit: step.address_limit.unwrap_or(true),
         };
         let r = exec.run_step(ws, &spec, &log, cancel);
         if r.unreachable {

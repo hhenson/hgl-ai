@@ -19,7 +19,7 @@ patterns = { error = ['^Diff in (?P<file>.+?):(?P<line>\d+):'] }
 name = "clippy"
 run = "cargo clippy --workspace --all-targets --locked --message-format=json -- -D warnings"
 platforms = ["linux", "macos"]
-memcap_gb = 16
+memcap_gb = 64
 time = "30m"
 parser = "cargo"
 needs = ["tool:cargo"]
@@ -29,7 +29,7 @@ name = "test"
 # The live tests use nats-server from PATH and skip without it.
 run = "cargo test --workspace --locked --message-format=json"
 platforms = ["linux", "macos"]
-memcap_gb = 32
+memcap_gb = 64
 time = "40m"
 parser = "cargo"
 needs = ["tool:cargo"]

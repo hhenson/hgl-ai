@@ -11,7 +11,8 @@
 //! cwd = "."                                 # relative to the checkout
 //! env = { RUST_BACKTRACE = "0" }
 //! platforms = ["linux", "macos", "windows"] # default: all
-//! memcap_gb = 32                            # default 16; no cap on a Windows remote
+//! memcap_gb = 64                            # default 32; no cap on a Windows remote
+//! address_limit = false                     # sanitizer builds: no per-process address limit
 //! time = "40m"                              # default 60m
 //! parser = "cargo"                          # default lines
 //! needs = ["sdk:hgraph", "tool:cmake", "step:build"]
@@ -34,7 +35,7 @@ pub enum RecipeError {
     Invalid(String),
 }
 
-pub const DEFAULT_MEMCAP_GB: u64 = 16;
+pub const DEFAULT_MEMCAP_GB: u64 = 32;
 pub const DEFAULT_TIME: &str = "60m";
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -94,6 +95,10 @@ pub struct Step {
     pub platforms: Option<Vec<Platform>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memcap_gb: Option<u64>,
+    /// `false` for sanitizer builds (ASan, TSan): no per-process address-space limit
+    /// where the cap falls back to one (`hgl-ai cap --no-address-limit`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub address_limit: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub time: Option<String>,
     #[serde(default)]
@@ -365,7 +370,7 @@ time = "40m"
         assert_eq!(r.steps[1].run_for(Platform::Windows), Some("nmake test"));
         assert_eq!(r.steps[1].run_for(Platform::Linux), Some("make test"));
         assert_eq!(r.steps[1].memcap_bytes(), 32 << 30);
-        assert_eq!(r.steps[0].memcap_bytes(), 16 << 30);
+        assert_eq!(r.steps[0].memcap_bytes(), 32 << 30);
         assert_eq!(r.steps[1].time_limit(), Duration::from_secs(2400));
         let names = |v: Vec<&Step>| v.iter().map(|s| s.name.clone()).collect::<Vec<_>>();
         assert_eq!(names(r.plan(Platform::Macos, None).unwrap()), ["build"]);

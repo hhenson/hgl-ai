@@ -206,28 +206,28 @@ impl Dialect {
         }
     }
 
-    /// Prints the files in `dir` matching the one-segment `pattern`, one per line.
+    /// Prints `SIZE PATH` for each file in `dir` matching the one-segment `pattern`.
     pub fn list(self, dir: &str, pattern: &str) -> String {
         match self {
             Dialect::PowerShell => format!(
-                "Get-ChildItem -LiteralPath {} -File -Filter {} -ErrorAction SilentlyContinue | ForEach-Object {{ $_.FullName }}",
+                "Get-ChildItem -LiteralPath {} -File -Filter {} -ErrorAction SilentlyContinue | ForEach-Object {{ \"$($_.Length) $($_.FullName)\" }}",
                 self.quote(dir),
                 self.quote(pattern)
             ),
             // The pattern is left unquoted for the shell to expand; recipes refuse quotes
             // and separators in artifacts.
             Dialect::Posix => format!(
-                "cd {} 2>/dev/null && for f in {pattern}; do [ -f \"$f\" ] && printf '%s/%s\\n' \"$(pwd)\" \"$f\"; done; true",
+                "cd {} 2>/dev/null && for f in {pattern}; do [ -f \"$f\" ] && printf '%s %s/%s\\n' \"$(wc -c < \"$f\" | tr -d ' ')\" \"$(pwd)\" \"$f\"; done; true",
                 self.quote(dir)
             ),
         }
     }
 
-    /// Writes file `p` to stdout, byte for byte.
+    /// Writes file `p` to stdout, byte for byte, streamed (never read whole).
     pub fn cat(self, p: &str) -> String {
         match self {
             Dialect::PowerShell => format!(
-                "$b = [IO.File]::ReadAllBytes({})\n$o = [Console]::OpenStandardOutput()\n$o.Write($b, 0, $b.Length)\n$o.Flush()",
+                "$f = [IO.File]::OpenRead({})\n$o = [Console]::OpenStandardOutput()\n$f.CopyTo($o)\n$o.Flush()\n$f.Close()",
                 self.quote(p)
             ),
             Dialect::Posix => format!("cat {}", self.quote(p)),
@@ -671,6 +671,8 @@ pub struct Ssh {
     kick: Arc<tokio::sync::Notify>,
     /// Remote step shells whose session dropped: killed at the next cleanup.
     orphans: Mutex<Vec<u32>>,
+    /// Bytes of artifacts one step may bring back.
+    artifact_limit: u64,
 }
 
 impl Ssh {
@@ -689,7 +691,14 @@ impl Ssh {
             conn,
             kick: Arc::new(tokio::sync::Notify::new()),
             orphans: Mutex::new(Vec::new()),
+            artifact_limit: ARTIFACT_LIMIT,
         }
+    }
+
+    /// A smaller artifact budget than [`ARTIFACT_LIMIT`] (tests).
+    pub fn with_artifact_limit(mut self, bytes: u64) -> Ssh {
+        self.artifact_limit = bytes;
+        self
     }
 
     pub fn conn(&self) -> &Arc<Conn> {
@@ -756,6 +765,42 @@ impl Ssh {
             }
         }
         Ok(())
+    }
+
+    /// Stream remote file `from` into local `to`, at most `budget` bytes: a file that
+    /// grows past it is cut off and dropped (`None`). Returns the bytes written.
+    fn fetch(&self, from: &str, to: &Path, budget: u64) -> Option<u64> {
+        let cmdline = self.dialect.command(&self.dialect.cat(from)).ok()?;
+        let mut c = self.conn.command(false);
+        c.arg(&cmdline)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null());
+        let mut child = c.spawn().ok()?;
+        let mut out = child.stdout.take()?;
+        let mut file = std::fs::File::create(to).ok()?;
+        let mut buf = vec![0u8; 64 << 10];
+        let mut n = 0u64;
+        let deadline = Instant::now() + Duration::from_secs(600);
+        let ok = loop {
+            match out.read(&mut buf) {
+                Ok(0) => break true,
+                Ok(k) => {
+                    n += k as u64;
+                    if n > budget || Instant::now() > deadline || file.write_all(&buf[..k]).is_err()
+                    {
+                        break false;
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        if !ok {
+            let _ = child.kill();
+        }
+        drop(out);
+        let status = child.wait().ok()?;
+        (ok && status.success()).then_some(n)
     }
 
     fn is_absolute(&self, p: &str) -> bool {
@@ -977,28 +1022,33 @@ impl Executor for Ssh {
             let Ok(o) = self.exec(&self.dialect.list(dir, pat), SHORT) else {
                 continue;
             };
-            for f in o.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
-                if out.len() >= ARTIFACT_FILES || total >= ARTIFACT_LIMIT {
+            for line in o.stdout.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                if out.len() >= ARTIFACT_FILES || total >= self.artifact_limit {
                     return out;
                 }
-                let name = f.rsplit(['/', '\\']).next().unwrap_or(f).to_string();
-                let Ok(cmdline) = self.dialect.command(&self.dialect.cat(f)) else {
-                    continue;
-                };
-                let Ok((Some(0), bytes, _)) =
-                    self.conn.run(&cmdline, None, Duration::from_secs(600))
+                let Some((size, f)) = line
+                    .split_once(' ')
+                    .and_then(|(n, f)| Some((n.parse::<u64>().ok()?, f)))
                 else {
                     continue;
                 };
-                if total + bytes.len() as u64 > ARTIFACT_LIMIT
-                    || std::fs::create_dir_all(dest).is_err()
-                {
+                let budget = self.artifact_limit - total;
+                if size > budget || std::fs::create_dir_all(dest).is_err() {
+                    tracing::warn!(
+                        "artifact {f} ({size} bytes) is over the {budget} bytes left; skipped"
+                    );
                     continue;
                 }
+                let name = f.rsplit(['/', '\\']).next().unwrap_or(f).to_string();
                 let to = dest.join(&name);
-                if std::fs::write(&to, &bytes).is_ok() {
-                    total += bytes.len() as u64;
-                    out.push(to);
+                match self.fetch(f, &to, budget) {
+                    Some(n) => {
+                        total += n;
+                        out.push(to);
+                    }
+                    None => {
+                        let _ = std::fs::remove_file(&to);
+                    }
                 }
             }
         }

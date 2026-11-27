@@ -121,6 +121,8 @@ pub struct StepSpec {
     pub env: Vec<(String, String)>,
     pub mem_bytes: u64,
     pub time: Duration,
+    /// A per-process address-space limit where the cap uses one (off for sanitizers).
+    pub address_limit: bool,
 }
 
 /// How a step ended.

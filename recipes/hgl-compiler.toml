@@ -21,7 +21,7 @@ patterns = { error = ['^Diff in (?P<file>.+?):(?P<line>\d+):'] }
 [[step]]
 name = "clippy"
 run = "cargo clippy --workspace --all-targets --locked --message-format=json -- -D warnings"
-memcap_gb = 32
+memcap_gb = 64
 time = "40m"
 parser = "cargo"
 
@@ -30,7 +30,7 @@ parser = "cargo"
 [[step]]
 name = "test"
 run = "cargo test --workspace --locked --message-format=json"
-memcap_gb = 32
+memcap_gb = 64
 time = "60m"
 parser = "cargo"
 
@@ -43,7 +43,7 @@ name = "runtime-plain"
 run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && cmake -S runtime/cpp -B "$HGL_AI_BUILD_DIR/cpp-plain" -G Ninja -DCMAKE_BUILD_TYPE=Debug && cmake --build "$HGL_AI_BUILD_DIR/cpp-plain"'
 platforms = ["linux"]
 env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS" }
-memcap_gb = 16
+memcap_gb = 64
 time = "30m"
 parser = "gcc"
 needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
@@ -52,7 +52,7 @@ needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
 name = "runtime-plain-test"
 run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && ctest --test-dir "$HGL_AI_BUILD_DIR/cpp-plain" --output-on-failure'
 platforms = ["linux"]
-memcap_gb = 16
+memcap_gb = 32
 time = "20m"
 parser = "ctest"
 needs = ["step:runtime-plain", "sdk:hgraph-deps"]
@@ -61,8 +61,9 @@ needs = ["step:runtime-plain", "sdk:hgraph-deps"]
 name = "runtime-sanitize"
 run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && cmake -S runtime/cpp -B "$HGL_AI_BUILD_DIR/cpp-sanitize" -G Ninja -DCMAKE_BUILD_TYPE=Debug -DHGLRT_SANITIZE=ON && cmake --build "$HGL_AI_BUILD_DIR/cpp-sanitize"'
 platforms = ["linux"]
+address_limit = false
 env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS" }
-memcap_gb = 16
+memcap_gb = 64
 time = "30m"
 parser = "gcc"
 needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
@@ -71,7 +72,8 @@ needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
 name = "runtime-sanitize-test"
 run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && ctest --test-dir "$HGL_AI_BUILD_DIR/cpp-sanitize" --output-on-failure'
 platforms = ["linux"]
-memcap_gb = 16
+address_limit = false
+memcap_gb = 32
 time = "20m"
 parser = "ctest"
 needs = ["step:runtime-sanitize", "sdk:hgraph-deps"]
@@ -89,6 +91,7 @@ needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
 
 [[step]]
 name = "sdk-sanitize"
+address_limit = false
 run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && jobs=$(nproc) && cases=$((jobs < 8 ? jobs : 8)) && scripts/check-cpp-sdk.sh "$jobs" "$cases" --message-format=json'
 platforms = ["linux"]
 env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS", HGL_CPP_FLAGS = "-fsanitize=address,undefined -fno-omit-frame-pointer -fno-sanitize-recover=undefined" }
@@ -102,7 +105,7 @@ needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
 name = "build-tool-test"
 run = "cargo test --locked -p hgl_build_tool --message-format=json"
 platforms = ["linux"]
-memcap_gb = 16
+memcap_gb = 32
 time = "20m"
 parser = "cargo"
 
@@ -111,7 +114,7 @@ name = "core-cases"
 run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && cargo build --locked --bin hgl && cargo run --locked --quiet -p hgl_build_tool -- check-core "${CARGO_TARGET_DIR:-target}/debug/hgl" spec/hgl_core'
 platforms = ["linux"]
 env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS" }
-memcap_gb = 32
+memcap_gb = 64
 time = "60m"
 parser = "lines"
 needs = ["sdk:hgraph", "sdk:hgraph-deps", "tool:g++-15"]
@@ -122,7 +125,7 @@ name = "core-doc-examples"
 run = 'export PATH="$HGL_SDK_HGRAPH_DEPS/bin:$PATH" && "${CARGO_TARGET_DIR:-target}/debug/hgl" test spec/hgl_core/hgl --target cpp'
 platforms = ["linux"]
 env = { CXX = "g++-15", HGL_HGRAPH_SDK = "$HGL_SDK_HGRAPH", HGL_HGRAPH_DEPS = "$HGL_SDK_HGRAPH_DEPS" }
-memcap_gb = 16
+memcap_gb = 32
 time = "60m"
 parser = "hgl-test"
 needs = ["step:core-cases", "sdk:hgraph", "sdk:hgraph-deps"]

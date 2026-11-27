@@ -33,7 +33,8 @@ name = "test"
 run = "cargo test --workspace --locked --message-format=json"
 platforms = ["linux", "macos", "windows"] # default: all
 cwd = "."                                 # in the checkout
-memcap_gb = 32                            # default 16; no cap on a Windows remote
+memcap_gb = 64                            # default 32; no cap on a Windows remote
+address_limit = false                     # sanitizers: no per-process address limit
 time = "40m"                              # default 60m
 parser = "cargo"                          # default lines
 needs = ["sdk:hgraph", "tool:cmake", "step:build"]

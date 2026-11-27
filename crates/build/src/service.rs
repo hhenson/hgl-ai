@@ -6,12 +6,12 @@
 //! `HGL_HOSTS/builder.<label>` with its health, and honours `drain` and `retire`.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hgl_ai_bus::Bus;
-use hgl_ai_proto::build::{BuildJob, BuildStatus, BuilderRecord, Summary};
+use hgl_ai_proto::build::{BuildJob, BuildStatus, BuilderRecord, StepStatus, Summary};
 use hgl_ai_proto::{Kind, Seat, utc_now_stamp};
 use tokio::sync::{Notify, watch};
 
@@ -62,6 +62,8 @@ pub struct Lane {
     /// Local directory of this lane's build logs.
     pub logs: PathBuf,
     busy: AtomicU32,
+    /// The startup cleanup of leftover job directories is done; no job is taken before.
+    cleaned: AtomicBool,
     gate: Mutex<Gate>,
     probe: Mutex<Probe>,
     /// Workspaces whose cleanup waits for the remote to come back.
@@ -86,6 +88,7 @@ impl Lane {
             kick: None,
             logs,
             busy: AtomicU32::new(0),
+            cleaned: AtomicBool::new(false),
             gate: Mutex::new(Gate::Active),
             probe: Mutex::new(Probe::default()),
             stale: Mutex::new(Vec::new()),
@@ -224,17 +227,19 @@ async fn lane_loop(
         );
         tokio::spawn(async move {
             let mut beat = 0u32;
-            let mut cleaned = false;
             let mut was_reachable = false;
             loop {
                 let gate = read_gate(&bus, &lane.label).await;
                 *lane.gate.lock().unwrap_or_else(|e| e.into_inner()) = gate;
                 let reachable = lane.reachable();
-                if reachable && !cleaned {
-                    // Leftovers of an earlier run of this builder.
+                if reachable && !lane.cleaned.load(Ordering::SeqCst) {
+                    // Leftovers of an earlier run of this builder, before any job is taken.
                     let ex = lane.exec.clone();
-                    if blocking(move || ex.clean_all()).await.is_ok() {
-                        cleaned = true;
+                    match blocking(move || ex.clean_all()).await {
+                        Ok(()) => lane.cleaned.store(true, Ordering::SeqCst),
+                        Err(e) => {
+                            tracing::warn!(builder = %lane.label, "startup cleanup: {e:?}; no job is taken until it is done")
+                        }
                     }
                 }
                 if reachable {
@@ -274,7 +279,10 @@ async fn lane_loop(
             break;
         }
         while jobs.try_join_next().is_some() {}
-        let open = lane.gate() == Gate::Active && lane.reachable() && lane.busy() < lane.slots;
+        let open = lane.cleaned.load(Ordering::SeqCst)
+            && lane.gate() == Gate::Active
+            && lane.reachable()
+            && lane.busy() < lane.slots;
         if !open {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(500)) => {}
@@ -332,17 +340,24 @@ async fn lane_loop(
                         }
                     })
                 };
-                let out = run_job(&bus, &lane, &settings, &job, &cancel).await;
+                // A redelivered job that ended before (its receipt not yet published):
+                // publish that result, build nothing again.
+                let out = match saved_result(&lane, &job.id) {
+                    Some(s) => Some(s),
+                    None => run_job(&bus, &lane, &settings, &job, &cancel).await,
+                };
+                // Acknowledged only once the result is published; until then the job
+                // stays ours (kept alive), and a crash redelivers it.
+                let published = match &out {
+                    Some(s) => finish(&bus, &lane, &job, s, &cancel).await,
+                    None => false,
+                };
                 keep.abort();
-                match out {
-                    Some(s) => {
-                        finish(&bus, &lane, &job, &s).await;
-                        let _ = d.ack().await;
-                    }
-                    None => {
-                        // Stopped by a shutdown: back to the inbox.
-                        let _ = d.nak(Duration::from_secs(15)).await;
-                    }
+                if published {
+                    let _ = d.ack().await;
+                } else {
+                    // Stopped by a shutdown: back to the inbox.
+                    let _ = d.nak(Duration::from_secs(15)).await;
                 }
                 running
                     .lock()
@@ -542,7 +557,13 @@ async fn run_job(
             retry_stale(lane).await;
             continue;
         }
-        if cancel.is_cancelled() && driven.summary.status == BuildStatus::Stopped {
+        // Cancelled with work left undone (a stopped step), whatever the other steps did.
+        let unfinished = driven
+            .summary
+            .steps
+            .iter()
+            .any(|x| x.status == StepStatus::Stopped);
+        if cancel.is_cancelled() && unfinished {
             let mut s = driven.summary;
             s.reason = Some("stopped by the builder's shutdown; the job is queued again".into());
             let _ = store::run_put(bus, &s).await;
@@ -552,23 +573,60 @@ async fn run_job(
     }
 }
 
-/// Keep the summary (log directory and hub), send the receipts, prune old logs.
-async fn finish(bus: &Bus, lane: &Lane, job: &BuildJob, s: &Summary) {
+/// The saved result of a job that ended on this lane before: `summary.json` in its log
+/// directory.
+fn saved_result(lane: &Lane, id: &str) -> Option<Summary> {
+    let b = std::fs::read(lane.logs.join(id).join(store::SUMMARY_FILE)).ok()?;
+    serde_json::from_slice::<Summary>(&b)
+        .ok()
+        .filter(|s| s.id == id && s.status.is_final())
+}
+
+/// Keep the summary (log directory first, then the hub) and send the receipts, retrying
+/// what fails until it is all published (`true`) or `cancel` (`false`: the job is
+/// redelivered and its saved result published then).
+async fn finish(bus: &Bus, lane: &Lane, job: &BuildJob, s: &Summary, cancel: &Cancel) -> bool {
     let dir = lane.logs.join(&job.id);
     if let Err(e) = store::write_final(&dir, s) {
         tracing::warn!("writing {}: {e}", dir.display());
     }
-    if let Err(e) = store::run_put(bus, s).await {
-        tracing::warn!("writing run {}: {e}", s.id);
-    }
+    let mut run_kept = false;
     let mut to = vec![job.reply_to.clone()];
     to.extend(job.notify.clone());
-    for seat in to {
-        if let Err(e) = store::send_receipt(bus, &lane.inbox, &seat, s, job.issue).await {
-            tracing::warn!("sending the receipt of {} to {seat}: {e}", s.id);
+    let mut pause = Duration::from_secs(1);
+    loop {
+        if !run_kept {
+            match store::run_put(bus, s).await {
+                Ok(()) => run_kept = true,
+                Err(e) => tracing::warn!("writing run {}: {e}", s.id),
+            }
         }
+        let mut left = Vec::new();
+        for seat in to {
+            match store::send_receipt(bus, &lane.inbox, &seat, s, job.issue).await {
+                Ok(()) => {}
+                // A summary that cannot be a receipt never will be.
+                Err(store::StoreError::Other(e)) => tracing::warn!("{e}"),
+                Err(e) => {
+                    tracing::warn!("sending the receipt of {} to {seat}: {e}; retrying", s.id);
+                    left.push(seat);
+                }
+            }
+        }
+        to = left;
+        if run_kept && to.is_empty() {
+            prune_logs(&lane.logs, LOGS_KEPT);
+            return true;
+        }
+        let deadline = std::time::Instant::now() + pause;
+        while std::time::Instant::now() < deadline {
+            if cancel.is_cancelled() {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(200)).await;
+        }
+        pause = (pause * 2).min(Duration::from_secs(30));
     }
-    prune_logs(&lane.logs, LOGS_KEPT);
 }
 
 /// Keep the newest `keep` build log directories under `root` (ids sort by start).

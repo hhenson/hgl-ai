@@ -173,7 +173,9 @@ impl Executor for Local {
         for (k, v) in &step.env {
             cmd.env(k, v);
         }
-        let spec = CapSpec::new(step.mem_bytes).with_time(step.time);
+        let spec = CapSpec::new(step.mem_bytes)
+            .with_time(step.time)
+            .with_address_limit(step.address_limit);
         run_capped(&cmd, spec, log, cancel)
     }
 

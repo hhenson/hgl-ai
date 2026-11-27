@@ -146,6 +146,7 @@ fn step(name: &str, script: &str, time: Duration) -> StepSpec {
         env: vec![("GREETING".into(), "it's here".into())],
         mem_bytes: 1 << 30,
         time,
+        address_limit: true,
     }
 }
 
@@ -264,6 +265,26 @@ fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
             .unwrap()
             .contains("<testcase")
     );
+    // An artifact over the budget is skipped, never read whole.
+    std::fs::write(format!("{}/big.bin", ws.build), vec![b'x'; 5000]).unwrap();
+    std::fs::write(format!("{}/small.bin", ws.build), vec![b'y'; 100]).unwrap();
+    let small = Ssh::new(
+        Platform::Windows,
+        Dialect::Posix,
+        w.remote.to_str().unwrap(),
+        BTreeMap::new(),
+        conn.clone(),
+    )
+    .with_artifact_limit(1000);
+    let got = small.collect(
+        &ws,
+        ".",
+        &["$HGL_AI_BUILD_DIR/*.bin".to_string()],
+        &env,
+        &logs.join("bins"),
+    );
+    assert_eq!(got, [logs.join("bins/small.bin")]);
+    assert!(!logs.join("bins/big.bin").exists());
 
     // Probes and needs.
     let p = ex.probe(&["git".into(), "no-such-tool".into()]).unwrap();
@@ -478,6 +499,15 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         toolchains: vec!["git".into()],
         heartbeat: Duration::from_millis(300),
     };
+    // A leftover job directory that cannot be removed yet: no job may start before the
+    // startup cleanup is done.
+    let jobs = w.remote.join("jobs");
+    std::fs::create_dir_all(jobs.join("20261126-000000-000000/src")).unwrap();
+    let mode = |m: u32| {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(m)).unwrap();
+    };
+    mode(0o500);
     // Unreachable from the start.
     w.down(true);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -513,13 +543,38 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
             .is_none()
     );
 
-    // Back up: the proxy reconnects and builds it.
+    // Back up: the proxy reconnects, but the cleanup fails, so the job still waits.
     w.down(false);
+    until("a reachable record", 30, || {
+        let bus = bus.clone();
+        async move {
+            bus.builders()
+                .await
+                .unwrap()
+                .iter()
+                .any(|b| b.label == "win1" && b.reachable)
+        }
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        store::run_get(&bus, "20261127-090000-aaaaaa")
+            .await
+            .unwrap()
+            .is_none(),
+        "not taken before the startup cleanup"
+    );
+    // The cleanup goes through on a later heartbeat; then the job is built.
+    mode(0o755);
     let r = bus
         .reply_wait(&reply, Duration::from_secs(60))
         .await
         .unwrap()
         .expect("a receipt");
+    assert!(
+        !jobs.join("20261126-000000-000000").exists(),
+        "the leftover is gone"
+    );
     let s = store::parse_receipt(&r).unwrap();
     assert_eq!(s.status, BuildStatus::Pass, "{s:?}");
     assert_eq!(
@@ -584,6 +639,44 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     );
     assert!(w.jobs().is_empty(), "{:?}", w.jobs());
 
+    // A redelivered job whose result was saved before the crash: published, not rebuilt.
+    let saved = w.root.join("work/builder/logs/win1/20261127-090000-dddddd");
+    std::fs::create_dir_all(&saved).unwrap();
+    let mut done = s.clone();
+    done.id = "20261127-090000-dddddd".into();
+    done.reason = Some("saved before the crash".into());
+    std::fs::write(
+        saved.join("summary.json"),
+        serde_json::to_vec(&done).unwrap(),
+    )
+    .unwrap();
+    let before = std::fs::read_to_string(w.state.join("log"))
+        .unwrap()
+        .lines()
+        .count();
+    let (note, reply) = job("20261127-090000-dddddd", &w.head);
+    bus.send(&note).await.unwrap();
+    let r = bus
+        .reply_wait(&reply, Duration::from_secs(30))
+        .await
+        .unwrap()
+        .expect("a receipt");
+    let got = store::parse_receipt(&r).unwrap();
+    assert_eq!(got.reason.as_deref(), Some("saved before the crash"));
+    let log = std::fs::read_to_string(w.state.join("log")).unwrap();
+    assert!(
+        !log.lines().skip(before).any(|l| l.contains("worktree")),
+        "no checkout for a saved result"
+    );
+    assert_eq!(
+        store::run_get(&bus, "20261127-090000-dddddd")
+            .await
+            .unwrap()
+            .unwrap()
+            .reason,
+        done.reason
+    );
+
     // Drain: the record says so.
     bus.state_put("builder.win1", "drain").await.unwrap();
     until("a draining record", 10, || {
@@ -601,9 +694,13 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
 
     // Shutdown during a build: the remote tree is killed, the job directory removed, the
     // master closed, the record gone, and the job back in the inbox.
-    let long = "repo = \"demo\"\n[[step]]\nname = \"build\"\nrun = \"sleep 60 & echo $! > ../../../long.pid; wait\"\ntime = \"5m\"\n";
+    // With --keep-going and a failed step before it, so the aggregate is `fail`.
+    let long = "repo = \"demo\"\n[[step]]\nname = \"lint\"\nrun = \"false\"\n[[step]]\nname = \"build\"\nrun = \"sleep 60 & echo $! > ../../../long.pid; wait\"\ntime = \"5m\"\n";
     store::recipe_put(&bus, long, None).await.unwrap();
-    let (note, reply) = job("20261127-090000-cccccc", &w.head);
+    let (mut note, reply) = job("20261127-090000-cccccc", &w.head);
+    let mut j: BuildJob = serde_json::from_str(note.body.trim()).unwrap();
+    j.keep_going = true;
+    note.body = serde_json::to_string(&j).unwrap() + "\n";
     bus.send(&note).await.unwrap();
     let pidfile = w.remote.join("long.pid");
     until("the long step", 30, || {
@@ -637,5 +734,10 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(s.status, BuildStatus::Stopped);
+    assert!(
+        s.reason
+            .as_deref()
+            .is_some_and(|r| r.contains("queued again")),
+        "requeued although a step before failed: {s:?}"
+    );
 }

@@ -650,8 +650,8 @@ async fn run_remote(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
     }
 }
 
-/// Wait for the receipt of `id`. With `builder`, give up when its record is gone for
-/// three checks in a row (the job stays in its inbox).
+/// Wait for the receipt of `id`, or the hub's final summary of it. With `builder`, give up
+/// when its record is gone for three checks in a row (the job stays in its inbox).
 async fn wait_remote(
     bus: &Bus,
     id: &str,
@@ -669,6 +669,16 @@ async fn wait_remote(
         let step = left.unwrap_or(Duration::MAX).min(Duration::from_secs(30));
         if let Some(n) = bus.reply_wait(&reply, step).await? {
             return Ok(Some(store::parse_receipt(&n)?));
+        }
+        // The hub's final summary stands in for a receipt not (yet) published. A stopped
+        // run is queued again, so it is not final here.
+        if let Some(s) = store::run_get(bus, id).await?
+            && matches!(
+                s.status,
+                BuildStatus::Pass | BuildStatus::Fail | BuildStatus::NotRun
+            )
+        {
+            return Ok(Some(s));
         }
         if let Some(l) = builder {
             let live = bus.builders().await?.iter().any(|b| b.label == l);
