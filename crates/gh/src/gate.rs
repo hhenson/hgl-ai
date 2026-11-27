@@ -34,6 +34,7 @@ use crate::bot::{BotView, Comment, Review};
 pub use crate::builds::{GateBuilds, VerdictState};
 use crate::exec::{self, Gh};
 use crate::lock::LandLock;
+use crate::merge::{self, Merge};
 use crate::progress::{self, Progress};
 use crate::{Error, GateRules, Result, Settings, short, state};
 
@@ -45,6 +46,8 @@ pub struct Pr {
     pub merged: bool,
     /// `mergeable_state`, upper case (`CLEAN`, `UNSTABLE`, `DIRTY`, `BLOCKED`, `BEHIND`, `UNKNOWN`, ...).
     pub mergeable_state: String,
+    /// `mergeable`: `None` while GitHub has not computed it.
+    pub mergeable: Option<bool>,
     pub head: String,
     pub branch: String,
     pub base: String,
@@ -80,6 +83,7 @@ impl Pr {
             mergeable_state: s(&["mergeable_state"])
                 .unwrap_or_else(|| "unknown".into())
                 .to_ascii_uppercase(),
+            mergeable: v.get("mergeable").and_then(Value::as_bool),
             head: s(&["head", "sha"]).ok_or_else(|| resp("pull request", "no head.sha"))?,
             branch: s(&["head", "ref"]).unwrap_or_default(),
             base: s(&["base", "ref"]).unwrap_or_default(),
@@ -101,6 +105,14 @@ pub struct CheckRun {
 }
 
 impl CheckRun {
+    /// Completed with a conclusion that does not hold a merge back.
+    pub fn passed(&self) -> bool {
+        self.status == "completed"
+            && matches!(
+                self.conclusion.as_deref(),
+                Some("success" | "neutral" | "skipped")
+            )
+    }
     pub fn failed(&self) -> bool {
         matches!(
             self.conclusion.as_deref(),
@@ -269,6 +281,10 @@ pub struct Opts {
     /// A pull request the tool made, not an agent (the wrapper's pin pull requests): it has
     /// no author family for a review receipt to differ from, so none is asked for.
     pub tool_made: bool,
+    /// The landing's deadline: the latest an accepted merge is polled until, and no later
+    /// than the landing lock's lease from the merge; else [`crate::merge::POLL_LIMIT`]
+    /// from the merge ([`crate::merge::until`]).
+    pub merge_until: Option<tokio::time::Instant>,
 }
 
 /// The last word of a gate line.
@@ -488,6 +504,8 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
             }
         }
     }
+    // The local build passed and GitHub's checks are not all done (a relaxation may pass it).
+    let mut verdict_wait = false;
     if !rules.verdicts.is_empty() {
         let v = need!(f.verdicts, Need::Verdicts);
         let failed: Vec<&str> = v
@@ -564,7 +582,25 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         }
         line.push_str(&format!(" local-build-pass-on-main-{}", short(main)));
         behind = 0;
-        ms = "CLEAN".into();
+        // The verdicts are in addition to GitHub's checks, not instead of them: every check
+        // has to be done and passed too (the merge bypasses the rulesets that would wait).
+        let open: Vec<&str> = checks
+            .iter()
+            .filter(|c| !c.passed())
+            .map(|c| c.name.as_str())
+            .collect();
+        if open.is_empty() && !checks.is_empty() {
+            ms = "CLEAN".into();
+        } else {
+            if checks.is_empty() {
+                line.push_str(" no-checks-yet");
+            } else {
+                line.push_str(&format!(" checks-not-done: {}", open.join(",")));
+            }
+            // Not merged as `CLEAN`, whatever GitHub says, unless a relaxation passes it.
+            verdict_wait = true;
+            ms = "CHECKS-NOT-DONE".into();
+        }
     }
     if behind != 0 {
         let mine = need!(f.mine, Need::CompareFiles);
@@ -583,7 +619,10 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     if behind != 0 {
         return Step::Update(line);
     }
-    if ms == "UNSTABLE" && rules.relax_configured() {
+    // `merge_by_admin` (a ruleset only admins pass, which the merge bypasses) leaves a pull
+    // request `BLOCKED` when nothing else holds it: `mergeable` says it would merge.
+    let ruleset_only = ms == "BLOCKED" && pr.mergeable == Some(true);
+    if (ms == "UNSTABLE" || ruleset_only || verdict_wait) && rules.relax_configured() {
         let files = need!(f.pr_files, Need::PrFiles);
         let checks = need!(f.checks, Need::Checks);
         let inside = files
@@ -601,6 +640,16 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         if inside && required_pass && optional_ok {
             line.push_str(" relaxed-paths-only:not-waiting-for-optional-checks");
             ms = "CLEAN".into();
+        }
+    }
+    if ms == "BLOCKED" && ruleset_only && !verdict_wait {
+        // The bypass no longer waits for checks: every one has to be done and passed.
+        let checks = need!(f.checks, Need::Checks);
+        if !checks.is_empty() && checks.iter().all(CheckRun::passed) {
+            line.push_str(" blocked-by-ruleset-only:checks-passed");
+            ms = "CLEAN".into();
+        } else if checks.is_empty() {
+            line.push_str(" no-checks-yet");
         }
     }
     if ms != "CLEAN" {
@@ -757,6 +806,29 @@ pub fn unresolved_threads(pages: &[Value]) -> u64 {
 /// The pull request as `pulls/N` gives it.
 pub async fn fetch_pr<G: Gh>(gh: &G, s: &Settings, repo: &str, number: u64) -> Result<Pr> {
     Pr::from_rest(&exec::get(gh, &format!("repos/{}/pulls/{number}", s.full(repo))).await?)
+}
+
+/// How many times, and how far apart, a merge GitHub reported done is looked for on the
+/// pull request, which may lag behind.
+const READ_BACK: (u32, std::time::Duration) = (5, std::time::Duration::from_secs(2));
+
+/// The pull request after a merge; when the merge was reported done, read again a few
+/// times until it shows merged.
+async fn read_back<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    repo: &str,
+    number: u64,
+    reported: bool,
+) -> Result<Pr> {
+    let mut pr = fetch_pr(gh, s, repo, number).await?;
+    let mut left = if reported { READ_BACK.0 } else { 0 };
+    while !pr.merged && left > 0 {
+        tokio::time::sleep(READ_BACK.1).await;
+        pr = fetch_pr(gh, s, repo, number).await?;
+        left -= 1;
+    }
+    Ok(pr)
 }
 
 /// The head of `main` of a repository.
@@ -1009,15 +1081,22 @@ pub async fn evaluate<G: Gh>(
                 if let Some(b) = bus {
                     progress::write(b, repo, number, &Progress::new(&f.pr.head, None)).await?;
                 }
-                let path = format!("repos/{}/pulls/{number}/merge", s.full(repo));
-                let res = exec::write(
+                // The lease as it is now, just confirmed: not as it was when the landing began.
+                let lease = match (lock, bus) {
+                    (Some(_), Some(b)) => Some(b.locks_max_age().await?),
+                    _ => None,
+                };
+                let until = merge::until(tokio::time::Instant::now(), opts.merge_until, lease);
+                let res = merge::merge(
                     gh,
-                    "PUT",
-                    &path,
-                    &[("merge_method", "merge"), ("sha", &f.pr.head)],
+                    &s.full(repo),
+                    number,
+                    &f.pr.head,
+                    until,
+                    merge::POLL_EVERY,
                 )
-                .await;
-                let after = fetch_pr(gh, s, repo, number).await?;
+                .await?;
+                let after = read_back(gh, s, repo, number, res == Merge::Merged).await?;
                 if after.merged {
                     let m = after.merge_commit.clone().unwrap_or_default();
                     if let Some(b) = bus {
@@ -1033,15 +1112,35 @@ pub async fn evaluate<G: Gh>(
                     o.merge_commit = Some(m);
                     return Ok(o);
                 }
+                let why = match res {
+                    Merge::Refused(why) => why,
+                    // Accepted and maybe still merging: the record stays, and a later
+                    // attempt finds the pull request merged or adopts the pending request.
+                    Merge::Pending(why) => {
+                        return Ok(Outcome::new(
+                            Kind::Wait,
+                            format!("{line} merge accepted, not done yet ({why}) WAIT"),
+                            true,
+                            &f.pr.head,
+                        ));
+                    }
+                    Merge::Merged => {
+                        return Ok(Outcome::new(
+                            Kind::Wait,
+                            format!("{line} merge reported done, pull request not merged yet WAIT"),
+                            true,
+                            &f.pr.head,
+                        ));
+                    }
+                };
                 if let Some(b) = bus
                     && let Err(e) = progress::delete(b, repo, number).await
                 {
                     eprintln!("{repo} #{number}: removing the landing record: {e}");
                 }
-                let why = res.err().map(|e| format!(" ({e})")).unwrap_or_default();
                 return Ok(Outcome::new(
                     Kind::Blocked,
-                    format!("{line} merge refused{why} BLOCKED"),
+                    format!("{line} merge refused ({why}) BLOCKED"),
                     false,
                     &f.pr.head,
                 ));
@@ -1681,19 +1780,114 @@ mod tests {
             "{}",
             o.line
         );
-        // All three pass and nothing failed: merged without waiting and without an update.
-        f.checks = Some(vec![CheckRun {
-            id: 1,
-            name: "lint".into(),
-            status: "queued".into(),
-            conclusion: None,
+        // All three pass and a GitHub check is still queued or running: wait for it (#60).
+        for status in ["queued", "in_progress"] {
+            f.checks = Some(vec![
+                run("lint", "completed", Some("success")),
+                run("test (ubuntu-latest)", status, None),
+            ]);
+            let o = outcome(&f, &r, &Opts::default());
+            assert_eq!((o.kind, o.retry), (Kind::Wait, true), "{}", o.line);
+            assert!(
+                o.line.contains("checks-not-done: test (ubuntu-latest)"),
+                "{}",
+                o.line
+            );
+        }
+        f.checks = Some(vec![]);
+        let o = outcome(&f, &r, &Opts::default());
+        assert!(
+            o.kind == Kind::Wait && o.line.contains("no-checks-yet"),
+            "{}",
+            o.line
+        );
+        // GitHub's own `CLEAN` does not override the wait.
+        let mut clean = f.clone();
+        clean.pr.mergeable_state = "CLEAN".into();
+        clean.checks = Some(vec![run("lint", "queued", None)]);
+        assert_eq!(outcome(&clean, &r, &Opts::default()).kind, Kind::Wait);
+        // Only relaxed paths, the required checks passed: the optional one is not waited on.
+        let mut relaxed = f.clone();
+        relaxed.pr_files = Some(vec![PrFile {
+            name: "runtime/cpp/x.cpp".into(),
+            status: "modified".into(),
         }]);
+        let mut checks: Vec<CheckRun> = ["lint", "test (ubuntu-latest)", "hgraph", "cpp"]
+            .iter()
+            .map(|n| run(n, "completed", Some("success")))
+            .collect();
+        checks.push(run("test (macos-latest)", "in_progress", None));
+        relaxed.checks = Some(checks);
+        assert!(
+            matches!(decide(&relaxed, REPO, HEAD, &r, &Opts::default()), Step::Merge(l) if l.contains("relaxed-paths-only")),
+            "{:?}",
+            decide(&relaxed, REPO, HEAD, &r, &Opts::default())
+        );
+        // Every check done and passed: merged without an update.
+        f.checks = Some(vec![
+            run("lint", "completed", Some("success")),
+            run("docs", "completed", Some("skipped")),
+        ]);
         match decide(&f, REPO, HEAD, &r, &Opts::default()) {
             Step::Merge(l) => assert!(
                 l.ends_with(&format!("local-build-pass-on-main-{}", short(MAIN))),
                 "{l}"
             ),
             s => panic!("{s:?}"),
+        }
+    }
+
+    fn run(name: &str, status: &str, conclusion: Option<&str>) -> CheckRun {
+        CheckRun {
+            id: 1,
+            name: name.into(),
+            status: status.into(),
+            conclusion: conclusion.map(String::from),
+        }
+    }
+
+    #[test]
+    fn blocked_by_the_ruleset_only() {
+        let mut f = allowed();
+        f.pr.mergeable_state = "BLOCKED".into();
+        f.pr.mergeable = Some(true);
+        let opts = Opts::default();
+        assert_eq!(
+            decide(&f, REPO, HEAD, &rules(), &opts),
+            Step::Need(Need::Checks)
+        );
+        let done = vec![
+            run("lint", "completed", Some("success")),
+            run("docs", "completed", Some("skipped")),
+        ];
+        f.checks = Some(done.clone());
+        assert!(
+            matches!(decide(&f, REPO, HEAD, &rules(), &opts), Step::Merge(l) if l.contains("blocked-by-ruleset-only:checks-passed")),
+            "{:?}",
+            decide(&f, REPO, HEAD, &rules(), &opts)
+        );
+        // A check queued or running: the bypass would not wait for it, so the gate does.
+        for status in ["queued", "in_progress"] {
+            let mut c = done.clone();
+            c.push(run("test (ubuntu-latest)", status, None));
+            f.checks = Some(c);
+            let o = outcome(&f, &rules(), &opts);
+            assert_eq!((o.kind, o.retry), (Kind::Wait, true), "{}", o.line);
+        }
+        // A failed check, or no checks yet.
+        let mut c = done.clone();
+        c.push(run("test (ubuntu-latest)", "completed", Some("failure")));
+        f.checks = Some(c);
+        assert_eq!(outcome(&f, &rules(), &opts).kind, Kind::Blocked);
+        f.checks = Some(vec![]);
+        let o = outcome(&f, &rules(), &opts);
+        assert_eq!(o.kind, Kind::Wait);
+        assert!(o.line.contains("no-checks-yet"), "{}", o.line);
+        // Not `mergeable` (or not known yet): blocked by something else, waited on.
+        for m in [None, Some(false)] {
+            f.pr.mergeable = m;
+            f.checks = Some(done.clone());
+            assert_eq!(outcome(&f, &rules(), &opts).kind, Kind::Wait);
         }
     }
 
@@ -1731,6 +1925,13 @@ mod tests {
         f.checks = Some(checks.clone());
         assert!(
             matches!(decide(&f, REPO, HEAD, &r, &Opts::default()), Step::Merge(l) if l.contains("relaxed-paths-only"))
+        );
+        // Under the ruleset alone (`BLOCKED`, mergeable) the relaxation holds as well.
+        let mut b = f.clone();
+        b.pr.mergeable_state = "BLOCKED".into();
+        b.pr.mergeable = Some(true);
+        assert!(
+            matches!(decide(&b, REPO, HEAD, &r, &Opts::default()), Step::Merge(l) if l.contains("relaxed-paths-only"))
         );
         // An optional check that failed, a required one missing, or a file outside: wait.
         let mut failed = checks.clone();
@@ -1790,9 +1991,11 @@ mod tests {
         assert_eq!(lines_matching(own, &rules().hygiene_lines), 0);
     }
 
+    const MERGED_ASYNC: &str = "{\"status\":\"merged\",\"details\":{\"message\":\"m\"}}";
+
     fn fake() -> FakeGh {
         FakeGh::default()
-            .on("pulls/7/merge", "{\"merged\":true}")
+            .on("pulls/7/merge-async", MERGED_ASYNC)
             .on("pulls/7/files", &fixture("pr-files.json"))
             .on("Accept: application/vnd.github.v3.diff", &fixture("pr.diff"))
             .on("issues/7/comments", &fixture("comments-clean.json"))
@@ -1846,16 +2049,22 @@ mod tests {
             Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed")
         );
         assert!(o.line.ends_with("-> MERGED 01e99ea5 MERGED"));
-        let merge = gh
+        let merges: Vec<String> = gh
             .calls()
             .into_iter()
-            .find(|c| c.contains("/merge"))
-            .unwrap();
-        assert!(
-            merge.contains("-X PUT")
-                && merge.contains(&format!("sha={HEAD}"))
-                && merge.contains("merge_method=merge")
+            .filter(|c| c.contains("/merge"))
+            .collect();
+        assert_eq!(
+            merges,
+            [format!(
+                "api -X PUT repos/{}/pulls/7/merge-async --input -",
+                s.full(REPO)
+            )]
         );
+        let (_, body) = gh.inputs.lock().unwrap()[0].clone();
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(body, merge::body(HEAD));
+        assert_eq!(body["bypass_rules"], Value::Bool(true));
         // A merged pull request is reported as such; a short head is refused before any call.
         let gh = fake().on("pulls/7", &fixture("pr-merged.json"));
         assert_eq!(
@@ -1891,6 +2100,97 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    /// The fake with the merge rules `first` answering before its own, and the pull
+    /// request's reads `prs` after them (a bare `pulls/7` would match its other reads).
+    fn fake_with(first: FakeGh, prs: &[&str]) -> FakeGh {
+        let rest = fake();
+        first
+            .rules
+            .lock()
+            .unwrap()
+            .extend(rest.rules.into_inner().unwrap());
+        let (last, once) = prs.split_last().unwrap();
+        once.iter()
+            .fold(first, |g, p| g.once("pulls/7", &fixture(p)))
+            .on("pulls/7", &fixture(last))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn evaluate_after_merge_async() {
+        let s = without_receipts(settings(), &[REPO]);
+        let s = &s;
+        let run = |gh: FakeGh, until: Option<tokio::time::Instant>| async move {
+            let o = Opts {
+                merge_until: until,
+                ..Opts::default()
+            };
+            let out = evaluate(&gh, s, None, REPO, 7, HEAD, &o, true, None)
+                .await
+                .unwrap();
+            (out, gh)
+        };
+        let pending = "{\"status\":\"pending\",\"details\":{\"uuid\":\"u-9\"}}";
+        // A transient poll failure, then merged; the pull request lags one read behind.
+        let gh = fake_with(
+            FakeGh::default()
+                .on("merge-async --input", pending)
+                .push_fail_once("merge-async/u-9", "gh: Server Error (HTTP 502)")
+                .on("merge-async/u-9", MERGED_ASYNC),
+            &["pr-open.json", "pr-open.json", "pr-merged.json"],
+        );
+        let (o, gh) = run(gh, None).await;
+        assert_eq!(o.kind, Kind::Merged, "{}", o.line);
+        let polls = gh.calls().iter().filter(|c| c.contains("u-9")).count();
+        assert_eq!(polls, 2);
+        // A landing whose gate waited past the lease's max age (30 min) before the merge:
+        // the bound comes from its deadline at the merge, so the poll still runs.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(50 * 60);
+        tokio::time::advance(std::time::Duration::from_secs(40 * 60)).await;
+        let gh = fake_with(
+            FakeGh::default()
+                .on("merge-async --input", pending)
+                .once("merge-async/u-9", pending)
+                .on("merge-async/u-9", MERGED_ASYNC),
+            &["pr-open.json", "pr-merged.json"],
+        );
+        let (o, gh) = run(gh, Some(deadline)).await;
+        assert_eq!(o.kind, Kind::Merged, "{}", o.line);
+        let polls = gh.calls().iter().filter(|c| c.contains("u-9")).count();
+        assert_eq!(polls, 2);
+        // Still pending at the deadline: a wait that a retry may change, not a refusal.
+        let gh = fake_with(
+            FakeGh::default().on("merge-async", pending),
+            &["pr-open.json"],
+        );
+        let until = tokio::time::Instant::now() + std::time::Duration::from_secs(7);
+        let (o, _) = run(gh, Some(until)).await;
+        assert_eq!((o.kind, o.retry), (Kind::Wait, true), "{}", o.line);
+        assert!(
+            o.line.contains("merge accepted, not done yet"),
+            "{}",
+            o.line
+        );
+        assert_eq!(
+            tokio::time::Instant::now(),
+            until,
+            "polled up to the deadline"
+        );
+        // Failed: refused.
+        let gh = fake_with(
+            FakeGh::default().on(
+                "merge-async",
+                "{\"status\":\"failed\",\"details\":{\"message\":\"conflict\"}}",
+            ),
+            &["pr-open.json"],
+        );
+        let (o, _) = run(gh, None).await;
+        assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+        assert!(
+            o.line
+                .contains("merge refused (asynchronous merge failed: conflict)")
         );
     }
 

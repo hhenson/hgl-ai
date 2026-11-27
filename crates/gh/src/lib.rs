@@ -26,6 +26,7 @@ pub mod exec;
 pub mod gate;
 pub mod land;
 pub mod lock;
+pub mod merge;
 pub mod pins;
 pub mod progress;
 pub mod release;
