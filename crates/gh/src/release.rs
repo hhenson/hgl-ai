@@ -1,15 +1,16 @@
-//! `gh release watch SHA`: hold the repository's landing lock while every workflow run on
-//! the commit (of one event, `push` by default) finishes, so `main` does not move under a
-//! release. Prints each run and the jobs of the release workflows; the last line is
-//! `ALL GREEN on <sha8>` or `NOT ALL GREEN on <sha8>`.
+//! `gh release watch SHA`: hold the repository's landing lock (the hub lease of
+//! [`crate::lock`]) while every workflow run on the commit (of one event, `push` by default)
+//! finishes, so `main` does not move under a release. Prints each run and the jobs of the
+//! release workflows; the last line is `ALL GREEN on <sha8>` or `NOT ALL GREEN on <sha8>`.
 
 use std::time::{Duration, Instant};
 
+use hgl_ai_bus::Bus;
 use serde_json::Value;
 
 use crate::exec::{self, Gh};
-use crate::lock::Lock;
-use crate::{Result, Settings, short};
+use crate::lock::{LandLock, holder};
+use crate::{Result, Settings, invalid, short};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Run {
@@ -140,19 +141,37 @@ pub struct WatchOpts {
     pub dry_run: bool,
 }
 
-/// Watch the runs on `sha`; the report and whether all are green.
+/// Watch the runs on `sha`, under the landing lock unless a dry run; the report and
+/// whether all are green.
 pub async fn watch<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: Option<&Bus>,
+    sha: &str,
+    o: &WatchOpts,
+) -> Result<(String, bool)> {
+    hgl_ai_proto::check_head(sha)?;
+    let lock = match bus {
+        _ if o.dry_run => None,
+        Some(bus) => {
+            let who = holder(s, &format!("release watch {}", short(sha)));
+            Some(LandLock::acquire(bus, &o.repo, &who, o.lock_wait).await?)
+        }
+        None => return Err(invalid("release watch takes the landing lock on the hub")),
+    };
+    let watched = watch_runs(gh, s, sha, o).await;
+    if let Some(lock) = lock {
+        lock.release().await;
+    }
+    watched
+}
+
+async fn watch_runs<G: Gh>(
     gh: &G,
     s: &Settings,
     sha: &str,
     o: &WatchOpts,
 ) -> Result<(String, bool)> {
-    hgl_ai_proto::check_head(sha)?;
-    let _lock = if o.dry_run {
-        None
-    } else {
-        Some(Lock::acquire(&s.lock_path(&o.repo), o.lock_wait).await?)
-    };
     let path = format!(
         "repos/{}/actions/runs?head_sha={sha}&event={}&per_page=50",
         s.full(&o.repo),

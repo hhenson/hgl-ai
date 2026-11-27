@@ -639,7 +639,6 @@ dependencies = [
  "hgl-ai-bus",
  "hgl-ai-config",
  "hgl-ai-proto",
- "libc",
  "regex",
  "serde",
  "serde_json",

@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_config::Config;
-use hgl_ai_proto::{KV_HOSTS, KV_STATE, KV_TREES, STREAM_NOTES};
+use hgl_ai_proto::{KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES, STREAM_NOTES};
 
 pub trait Hub {
     /// Connect with the host configuration (client install).
@@ -29,7 +29,7 @@ impl Hub for BusHub {
     }
 
     /// Read-only: the bus API has no existence check that does not create, so
-    /// this looks the four objects up directly.
+    /// this looks the five objects up directly.
     async fn health(&self, cfg: &Config) -> Result<Vec<String>, String> {
         let path = cfg.token_file().map_err(|e| e.to_string())?;
         let token = std::fs::read_to_string(&path)
@@ -44,7 +44,7 @@ impl Hub for BusHub {
         if js.get_stream(STREAM_NOTES).await.is_err() {
             missing.push(STREAM_NOTES.to_string());
         }
-        for b in [KV_STATE, KV_HOSTS, KV_TREES] {
+        for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS] {
             if js.get_key_value(b).await.is_err() {
                 missing.push(b.to_string());
             }
@@ -167,7 +167,10 @@ mod live {
         cfg.hub.token_file = tok_file.display().to_string();
 
         let missing = BusHub.health(&cfg).await.unwrap();
-        assert_eq!(missing, [STREAM_NOTES, KV_STATE, KV_HOSTS, KV_TREES]);
+        assert_eq!(
+            missing,
+            [STREAM_NOTES, KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS]
+        );
 
         let client = async_nats::ConnectOptions::with_token(token.clone())
             .connect(cfg.hub.url.as_str())
@@ -181,7 +184,7 @@ mod live {
         })
         .await
         .unwrap();
-        for b in [KV_STATE, KV_HOSTS, KV_TREES] {
+        for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS] {
             js.create_key_value(async_nats::jetstream::kv::Config {
                 bucket: b.into(),
                 ..Default::default()

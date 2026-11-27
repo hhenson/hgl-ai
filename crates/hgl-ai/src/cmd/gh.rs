@@ -411,9 +411,10 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 dry_run,
             };
             let (text, green) = if dry_run {
-                release::watch(&ReadOnly(gh), &s, &sha, &o).await
+                release::watch(&ReadOnly(gh), &s, None, &sha, &o).await
             } else {
-                release::watch(&gh, &s, &sha, &o).await
+                let bus = Bus::connect(&cfg).await?;
+                release::watch(&gh, &s, Some(&bus), &sha, &o).await
             }
             .map_err(lift)?;
             print!("{text}");

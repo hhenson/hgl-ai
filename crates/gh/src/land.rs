@@ -1,9 +1,10 @@
-//! `gh land REPO PR HEAD`: one landing at a time per repository (the landing lock). The gate
-//! runs until it merges or refuses for good: it is tried again while it waits for checks, a
-//! review or an update. After the merge: `landed.log` and `main` (docs/protocol.md §8), the
-//! `landed` notes (to the author's seat and to `all`; the bridges remove the task's
-//! worktrees on them), one GitHub comment for the note (PROTO-1), then the wrapper's pins
-//! when the repository is one they follow (ROLE-10).
+//! `gh land REPO PR HEAD`: one landing at a time per repository, on any host (the landing
+//! lock, a hub lease: [`crate::lock`]). The gate runs until it merges or refuses for good: it
+//! is tried again while it waits for checks, a review or an update. After the merge, still
+//! under the lock: `landed.log` and `main` (docs/protocol.md §8), the `landed` notes (to the
+//! author's seat and to `all`; the bridges remove the task's worktrees on them), one GitHub
+//! comment for the note (PROTO-1). Then, without it, the wrapper's pins when the repository
+//! is one they follow (ROLE-10).
 
 use std::time::{Duration, Instant};
 
@@ -13,7 +14,7 @@ use hgl_ai_proto::{Kind as NoteKind, Note, Seat, utc_now_stamp};
 use crate::bot::{Comment, ready_signers};
 use crate::exec::{self, Gh};
 use crate::gate::{self, Kind, Opts, Outcome};
-use crate::lock::Lock;
+use crate::lock::{LandLock, holder};
 use crate::table::{self, TableWord, hold_active};
 use crate::{Error, Result, Settings, pins, short, state, store};
 
@@ -146,14 +147,48 @@ pub async fn land<G: Gh>(
     o: &LandOpts,
 ) -> Result<Landing> {
     hgl_ai_proto::check_head(head)?;
-    let lock = Lock::acquire(&s.lock_path(repo), o.lock_wait).await?;
+    let who = holder(s, &format!("land {repo}#{number}"));
+    let lock = LandLock::acquire(bus, repo, &who, o.lock_wait).await?;
+    let held = land_locked(gh, s, bus, repo, number, head, o).await;
+    lock.release().await;
+    let (Landing { outcome, mut after }, what) = held?;
+    if outcome.kind != Kind::Merged {
+        return Ok(Landing { outcome, after });
+    }
+    if o.sync_pins && s.pin_sources().contains(&repo) {
+        let what = format!("{what} ({}#{number})", s.full(repo));
+        let po = pins::PinOpts {
+            what,
+            trailer: o.trailer.clone(),
+            footer: o.footer.clone(),
+            ..pins::PinOpts::default()
+        };
+        // Boxed: a pin pull request is landed by `land` itself.
+        after.push(
+            Box::pin(pins::sync(gh, s, Some(bus), &po, false))
+                .await?
+                .line(),
+        );
+    }
+    Ok(Landing { outcome, after })
+}
+
+/// `land` under the landing lock: the gate until it decides, and after a merge the records,
+/// notes and comment; also returns what `main` gained.
+async fn land_locked<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: &Bus,
+    repo: &str,
+    number: u64,
+    head: &str,
+    o: &LandOpts,
+) -> Result<(Landing, String)> {
     let deadline = Instant::now() + o.timeout;
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
     {
-        return Ok(Landing {
-            outcome,
-            after: Vec::new(),
-        });
+        let after = Vec::new();
+        return Ok((Landing { outcome, after }, String::new()));
     }
     let mut shown = String::new();
     let outcome = loop {
@@ -177,33 +212,16 @@ pub async fn land<G: Gh>(
         tokio::time::sleep(o.interval).await;
     };
     if outcome.kind != Kind::Merged {
-        return Ok(Landing {
-            outcome,
-            after: Vec::new(),
-        });
+        let after = Vec::new();
+        return Ok((Landing { outcome, after }, String::new()));
     }
-    let (mut after, what) = after_merge(gh, s, bus, repo, number, &outcome, o).await?;
-    drop(lock);
-    if o.sync_pins && s.pin_sources().contains(&repo) {
-        let what = format!("{what} ({}#{number})", s.full(repo));
-        let po = pins::PinOpts {
-            what,
-            trailer: o.trailer.clone(),
-            footer: o.footer.clone(),
-            ..pins::PinOpts::default()
-        };
-        // Boxed: a pin pull request is landed by `land` itself.
-        after.push(
-            Box::pin(pins::sync(gh, s, Some(bus), &po, false))
-                .await?
-                .line(),
-        );
-    }
-    Ok(Landing { outcome, after })
+    let (after, what) = after_merge(gh, s, bus, repo, number, &outcome, o).await?;
+    Ok((Landing { outcome, after }, what))
 }
 
 /// One gate attempt under the landing lock (`gh merge-if-clean`), and after a merge the same
-/// records, notes and comment as `land`; the pins are left to `gh pins sync` or `gh land`.
+/// records, notes and comment as `land`, still under the lock; the pins are left to
+/// `gh pins sync` or `gh land`.
 pub async fn merge_once<G: Gh>(
     gh: &G,
     s: &Settings,
@@ -214,7 +232,22 @@ pub async fn merge_once<G: Gh>(
     o: &LandOpts,
 ) -> Result<Landing> {
     hgl_ai_proto::check_head(head)?;
-    let _lock = Lock::acquire(&s.lock_path(repo), o.lock_wait).await?;
+    let who = holder(s, &format!("merge-if-clean {repo}#{number}"));
+    let lock = LandLock::acquire(bus, repo, &who, o.lock_wait).await?;
+    let held = merge_locked(gh, s, bus, repo, number, head, o).await;
+    lock.release().await;
+    held
+}
+
+async fn merge_locked<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: &Bus,
+    repo: &str,
+    number: u64,
+    head: &str,
+    o: &LandOpts,
+) -> Result<Landing> {
     let outcome = gate::evaluate(gh, s, Some(bus), repo, number, head, &o.gate, true).await?;
     if outcome.kind != Kind::Merged {
         return Ok(Landing {

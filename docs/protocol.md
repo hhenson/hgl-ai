@@ -48,6 +48,7 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
 | State | KV `HGL_STATE` | file storage, history 5 |
 | Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
 | Trees | KV `HGL_TREES` | file storage, history 1 |
+| Locks | KV `HGL_LOCKS` | file storage, history 1, `max_age` 30 min |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
   broadcast address. A seat is a logical address; the runtime and model bound
@@ -172,6 +173,12 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.
+
+`HGL_LOCKS` holds leases, `{"holder", "acquired_at"}`, created only if absent,
+rewritten every minute while held, deleted by their holder; one not rewritten
+within `max_age` expires. `lock.land.<repo>` is the landing lock: `gh land`,
+`gh merge-if-clean` and `gh release watch` hold it from before the gate until
+the merge, `landed.log`, `main` and the `landed` notes are done.
 
 ## 9. Host record
 

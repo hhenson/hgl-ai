@@ -161,7 +161,7 @@ fn notes_send_wait_peek() {
     };
     assert_eq!(
         ok(&hub.run(&["init"])),
-        "provisioned HGL_NOTES HGL_STATE HGL_HOSTS HGL_TREES\n"
+        "provisioned HGL_NOTES HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS\n"
     );
     ok(&hub.run(&["init"]));
 

@@ -11,10 +11,15 @@
 //!   [`Delivery`] values that the receiver must [`ack`](Delivery::ack),
 //!   [`nak`](Delivery::nak) or keep alive with
 //!   [`in_progress`](Delivery::in_progress) (PROTO-8).
-//! - `state_*`, `host*` and `tree*` read and write the three KV buckets.
-//!   Writers of shared keys (`prs`, `main`, `landed.log`) use the
-//!   compare-and-set calls [`Bus::state_create`], [`Bus::state_update`] and
-//!   [`Bus::append_line`]; [`Bus::state_put`] is the explicit blind write.
+//! - `state_*`, `host*` and `tree*` read and write the `HGL_STATE`, `HGL_HOSTS`
+//!   and `HGL_TREES` buckets. Writers of shared keys (`prs`, `main`,
+//!   `landed.log`) use the compare-and-set calls [`Bus::state_create`],
+//!   [`Bus::state_update`] and [`Bus::append_line`]; [`Bus::state_put`] is the
+//!   explicit blind write.
+//! - [`Bus::lock_acquire`] takes a lease in `HGL_LOCKS` (create-if-absent, so
+//!   one holder on any host); the holder keeps it with [`Lease::refresh`] and
+//!   gives it up with [`Lease::release`]. A lease not refreshed within the
+//!   bucket's `max_age` expires, so a dead holder does not keep it.
 //! - Every read is bounded: a note payload over [`MAX_NOTE_BYTES`] is refused
 //!   on send and terminated on receipt; buckets refuse values over
 //!   [`MAX_VALUE_BYTES`].
@@ -31,8 +36,8 @@ use async_nats::jetstream::{self, AckKind, context::Publish, kv, stream};
 use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
-    BROADCAST, HostRecord, KV_HOSTS, KV_STATE, KV_TREES, Note, STREAM_NOTES, SUBJECT_PREFIX, Seat,
-    TreeRecord,
+    BROADCAST, HostRecord, KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES, LockRecord, Note, STREAM_NOTES,
+    SUBJECT_PREFIX, Seat, TreeRecord, utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -55,6 +60,16 @@ pub enum BusError {
     /// (`expected == 0`: the key already exists).
     #[error("{}", conflict_text(key, *expected))]
     Conflict { key: String, expected: u64 },
+    /// [`Bus::lock_acquire`]: someone else holds the lease.
+    #[error("{name} is held by {holder} since {since}")]
+    Held {
+        name: String,
+        holder: String,
+        since: String,
+    },
+    /// [`Lease::refresh`]: the lease expired or another holder took it.
+    #[error("the lease {name} is no longer ours (it expired or was taken)")]
+    LeaseLost { name: String },
     #[error("{0}")]
     Nats(String),
 }
@@ -79,6 +94,8 @@ pub const STATE_HISTORY: i64 = 5;
 pub const HOSTS_TTL: Duration = Duration::from_secs(120);
 /// Revisions kept per `HGL_TREES` key.
 pub const TREES_HISTORY: i64 = 1;
+/// A lease in `HGL_LOCKS` expires this long after its last write (§3).
+pub const LOCKS_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 /// Inbox `ack_wait` (§3); the bridge extends it with `in_progress` (PROTO-8).
 pub const INBOX_ACK_WAIT: Duration = Duration::from_secs(300);
 /// Inbox `max_deliver` (§3).
@@ -130,6 +147,21 @@ impl Default for InboxOptions {
     }
 }
 
+/// Provisioning settings. [`Default`] is the protocol's (§3); a short
+/// `locks_max_age` is for tests of lease expiry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProvisionOptions {
+    pub locks_max_age: Duration,
+}
+
+impl Default for ProvisionOptions {
+    fn default() -> Self {
+        ProvisionOptions {
+            locks_max_age: LOCKS_MAX_AGE,
+        }
+    }
+}
+
 /// Read a hub token file: the contents with surrounding whitespace trimmed,
 /// or `None` when the file is empty.
 pub fn read_token(path: &Path) -> Result<Option<String>> {
@@ -149,6 +181,7 @@ pub struct Bus {
     state: OnceCell<kv::Store>,
     hosts: OnceCell<kv::Store>,
     trees: OnceCell<kv::Store>,
+    locks: OnceCell<kv::Store>,
 }
 
 impl Bus {
@@ -182,6 +215,7 @@ impl Bus {
             state: OnceCell::new(),
             hosts: OnceCell::new(),
             trees: OnceCell::new(),
+            locks: OnceCell::new(),
         })
     }
 
@@ -200,6 +234,11 @@ impl Bus {
 
     /// Create the stream and buckets, or update them to match §3 (idempotent).
     pub async fn provision(&self) -> Result<()> {
+        self.provision_with(ProvisionOptions::default()).await
+    }
+
+    /// [`Bus::provision`] with explicit settings.
+    pub async fn provision_with(&self, opts: ProvisionOptions) -> Result<()> {
         self.js
             .create_or_update_stream(stream::Config {
                 name: STREAM_NOTES.to_string(),
@@ -237,6 +276,13 @@ impl Bus {
                 stream::StorageType::File,
                 TREES_HISTORY,
                 Duration::ZERO,
+            ),
+            (
+                KV_LOCKS,
+                "hgl-ai leases",
+                stream::StorageType::File,
+                1,
+                opts.locks_max_age,
             ),
         ];
         for (bucket, description, storage, history, max_age) in buckets {
@@ -510,6 +556,44 @@ impl Bus {
         list_json(store).await
     }
 
+    /// Take the lease `name` for `holder` if nobody holds it (create-if-absent: of
+    /// concurrent callers on any host, one wins). Fails with [`BusError::Held`], naming
+    /// the holder, when it is held. The caller refreshes it well within the bucket's
+    /// `max_age` and releases it when done.
+    pub async fn lock_acquire(&self, name: &str, holder: &str) -> Result<Lease> {
+        check_kv_key(name)?;
+        let store = self.store(&self.locks, KV_LOCKS).await?;
+        let record = LockRecord {
+            holder: holder.to_string(),
+            acquired_at: utc_now_stamp(),
+        };
+        let value: bytes::Bytes = serde_json::to_vec(&record)
+            .map_err(|e| nats(&format!("encoding lease {name}"), e))?
+            .into();
+        match store.create(name, value.clone()).await {
+            Ok(revision) => Ok(Lease {
+                store: store.clone(),
+                name: name.to_string(),
+                record,
+                value,
+                revision,
+            }),
+            Err(e) if e.kind() == kv::CreateErrorKind::AlreadyExists => {
+                let held = live_entry(store, name)
+                    .await?
+                    .and_then(|e| serde_json::from_slice::<LockRecord>(&e.value).ok());
+                Err(BusError::Held {
+                    name: name.to_string(),
+                    holder: held
+                        .as_ref()
+                        .map_or_else(|| "another holder".to_string(), |r| r.holder.clone()),
+                    since: held.map_or_else(|| "just now".to_string(), |r| r.acquired_at),
+                })
+            }
+            Err(e) => Err(nats(&format!("taking lease {name}"), e)),
+        }
+    }
+
     async fn store<'a>(
         &self,
         cell: &'a OnceCell<kv::Store>,
@@ -720,6 +804,66 @@ impl Delivery {
         let ctx = || format!("{what} note {}", self.seq);
         h.msg.ack_with(kind).await.map_err(|e| nats(&ctx(), e))?;
         h.client.flush().await.map_err(|e| nats(&ctx(), e))
+    }
+}
+
+/// A lease in `HGL_LOCKS`, from [`Bus::lock_acquire`]. Dropping it releases nothing:
+/// call [`Lease::release`], or the lease expires after the bucket's `max_age`.
+pub struct Lease {
+    store: kv::Store,
+    name: String,
+    record: LockRecord,
+    value: bytes::Bytes,
+    revision: u64,
+}
+
+impl Lease {
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub fn record(&self) -> &LockRecord {
+        &self.record
+    }
+
+    /// The revision of the lease's last write.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
+    /// Write the lease again at its revision (compare-and-set), so it lives another
+    /// `max_age`. Fails with [`BusError::LeaseLost`] when it expired or was taken.
+    pub async fn refresh(&mut self) -> Result<()> {
+        match self
+            .store
+            .update(&self.name, self.value.clone(), self.revision)
+            .await
+        {
+            Ok(revision) => {
+                self.revision = revision;
+                Ok(())
+            }
+            Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision => {
+                Err(BusError::LeaseLost {
+                    name: self.name.clone(),
+                })
+            }
+            Err(e) => Err(nats(&format!("refreshing lease {}", self.name), e)),
+        }
+    }
+
+    /// Delete the lease if it is still at our revision. `false`: it was no longer ours
+    /// (it expired, and perhaps another holder took it), so nothing was deleted.
+    pub async fn release(self) -> Result<bool> {
+        match self
+            .store
+            .purge_expect_revision(&self.name, Some(self.revision))
+            .await
+        {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision => Ok(false),
+            Err(e) => Err(nats(&format!("releasing lease {}", self.name), e)),
+        }
     }
 }
 

@@ -5,14 +5,15 @@
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use hgl_ai_bus::Bus;
+use hgl_ai_bus::{Bus, ProvisionOptions};
 use hgl_ai_proto::{Kind, Seat};
 
 use crate::coord::{self, CoordOpts};
 use crate::exec::fake::FakeGh;
+use crate::lock::LandLock;
 use crate::table::Table;
 use crate::testutil::{fixture, settings};
-use crate::{land, state, store};
+use crate::{Error, land, state, store};
 
 struct Hub {
     child: Child,
@@ -206,4 +207,122 @@ async fn a_landing_is_recorded() {
     assert!(main.starts_with("updated "), "{main}");
     assert!(main.contains("alpha main cccccccccccccccccccccccccccccccccccccccc\n"));
     assert!(main.contains("hgl-project pins hgl_spec 5555555555555555555555555555555555555555\n"));
+}
+
+const HEAD: &str = "1f461fa77bba922fe81383df4c475feb58b7c233";
+
+fn locked(r: Result<LandLock, Error>) -> String {
+    match r {
+        Err(Error::Locked(m)) => m,
+        Err(e) => panic!("not Locked: {e}"),
+        Ok(l) => panic!("acquired {}", l.name()),
+    }
+}
+
+/// The landing lock is the hub's, so two connections (two hosts) exclude each other; it is
+/// released after a landing however the landing ends.
+#[tokio::test]
+async fn the_landing_lock_excludes_across_connections() {
+    let Some(h) = hub() else { return };
+    let (a, b) = (bus(&h).await, bus(&h).await);
+    let one = LandLock::acquire(&a, "alpha", "build-1 pid 1 (land alpha#7)", Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(one.name(), "lock.land.alpha");
+    let m = locked(LandLock::acquire(&b, "alpha", "build-2", Duration::ZERO).await);
+    assert!(
+        m.contains("lock.land.alpha is held by build-1 pid 1 (land alpha#7)"),
+        "{m}"
+    );
+    // Another repository's lock is free.
+    LandLock::acquire(&b, "beta", "build-2", Duration::ZERO)
+        .await
+        .unwrap()
+        .release()
+        .await;
+    // A waiter gets it once the holder releases.
+    let waiter = tokio::spawn(async move {
+        let l = LandLock::acquire(&b, "alpha", "build-2", Duration::from_secs(20)).await;
+        (l.map(|l| l.name().to_string()), b)
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    one.release().await;
+    let (got, b) = waiter.await.unwrap();
+    assert_eq!(got.unwrap(), "lock.land.alpha");
+
+    // The waiter's guard was dropped without `release`: the lease still goes.
+    let end = Instant::now() + Duration::from_secs(10);
+    let again = loop {
+        match LandLock::acquire(&a, "alpha", "build-1", Duration::ZERO).await {
+            Ok(l) => break l,
+            Err(Error::Locked(_)) if Instant::now() < end => {
+                tokio::time::sleep(Duration::from_millis(100)).await
+            }
+            Err(e) => panic!("{e}"),
+        }
+    };
+
+    // `merge-if-clean` is refused before any GitHub call while another landing holds it.
+    let s = settings();
+    let gh = FakeGh::default();
+    let o = land::LandOpts::default();
+    let r = land::merge_once(
+        &gh,
+        &s,
+        &b,
+        "alpha",
+        7,
+        HEAD,
+        &land::LandOpts {
+            lock_wait: Duration::ZERO,
+            ..o.clone()
+        },
+    )
+    .await;
+    assert!(matches!(r, Err(Error::Locked(_))), "{:?}", r.err());
+    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    again.release().await;
+
+    // A landing that fails part way releases the lock before it returns.
+    let r = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o).await;
+    assert!(matches!(r, Err(Error::Command { .. })), "{:?}", r.err());
+    assert!(!gh.calls().is_empty());
+    LandLock::acquire(&a, "alpha", "build-1", Duration::ZERO)
+        .await
+        .expect("released after the failed landing")
+        .release()
+        .await;
+}
+
+/// A held lock is refreshed in the background, so it outlives the bucket's `max_age`.
+#[tokio::test]
+async fn a_held_landing_lock_is_refreshed() {
+    let Some(h) = hub() else { return };
+    let a = Bus::connect_url(&h.url, None).await.unwrap();
+    a.provision_with(ProvisionOptions {
+        locks_max_age: Duration::from_secs(1),
+    })
+    .await
+    .unwrap();
+    let b = Bus::connect_url(&h.url, None).await.unwrap();
+    let held = LandLock::acquire_every(
+        &a,
+        "lock.land.alpha",
+        "build-1",
+        Duration::ZERO,
+        Duration::from_millis(200),
+    )
+    .await
+    .unwrap();
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(3) {
+        locked(LandLock::acquire(&b, "alpha", "build-2", Duration::ZERO).await);
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    held.release().await;
+    LandLock::acquire(&b, "alpha", "build-2", Duration::ZERO)
+        .await
+        .unwrap()
+        .release()
+        .await;
 }

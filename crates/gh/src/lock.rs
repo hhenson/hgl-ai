@@ -1,82 +1,122 @@
-//! The landing lock: one landing (or release watch) per repository at a time on the
-//! controller's host. An advisory `flock` on `<data_dir>/gh/land-<repo>.lock`, so it is
-//! released when the holder exits, however it exits.
+//! The landing lock: one landing (or release watch) per repository at a time, on any host.
+//! A lease on the hub, `HGL_LOCKS/lock.land.<repo>` (docs/protocol.md §3, §8): taken by
+//! create-if-absent, refreshed every [`REFRESH`] while held, released when the work is done.
+//! A holder that dies stops refreshing, and the lease expires after the bucket's `max_age`.
 
-use std::fs::File;
-use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use crate::{Error, Result, io_err};
+use hgl_ai_bus::{Bus, BusError, Lease};
+use hgl_ai_proto::land_lock_key;
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
 
-pub struct Lock {
-    _file: File,
-    pub path: PathBuf,
+use crate::{Error, Result, Settings};
+
+/// How often a held lease is written again; well within the bucket's `max_age`.
+pub const REFRESH: Duration = Duration::from_secs(60);
+/// Between attempts while another holder has it.
+const POLL: Duration = Duration::from_secs(2);
+
+/// A held landing lock. Call [`LandLock::release`] when done; dropping it releases the
+/// lease in the background, which a process about to exit may not finish.
+pub struct LandLock {
+    name: String,
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
 }
 
-#[cfg(unix)]
-fn try_flock(f: &File) -> std::io::Result<bool> {
-    use std::os::fd::AsRawFd;
-    // SAFETY: `flock` on a descriptor this process owns for the call's duration.
-    let r = unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if r == 0 {
-        return Ok(true);
+/// `<host> pid <pid> (<what>)`: who holds a lock, as a refused acquirer is told.
+pub fn holder(s: &Settings, what: &str) -> String {
+    format!("{} pid {} ({what})", s.host, std::process::id())
+}
+
+impl LandLock {
+    /// Take `lock.land.<repo>`, waiting at most `wait` while another holder has it.
+    pub async fn acquire(bus: &Bus, repo: &str, holder: &str, wait: Duration) -> Result<LandLock> {
+        Self::acquire_every(bus, &land_lock_key(repo), holder, wait, REFRESH).await
     }
-    let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
-        Ok(false)
-    } else {
-        Err(e)
-    }
-}
 
-#[cfg(not(unix))]
-fn try_flock(_f: &File) -> std::io::Result<bool> {
-    Ok(true)
-}
-
-impl Lock {
-    /// Take the lock at `path`, waiting at most `wait`.
-    pub async fn acquire(path: &Path, wait: Duration) -> Result<Lock> {
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(io_err(format!("creating {}", dir.display())))?;
-        }
-        let file = File::options()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(path)
-            .map_err(io_err(format!("opening {}", path.display())))?;
+    pub(crate) async fn acquire_every(
+        bus: &Bus,
+        name: &str,
+        holder: &str,
+        wait: Duration,
+        refresh: Duration,
+    ) -> Result<LandLock> {
         let start = Instant::now();
-        loop {
-            if try_flock(&file).map_err(io_err(format!("locking {}", path.display())))? {
-                return Ok(Lock {
-                    _file: file,
-                    path: path.to_path_buf(),
-                });
+        let mut told = false;
+        let lease = loop {
+            match bus.lock_acquire(name, holder).await {
+                Ok(l) => break l,
+                Err(e @ BusError::Held { .. }) => {
+                    if start.elapsed() + POLL > wait {
+                        return Err(Error::Locked(format!("{e} (waited {wait:?})")));
+                    }
+                    if !told {
+                        eprintln!("{e}; waiting up to {wait:?}");
+                        told = true;
+                    }
+                    tokio::time::sleep(POLL).await;
+                }
+                Err(e) => return Err(e.into()),
             }
-            if start.elapsed() >= wait {
-                return Err(Error::Locked(format!(
-                    "another landing holds {} (waited {wait:?})",
-                    path.display()
-                )));
-            }
-            tokio::time::sleep(Duration::from_millis(500)).await;
+        };
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(keep(lease, refresh, stopped));
+        Ok(LandLock {
+            name: name.to_string(),
+            stop: Some(stop),
+            task: Some(task),
+        })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Stop refreshing and delete the lease if it is still ours; returns once the hub has
+    /// answered.
+    pub async fn release(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
         }
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+impl Drop for LandLock {
+    fn drop(&mut self) {
+        // Dropping the sender wakes the refresher, which then releases the lease.
+        self.stop.take();
+    }
+}
 
-    #[tokio::test]
-    async fn one_holder_at_a_time() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("gh/land-x.lock");
-        let a = Lock::acquire(&p, Duration::ZERO).await.unwrap();
-        #[cfg(unix)]
-        assert!(Lock::acquire(&p, Duration::from_millis(600)).await.is_err());
-        drop(a);
-        assert!(Lock::acquire(&p, Duration::ZERO).await.is_ok());
+/// Refresh `lease` every `every` until told to stop (or the guard is dropped), then
+/// release it. A lost lease is reported and no longer refreshed.
+async fn keep(mut lease: Lease, every: Duration, mut stopped: oneshot::Receiver<()>) {
+    let mut lost = false;
+    loop {
+        tokio::select! {
+            _ = &mut stopped => break,
+            _ = tokio::time::sleep(every), if !lost => match lease.refresh().await {
+                Ok(()) => {}
+                Err(e @ BusError::LeaseLost { .. }) => {
+                    eprintln!("warning: {e}; another landing may start");
+                    lost = true;
+                }
+                Err(e) => eprintln!("warning: refreshing {}: {e}; trying again", lease.name()),
+            },
+        }
+    }
+    if lost {
+        return;
+    }
+    let name = lease.name().to_string();
+    match lease.release().await {
+        Ok(true) => {}
+        Ok(false) => eprintln!("warning: {name} was no longer ours at release"),
+        Err(e) => eprintln!("warning: releasing {name}: {e}; it expires on its own"),
     }
 }

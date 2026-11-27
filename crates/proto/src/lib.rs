@@ -17,6 +17,7 @@ pub const SUBJECT_PREFIX: &str = "hgl.notes";
 pub const KV_STATE: &str = "HGL_STATE";
 pub const KV_HOSTS: &str = "HGL_HOSTS";
 pub const KV_TREES: &str = "HGL_TREES";
+pub const KV_LOCKS: &str = "HGL_LOCKS";
 /// The broadcast seat (PROTO-7).
 pub const BROADCAST: &str = "all";
 
@@ -404,6 +405,20 @@ pub fn tree_key(host: &str, seat: &Seat, task: &TaskKey, review: bool) -> String
     format!("{host}.{seat}.{}-{}{suffix}", task.repo, task.issue)
 }
 
+/// `HGL_LOCKS/<name>`: a lease, held until released or until it is not refreshed
+/// within the bucket's `max_age` (§3).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LockRecord {
+    /// Who holds it: host label, process and purpose.
+    pub holder: String,
+    pub acquired_at: String,
+}
+
+/// The landing lock of `repo` (§8): one landing or release watch at a time, on any host.
+pub fn land_lock_key(repo: &str) -> String {
+    format!("lock.land.{repo}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -536,5 +551,6 @@ mod tests {
             tree_key("build-1", &seat("r1"), &t, true),
             "build-1.r1.hgl-compiler-992-review"
         );
+        assert_eq!(land_lock_key("hgl-compiler"), "lock.land.hgl-compiler");
     }
 }

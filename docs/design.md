@@ -12,14 +12,14 @@ no GitHub or git library.
 
 | Crate | Owns | Depends on |
 | --- | --- | --- |
-| `proto` | Note, kinds, receipts, host and tree records, name and key validation, message ids. No I/O. | — |
+| `proto` | Note, kinds, receipts, host, tree and lock records, name and key validation, message ids. No I/O. | — |
 | `config` | `config.toml` schema, defaults, path expansion, load and save. | `proto` |
-| `bus` | NATS connection, provisioning, send, inbox fetch, ack/nak/in-progress, KV. | `proto`, `config` |
+| `bus` | NATS connection, provisioning, send, inbox fetch, ack/nak/in-progress, KV, leases. | `proto`, `config` |
 | `cap` | Memory and time caps for a command tree (`systemd-run --user --scope` on Linux, `setrlimit` and a watchdog elsewhere). | — |
 | `tree` | Worktree layout, create, register, salvage, remove, stale listing. | `proto`, `config`, `bus` |
 | `bridge` | Seat loops, runtime adapters, prompt building, heartbeats, failover, cleanup on `landed`. | all above |
 | `install` | Hub and client installers, user services, `nats-server` provisioning, skill installation, agent launch. | `config`, `bus` |
-| `gh` | Coordinator service, merge gate, landing, pin sync, release watch, tap release. | `proto`, `config`, `bus` |
+| `gh` | Coordinator service, merge gate, landing, pin sync, release watch, tap release. Landing and release watch hold the hub lease `HGL_LOCKS/lock.land.<repo>`, so they exclude each other across hosts. | `proto`, `config`, `bus` |
 | `hgl-ai` | The `clap` command line; thin over the crates. | all |
 
 Async runtime `tokio`; NATS client `async-nats`; errors `anyhow` at the edge,

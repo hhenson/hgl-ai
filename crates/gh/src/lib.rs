@@ -43,7 +43,7 @@ pub enum Error {
     Command { args: String, msg: String },
     #[error("GitHub API rate limit reached: {0}")]
     RateLimited(String),
-    /// Another landing holds the repository's lock: try again later.
+    /// Another landing holds the repository's landing lock: try again later.
     #[error("{0}")]
     Locked(String),
     /// `gh` is missing or not signed in; waiting does not change it.
@@ -104,6 +104,8 @@ impl GateRules {
 /// What every command needs from the host configuration, checked once.
 #[derive(Debug, Clone)]
 pub struct Settings {
+    /// This host's label: it names the holder of a landing lock.
+    pub host: String,
     pub owner: String,
     pub repos: Vec<String>,
     pub branch_prefix: String,
@@ -155,6 +157,7 @@ impl Settings {
             .map(|s| s.binding.runtime.to_string())
             .unwrap_or_else(|| "claude".to_string());
         Ok(Settings {
+            host: cfg.host.clone(),
             owner: g.owner.clone(),
             repos: g.repos.clone(),
             branch_prefix: g.branch_prefix.clone(),
@@ -204,10 +207,6 @@ impl Settings {
     /// Repositories whose merges are followed by a pin update of the wrapper (ROLE-10).
     pub fn pin_sources(&self) -> Vec<&str> {
         self.pins.iter().filter_map(|p| p.repo.as_deref()).collect()
-    }
-
-    pub fn lock_path(&self, repo: &str) -> PathBuf {
-        self.data_dir.join("gh").join(format!("land-{repo}.lock"))
     }
 }
 

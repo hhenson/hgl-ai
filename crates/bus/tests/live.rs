@@ -8,7 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
-use hgl_ai_bus::{Bus, BusError, InboxOptions};
+use hgl_ai_bus::{Bus, BusError, InboxOptions, ProvisionOptions};
 use hgl_ai_proto::{
     Family, HostRecord, Kind, Note, Role, Runtime, Seat, SeatRecord, TaskKey, TreeRecord,
 };
@@ -167,6 +167,15 @@ async fn provision_is_idempotent_and_corrects_settings() {
     assert_eq!(
         (trees.max_messages_per_subject, trees.storage),
         (1, jetstream::stream::StorageType::File)
+    );
+    let locks = kv("HGL_LOCKS").await;
+    assert_eq!(
+        (locks.max_messages_per_subject, locks.storage, locks.max_age),
+        (
+            1,
+            jetstream::stream::StorageType::File,
+            Duration::from_secs(30 * 60)
+        )
     );
 }
 
@@ -709,4 +718,135 @@ async fn bridge_host_names_the_serving_host() {
         Some("build-1")
     );
     assert_eq!(bus.bridge_host(&seat("claude")).await.unwrap(), None);
+}
+
+const LAND: &str = "lock.land.hgl-compiler";
+
+#[tokio::test]
+async fn one_of_two_concurrent_acquirers_holds_the_lease() {
+    let Some(hub) = Hub::start() else { return };
+    hub.ready().await;
+    let (a, b) = (hub.bus().await, hub.bus().await);
+    let (ra, rb) = tokio::join!(
+        a.lock_acquire(LAND, "build-1 pid 1 (land #1)"),
+        b.lock_acquire(LAND, "build-2 pid 2 (land #2)")
+    );
+    let (won, lost, loser) = match (ra, rb) {
+        (Ok(l), Err(e)) => (l, e, "build-2"),
+        (Err(e), Ok(l)) => (l, e, "build-1"),
+        (Ok(_), Ok(_)) => panic!("both acquired {LAND}"),
+        (Err(x), Err(y)) => panic!("neither acquired {LAND}: {x}; {y}"),
+    };
+    match &lost {
+        BusError::Held {
+            name,
+            holder,
+            since,
+        } => {
+            assert_eq!(name, LAND);
+            assert_eq!(holder, &won.record().holder);
+            assert!(!holder.starts_with(loser), "{holder}");
+            assert_eq!(since, &won.record().acquired_at);
+        }
+        other => panic!("not Held: {other}"),
+    }
+    assert!(lost.to_string().contains("is held by"), "{lost}");
+    // Other names are independent.
+    a.lock_acquire("lock.land.hgl_spec", "x")
+        .await
+        .unwrap()
+        .release()
+        .await
+        .unwrap();
+    assert!(won.release().await.unwrap());
+}
+
+#[tokio::test]
+async fn a_released_lease_can_be_taken_again() {
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let first = bus.lock_acquire(LAND, "first").await.unwrap();
+    assert!(matches!(
+        bus.lock_acquire(LAND, "second").await,
+        Err(BusError::Held { .. })
+    ));
+    assert!(first.release().await.unwrap());
+    let second = bus.lock_acquire(LAND, "second").await.unwrap();
+    assert_eq!(second.record().holder, "second");
+    assert!(matches!(
+        bus.lock_acquire(LAND, "third").await,
+        Err(BusError::Held { holder, .. }) if holder == "second"
+    ));
+    assert!(second.release().await.unwrap());
+    assert!(matches!(
+        bus.lock_acquire("bad..name", "x").await,
+        Err(BusError::Nats(_))
+    ));
+}
+
+/// Wait until `f` holds, or fail after `secs`.
+async fn within(secs: u64, what: &str, mut f: impl AsyncFnMut() -> bool) {
+    let end = Instant::now() + Duration::from_secs(secs);
+    while !f().await {
+        assert!(Instant::now() < end, "timed out waiting for: {what}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_refreshed_lease_outlives_max_age_and_an_abandoned_one_expires() {
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.bus().await;
+    let max_age = Duration::from_secs(1);
+    bus.provision_with(ProvisionOptions {
+        locks_max_age: max_age,
+    })
+    .await
+    .unwrap();
+    let other = hub.bus().await;
+
+    // Refreshed well within max_age, it is kept for several times max_age.
+    let mut held = bus.lock_acquire(LAND, "build-1 pid 1").await.unwrap();
+    let start = Instant::now();
+    while start.elapsed() < max_age * 3 {
+        tokio::time::sleep(max_age / 4).await;
+        let before = held.revision();
+        held.refresh().await.unwrap();
+        assert!(held.revision() > before);
+        assert!(
+            matches!(
+                other.lock_acquire(LAND, "build-2 pid 2").await,
+                Err(BusError::Held { .. })
+            ),
+            "taken at {:?} despite refreshes",
+            start.elapsed()
+        );
+    }
+
+    // Abandoned (a dead holder), it expires and another host takes it.
+    let mut taken = None;
+    within(15, "the abandoned lease expires", async || {
+        match other.lock_acquire(LAND, "build-2 pid 2").await {
+            Ok(l) => {
+                taken = Some(l);
+                true
+            }
+            Err(BusError::Held { .. }) => false,
+            Err(e) => panic!("{e}"),
+        }
+    })
+    .await;
+    let taken = taken.unwrap();
+    assert_eq!(taken.record().holder, "build-2 pid 2");
+    // The old holder can neither keep it nor delete the new holder's lease.
+    assert!(matches!(
+        held.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+    assert!(!held.release().await.unwrap());
+    assert!(matches!(
+        bus.lock_acquire(LAND, "build-1 pid 1").await,
+        Err(BusError::Held { holder, .. }) if holder == "build-2 pid 2"
+    ));
+    assert!(taken.release().await.unwrap());
 }
