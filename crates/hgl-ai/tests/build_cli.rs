@@ -496,3 +496,68 @@ fn detach_inside_a_turn_is_refused() {
     );
     assert!(!logs.exists(), "nothing started");
 }
+
+/// Carbon's finding 10 on #12: a range in an XML report is read from that report, which
+/// the summary names.
+#[test]
+fn a_report_range_reads_the_report() {
+    let dir = Scratch::new("xml");
+    let src = dir.0.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let recipe = dir.0.join("r.toml");
+    std::fs::write(
+        &recipe,
+        r#"repo = "demo"
+[[step]]
+name = "test"
+run = "printf 'ran\n'; printf '<testsuite><testcase name=\"t1\"><failure message=\"boom\"/></testcase></testsuite>\n' > $HGL_AI_BUILD_DIR/report.xml"
+parser = "junit"
+artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
+"#,
+    )
+    .unwrap();
+    let logs = dir.0.join("logs");
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+            .args(args)
+            .arg("--log-dir")
+            .arg(&logs)
+            .env("HGL_AI_CONFIG", dir.0.join("none.toml"))
+            .env_remove("HGL_AI_TASK_DIR")
+            .env_remove("HGL_AI_TURN")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+    };
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .args(["--json", "build", "run", "demo", "--recipe"])
+        .arg(&recipe)
+        .arg("--dir")
+        .arg(&src)
+        .arg("--build-dir")
+        .arg(dir.0.join("build"))
+        .arg("--log-dir")
+        .arg(&logs)
+        .env("HGL_AI_CONFIG", dir.0.join("none.toml"))
+        .env_remove("HGL_AI_TASK_DIR")
+        .env_remove("HGL_AI_TURN")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let s: serde_json::Value =
+        serde_json::from_slice(&o.stdout).unwrap_or_else(|_| panic!("{}", text(&o)));
+    let f = &s["tests"]["failures"][0];
+    let source = f["source"].as_str().unwrap().to_string();
+    assert_eq!(source, "artifacts/test/report.xml");
+    let id = s["id"].as_str().unwrap().to_string();
+    let range = format!("{}-{}", f["start"], f["end"]);
+    let o = run(&["build", "log", &id, &source, "--bytes", &range]);
+    let got = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(got.starts_with("<testcase name=\"t1\">"), "{}", text(&o));
+    let o = run(&["build", "status", &id]);
+    let t = String::from_utf8_lossy(&o.stdout).into_owned();
+    assert!(t.contains(&format!("[{source} {range}]")), "{t}");
+    // Nothing outside the run's directory.
+    let o = run(&["build", "log", &id, "../../r.toml"]);
+    assert_ne!(o.status.code(), Some(0), "{}", text(&o));
+}

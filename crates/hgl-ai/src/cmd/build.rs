@@ -59,9 +59,11 @@ enum Cmd {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
-    /// Print part of a local build's step log (default: the first step that did not pass).
+    /// Print part of a local build's step log (default: the first step that did not pass),
+    /// or of a report the summary names (`artifacts/<step>/<file>`).
     Log {
         id: String,
+        /// A step, or a report's path in the run's directory as the summary gives it.
         step: Option<String>,
         /// A byte range of the log, START-END, as the summary gives it.
         #[arg(long, value_name = "START-END")]
@@ -862,8 +864,24 @@ fn log(
             })
             .ok_or_else(|| anyhow::anyhow!("build {id} has run no step yet"))?,
     };
-    let path = d.join(format!("{step}.log"));
-    let mut f = std::fs::File::open(&path).with_context(|| format!("{}", path.display()))?;
+    // A step's log, or a file the summary names inside the run's directory (a report).
+    let path = if step.contains(['/', '\\']) || step.ends_with(".xml") {
+        let rel = Path::new(&step);
+        let inside = rel
+            .components()
+            .all(|c| matches!(c, std::path::Component::Normal(_)));
+        if !inside {
+            bail!("{step}: name a file inside the build's directory, as the summary does");
+        }
+        d.join(rel)
+    } else {
+        d.join(format!("{step}.log"))
+    };
+    let real = std::fs::canonicalize(&path).with_context(|| format!("{}", path.display()))?;
+    if !real.starts_with(std::fs::canonicalize(&d)?) {
+        bail!("{step}: not inside the build's directory");
+    }
+    let mut f = std::fs::File::open(&real).with_context(|| format!("{}", path.display()))?;
     let len = f.metadata()?.len();
     const MAX: u64 = 64 << 10;
     let (start, end) = match bytes {

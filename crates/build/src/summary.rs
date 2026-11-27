@@ -188,7 +188,8 @@ fn cut(s: &str, width: usize) -> String {
 
 fn log_name(s: &Summary, step: &str, source: Option<&str>) -> String {
     if let Some(src) = source {
-        return src.rsplit(['/', '\\']).next().unwrap_or(src).to_string();
+        // As `build log ID <it> --bytes` takes it: its path in the run's directory.
+        return src.to_string();
     }
     s.steps
         .iter()
@@ -373,7 +374,7 @@ fn render_at(s: &Summary, width: usize, shown: usize) -> String {
     }
     let _ = writeln!(
         o,
-        "log: {} on {} (summary.json; a range: hgl-ai build log {} STEP --bytes START-END)",
+        "log: {} on {} (summary.json; a range: hgl-ai build log {} STEP|REPORT --bytes START-END)",
         s.log_dir,
         s.proxy.as_deref().unwrap_or(&s.host),
         s.id
