@@ -1,0 +1,5 @@
+{"type":"thread.started","thread_id":"00000000-0000-4000-8000-000000000022"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"Fixed the 429 handler in quota.rs; tests at line 429 run now."}}
+{"type":"error","message":"stream disconnected before completion: error decoding response body (issue #429)"}
+{"type":"turn.failed","error":{"message":"stream disconnected before completion: error decoding response body (issue #429)"}}

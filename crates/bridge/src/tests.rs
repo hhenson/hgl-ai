@@ -256,12 +256,7 @@ fn note(kind: Kind, to: &str, issue: u64, body: &str) -> Note {
     n
 }
 
-fn alive(pid: i32) -> bool {
-    // SAFETY: signal 0 checks existence only; a zombie does not count.
-    let exists = unsafe { libc::kill(pid, 0) == 0 };
-    exists
-        && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z "))
-}
+use crate::proc::alive;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn assign_then_sendback_resumes_then_landed_cleans_up() {
@@ -304,7 +299,7 @@ async fn assign_then_sendback_resumes_then_landed_cleans_up() {
     assert_eq!(prompts.len(), 1, "the turn's prompt is recorded");
     assert!(h.bus.trees().contains_key("build-1.w1.demo-980"));
     let tf = hgl_ai_tree::read_task(&dir).unwrap();
-    assert_eq!(tf.branch.as_deref(), Some("codex/980-fix-the-thing"));
+    assert_eq!(tf.branch.as_deref(), Some("codex/q980-fix-the-thing"));
     assert_eq!(tf.sessions.get("codex").map(String::as_str), Some(THREAD));
     assert!(
         std::fs::read_dir(dir.join("log")).unwrap().count() >= 2,
@@ -384,10 +379,8 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
         "w1",
         note(Kind::Assign, "w1", 3, "[claude] Assign: demo#3 Three"),
     );
-    eventually("nak then ack", || {
-        h.bus.events(a) == [Ev::Nak(Duration::from_millis(50)), Ev::Ack]
-    })
-    .await;
+    // Held, not naked: the refusal spends no delivery (PROTO-8).
+    eventually("acked once moved", || h.bus.events(a) == [Ev::Ack]).await;
     let moved = h
         .bus
         .sent_containing("moved from codex gpt/gpt-6.2-astra to agy claude/claude-opus-5-5");
@@ -468,7 +461,7 @@ async fn drain_holds_assign_until_the_gate_opens_and_tells_once_per_change() {
     .await;
     assert_eq!(h.calls("codex").len(), 2);
     eventually("open again", || {
-        h.bus.sent_containing("taking `assign` notes again").len() == 1
+        h.bus.sent_containing("taking new work again").len() == 1
     })
     .await;
     stop(tx, j).await;
@@ -609,10 +602,9 @@ async fn ended_tasks_wait_for_the_hub() {
             "[claude] Assign: demo#22 Twenty-two",
         ),
     );
-    eventually("naked while the hub cannot say", || {
-        h.bus.events(a).first() == Some(&Ev::Nak(Duration::from_millis(50)))
-    })
-    .await;
+    // Held, kept alive, no delivery spent (PROTO-8).
+    eventually("held while the hub cannot say", || h.bus.progressed(a)).await;
+    assert!(h.bus.events(a).is_empty(), "{:?}", h.bus.events(a));
     assert!(h.calls("codex").is_empty());
     h.bus.ended_down(false, false);
     eventually("run once the hub answers", || {
@@ -621,17 +613,17 @@ async fn ended_tasks_wait_for_the_hub() {
     .await;
     assert_eq!(h.calls("codex").len(), 1);
 
-    // The end cannot be recorded: the tree goes at once, the note is naked and retried.
+    // The end cannot be recorded: the tree goes at once, the note is held and done again.
     h.bus.ended_down(false, true);
     let l = h.bus.push(
         "w1",
         note(Kind::Landed, "w1", 22, "[claude] Landed: demo#22"),
     );
-    eventually("landed naked", || {
-        h.bus.events(l).first() == Some(&Ev::Nak(Duration::from_millis(50)))
+    eventually("landed held", || {
+        h.bus.progressed(l) && !h.work().join("w1/demo-22").exists()
     })
     .await;
-    assert!(!h.work().join("w1/demo-22").exists());
+    assert!(h.bus.events(l).is_empty(), "{:?}", h.bus.events(l));
     h.bus.ended_down(false, false);
     eventually("landed acked once recorded", || {
         h.bus.events(l).last() == Some(&Ev::Ack)
@@ -672,8 +664,8 @@ async fn a_seat_whose_lease_another_bridge_holds_is_not_served() {
     // The other bridge lets go: this one takes the seat.
     h.bus.drop_lease("seat.w1");
     eventually("served", || h.bus.events(n) == [Ev::Ack]).await;
-    let ours = format!("build-1 pid {} (bridge)", std::process::id());
-    assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours));
+    let ours = format!("build-1 pid {} (bridge) id ", std::process::id());
+    assert!(h.bus.lease_holder("seat.w1").unwrap().starts_with(&ours));
     stop(tx, j).await;
     assert_eq!(h.bus.lease_holder("seat.w1"), None, "released at shutdown");
 }
@@ -691,8 +683,8 @@ async fn the_lease_of_a_crashed_bridge_of_this_host_is_taken_over() {
         Note::new(seat("claude"), seat("w1"), Kind::Note, "hello"),
     );
     eventually("served at once", || h.bus.events(n) == [Ev::Ack]).await;
-    let ours = format!("build-1 pid {} (bridge)", std::process::id());
-    assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours.clone()));
+    let ours = h.bus.lease_holder("seat.w1").unwrap();
+    assert!(ours.starts_with(&format!("build-1 pid {} (bridge) id ", std::process::id())));
     stop(tx, j).await;
 
     // Likewise the lease of a `note wait` of this host that is gone.
@@ -704,7 +696,27 @@ async fn the_lease_of_a_crashed_bridge_of_this_host_is_taken_over() {
         Note::new(seat("claude"), seat("w1"), Kind::Note, "again"),
     );
     eventually("served at once", || h.bus.events(n) == [Ev::Ack]).await;
-    assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours));
+    assert_eq!(h.bus.lease_holder("seat.w1"), Some(ours.clone()));
+    stop(tx, j).await;
+
+    // A dead holder of another machine that shares the label (another host id): not ours.
+    let id = ours.rsplit(' ').next().unwrap();
+    let other = format!("build-1 pid 999999999 (bridge) id {}", "f".repeat(id.len()));
+    h.bus.steal_lease("seat.w1", &other);
+    let (tx, j) = h.start(&["w1"]);
+    let n = h.bus.push(
+        "w1",
+        Note::new(seat("claude"), seat("w1"), Kind::Note, "third"),
+    );
+    eventually("a heartbeat", || h.bus.last_host().is_some()).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(
+        h.bus.events(n).is_empty(),
+        "not taken from the other machine"
+    );
+    assert_eq!(h.bus.lease_holder("seat.w1"), Some(other));
+    h.bus.drop_lease("seat.w1");
+    eventually("served once it lets go", || h.bus.events(n) == [Ev::Ack]).await;
     stop(tx, j).await;
 }
 
@@ -1304,13 +1316,13 @@ async fn a_redelivered_end_leaves_a_restarted_task_running() {
     stop(tx, j).await;
 }
 
-/// A `landed` whose end could not be recorded (naked) is delivered again after a newer
-/// `assign` restarted the task: the restart is left alone, and the end is then recorded.
+/// A `landed` whose end could not be recorded (held) is done again after a newer `assign`
+/// restarted the task: the restart is left alone, and the end is then recorded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_end_redelivered_before_it_was_recorded_leaves_a_restart_alone() {
     let mut h = harness();
-    // Room for the restart to start before `max_deliver` runs out.
-    h.opts.nak_delay = Duration::from_secs(1);
+    // Room for the restart to start while the end waits for the hub.
+    h.opts.hub_retry = Duration::from_millis(300);
     let (pid, gate) = held_after_the_first(&h);
     let (tx, j) = h.start(&["w1"]);
     let assign = note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Forty-one");
@@ -1321,12 +1333,9 @@ async fn an_end_redelivered_before_it_was_recorded_leaves_a_restart_alone() {
         "w1",
         note(Kind::Landed, "w1", 41, "[claude] Landed: demo#41"),
     );
-    eventually("landed naked", || {
-        h.bus.events(l).first() == Some(&Ev::Nak(Duration::from_secs(1)))
-    })
-    .await;
     let dir = h.work().join("w1/demo-41");
-    assert!(!dir.exists());
+    eventually("landed held, its tree removed", || !dir.exists()).await;
+    assert!(h.bus.events(l).is_empty(), "{:?}", h.bus.events(l));
     let again = h.bus.push("w1", assign);
     eventually("the restart runs", || pid.exists()).await;
     h.bus.ended_down(false, false);
@@ -1431,5 +1440,280 @@ async fn the_bridges_notes_go_to_the_configured_controller() {
     for n in &sent {
         assert_eq!(n.recipient.as_str(), "boss", "{}", n.body);
     }
+    stop(tx, j).await;
+}
+
+/// A note whose turns fail for real (a crash) is naked until the fifth failure, then
+/// dead-lettered: terminated and sent, with the reason and the note, to the controller. The
+/// count is kept across bridges of the host (PROTO-8).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_note_that_fails_five_times_is_dead_lettered() {
+    let h = harness();
+    h.script("codex", "echo boom >&2; exit 2");
+    let (tx, j) = h.start(&["w1"]);
+    let body = "[claude] Assign: demo#5 Five\n\nThe details that must not be lost.";
+    let a = h.bus.push("w1", note(Kind::Assign, "w1", 5, body));
+    let nak = Ev::Nak(Duration::from_millis(50));
+    eventually("two real failures", || h.bus.events(a).len() == 2).await;
+    stop(tx, j).await;
+    // A restarted bridge goes on counting.
+    let (tx, j) = h.start(&["w1"]);
+    eventually("terminated at the fifth", || {
+        h.bus.events(a).last() == Some(&Ev::Term)
+    })
+    .await;
+    let events = h.bus.events(a);
+    assert_eq!(
+        events.iter().filter(|e| **e == nak).count(),
+        4,
+        "{events:?}"
+    );
+    assert_eq!(h.calls("codex").len(), 5);
+    let dead = h.bus.sent_containing("[bridge] Dead letter:");
+    assert_eq!(dead.len(), 1);
+    let d = &dead[0];
+    assert_eq!((d.kind, d.recipient.as_str()), (Kind::Note, "claude"));
+    assert_eq!((d.repo.as_deref(), d.issue), (Some("demo"), 5));
+    assert!(d.body.contains("failed 5 times"), "{}", d.body);
+    assert!(d.body.contains("exit 2"), "{}", d.body);
+    assert!(
+        d.body
+            .contains(&format!("--- seq={a} from=claude to=w1 kind=assign demo#5")),
+        "{}",
+        d.body
+    );
+    assert!(d.body.contains("The details that must not be lost."));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        h.calls("codex").len(),
+        5,
+        "not retried after the dead letter"
+    );
+    stop(tx, j).await;
+}
+
+/// Carbon's check 3 (hgl-ai PR 1): a seat refused for quota with no binding left keeps its
+/// notes held, alive and undelivered, and tries again; nothing is dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_quota_refusal_with_no_fallback_holds_the_notes() {
+    let mut h = harness();
+    h.opts.quota_retry = Duration::from_millis(400);
+    let flag = h.calls.join("ok");
+    h.script(
+        "claude",
+        &format!(
+            "if [ -e '{ok}' ]; then cat '{good}'; else cat '{quota}'; exit 1; fi",
+            ok = flag.display(),
+            good = fixture("claude-ok.jsonl"),
+            quota = fixture("claude-quota.synthetic.jsonl")
+        ),
+    );
+    let (tx, j) = h.start(&["r1"]);
+    let mut rv = note(Kind::Review, "r1", 6, "[claude] Review: demo#6");
+    rv.head = Some(
+        h.git
+            .run(&h.seed, ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string(),
+    );
+    let r = h.bus.push("r1", rv);
+    eventually("refused twice", || h.calls("claude").len() >= 2).await;
+    assert!(h.bus.events(r).is_empty(), "{:?}", h.bus.events(r));
+    assert!(h.bus.progressed(r), "kept alive");
+    let told = h.bus.sent_containing("has no fallback left");
+    assert_eq!(told.len(), 1, "told once");
+    std::fs::write(&flag, "").unwrap();
+    eventually("acked once allowed", || h.bus.events(r) == [Ev::Ack]).await;
+    stop(tx, j).await;
+}
+
+/// After a failover the seat returns to its primary binding once the cool-down is over.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_over_seat_returns_to_its_primary_after_the_cool_down() {
+    let mut h = harness();
+    h.opts.failover_cooldown = Duration::from_millis(300);
+    let flag = h.calls.join("ok");
+    h.script(
+        "codex",
+        &format!(
+            "if [ -e '{ok}' ]; then cat '{good}'; else cat '{quota}'; exit 1; fi",
+            ok = flag.display(),
+            good = fixture("codex-ok.jsonl"),
+            quota = fixture("codex-quota.synthetic.jsonl")
+        ),
+    );
+    h.script("agy", &format!("cat '{}'", fixture("agy-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 7, "[claude] Assign: demo#7 Seven"),
+    );
+    eventually("run on the fallback", || h.bus.events(a) == [Ev::Ack]).await;
+    assert_eq!(h.calls("agy").len(), 1);
+    std::fs::write(&flag, "").unwrap();
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let q = h.bus.push(
+        "w1",
+        note(Kind::Question, "w1", 7, "[claude] Question: done?"),
+    );
+    eventually("run on the primary again", || h.bus.events(q) == [Ev::Ack]).await;
+    assert_eq!(h.calls("agy").len(), 1);
+    assert_eq!(h.calls("codex").len(), 2);
+    assert_eq!(
+        h.bus
+            .sent_containing("to its primary codex gpt/gpt-6.2-astra after")
+            .len(),
+        1
+    );
+    // Both families worked on the task: its authors (ROLE-9).
+    let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-7")).unwrap();
+    assert_eq!(tf.families, [Family::Gpt, Family::Claude]);
+    let rec = h.bus.trees()["build-1.w1.demo-7"].clone();
+    assert_eq!(rec.families, [Family::Gpt, Family::Claude]);
+    stop(tx, j).await;
+}
+
+/// A failover that would leave the task no reviewer of another family (ROLE-9) is not
+/// taken: the seat holds its notes instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failover_that_breaks_role_9_is_not_taken() {
+    let mut h = harness();
+    h.opts.quota_retry = Duration::from_secs(3600);
+    h.script(
+        "codex",
+        &format!("cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")),
+    );
+    h.script("agy", &format!("cat '{}'", fixture("agy-ok.jsonl")));
+    // The fleet's only reviewer is of the fallback's family, claude.
+    h.bus.put_host(hgl_ai_proto::HostRecord {
+        host: "build-2".into(),
+        seats: vec![hgl_ai_proto::SeatRecord {
+            seat: seat("r9"),
+            role: Role::Reviewer,
+            runtime: Runtime::Claude,
+            family: Family::Claude,
+            model: "claude-opus-5-5".into(),
+        }],
+        memcap_gb: 64,
+        work_root_free_gb: 500,
+        updated_at: hgl_ai_proto::utc_now_stamp(),
+    });
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 8, "[claude] Assign: demo#8 Eight"),
+    );
+    eventually("held", || {
+        !h.bus.sent_containing("has no fallback left").is_empty()
+    })
+    .await;
+    let told = &h.bus.sent_containing("has no fallback left")[0];
+    assert!(
+        told.body
+            .contains("every live reviewer family (claude) would then be among the task's authors"),
+        "{}",
+        told.body
+    );
+    assert!(h.calls("agy").is_empty());
+    assert!(h.bus.events(a).is_empty());
+    stop(tx, j).await;
+}
+
+/// A note of a task queued behind its `assign` joins the assign's turn in the new tree
+/// rather than running in the inbox; under low disk, a review (a new tree) waits too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn follow_ups_join_their_tasks_tree_and_low_disk_holds_every_new_tree() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    h.script("claude", &format!("cat '{}'", fixture("claude-ok.jsonl")));
+    h.bus.set_state("mode", "drain");
+    let (tx, j) = h.start(&["w1", "r1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 9, "[claude] Assign: demo#9 Nine"),
+    );
+    let q = h.bus.push(
+        "w1",
+        note(
+            Kind::Answer,
+            "w1",
+            9,
+            "[claude] Answer: use the second form",
+        ),
+    );
+    eventually("both held", || h.bus.progressed(a) && h.bus.progressed(q)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        h.calls("codex").is_empty(),
+        "the answer waits with its assign"
+    );
+    h.bus.set_state("mode", "normal");
+    eventually("one turn for both", || {
+        h.bus.events(a) == [Ev::Ack] && h.bus.events(q) == [Ev::Ack]
+    })
+    .await;
+    let calls = h.calls("codex");
+    assert_eq!(calls.len(), 1);
+    assert_eq!(
+        calls[0].cwd,
+        h.work().join("w1/demo-9/src").display().to_string()
+    );
+    assert!(
+        calls[0].stdin.contains("Note 2 of 2: answer"),
+        "{}",
+        calls[0].stdin
+    );
+
+    h.disk.0.store(crate::disk::GB, Ordering::SeqCst);
+    let head = h
+        .git
+        .run(&h.seed, ["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let mut rv = note(Kind::Review, "r1", 10, "[claude] Review: demo#10");
+    rv.head = Some(head);
+    let r = h.bus.push("r1", rv);
+    eventually("the review held", || h.bus.progressed(r)).await;
+    assert!(h.calls("claude").is_empty());
+    assert!(!h.work().join("r1/demo-10-review").exists());
+    h.disk.0.store(1000 * crate::disk::GB, Ordering::SeqCst);
+    eventually("reviewed once there is room", || {
+        h.bus.events(r) == [Ev::Ack]
+    })
+    .await;
+    stop(tx, j).await;
+}
+
+/// A tree that cannot be prepared (the clone cannot be fetched) holds its notes, alive and
+/// undelivered, tells the controller once, and is tried again until it works.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tree_that_cannot_be_prepared_yet_is_tried_again() {
+    let mut h = harness();
+    h.opts.prep_retry = Duration::from_millis(100);
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let mut n = note(Kind::Assign, "w1", 11, "[claude] Assign: later#11 Eleven");
+    n.repo = Some("later".into());
+    let a = h.bus.push("w1", n);
+    eventually("held after failed preparations", || {
+        h.bus.progressed(a)
+            && !h
+                .bus
+                .sent_containing("could not prepare later#11")
+                .is_empty()
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(h.bus.events(a).is_empty(), "{:?}", h.bus.events(a));
+    assert_eq!(
+        h.bus.sent_containing("could not prepare").len(),
+        1,
+        "told once"
+    );
+    // The repository appears: the next try makes the tree and runs.
+    remote(&h.git, &h.root, "later");
+    eventually("run once it heals", || h.bus.events(a) == [Ev::Ack]).await;
     stop(tx, j).await;
 }

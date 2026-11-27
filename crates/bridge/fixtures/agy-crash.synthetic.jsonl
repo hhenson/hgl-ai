@@ -1,0 +1,2 @@
+{"event":"init","conversation_id":"00000000-0000-4000-8000-000000000023","init":{"model":"gemini-4-carbon-high","cwd":"/work/w1/repo-1/src","tools":["run_command"],"permission_mode":"always-proceed"}}
+{"event":"result","result":{"conversation_id":"00000000-0000-4000-8000-000000000023","status":"ERROR","error":"INTERNAL: tool run_command exited 1 (cargo test: 429 passed, 1 failed in quota tests)","num_turns":2}}

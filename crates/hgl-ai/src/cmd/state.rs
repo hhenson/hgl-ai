@@ -142,7 +142,7 @@ pub async fn hosts(ctx: &Ctx) -> anyhow::Result<i32> {
     Ok(EXIT_OK)
 }
 
-/// `build-1 at STAMP memcap 64G free 812G: w3 implementor/codex/gpt-6.1-sol, ...`
+/// `build-1 at STAMP memcap 64G free 812 GB: w3 implementor/codex/gpt-6.1-sol, ...`
 fn host_line(h: &HostRecord) -> String {
     let seats: Vec<String> = h
         .seats
@@ -155,7 +155,7 @@ fn host_line(h: &HostRecord) -> String {
         seats.join(", ")
     };
     format!(
-        "{} at {} memcap {}G free {}G: {seats}",
+        "{} at {} memcap {}G free {} GB: {seats}",
         h.host, h.updated_at, h.memcap_gb, h.work_root_free_gb
     )
 }
@@ -182,7 +182,7 @@ mod tests {
         };
         assert_eq!(
             host_line(&h),
-            "build-1 at 20261127T083000Z memcap 64G free 812G: w3 implementor/codex/gpt-6.1-sol"
+            "build-1 at 20261127T083000Z memcap 64G free 812 GB: w3 implementor/codex/gpt-6.1-sol"
         );
         h.seats.clear();
         assert!(host_line(&h).ends_with(": no seats"));
