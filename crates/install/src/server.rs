@@ -405,7 +405,8 @@ fn ensure_user(
 
 /// What `server user add` did.
 pub struct UserAdded {
-    pub cred: PathBuf,
+    /// The credential written, unless the user was added by its public key.
+    pub cred: Option<PathBuf>,
     pub hub_restarted: bool,
 }
 
@@ -454,26 +455,47 @@ fn apply_users(
 }
 
 /// `hgl-ai server user add NAME --role ROLE`: a hub user and its credential file (mode
-/// 0600) under `<config_dir>/hub-users/`, to be copied to its host.
-pub fn user_add(sys: &dyn System, name: &str, role: Role, rotate: bool) -> Result<UserAdded> {
+/// 0600) under `<config_dir>/hub-users/`, to be copied to its host. With `nkey`, the user
+/// is the holder of that public key, whose seed stays on its own host (FLEET-10), and
+/// nothing secret is written.
+pub fn user_add(
+    sys: &dyn System,
+    name: &str,
+    role: Role,
+    nkey: Option<&str>,
+    rotate: bool,
+) -> Result<UserAdded> {
     let (cfg, srv) = hub_config(sys)?;
     let env = sys.env();
     let data_dir = env.expand(&cfg.paths.data_dir);
     let mut reg = Registry::load(sys, &data_dir)?;
-    let text = reg.issue(name, role, rotate)?;
-    let cred = users::cred_path(&env.config_dir(), name);
-    users::write_cred(sys, &cred, &text)?;
+    let cred = match nkey {
+        Some(k) => {
+            reg.register(name, role, k, rotate)?;
+            sys.say(&format!(
+                "hub user {name} ({role}): public key {k}, fingerprint {}",
+                users::fingerprint(k)
+            ));
+            None
+        }
+        None => {
+            let text = reg.issue(name, role, rotate)?;
+            let cred = users::cred_path(&env.config_dir(), name);
+            users::write_cred(sys, &cred, &text)?;
+            let shown = env.contract(&cred);
+            sys.say(&format!(
+                "credential: {shown} (hub user {name}, {role}, mode 600)"
+            ));
+            if role == Role::Seat {
+                sys.say(&format!(
+                    "copy {shown} to host {name}, then there: hgl-ai client install --hub <hub url> --token-file <copied file> --host {name}"
+                ));
+            }
+            Some(cred)
+        }
+    };
     reg.save(sys, &data_dir)?;
-    let shown = env.contract(&cred);
-    sys.say(&format!(
-        "credential: {shown} (hub user {name}, {role}, mode 600)"
-    ));
     let hub_restarted = apply_users(sys, &cfg, &srv, &reg)?;
-    if role == Role::Seat {
-        sys.say(&format!(
-            "copy {shown} to host {name}, then there: hgl-ai client install --hub <hub url> --token-file <copied file> --host {name}"
-        ));
-    }
     Ok(UserAdded {
         cred,
         hub_restarted,
@@ -834,10 +856,11 @@ mod tests {
             .await
             .unwrap();
         let before = f.runs().len();
-        let added = user_add(&f, "build-1", Role::Seat, false).unwrap();
+        let added = user_add(&f, "build-1", Role::Seat, None, false).unwrap();
         assert!(added.hub_restarted);
-        assert_eq!(f.mode(&added.cred).unwrap(), 0o600);
-        let c = token::read_credential(&f, &added.cred).unwrap().unwrap();
+        let cred = added.cred.unwrap();
+        assert_eq!(f.mode(&cred).unwrap(), 0o600);
+        let c = token::read_credential(&f, &cred).unwrap().unwrap();
         assert_eq!(c.describe(), "hub user build-1 (seat)");
         let conf =
             std::fs::read_to_string(f.env.home.join(".local/share/hgl-ai/nats.conf")).unwrap();
@@ -847,7 +870,7 @@ mod tests {
             ["systemctl --user restart hgl-ai-hub.service"]
         );
         assert!(
-            user_add(&f, "build-1", Role::Seat, false).is_err(),
+            user_add(&f, "build-1", Role::Seat, None, false).is_err(),
             "exists"
         );
         let key = user_list(&f)
@@ -856,7 +879,7 @@ mod tests {
             .find(|u| u.name == "build-1")
             .unwrap()
             .nkey;
-        user_add(&f, "build-1", Role::Seat, true).unwrap();
+        user_add(&f, "build-1", Role::Seat, None, true).unwrap();
         let rotated = user_list(&f)
             .unwrap()
             .into_iter()
@@ -865,7 +888,19 @@ mod tests {
             .nkey;
         assert_ne!(key, rotated);
         assert!(user_remove(&f, "build-1").unwrap());
-        assert!(!added.cred.exists());
+        assert!(!cred.exists());
+        // A host that made its own key: only its public key is registered.
+        let kp = nkeys::KeyPair::new_user();
+        let by_key = user_add(&f, "host-2", Role::Seat, Some(&kp.public_key()), false).unwrap();
+        assert!(by_key.cred.is_none());
+        assert!(!users::cred_path(&f.env.config_dir(), "host-2").exists());
+        let conf =
+            std::fs::read_to_string(f.env.home.join(".local/share/hgl-ai/nats.conf")).unwrap();
+        assert!(conf.contains(&format!(
+            "{{ nkey: \"{}\", permissions: $SEAT }}  # host-2 (seat)",
+            kp.public_key()
+        )));
+        assert!(f.output().contains(&users::fingerprint(&kp.public_key())));
         assert!(!user_remove(&f, "build-1").unwrap());
         let conf =
             std::fs::read_to_string(f.env.home.join(".local/share/hgl-ai/nats.conf")).unwrap();
@@ -873,7 +908,7 @@ mod tests {
 
         let g = fake(&d.path().join("other"), Os::Linux);
         assert!(
-            user_add(&g, "x", Role::Seat, false).is_err(),
+            user_add(&g, "x", Role::Seat, None, false).is_err(),
             "not a hub host"
         );
     }

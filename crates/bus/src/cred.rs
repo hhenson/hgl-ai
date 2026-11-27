@@ -123,6 +123,12 @@ pub fn parse_credential(text: &str) -> std::result::Result<Option<Credential>, S
         .collect();
     match token[..] {
         [] => Ok(None),
+        // A bare NKey user seed (a host's own key pair, docs/fleet.md FLEET-10).
+        [t] if t.starts_with("SU") && t.len() == 58 => Ok(Some(Credential::Nkey {
+            seed: t.to_string(),
+            user: None,
+            role: None,
+        })),
         [t] => Ok(Some(Credential::Token(t.to_string()))),
         _ => Err("a token file holds one line".into()),
     }
@@ -161,6 +167,10 @@ mod tests {
         );
         assert_eq!(c.describe(), "hub user build-1 (seat)");
         assert!(!format!("{c:?}").contains(&seed), "Debug hides the seed");
+        assert!(matches!(
+            parse_credential(&format!("{seed}\n")).unwrap(),
+            Some(Credential::Nkey { user: None, .. })
+        ));
         assert!(parse_credential("user = \"x\"\n").is_err());
         assert!(parse_credential("seed = \"nope\"\n").is_err());
         assert!(parse_credential("a\nb\n").is_err());

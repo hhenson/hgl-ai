@@ -137,7 +137,20 @@ impl Registry {
     /// Add `name` with a fresh key, or give it a fresh key (`rotate`). Returns the
     /// credential text, to be written once and never printed.
     pub fn issue(&mut self, name: &str, role: Role, rotate: bool) -> Result<String> {
+        let kp = nkeys::KeyPair::new_user();
+        let seed = kp
+            .seed()
+            .map_err(|e| other(format!("making an NKey: {e}")))?;
+        self.register(name, role, &kp.public_key(), rotate)?;
+        Ok(Credential::render_nkey(name, role.as_str(), &seed))
+    }
+
+    /// Add `name` by a public NKey whose seed stays on its host (a host that made its own
+    /// key pair; docs/fleet.md FLEET-10), or replace its key (`rotate`). No secret is
+    /// written here.
+    pub fn register(&mut self, name: &str, role: Role, nkey: &str, rotate: bool) -> Result<()> {
         check_name(name)?;
+        check_public_key(nkey)?;
         if let Some(u) = self.get(name)
             && !rotate
         {
@@ -146,20 +159,19 @@ impl Registry {
                 u.role
             )));
         }
-        let kp = nkeys::KeyPair::new_user();
-        let seed = kp
-            .seed()
-            .map_err(|e| other(format!("making an NKey: {e}")))?;
+        if let Some(u) = self.users.iter().find(|u| u.nkey == nkey && u.name != name) {
+            return Err(other(format!("that key is already hub user {}", u.name)));
+        }
         let user = User {
             name: name.to_string(),
             role,
-            nkey: kp.public_key(),
+            nkey: nkey.to_string(),
             created_at: hgl_ai_proto::utc_now_stamp(),
         };
         self.users.retain(|u| u.name != name);
         self.users.push(user);
         self.users.sort_by(|a, b| a.name.cmp(&b.name));
-        Ok(Credential::render_nkey(name, role.as_str(), &seed))
+        Ok(())
     }
 
     pub fn remove(&mut self, name: &str) -> bool {
@@ -167,6 +179,28 @@ impl Registry {
         self.users.retain(|u| u.name != name);
         self.users.len() != before
     }
+}
+
+/// A user's public NKey: `U...`, checksum valid.
+pub fn check_public_key(k: &str) -> Result<()> {
+    if k.starts_with('U') && nkeys::KeyPair::from_public_key(k).is_ok() {
+        Ok(())
+    } else {
+        Err(other(format!("{k:?} is not a user's public NKey (U...)")))
+    }
+}
+
+/// A short fingerprint of a public key, for comparing it by eye: the first 16 hex
+/// digits of its SHA-256, in groups of four.
+pub fn fingerprint(nkey: &str) -> String {
+    use sha2::Digest as _;
+    let h = hex::encode(sha2::Sha256::digest(nkey.as_bytes()));
+    h[..16]
+        .as_bytes()
+        .chunks(4)
+        .map(|c| std::str::from_utf8(c).unwrap_or(""))
+        .collect::<Vec<_>>()
+        .join("-")
 }
 
 /// A role's permissions: publish allow and deny, subscribe allow. `None`: no limits (admin).
@@ -388,8 +422,29 @@ mod tests {
         let back = Registry::load(&f, &data).unwrap();
         assert_eq!(back, reg);
         let text = std::fs::read_to_string(registry_path(&data)).unwrap();
-        assert!(!text.contains("SU"), "no seeds in the registry");
+        assert!(!text.contains("seed"), "no seeds in the registry");
         assert!(reg.remove("build-1") && !reg.remove("build-1"));
+
+        // A host's own key: only the public half is registered.
+        let kp = nkeys::KeyPair::new_user();
+        reg.register("host-2", Role::Seat, &kp.public_key(), false)
+            .unwrap();
+        assert_eq!(reg.get("host-2").unwrap().nkey, kp.public_key());
+        assert!(
+            reg.register("host-3", Role::Seat, &kp.public_key(), false)
+                .is_err(),
+            "one key, one user"
+        );
+        assert!(
+            reg.register("host-4", Role::Seat, "UNOTAKEY", false)
+                .is_err()
+        );
+        assert!(
+            reg.register("host-4", Role::Seat, &kp.seed().unwrap(), false)
+                .is_err(),
+            "never a seed"
+        );
+        assert_eq!(fingerprint(&kp.public_key()).len(), 19);
     }
 
     /// The rendered block is a valid `nats-server` configuration (when one is installed).

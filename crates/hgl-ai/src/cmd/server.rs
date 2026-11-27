@@ -45,6 +45,10 @@ enum UserCmd {
         /// seat (a client host), coord, console or admin.
         #[arg(long, value_parser = |s: &str| s.parse::<install::users::Role>())]
         role: install::users::Role,
+        /// Register this public NKey (U...) instead of making a credential: the
+        /// user's seed stays on its own host.
+        #[arg(long, value_name = "PUBKEY")]
+        nkey: Option<String>,
         /// Give an existing user a new key; its old credential stops working.
         #[arg(long)]
         rotate: bool,
@@ -155,10 +159,12 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
             UserCmd::Add {
                 name,
                 role,
+                nkey,
                 rotate,
                 dry_run,
             } => {
-                server::user_add(pick(dry_run), &name, role, rotate).map_err(lift)?;
+                server::user_add(pick(dry_run), &name, role, nkey.as_deref(), rotate)
+                    .map_err(lift)?;
             }
             UserCmd::List => {
                 let users = server::user_list(&real).map_err(lift)?;
