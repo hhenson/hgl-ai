@@ -113,8 +113,10 @@ changes one file.
 ## 4. Resources
 
 - **ROLE-15 — Memory and time caps.** Every build, test, probe and generated
-  program runs under `hgl-ai cap SIZE -- CMD` with a time limit: 16 GiB for one
-  compiler run or program, up to 64 GiB for a workspace build or test run.
+  program runs under `hgl-ai cap SIZE -- CMD` with a time limit: 32 GiB for one
+  compiler run or program, 64 GiB for a C++ build or a whole-workspace build or test
+  run (a C++ build at 16 parallel jobs needs 1–4 GiB a job), and 96 GiB for an agent
+  turn's whole tree (HPH, 2026-11-27).
   Reaching a cap is a finding, never a reason to raise it. Inside a turn a cap's
   scope joins the turn's slice, so the seat's limit holds over every cap the
   agent runs. Without systemd the cap also sets a per-process address-space limit;

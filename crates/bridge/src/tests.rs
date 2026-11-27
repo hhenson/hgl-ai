@@ -1078,7 +1078,7 @@ async fn startup_report_and_heartbeat() {
     .await;
     let host = h.bus.last_host().unwrap();
     assert_eq!(host.host, "build-1");
-    assert_eq!(host.memcap_gb, 64);
+    assert_eq!(host.memcap_gb, 96, "the default turn cap");
     assert_eq!(host.work_root_free_gb, 1000);
     assert_eq!(host.seats[0].seat.as_str(), "r1");
     assert_eq!(
