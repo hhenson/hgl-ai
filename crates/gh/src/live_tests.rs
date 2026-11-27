@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use hgl_ai_bus::{Bus, ProvisionOptions};
 use hgl_ai_proto::{Kind, Seat};
 
+use crate::backlog::Backlog;
 use crate::coord::{self, CoordOpts};
 use crate::exec::fake::FakeGh;
 use crate::lock::LandLock;
@@ -129,6 +130,7 @@ async fn a_round_writes_the_table_alerts_and_hold() {
 
     let gh = FakeGh::default()
         .on("auth status", "")
+        .on("query Backlog", &fixture("backlog-batch.json"))
         .on("graphql", &fixture("coord-batch.json"));
     let o = CoordOpts {
         once: true,
@@ -160,20 +162,31 @@ async fn a_round_writes_the_table_alerts_and_hold() {
         d.ack().await.unwrap();
     }
 
-    // The allowance runs low: the round writes `hold`, the next round does not run.
-    let low = fixture("coord-batch.json").replace("\"remaining\": 4945", "\"remaining\": 40");
-    let gh = FakeGh::default().on("auth status", "").on("graphql", &low);
+    // The allowance runs low: the round writes `hold`; the backlog round and the next round
+    // do not run.
+    let low = fixture("coord-batch.json")
+        .replace("\"remaining\": 4945", "\"remaining\": 40")
+        .replace("2026-01-05T12:55:49Z", "2100-01-01T00:00:00Z");
+    let gh = FakeGh::default()
+        .on("auth status", "")
+        .on("query Backlog", &fixture("backlog-batch.json"))
+        .on("graphql", &low);
     coord::run(&gh, &s, Some(&b), &o, &mut Vec::new())
         .await
         .unwrap();
     assert_eq!(
         b.state_get(state::KEY_HOLD).await.unwrap().unwrap().value,
-        "2026-01-05T12:55:49Z"
+        "2100-01-01T00:00:00Z"
     );
-    store::put_latest(&b, state::KEY_HOLD, "2100-01-01T00:00:00Z")
-        .await
-        .unwrap();
-    let gh = FakeGh::default().on("auth status", "").on("graphql", &low);
+    assert!(!gh.calls().iter().any(|c| c.contains("query Backlog")));
+    assert!(
+        b.state_get(state::KEY_BACKLOG).await.unwrap().is_some(),
+        "from the first run"
+    );
+    let gh = FakeGh::default()
+        .on("auth status", "")
+        .on("query Backlog", &fixture("backlog-batch.json"))
+        .on("graphql", &low);
     coord::run(&gh, &s, Some(&b), &o, &mut Vec::new())
         .await
         .unwrap();
@@ -181,6 +194,80 @@ async fn a_round_writes_the_table_alerts_and_hold() {
         !gh.calls().iter().any(|c| c.contains("graphql")),
         "no round under a hold"
     );
+}
+
+/// A backlog round writes `backlog` and one `HGL_METRICS` sample per repository for the day;
+/// the next round rewrites the same keys.
+#[tokio::test]
+async fn a_backlog_round_writes_the_queue_and_the_day() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+    let o = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+    let both = || {
+        FakeGh::default()
+            .on("auth status", "")
+            .on("query Backlog", &fixture("backlog-batch.json"))
+            .on("graphql", &fixture("coord-batch.json"))
+    };
+    coord::run(&both(), &s, Some(&b), &o, &mut Vec::new())
+        .await
+        .unwrap();
+    let text = b
+        .state_get(state::KEY_BACKLOG)
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    let got = Backlog::parse(&text);
+    let want = Backlog::parse(&fixture("backlog-batch.backlog"));
+    assert_eq!(got.queue, want.queue);
+    assert_eq!((&got.open, &got.labels), (&want.open, &want.labels));
+    let day = chrono::Utc::now().format("%Y%m%d").to_string();
+    let m = b.metrics().await.unwrap();
+    let keys: Vec<String> = m.iter().map(|m| m.key()).collect();
+    assert_eq!(
+        keys,
+        ["alpha", "beta", "gamma"].map(|r| format!("{r}.{day}"))
+    );
+    assert_eq!((m[0].open, m[0].opened, m[0].closed), (9, 2, 1));
+    assert_eq!(m[0].labels.get("good first issue"), Some(&2));
+    assert_eq!(m[0].taken_at, got.read);
+
+    // The next round rewrites the day's samples.
+    let more = fixture("backlog-batch.json").replace("\"totalCount\": 9", "\"totalCount\": 10");
+    let gh = FakeGh::default()
+        .on("auth status", "")
+        .on("query Backlog", &more)
+        .on("graphql", &fixture("coord-batch.json"));
+    coord::run(&gh, &s, Some(&b), &o, &mut Vec::new())
+        .await
+        .unwrap();
+    let m = b.metrics().await.unwrap();
+    assert_eq!(m.len(), 3);
+    assert_eq!(m[0].open, 10);
+    let text = b
+        .state_get(state::KEY_BACKLOG)
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    assert!(text.contains("# open alpha 10\n"), "{text}");
+
+    // Under a hold neither round runs.
+    store::put_latest(&b, state::KEY_HOLD, "2100-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let gh = both();
+    coord::run(&gh, &s, Some(&b), &o, &mut Vec::new())
+        .await
+        .unwrap();
+    assert!(!gh.calls().iter().any(|c| c.contains("graphql")));
 }
 
 #[tokio::test]
