@@ -34,7 +34,8 @@ pub enum ProtoError {
     Note(String),
 }
 
-static SEAT_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9_-]{0,31}$").unwrap());
+static SEAT_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-z0-9][a-z0-9_-]{0,31}$").unwrap());
 static KEY_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9_./=-]{1,64}$").unwrap());
 static HEAD_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[0-9a-f]{40}$").unwrap());
 
@@ -46,7 +47,11 @@ pub struct Seat(String);
 impl Seat {
     pub fn new(s: impl Into<String>) -> Result<Self, ProtoError> {
         let s = s.into();
-        if SEAT_RE.is_match(&s) { Ok(Seat(s)) } else { Err(ProtoError::Seat(s)) }
+        if SEAT_RE.is_match(&s) {
+            Ok(Seat(s))
+        } else {
+            Err(ProtoError::Seat(s))
+        }
     }
     pub fn broadcast() -> Self {
         Seat(BROADCAST.to_string())
@@ -92,12 +97,20 @@ impl fmt::Display for Seat {
 
 /// Validate an `HGL_STATE` key (§8).
 pub fn check_state_key(k: &str) -> Result<(), ProtoError> {
-    if KEY_RE.is_match(k) { Ok(()) } else { Err(ProtoError::StateKey(k.to_string())) }
+    if KEY_RE.is_match(k) {
+        Ok(())
+    } else {
+        Err(ProtoError::StateKey(k.to_string()))
+    }
 }
 
 /// Validate a full commit id (PROTO-10).
 pub fn check_head(h: &str) -> Result<(), ProtoError> {
-    if HEAD_RE.is_match(h) { Ok(()) } else { Err(ProtoError::Head(h.to_string())) }
+    if HEAD_RE.is_match(h) {
+        Ok(())
+    } else {
+        Err(ProtoError::Head(h.to_string()))
+    }
 }
 
 macro_rules! string_enum {
@@ -133,11 +146,17 @@ string_enum!(
 impl Kind {
     /// Kinds that also get one GitHub comment from their sender (PROTO-1).
     pub fn mirrored_on_github(self) -> bool {
-        matches!(self, Kind::Ready | Kind::Blocked | Kind::Sendback | Kind::Approved | Kind::Landed)
+        matches!(
+            self,
+            Kind::Ready | Kind::Blocked | Kind::Sendback | Kind::Approved | Kind::Landed
+        )
     }
     /// Kinds that must carry `head` (PROTO-10).
     pub fn needs_head(self) -> bool {
-        matches!(self, Kind::Ready | Kind::Review | Kind::Receipt | Kind::Sendback | Kind::Approved)
+        matches!(
+            self,
+            Kind::Ready | Kind::Review | Kind::Receipt | Kind::Sendback | Kind::Approved
+        )
     }
     /// Kinds after which the bridge removes the issue's worktrees (PROTO-14).
     pub fn ends_task(self) -> bool {
@@ -235,10 +254,18 @@ impl Note {
         if let Some(h) = &self.head {
             check_head(h)?;
         } else if self.kind.needs_head() {
-            return Err(ProtoError::Note(format!("a `{}` note needs a full head", self.kind)));
+            return Err(ProtoError::Note(format!(
+                "a `{}` note needs a full head",
+                self.kind
+            )));
         }
-        if (self.kind.starts_task() || self.kind.ends_task()) && (self.repo.is_none() || self.issue == 0) {
-            return Err(ProtoError::Note(format!("a `{}` note needs repo and issue", self.kind)));
+        if (self.kind.starts_task() || self.kind.ends_task())
+            && (self.repo.is_none() || self.issue == 0)
+        {
+            return Err(ProtoError::Note(format!(
+                "a `{}` note needs repo and issue",
+                self.kind
+            )));
         }
         if self.body.trim().is_empty() {
             return Err(ProtoError::Note("empty body".into()));
@@ -249,13 +276,21 @@ impl Note {
     /// `Nats-Msg-Id` for deduplication (PROTO-9).
     pub fn msg_id(&self) -> String {
         let digest = Sha256::digest(self.body.as_bytes());
-        format!("{}-{}-{}", self.sender, self.created_at, &hex::encode(digest)[..12])
+        format!(
+            "{}-{}-{}",
+            self.sender,
+            self.created_at,
+            &hex::encode(digest)[..12]
+        )
     }
 
     /// The task this note belongs to, if it names one.
     pub fn task(&self) -> Option<TaskKey> {
         match (&self.repo, self.issue) {
-            (Some(r), n) if n > 0 => Some(TaskKey { repo: r.clone(), issue: n }),
+            (Some(r), n) if n > 0 => Some(TaskKey {
+                repo: r.clone(),
+                issue: n,
+            }),
             _ => None,
         }
     }
@@ -431,8 +466,17 @@ mod tests {
 
     #[test]
     fn tree_keys() {
-        let t = TaskKey { repo: "hgl-compiler".into(), issue: 992 };
-        assert_eq!(tree_key("build-1", &seat("w1"), &t, false), "build-1.w1.hgl-compiler-992");
-        assert_eq!(tree_key("build-1", &seat("r1"), &t, true), "build-1.r1.hgl-compiler-992-review");
+        let t = TaskKey {
+            repo: "hgl-compiler".into(),
+            issue: 992,
+        };
+        assert_eq!(
+            tree_key("build-1", &seat("w1"), &t, false),
+            "build-1.w1.hgl-compiler-992"
+        );
+        assert_eq!(
+            tree_key("build-1", &seat("r1"), &t, true),
+            "build-1.r1.hgl-compiler-992-review"
+        );
     }
 }
