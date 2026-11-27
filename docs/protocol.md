@@ -31,7 +31,11 @@ this repository.
   serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`: the bridge,
   `note wait` and `note peek` alike.
   A bridge serves a seat only while it holds the lease `HGL_LOCKS/seat.<seat>`,
-  refreshed with its heartbeat. `note wait` and `note peek` refuse a held one
+  refreshed every 30 s (or a sixth of the bucket's `max_age`, if shorter). One the
+  hub has not confirmed for half of `max_age` (no answer: a partition) stops the seat
+  as a lost one does (its turn stopped, its notes naked), so it has stopped before
+  the lease can expire and another host take it; `note wait` and `note peek` give it
+  up likewise. `note wait` and `note peek` refuse a held one
   and hold it themselves until they return; `--force` skips the lock and the
   lease, with a warning. A lease holder is `<host> pid <pid> (<what>) id <host-id>`,
   with a host id kept in `<data_dir>/host-id`. A bridge, `note wait` or `note
@@ -149,7 +153,11 @@ link (tailnet, WireGuard or an SSH forward) with a token or NKey credential.
   without action. An ending note acts only on a tree made for a note with a
   lower sequence than its own (`task.json` records it) and on that tree's turn;
   a tree made for a later note is a restart of the task and is left alone. Of
-  the notes of a turn it stops, the later ones are naked, not acknowledged.
+  the notes of a turn it stops, the later ones are naked, not acknowledged. A
+  removal that fails (a salvage patch that cannot be written) does not undo the
+  end: it is kept in `<data_dir>/bridge/cleanup/<seat>.json`, said in the cleanup
+  receipt, tried again every 5 min until it works, and reported then; a later note
+  of the task that runs a turn there takes the tree over instead.
 - **PROTO-15 — Leftovers are visible.** `hgl-ai tree list --stale` lists
   trees whose issue is closed or that are older than `stale_after` (default
   3 days). The bridge posts that list and the disk use of `work_root` to the

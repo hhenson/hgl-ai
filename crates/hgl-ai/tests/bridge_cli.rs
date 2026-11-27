@@ -930,3 +930,98 @@ fn a_cap_inside_a_turn_is_held_to_the_turn_cap() {
         "both caps' report files in the turn's TMPDIR: {listing:?}"
     );
 }
+
+/// The bot's P1 (hgl-ai PR 1) against a live hub with a short lease `max_age` (10 s): the
+/// hub stops answering (SIGSTOP, a partition), and the bridge stops the seat's turn before
+/// its lease could expire for another host to take.
+#[test]
+fn a_partitioned_bridge_stops_its_seat_before_the_lease_expires() {
+    let d = Scratch::new("partition");
+    let Some(hub) = Hub::start(&d.0) else { return };
+    let g = git(&d.0);
+    remote(&g, &d.0, "demo");
+    let token = d.0.join("hub.token");
+    std::fs::write(&token, format!("{}\n", hub.token)).unwrap();
+    let pid = d.0.join("agent.pid");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bridge/fixtures/codex-ok.jsonl");
+    let (dir, p) = seat_host(
+        &d.0,
+        &hub,
+        &token,
+        "host-a",
+        &format!(
+            "if [ ! -e '{p}' ]; then echo $$ > '{p}'; exec sleep 120; fi\ncat '{f}'",
+            p = pid.display(),
+            f = fixture.display()
+        ),
+    );
+    assert!(hgl(&p, &["init"]).output().unwrap().status.success());
+    let max_age = Duration::from_secs(10);
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let bus = hgl_ai_bus::Bus::connect_url(&hub.url, Some(hub.token.clone()))
+            .await
+            .unwrap();
+        bus.provision_with(hgl_ai_bus::ProvisionOptions {
+            locks_max_age: max_age,
+        })
+        .await
+        .unwrap();
+    });
+    let log = || std::fs::read_to_string(dir.join("bridge.log")).unwrap_or_default();
+    let bridge = start_bridge(&d.0, &dir, &p);
+    send_w1(&p, "assign", "70", "[claude] Assign: demo#70 Seventy");
+    until("the turn runs", 60, &log, || pid.exists());
+    let agent: i32 = std::fs::read_to_string(&pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    let signal = |sig: &str, pid: u32| {
+        assert!(
+            Command::new("kill")
+                .args([sig, &pid.to_string()])
+                .status()
+                .unwrap()
+                .success()
+        )
+    };
+    signal("-STOP", hub.child.id());
+    let cut = Instant::now();
+    let stopped = loop {
+        if !running(agent) {
+            break cut.elapsed();
+        }
+        if cut.elapsed() > Duration::from_secs(30) {
+            signal("-CONT", hub.child.id());
+            panic!("the turn outlived the partition\n{}", log());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    signal("-CONT", hub.child.id());
+    // The last confirmed refresh was at most a sixth of max_age before the cut.
+    assert!(
+        stopped < max_age - max_age / 6,
+        "stopped after {stopped:?}, when the lease could have expired\n{}",
+        log()
+    );
+    until("the bridge says why", 30, &log, || {
+        log().contains("was not refreshed for")
+    });
+    stop_bridge(bridge, &log);
+    drop(hub);
+}
+
+/// Whether `pid` runs: `kill -0` succeeds and it is no zombie.
+fn running(pid: i32) -> bool {
+    let exists = Command::new("kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success());
+    exists
+        && std::fs::read_to_string(format!("/proc/{pid}/stat")).map_or(true, |s| {
+            s.rfind(')')
+                .is_some_and(|i| !s[i + 1..].trim_start().starts_with('Z'))
+        })
+}

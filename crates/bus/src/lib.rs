@@ -127,6 +127,8 @@ const MIN_PULL: Duration = Duration::from_millis(10);
 /// JetStream API error code for a missing stream.
 const STREAM_NOT_FOUND: &str = "error code 10059";
 
+/// Longest wait for the hub to confirm an ack, nak, term or in-progress.
+const SIGNAL_WAIT: Duration = Duration::from_secs(10);
 /// Largest batch one stream read asks for.
 const READ_BATCH: usize = 256;
 /// How long an ephemeral reader outlives its last use, should it not be deleted.
@@ -813,6 +815,16 @@ impl Bus {
         }
     }
 
+    /// How long a lease in `HGL_LOCKS` lives without a refresh: the bucket's `max_age`.
+    pub async fn locks_max_age(&self) -> Result<Duration> {
+        let store = self.store(&self.locks, KV_LOCKS).await?;
+        let status = store
+            .status()
+            .await
+            .map_err(|e| nats(&format!("reading bucket {KV_LOCKS}"), e))?;
+        Ok(status.info.config.max_age)
+    }
+
     /// Who holds the lease `name` now, if anyone.
     pub async fn lock_get(&self, name: &str) -> Result<Option<LockRecord>> {
         check_kv_key(name)?;
@@ -1121,7 +1133,14 @@ impl Delivery {
         let Some(h) = &self.handle else { return Ok(()) };
         let ctx = || format!("{what} note {}", self.seq);
         h.msg.ack_with(kind).await.map_err(|e| nats(&ctx(), e))?;
-        h.client.flush().await.map_err(|e| nats(&ctx(), e))
+        // Bounded: a hub that does not answer must not hold the caller.
+        match tokio::time::timeout(SIGNAL_WAIT, h.client.flush()).await {
+            Ok(r) => r.map_err(|e| nats(&ctx(), e)),
+            Err(_) => Err(BusError::Nats(format!(
+                "{}: the hub did not answer within {SIGNAL_WAIT:?}",
+                ctx()
+            ))),
+        }
     }
 }
 

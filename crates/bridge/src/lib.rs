@@ -9,6 +9,7 @@
 
 pub mod adapter;
 pub mod bus;
+mod cleanup;
 pub mod disk;
 mod ended;
 mod failures;
@@ -37,6 +38,7 @@ pub use bus::{BusApi, DeliveryApi, InboxApi, LeaseApi};
 pub use disk::{DiskProbe, Statvfs};
 pub use hgl_ai_cap::Method as CapMethod;
 
+use crate::cleanup::Cleanup;
 use crate::ended::EndedTasks;
 use crate::failures::Failures;
 use crate::lock::FileLock;
@@ -74,6 +76,8 @@ pub struct Options {
     pub hub_retry: Duration,
     /// How long a seat stays on a fallback binding before it tries its primary again.
     pub failover_cooldown: Duration,
+    /// Retry of a tree whose removal on `landed` or `closed` failed.
+    pub cleanup_retry: Duration,
     /// Retry of a task whose turn lock another process holds.
     pub busy_retry: Duration,
     /// Also how often held `assign` notes are looked at again.
@@ -106,6 +110,7 @@ impl Options {
             quota_retry: Duration::from_secs(600),
             hub_retry: Duration::from_secs(15),
             failover_cooldown: cfg.failover_cooldown(),
+            cleanup_retry: Duration::from_secs(300),
             busy_retry: Duration::from_secs(30),
             in_progress_every: Duration::from_secs(60),
             heartbeat_every: Duration::from_secs(30),
@@ -152,6 +157,27 @@ pub struct Bridge<B: BusApi> {
     leases: tokio::sync::Mutex<BTreeMap<Seat, HeldLease<B::Lease>>>,
     /// This host's id in lease holder strings ([`holder`]).
     host_id: String,
+    /// How the seat leases are kept, from the hub's `max_age` ([`LeaseTiming`]).
+    lease_timing: Mutex<LeaseTiming>,
+}
+
+/// The seat leases' refresh, from `HGL_LOCKS`' `max_age` (PROTO-6): written every `every`
+/// (the heartbeat, or a sixth of `max_age` when that is shorter), each attempt bounded by
+/// `every`. A lease not refreshed for `deadline` (half of `max_age`) stops its seat, so the
+/// seat has stopped before the lease can expire and another host take it.
+#[derive(Debug, Clone, Copy)]
+struct LeaseTiming {
+    every: Duration,
+    deadline: Duration,
+}
+
+impl LeaseTiming {
+    fn of(max_age: Duration, heartbeat: Duration) -> LeaseTiming {
+        LeaseTiming {
+            every: heartbeat.min(max_age / 6).max(Duration::from_millis(50)),
+            deadline: max_age / 2,
+        }
+    }
 }
 
 /// Turns started by this process, for [`Bridge::next_marker`]: counted per process, not per
@@ -161,6 +187,8 @@ static TURNS: AtomicU64 = AtomicU64::new(0);
 struct HeldLease<L> {
     lease: L,
     seat: Arc<SeatRt>,
+    /// The last write of the lease that the hub confirmed.
+    ok_at: Instant,
 }
 
 /// One seat at run time: its configuration and current binding.
@@ -172,10 +200,14 @@ struct SeatRt {
     busy_told: Mutex<HashSet<Target>>,
     /// Targets whose failed preparation the controller was told of (once until it works).
     prep_told: Mutex<HashSet<Target>>,
-    /// Raised when a refresh finds the seat lease no longer ours.
+    /// Raised when a refresh finds the seat lease no longer ours, or could not refresh it
+    /// within the deadline; why, in `lost_why`.
     lost: watch::Sender<bool>,
+    lost_why: Mutex<String>,
     ended: Mutex<EndedTasks>,
     failures: Mutex<Failures>,
+    /// Tree removals that failed, tried again until they work.
+    cleanup: Mutex<Cleanup>,
     /// No turn starts before this: a quota refusal with no binding left (PROTO-17).
     quota_until: Mutex<Option<Instant>>,
     /// When the seat last moved to a fallback binding; it returns to the primary after the
@@ -184,8 +216,10 @@ struct SeatRt {
 }
 
 impl SeatRt {
-    fn new(cfg: SeatConfig, ended: EndedTasks, failures: Failures) -> Self {
+    fn new(cfg: SeatConfig, ended: EndedTasks, failures: Failures, cleanup: Cleanup) -> Self {
         SeatRt {
+            lost_why: Mutex::default(),
+            cleanup: Mutex::new(cleanup),
             cfg,
             binding: Mutex::new(0),
             exhausted_told: AtomicBool::new(false),
@@ -272,8 +306,13 @@ impl<B: BusApi> Bridge<B> {
                 format!("{:016x}", std::process::id())
             }
         };
+        let lease_timing = Mutex::new(LeaseTiming::of(
+            hgl_ai_bus::LOCKS_MAX_AGE,
+            opts.heartbeat_every,
+        ));
         Arc::new(Bridge {
             host_id,
+            lease_timing,
             cfg,
             bus,
             trees: Arc::new(trees),
@@ -339,17 +378,30 @@ impl<B: BusApi> Bridge<B> {
             }
         }
         let data = self.cfg.data_dir()?;
+        match self.bus.lease_max_age().await {
+            Ok(max_age) => {
+                let t = LeaseTiming::of(max_age, self.opts.heartbeat_every);
+                tracing::info!(?max_age, refresh = ?t.every, deadline = ?t.deadline, "seat leases");
+                *lock(&self.lease_timing) = t;
+            }
+            Err(e) => tracing::warn!(
+                "reading the leases' max_age: {e}; assuming {:?}",
+                hgl_ai_bus::LOCKS_MAX_AGE
+            ),
+        }
         let mut set = tokio::task::JoinSet::new();
         for s in seats {
             let file = format!("{}.json", s.name);
             let ended = EndedTasks::load(data.join("bridge").join("ended").join(&file));
             let failures = Failures::load(data.join("bridge").join("failures").join(&file));
-            set.spawn(
-                self.clone()
-                    .seat_main(Arc::new(SeatRt::new(s, ended, failures)), shutdown.clone()),
-            );
+            let cleanup = Cleanup::load(data.join("bridge").join("cleanup").join(&file));
+            set.spawn(self.clone().seat_main(
+                Arc::new(SeatRt::new(s, ended, failures, cleanup)),
+                shutdown.clone(),
+            ));
         }
         set.spawn(self.clone().heartbeat_loop(shutdown.clone()));
+        set.spawn(self.clone().lease_loop(shutdown.clone()));
         set.spawn(self.clone().report_loop(shutdown.clone()));
         while let Some(r) = set.join_next().await {
             if let Err(e) = r {
@@ -397,8 +449,9 @@ impl<B: BusApi> Bridge<B> {
             }
             drop(held);
             let Some(stopped) = ended.lost else { return };
+            let why = lock(&seat.lost_why).clone();
             let body = format!(
-                "[bridge] {}/{}: the seat lease {} is no longer ours (it expired or another bridge took it); stopped serving the seat{}, naked its notes, and wait to take it again.",
+                "[bridge] {}/{}: the seat lease {} {why}; stopped serving the seat{}, naked its notes, and wait to take it again.",
                 self.cfg.host,
                 seat.name(),
                 seat_lock_key(seat.name()),
@@ -444,6 +497,7 @@ impl<B: BusApi> Bridge<B> {
                                 HeldLease {
                                     lease,
                                     seat: seat.clone(),
+                                    ok_at: Instant::now(),
                                 },
                             );
                             if told.is_some() {
@@ -490,24 +544,55 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// Refresh every held seat lease (with the heartbeat); a lease no longer ours stops
-    /// its seat.
+    /// Refresh every held seat lease (with the heartbeat). A lease no longer ours stops its
+    /// seat; so does one the hub has not confirmed for the deadline ([`LeaseTiming`]): in a
+    /// partition no answer says it is lost, and it expires on its own while the seat would
+    /// still run.
     pub(crate) async fn refresh_leases(&self) {
+        let t = *lock(&self.lease_timing);
         let mut leases = self.leases.lock().await;
         let mut lost = Vec::new();
         for (seat, held) in leases.iter_mut() {
-            match held.lease.refresh().await {
-                Ok(()) => {}
-                Err(BusError::LeaseLost { .. }) => lost.push(seat.clone()),
-                Err(e) => tracing::warn!(%seat, "refreshing the seat lease: {e}; trying again"),
+            let r = tokio::time::timeout(t.every, held.lease.refresh()).await;
+            let failed = match r {
+                Ok(Ok(())) => {
+                    held.ok_at = Instant::now();
+                    continue;
+                }
+                Ok(Err(BusError::LeaseLost { .. })) => {
+                    lost.push((
+                        seat.clone(),
+                        "is no longer ours (it expired or another bridge took it)".to_string(),
+                    ));
+                    continue;
+                }
+                Ok(Err(e)) => e.to_string(),
+                Err(_) => format!("no answer within {:?}", t.every),
+            };
+            let since = held.ok_at.elapsed();
+            if since >= t.deadline {
+                lost.push((
+                    seat.clone(),
+                    format!(
+                        "was not refreshed for {since:?} ({failed}), so it could expire and another host take the seat"
+                    ),
+                ));
+            } else {
+                tracing::warn!(%seat, "refreshing the seat lease: {failed}; trying again (unrefreshed for {since:?} of {:?})", t.deadline);
             }
         }
-        for seat in lost {
+        for (seat, why) in lost {
             if let Some(held) = leases.remove(&seat) {
-                tracing::error!(%seat, "the seat lease is no longer ours; stopping the seat");
+                tracing::error!(%seat, "the seat lease {why}; stopping the seat");
+                *lock(&held.seat.lost_why) = why;
                 held.seat.lost.send_replace(true);
             }
         }
+    }
+
+    /// How often the seat leases are refreshed.
+    pub(crate) fn lease_every(&self) -> Duration {
+        lock(&self.lease_timing).every
     }
 
     /// Serve until shutdown or a lost lease; the notes held at the end are naked. This loop
@@ -524,6 +609,8 @@ impl<B: BusApi> Bridge<B> {
         let fetcher = tokio::spawn(self.clone().fetch_loop(seat.name().clone(), tx));
         let mut st: SeatState<B::Delivery> = SeatState::new();
         let mut stopping = false;
+        // Removals owed from before (a restart) are tried at once.
+        let mut cleanup_at = Instant::now();
         let every = self.opts.in_progress_every;
         let mut tick = tokio::time::interval_at(Instant::now() + every, every);
         loop {
@@ -542,6 +629,7 @@ impl<B: BusApi> Bridge<B> {
                 None
             };
             let due = st.deferred.iter().map(|(_, t)| *t).min();
+            let owed = !lock(&seat.cleanup).is_empty();
             tokio::select! {
                 _ = down(&mut shutdown), if !stopping => {
                     stopping = true;
@@ -583,6 +671,10 @@ impl<B: BusApi> Bridge<B> {
                     for (d, _) in ready {
                         self.on_delivery(seat, d, &mut st).await;
                     }
+                }
+                _ = tokio::time::sleep_until(cleanup_at), if owed && !stopping => {
+                    self.retry_cleanup(seat, &mut st).await;
+                    cleanup_at = Instant::now() + self.opts.cleanup_retry;
                 }
             }
         }
@@ -794,16 +886,29 @@ impl<B: BusApi> Bridge<B> {
             }
             let trees = self.trees.clone();
             let (s, t) = (seat.name().clone(), task.clone());
-            match tokio::task::spawn_blocking(move || trees.remove(&s, &t, review)).await {
-                Ok(Ok(Some(rm))) => {
-                    if let Err(e) = self.bus.tree_del(&rm.key).await {
-                        tracing::warn!(key = %rm.key, "deregistering: {e}");
+            let failed =
+                match tokio::task::spawn_blocking(move || trees.remove(&s, &t, review)).await {
+                    Ok(Ok(Some(rm))) => {
+                        if let Err(e) = self.bus.tree_del(&rm.key).await {
+                            tracing::warn!(key = %rm.key, "deregistering: {e}");
+                        }
+                        removed.push(rm);
+                        None
                     }
-                    removed.push(rm);
+                    Ok(Ok(None)) => None,
+                    Ok(Err(e)) => Some(e.to_string()),
+                    Err(e) => Some(format!("removal panicked: {e}")),
+                };
+            match failed {
+                // Owed apart from the end, which stands: tried again until it works.
+                Some(e) => {
+                    lock(&seat.cleanup).owe(&task, review, end, &e);
+                    errors.push(format!(
+                        "{e} (the removal is tried again every {:?} until it works)",
+                        self.opts.cleanup_retry
+                    ));
                 }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => errors.push(e.to_string()),
-                Err(e) => errors.push(format!("removal panicked: {e}")),
+                None => lock(&seat.cleanup).settle(&task, review),
             }
             cleared.push(target);
         }
@@ -837,6 +942,92 @@ impl<B: BusApi> Bridge<B> {
                 // Done again later, the note finds nothing left to remove and records the end.
                 tracing::warn!(seat = %seat.name(), %task, "recording the end in {}: {e}; held, done again in {:?}", hgl_ai_proto::KV_ENDED, self.opts.hub_retry);
                 st.deferred.push((d, Instant::now() + self.opts.hub_retry));
+            }
+        }
+    }
+
+    /// Try again the removals the seat owes (a failed removal on `landed` or `closed`): each
+    /// whose tree no turn uses now. Reported when it works.
+    async fn retry_cleanup(&self, seat: &Arc<SeatRt>, st: &mut SeatState<B::Delivery>) {
+        let owed = lock(&seat.cleanup).list();
+        for o in owed {
+            let task = o.task();
+            let target = Target::Tree {
+                task: task.clone(),
+                review: o.review,
+            };
+            if st.running.as_ref().is_some_and(|r| r.target == target) {
+                continue;
+            }
+            if let Some(dir) = self
+                .trees
+                .layout()
+                .task_dir(seat.name(), &task, o.review)
+                .ok()
+                .filter(|p| p.exists())
+            {
+                let lp = dir.join(lock::TURN_LOCK);
+                if lp.exists()
+                    && matches!(FileLock::turn_patiently(&lp).await, Ok(None))
+                    && !turn::reap_lock_holders(&lp, self.opts.kill_grace).await
+                {
+                    lock(&seat.cleanup).owe(
+                        &task,
+                        o.review,
+                        o.end,
+                        "a process still holds its turn lock",
+                    );
+                    continue;
+                }
+            }
+            let trees = self.trees.clone();
+            let (s, t, review) = (seat.name().clone(), task.clone(), o.review);
+            match tokio::task::spawn_blocking(move || trees.remove(&s, &t, review)).await {
+                Ok(Ok(rm)) => {
+                    lock(&seat.cleanup).settle(&task, o.review);
+                    let what = match &rm {
+                        Some(rm) => {
+                            if let Err(e) = self.bus.tree_del(&rm.key).await {
+                                tracing::warn!(key = %rm.key, "deregistering: {e}");
+                            }
+                            let salvage = rm
+                                .salvage
+                                .as_ref()
+                                .and_then(|p| p.strip_prefix(self.trees.layout().root()).ok())
+                                .map(|p| format!("; salvage: {}", p.display()))
+                                .unwrap_or_default();
+                            format!(
+                                "removed {} at try {}, freed {}{salvage}",
+                                hgl_ai_tree::layout::task_dir_name(&task, o.review),
+                                o.tries + 1,
+                                hgl_ai_tree::stale::human_bytes(rm.freed_bytes)
+                            )
+                        }
+                        None => "nothing was left to remove".to_string(),
+                    };
+                    tracing::info!(seat = %seat.name(), %task, "{what}");
+                    let body = format!(
+                        "[bridge] {}/{}: Cleanup: {}#{}: {what} (the removal at its end had failed: {}).",
+                        self.cfg.host,
+                        seat.name(),
+                        task.repo,
+                        task.issue,
+                        o.error
+                    );
+                    self.tell(seat.name(), Kind::Done, Some(&task), body).await;
+                }
+                Ok(Err(e)) => {
+                    tracing::warn!(seat = %seat.name(), %task, "the owed removal failed again: {e}");
+                    lock(&seat.cleanup).owe(&task, o.review, o.end, &e.to_string());
+                }
+                Err(e) => {
+                    lock(&seat.cleanup).owe(
+                        &task,
+                        o.review,
+                        o.end,
+                        &format!("removal panicked: {e}"),
+                    );
+                }
             }
         }
     }
@@ -926,6 +1117,11 @@ impl<B: BusApi> Bridge<B> {
             }
         }
         st.pending = rest;
+        if let Target::Tree { task, review } = &target {
+            // A turn of the task after its end is a restart: the tree is its now, not a
+            // removal still owed (older notes of the task are moot, so these are later).
+            lock(&seat.cleanup).settle(task, *review);
+        }
         let create = turn::choose_create(creates);
         // The tree the turn runs in: one kept from before (a review always gets a new one),
         // or the one its creating note makes.
@@ -1323,10 +1519,17 @@ impl<B: BusApi> Bridge<B> {
         if let Some(r) = &st.running {
             all.extend(lock(&r.deliveries).iter().cloned());
         }
-        for d in all {
-            if let Err(e) = d.in_progress().await {
-                tracing::warn!(seq = d.seq(), "in_progress: {e}");
+        // Bounded: with the hub gone, the seat loop must still see a lost lease.
+        let sent = tokio::time::timeout(self.opts.in_progress_every / 2, async {
+            for d in all {
+                if let Err(e) = d.in_progress().await {
+                    tracing::warn!(seq = d.seq(), "in_progress: {e}");
+                }
             }
+        })
+        .await;
+        if sent.is_err() {
+            tracing::warn!("in_progress: the hub did not answer in time");
         }
     }
 
