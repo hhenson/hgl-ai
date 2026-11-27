@@ -139,7 +139,7 @@ class HglBus:
             subjects=[f"{NOTES_SUBJECT_PREFIX}.>"],
             retention=RetentionPolicy.LIMITS,
             storage=StorageType.FILE,
-            max_age=14 * 86400,  # 14 days (matches /tmp/hgl-queue 10-day retention)
+            max_age=14 * 86400,  # 14-day retention window
             duplicate_window=86400,  # 24h deduplication via Nats-Msg-Id
         )
         try:

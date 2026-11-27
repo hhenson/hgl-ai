@@ -92,7 +92,7 @@ def main() -> None:
 
     sub.add_parser("init", help="Ensure HGL_NOTES stream and KV buckets exist")
 
-    imp_p = sub.add_parser("import-queue", help="Import /tmp/hgl-queue state and notes idempotently")
+    imp_p = sub.add_parser("import-queue", help="Import legacy file-queue state and notes idempotently")
     imp_p.add_argument("queue_dir", type=Path)
 
     post_p = sub.add_parser("post", help="Publish a note to HGL_NOTES")

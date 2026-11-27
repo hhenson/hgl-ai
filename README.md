@@ -4,6 +4,9 @@ NATS JetStream coordination bus, `stdio` MCP server (`hgl-mcp`), and async worke
 
 GitHub holds issues, pull requests, reviews, and merges. `hgl-ai` provides the low-latency inter-agent transport, shared PR/hold state, and host-isolated worker wakeups.
 
+- **[Communication Protocol Specification](docs/protocol.md)** — Wire envelopes, note kinds, `HGL_NOTES` / `HGL_STATE` / `HGL_HOSTS` schemas, gate receipts, and MCP tools.
+- **[Roles, Governance Rules, and Multi-Host Distribution](docs/roles-and-distribution.md)** — Controller, Coordinator, Desk, Implementor, and Independent Reviewer responsibilities, exact-SHA gates, `memcap`, worktree cleanup, and multi-machine placement.
+
 ---
 
 ## 1. Architecture
