@@ -10,6 +10,9 @@ Status: running. Results replace the provisional tiers in `docs/roles.md` §3.
 | neon-high, neon-xhigh | Antigravity | `gemini-4-neon` | high, xhigh |
 | hydrogen-high, hydrogen-xhigh | Antigravity | `gemini-4-hydrogen` | high, xhigh |
 | agyopus-high (task 2 only) | Antigravity | `claude-opus-5-5` | high |
+| astra-high, astra-xhigh | Codex | `gpt-6.2-astra` | high, xhigh |
+| sol-high, sol-xhigh | Codex | `gpt-6.2-sol` | high, xhigh |
+| terra-high, terra-xhigh | Codex | `gpt-6.1-terra` | high, xhigh |
 
 `agyopus-high` separates the harness from the model.
 
@@ -26,7 +29,7 @@ Status: running. Results replace the provisional tiers in `docs/roles.md` §3.
 - One brief per task, identical for every contestant; one headless turn, no questions answered.
 - Same base commit; a fresh clone per run; pushing and GitHub disabled.
 - Same caps: every build and test under `memcap 16G` (32G for a workspace run); build parallelism 16; 4 h wall limit.
-- At most 2 Claude and 4 Antigravity runs at once, so wall times share one machine's load.
+- At most 2 Claude, 4 Antigravity and 3 Codex runs at once, so wall times share one machine's load; the Codex runs started later, against a different mix.
 
 ## Scoring
 
@@ -44,12 +47,12 @@ Also recorded: wall time, turns and tokens where the runtime reports them.
 
 ## Reviews
 
-- Cross-review: each result reviewed by the other two models at xhigh, fresh context, one receipt (`docs/protocol.md` PROTO-19).
+- Cross-review: each result reviewed by models of the other families at xhigh, fresh context, one receipt (`docs/protocol.md` PROTO-19).
 - Seeded review: the best t2 result with three planted defects, reviewed by every contestant. Recall and false findings are counted.
 
 ## Controller trials
 
-`gemini-4-carbon-high` on: the triage of all open issues (compared with an Opus triage of the same brief), an architectural assessment of an external review (compared with an Opus assessment and the controller's checks), and blind scoring of the task results (compared with the controller's scores).
+`gemini-4-carbon-high`, and `gpt-6.2-astra` at high for comparison, on: the triage of all open issues (compared with an Opus triage of the same brief), an architectural assessment of an external review (compared with an Opus assessment and the controller's checks), and blind scoring of the task results (compared with the controller's scores).
 
 ## Results
 
