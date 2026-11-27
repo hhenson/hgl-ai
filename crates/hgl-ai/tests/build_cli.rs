@@ -1,11 +1,20 @@
 //! `hgl-ai build` and `hgl-ai builder`, run as the binary against a live
 //! `nats-server -js` (skipped, with the reason printed, when `nats-server` is not on
-//! `PATH`): a builder service and `build run --platform linux` through the hub, on a
-//! fixture repository whose recipe has a passing and a failing step.
+//! `PATH`): a builder service and `build run --platform P` through the hub, P this host's
+//! own platform, on a fixture repository whose recipe has a passing and a failing step.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
+
+use hgl_ai_proto::build::{BuilderRecord, Platform};
+
+/// This host's platform: the one its builder advertises and builds.
+fn platform() -> &'static str {
+    Platform::current()
+        .expect("a linux, macos or windows host")
+        .as_str()
+}
 
 struct Scratch(PathBuf);
 
@@ -216,7 +225,7 @@ fn builder_runs_a_remote_build_through_the_hub() {
 
     // No builder yet: not run (3).
     let o = hub
-        .cmd(&["build", "run", "demo", "--platform", "linux"])
+        .cmd(&["build", "run", "demo", "--platform", platform()])
         .current_dir(&seed)
         .output()
         .unwrap();
@@ -230,15 +239,31 @@ fn builder_runs_a_remote_build_through_the_hub() {
             .spawn()
             .unwrap(),
     );
-    let deadline = Instant::now() + Duration::from_secs(20);
+    // The record as written, field by field, whatever the platform and the line format.
+    let deadline = Instant::now() + Duration::from_secs(30);
     loop {
-        let o = hub.run(&["builder", "list"]);
+        let o = hub.run(&["--json", "builder", "list"]);
         let l = String::from_utf8_lossy(&o.stdout).into_owned();
-        if l.starts_with("lab1 linux local active reachable busy 0/1") {
-            assert!(l.contains("git: git version"), "{l}");
+        let found = l
+            .lines()
+            .filter_map(|r| serde_json::from_str::<BuilderRecord>(r).ok())
+            .find(|b| b.label == "lab1");
+        if let Some(b) = found.filter(|b| b.reachable && b.state == "active") {
+            assert_eq!(b.platform.as_str(), platform(), "{b:?}");
+            assert_eq!(
+                (b.executor.as_str(), b.slots, b.busy),
+                ("local", 1, 0),
+                "{b:?}"
+            );
+            assert_eq!(b.inbox.as_str(), "builder-lab1");
+            assert!(b.toolchains["git"].starts_with("git version"), "{b:?}");
             break;
         }
-        assert!(Instant::now() < deadline, "no builder record: {l}");
+        assert!(
+            Instant::now() < deadline,
+            "no builder record: {l}\n{}",
+            std::fs::read_to_string(hub.dir.0.join("builder.log")).unwrap_or_default()
+        );
         std::thread::sleep(Duration::from_millis(200));
     }
     let o = hub.run(&["hosts"]);
@@ -255,7 +280,7 @@ fn builder_runs_a_remote_build_through_the_hub() {
             "build",
             "run",
             "--platform",
-            "linux",
+            platform(),
             "--timeout",
             "2m",
         ])
@@ -316,8 +341,9 @@ fn builder_runs_a_remote_build_through_the_hub() {
     println!("--- sample summary ---\n{t}---");
     assert!(
         t.starts_with(&format!(
-            "build {id} demo at {} on lab1 (linux): FAIL",
-            &head[..12]
+            "build {id} demo at {} on lab1 ({}): FAIL",
+            &head[..12],
+            platform()
         )),
         "{t}"
     );
@@ -341,7 +367,7 @@ fn builder_runs_a_remote_build_through_the_hub() {
             "build",
             "run",
             "--platform",
-            "linux",
+            platform(),
             "--steps",
             "prepare",
             "--detach",
