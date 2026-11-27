@@ -70,6 +70,13 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
     if let Some(c) = c.controller {
         let _ = writeln!(s, "The controller is seat `{c}`.");
     }
+    if c.role == Role::Controller {
+        s.push_str(
+            "You are the headless controller (OWN-7): this turn handles the notes below, \
+             then ends; never run `hgl-ai note wait`. Start from `hgl-ai decision tail`, \
+             `hgl-ai thread list --open` and `hgl-ai state get main` (OWN-8).\n",
+        );
+    }
     s.push_str(
         "The `hgl-ai` skill describes the commands. Reply with `hgl-ai note send`.\n\
          Do not remove worktrees; the bridge does that. Keep all scratch inside $HGL_AI_TASK_DIR \
@@ -119,6 +126,19 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
             ", created {} (seq {seq}, delivery {delivered}) ---",
             n.created_at
         );
+        if n.sender.is_owner() {
+            let who = match &n.by {
+                Some(h) => format!("{h} (owner) says"),
+                None => "The owner says".to_string(),
+            };
+            let _ = writeln!(
+                s,
+                "{who}, through the console (the hub accepts sender `owner` only there). \
+                 Post a ruling once on its issue as `{}, <date>: \"<their words>\"`, naming \
+                 the thread (OWN-4, OWN-10):",
+                n.by.as_deref().unwrap_or("owner")
+            );
+        }
         s.push_str(&truncate(n.body.trim_end(), budget));
         s.push('\n');
     }
@@ -227,6 +247,36 @@ mod tests {
         let plain = build(&ctx(None, &s), &[(1, 1, &q)]);
         assert!(plain.contains("No task"));
         assert!(!plain.contains("State "), "hold and mode only when set");
+        assert!(!plain.contains("(owner) says") && !plain.contains("The owner says"));
+        let mut o = Note::new(
+            Seat::owner(),
+            seat("w1"),
+            Kind::Answer,
+            "[owner] Answer: accept a",
+        );
+        o.by = Some("HPH".into());
+        let p = build(&ctx(None, &s), &[(2, 1, &o)]);
+        assert!(p.contains("answer from owner to w1"));
+        assert!(p.contains("HPH (owner) says, through the console"), "{p}");
+        assert!(p.contains("`HPH, <date>: \"<their words>\"`"));
+        assert!(!p.contains("The owner says"));
+        o.by = None;
+        let p = build(&ctx(None, &s), &[(2, 1, &o)]);
+        assert!(p.contains("The owner says, through the console"));
+    }
+
+    #[test]
+    fn a_headless_controller_is_told_not_to_wait() {
+        let s = seat("claude");
+        let mut c = ctx(None, &s);
+        c.role = Role::Controller;
+        let n = Note::new(seat("w1"), seat("claude"), Kind::Note, "x");
+        let p = build(&c, &[(1, 1, &n)]);
+        assert!(
+            p.contains("headless controller (OWN-7)") && p.contains("never run `hgl-ai note wait`"),
+            "{p}"
+        );
+        assert!(!build(&ctx(None, &s), &[(1, 1, &n)]).contains("headless controller"));
     }
 
     #[test]

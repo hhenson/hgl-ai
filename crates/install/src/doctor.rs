@@ -149,6 +149,252 @@ fn parse_df(out: &str) -> Option<u64> {
     Some(kb.saturating_mul(1024) / 1_000_000_000)
 }
 
+/// A secret file: present, and readable by its owner only.
+fn secret_check(sys: &dyn System, name: &str, shown: &str) -> Check {
+    let p = sys.env().expand(shown);
+    match sys.mode(&p) {
+        Err(_) => Check::fail(
+            name,
+            format!("no {shown}"),
+            format!("write it, then `chmod 600 {shown}`"),
+        ),
+        Ok(m) if !token::mode_ok(m) => Check::fail(
+            name,
+            format!("{shown} has mode {m:o}"),
+            format!("`chmod 600 {shown}`"),
+        ),
+        Ok(_) => Check::ok(name, shown.to_string()),
+    }
+}
+
+/// The server side and the client side apart (docs/install.md): the server user's home
+/// is its own (mode 0700), and the console's credential is out of the client user's
+/// reach; on the server user's side, its credentials are its own, mode 0600.
+fn separation_checks(sys: &dyn System, c: &Config) -> Vec<Check> {
+    let env = sys.env();
+    let mut out = Vec::new();
+    let me = sys
+        .query(&Cmd::new("id").arg("-u"))
+        .ok()
+        .and_then(|o| o.stdout.trim().parse::<u32>().ok());
+    if let Some(su) = &c.server_user {
+        let home = env.expand(&su.home);
+        let stat = match env.os {
+            crate::Os::Linux => Cmd::new("stat").args(["-c", "%U %a"]),
+            crate::Os::MacOs => Cmd::new("stat").args(["-f", "%Su %Lp"]),
+        }
+        .arg(home.display().to_string());
+        let got = sys
+            .query(&stat)
+            .ok()
+            .filter(|o| o.ok())
+            .map(|o| o.stdout.trim().to_string());
+        let want = format!("{} 700", su.name);
+        out.push(match got {
+            Some(g) if g == want => Check::ok(
+                "server user",
+                format!("{} owns {} (mode 700)", su.name, su.home),
+            ),
+            Some(g) => Check::fail(
+                "server user",
+                format!("{}: owner and mode are {g}, not {want}", su.home),
+                format!(
+                    "`sudo chown -R {0} {1} && sudo chmod 700 {1}`",
+                    su.name, su.home
+                ),
+            ),
+            None => Check::fail(
+                "server user",
+                format!("no {}", su.home),
+                "`hgl-ai server install`",
+            ),
+        });
+        let cred = home.join(".config/hgl-ai/hub-users/console.cred");
+        out.push(if sys.can_read(&cred) {
+            Check::fail(
+                "console credential",
+                format!(
+                    "{} is readable by you, the client user: an agent could speak as the owner",
+                    cred.display()
+                ),
+                format!(
+                    "`sudo chmod 700 {}` and `sudo chmod 600 {}`",
+                    su.home,
+                    cred.display()
+                ),
+            )
+        } else {
+            Check::ok("console credential", "not readable by the client user")
+        });
+    } else if let Some(srv) = &c.server {
+        let cred = env.config_dir().join("hub-users/console.cred");
+        if srv.units == hgl_ai_config::Units::User && sys.exists(&cred) {
+            out.push(Check::warn(
+                "console credential",
+                "a same-user install: this user, and every agent it runs, can read the console's credential",
+                "install the server side as its own user (`hgl-ai server install` without --same-user)",
+            ));
+        }
+        if srv.units == hgl_ai_config::Units::System {
+            // As the server user: its secrets are its own, mode 0600.
+            let mut files = vec![env.expand(&c.hub.token_file)];
+            let dir = env.config_dir().join("hub-users");
+            if let Ok(rd) = std::fs::read_dir(&dir) {
+                files.extend(rd.flatten().map(|e| e.path()));
+            }
+            for f in files.iter().filter(|f| sys.exists(f)) {
+                let shown = env.contract(f);
+                let mode = sys.mode(f).ok();
+                let uid = sys.owner_uid(f).ok();
+                out.push(match (mode, uid, me) {
+                    (Some(m), _, _) if !crate::token::mode_ok(m) => Check::fail(
+                        format!("secret {shown}"),
+                        format!("mode {m:o}"),
+                        format!("`chmod 600 {shown}`"),
+                    ),
+                    (_, Some(u), Some(me)) if u != me => Check::fail(
+                        format!("secret {shown}"),
+                        "owned by another user".to_string(),
+                        format!("`sudo chown $(id -un) {shown}`"),
+                    ),
+                    _ => Check::ok(format!("secret {shown}"), "mode 600, own"),
+                });
+            }
+        }
+    }
+    out
+}
+
+/// `[console]`: who can sign in, how, and the secrets beside the configuration.
+fn console_checks(sys: &dyn System, c: &hgl_ai_config::Console) -> Vec<Check> {
+    let mut out = Vec::new();
+    let missing = c.missing_handles();
+    let no_email = c.without_email();
+    let members = c.members().unwrap_or_default();
+    out.push(if c.users.is_empty() {
+        Check::warn(
+            "console users",
+            "nobody may sign in",
+            "add `{ email = \"<email>\", handle = \"<name>\" }` to [console] users",
+        )
+    } else if !no_email.is_empty() {
+        let fixes: Vec<String> = members
+            .iter()
+            .filter(|m| m.email.is_none())
+            .map(|m| {
+                let mut f = format!(
+                    "{{ email = \"<email>\", handle = \"{}\"",
+                    m.handle.as_deref().unwrap_or("<name>")
+                );
+                for (k, v) in [
+                    ("github", &m.github),
+                    ("apple", &m.apple),
+                    ("google", &m.google),
+                ] {
+                    if let Some(v) = v {
+                        f.push_str(&format!(", {k} = \"{v}\""));
+                    }
+                }
+                f.push_str(" }");
+                f
+            })
+            .collect();
+        Check::fail(
+            "console users",
+            format!(
+                "no email for {}: a user is keyed by email",
+                no_email.join(", ")
+            ),
+            format!("write {}", fixes.join(", ")),
+        )
+    } else if !missing.is_empty() {
+        Check::warn(
+            "console users",
+            format!(
+                "no handle for {}: their words are signed by email",
+                missing.join(", ")
+            ),
+            "add `handle = \"<the name they sign with>\"` (OWN-10)",
+        )
+    } else {
+        let names: Vec<String> = members
+            .iter()
+            .map(|m| {
+                let h = m.handle.as_deref().unwrap_or("?");
+                let note = if h.chars().count() > 12 {
+                    "; a shorter handle reads better"
+                } else {
+                    ""
+                };
+                format!("{h} ({}){note}", m.key)
+            })
+            .collect();
+        Check::ok("console users", names.join(", "))
+    });
+    if c.github.is_none() && c.apple.is_none() && c.google.is_none() {
+        out.push(Check::warn(
+            "console sign-in",
+            "no GitHub, Apple or Google app: a first sign-in or a new device cannot enrol a passkey",
+            "set [console.github], [console.apple] or [console.google] (docs/install.md)",
+        ));
+    }
+    if let Some(g) = &c.google {
+        out.push(secret_check(sys, "console google", &g.secret_file));
+    }
+    if let Some(g) = &c.github {
+        out.push(secret_check(sys, "console github", &g.secret_file));
+    }
+    if let Some(a) = &c.apple {
+        out.push(secret_check(sys, "console apple", &a.key_file));
+    }
+    match (&c.tls_cert, &c.tls_key) {
+        (Some(cert), Some(key)) => {
+            let p = sys.env().expand(cert);
+            out.push(if sys.exists(&p) {
+                Check::ok("console tls", format!("{cert} for {}", c.url))
+            } else {
+                Check::fail(
+                    "console tls",
+                    format!("no {cert}"),
+                    "write the certificate for the console's name",
+                )
+            });
+            out.push(secret_check(sys, "console tls key", key));
+        }
+        _ => out.push(Check::ok(
+            "console tls",
+            format!(
+                "plain HTTP on {} behind a TLS proxy for {}",
+                c.listen, c.url
+            ),
+        )),
+    }
+    if c.notify.is_empty() {
+        out.push(Check::warn(
+            "console notify",
+            "no channel: p1 questions show only in the console",
+            "add [[console.notify]] (ntfy, slack, email)",
+        ));
+    }
+    for n in &c.notify {
+        match n {
+            hgl_ai_config::Notify::Ntfy {
+                token_file: Some(t),
+                ..
+            } => out.push(secret_check(sys, "console notify ntfy", t)),
+            hgl_ai_config::Notify::Slack { webhook_file } => {
+                out.push(secret_check(sys, "console notify slack", webhook_file))
+            }
+            hgl_ai_config::Notify::Email {
+                password_file: Some(p),
+                ..
+            } => out.push(secret_check(sys, "console notify email", p)),
+            _ => {}
+        }
+    }
+    out
+}
+
 /// Run every check. Checks that need the configuration are skipped when it
 /// does not load.
 pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
@@ -197,19 +443,26 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
     if let Some(c) = &cfg {
         let tp = env.expand(&c.hub.token_file);
         let shown = &c.hub.token_file;
-        out.push(match token::read(sys, &tp) {
+        let cred = token::read_credential(sys, &tp);
+        let what = match &cred {
+            Ok(Some(c)) => c.describe(),
+            _ => String::new(),
+        };
+        out.push(match &cred {
             Ok(None) => Check::fail(
                 "token",
                 format!("no {shown}"),
-                format!("copy the hub token there, then {reinstall}"),
+                format!("copy the hub credential there, then {reinstall}"),
             ),
             Err(e) => Check::fail(
                 "token",
                 e.to_string(),
-                format!("copy the hub token to {shown}"),
+                format!("copy the hub credential to {shown}"),
             ),
             Ok(Some(_)) => match sys.mode(&tp) {
-                Ok(m) if token::mode_ok(m) => Check::ok("token", format!("{shown} (mode {m:o})")),
+                Ok(m) if token::mode_ok(m) => {
+                    Check::ok("token", format!("{shown} ({what}, mode {m:o})"))
+                }
                 Ok(m) => Check::fail(
                     "token",
                     format!("{shown} has mode {m:o}"),
@@ -217,6 +470,31 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 ),
                 Err(e) => Check::fail("token", e.to_string(), format!("`chmod 600 {shown}`")),
             },
+        });
+        let token_mode = c
+            .server
+            .as_ref()
+            .is_some_and(|s| s.auth == hgl_ai_config::HubAuth::Token)
+            || matches!(&cred, Ok(Some(c)) if c.is_token());
+        out.push(if token_mode {
+            Check::warn(
+                "hub auth",
+                "single shared token: any client can publish as the owner (OWN-5)",
+                "give each client its own hub user: docs/install.md, Hub users",
+            )
+        } else {
+            let n = c.server.as_ref().map(|_| {
+                crate::users::Registry::load(sys, &env.expand(&c.paths.data_dir))
+                    .map(|r| r.users.len())
+                    .unwrap_or(0)
+            });
+            Check::ok(
+                "hub auth",
+                match n {
+                    Some(n) => format!("hub users ({n} registered)"),
+                    None => "hub user".to_string(),
+                },
+            )
         });
         out.push(match hub.health(c).await {
             Err(e) => Check::fail(
@@ -233,8 +511,19 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         });
     }
 
-    let clis = skill::installed_clis(sys);
-    for rt in Runtime::ALL.iter().copied() {
+    // The server user (a system install) runs no agents: no CLIs, skills, work_root
+    // or tmux to check there.
+    let server_side = cfg.as_ref().is_some_and(|c| {
+        c.server
+            .as_ref()
+            .is_some_and(|s| s.units == hgl_ai_config::Units::System)
+    });
+    let clis = if server_side {
+        Vec::new()
+    } else {
+        skill::installed_clis(sys)
+    };
+    for rt in Runtime::ALL.iter().copied().filter(|_| !server_side) {
         let name = format!("cli {rt}");
         let used = seat_uses(cfg.as_ref(), rt);
         let Some((_, bin)) = clis.iter().find(|(r, _)| *r == rt) else {
@@ -273,26 +562,65 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
     }
 
     if let Some(c) = &cfg {
-        let mut svcs = vec![(Service::Bridge, reinstall.clone())];
-        if c.server.is_some() {
+        let system_units = c
+            .server
+            .as_ref()
+            .is_some_and(|s| s.units == hgl_ai_config::Units::System);
+        // The server user (a system install) has no client of its own.
+        let mut svcs = if system_units {
+            Vec::new()
+        } else {
+            vec![(Service::Bridge, reinstall.clone())]
+        };
+        if c.server.is_some() || c.server_user.is_some() {
             svcs.push((Service::Hub, "`hgl-ai server install`".into()));
             svcs.push((Service::Coord, "`hgl-ai server install`".into()));
+            svcs.push((
+                Service::Console,
+                "`hgl-ai server install --console-url https://<stable name>`".into(),
+            ));
         }
+        let system = |s: Service| system_units || (s != Service::Bridge && c.server_user.is_some());
         for (s, install) in svcs {
             let name = format!("service {}", s.short());
-            out.push(match service::state(sys, s) {
-                State::Running => Check::ok(name, "running"),
-                State::Stopped => Check::fail(
+            let st = if system(s) {
+                service::system_state(sys, s)
+            } else {
+                service::state(sys, s)
+            };
+            let hint = if system(s) {
+                match env.os {
+                    crate::Os::Linux => format!("`sudo systemctl start {}`", s.unit()),
+                    crate::Os::MacOs => format!("`sudo launchctl kickstart system/{}`", s.label()),
+                }
+            } else {
+                format!("`{}`", service::start_hint(env, s))
+            };
+            out.push(match st {
+                State::Running => Check::ok(
                     name,
-                    "installed, not running",
-                    format!("`{}`", service::start_hint(env, s)),
+                    if system(s) {
+                        "running (system)"
+                    } else {
+                        "running"
+                    },
                 ),
+                State::Stopped => Check::fail(name, "installed, not running", hint),
                 State::NotInstalled if s == Service::Coord => {
                     Check::new(name, Level::Warn, "not installed on this hub host", None)
                 }
+                State::NotInstalled if s == Service::Console => Check::warn(
+                    name,
+                    "not installed on this hub host; the owner has no console",
+                    install,
+                ),
                 State::NotInstalled => Check::fail(name, "not installed", install),
             });
         }
+        if let Some(con) = &c.console {
+            out.extend(console_checks(sys, con));
+        }
+        out.extend(separation_checks(sys, c));
         if let Ok(Some(on)) = service::linger(sys, false) {
             out.push(if on {
                 Check::ok("lingering", "on")
@@ -307,7 +635,9 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
 
         let wr = env.expand(&c.paths.work_root);
         let shown = &c.paths.work_root;
-        out.push(if !sys.exists(&wr) {
+        out.push(if server_side {
+            Check::ok("work_root", "none on the server side")
+        } else if !sys.exists(&wr) {
             Check::fail(
                 "work_root",
                 format!("no {shown}"),
@@ -335,29 +665,69 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
     }
 
     let tool = |name: &str| sys.which(name);
-    out.push(match tool("tmux") {
-        Some(p) => Check::ok("tmux", p.display().to_string()),
-        None => Check::warn(
-            "tmux",
-            "not on PATH; `hgl-ai agent start` needs it",
-            "install tmux",
-        ),
-    });
+    if !server_side {
+        out.push(match tool("tmux") {
+            Some(p) => Check::ok("tmux", p.display().to_string()),
+            None => Check::warn(
+                "tmux",
+                "not on PATH; `hgl-ai agent start` needs it",
+                "install tmux",
+            ),
+        });
+    }
+    // `gh` with the token the coordinator uses (`[github] token_file`), when there is one.
+    let token_file = cfg.as_ref().and_then(|c| c.github.token_file.clone());
+    let mut gh_token = None;
+    if let Some(tf) = &token_file {
+        let p = env.expand(tf);
+        out.push(match sys.mode(&p) {
+            Err(_) => Check::fail(
+                "github token",
+                format!("no {tf}"),
+                "write a fine-grained read-only token there, mode 0600 (docs/install.md)",
+            ),
+            Ok(m) if !token::mode_ok(m) => Check::fail(
+                "github token",
+                format!("{tf} has mode {m:o}"),
+                format!("`chmod 600 {tf}`"),
+            ),
+            Ok(_) => match sys.read_to_string(&p) {
+                Ok(t) if !t.trim().is_empty() => {
+                    gh_token = Some(t.trim().to_string());
+                    Check::ok("github token", format!("{tf} (mode 600)"))
+                }
+                _ => Check::fail(
+                    "github token",
+                    format!("{tf} is empty"),
+                    "write the token there",
+                ),
+            },
+        });
+    }
     out.push(match tool("git") {
         Some(p) => Check::ok("git", p.display().to_string()),
         None => Check::fail("git", "not on PATH", "install git"),
     });
     out.push(match tool("gh") {
         None => Check::fail("gh", "not on PATH", "install gh"),
-        Some(p) => match sys.query(
-            &Cmd::new(p.display().to_string())
+        Some(p) => match sys.query(&{
+            let c = Cmd::new(p.display().to_string())
                 .args(["auth", "status"])
-                .timeout(PROBE),
-        ) {
+                .timeout(PROBE);
+            match &gh_token {
+                Some(t) => c.env("GH_TOKEN", t.clone()),
+                None => c,
+            }
+        }) {
             Ok(o) if o.ok() => Check::ok("gh", format!("{} (authenticated)", p.display())),
             Ok(o) if o.timed_out => {
                 Check::new("gh", Level::Warn, "`gh auth status` timed out", None)
             }
+            _ if token_file.is_some() => Check::fail(
+                "gh",
+                "`gh auth status` failed with the token in [github] token_file",
+                "renew the token",
+            ),
             _ => Check::fail("gh", "`gh auth status` failed", "`gh auth login`"),
         },
     });
@@ -415,7 +785,17 @@ mod tests {
         .unwrap()
         .seats;
         crate::save_config(&f, &f.env, &cfg).unwrap();
-        crate::sys::write_atomic(&home.join(".config/hgl-ai/hub.token"), b"t\n", 0o600).unwrap();
+        let cred = hgl_ai_bus::Credential::render_nkey(
+            "build-1",
+            "seat",
+            &nkeys::KeyPair::new_user().seed().unwrap(),
+        );
+        crate::sys::write_atomic(
+            &home.join(".config/hgl-ai/hub.token"),
+            cred.as_bytes(),
+            0o600,
+        )
+        .unwrap();
         std::fs::create_dir_all(home.join("hgl-ai/work")).unwrap();
         for rt in [Runtime::Claude, Runtime::Codex] {
             skill::install(&f, rt).unwrap();
@@ -460,6 +840,223 @@ mod tests {
                 .any(|c| c.name == "work_root" && c.detail.contains("536 GB free"))
         );
         assert!(f.runs().is_empty(), "doctor changes nothing");
+        let auth = cs.iter().find(|c| c.name == "hub auth").unwrap();
+        assert_eq!(auth.detail, "hub user");
+        assert!(
+            cs.iter()
+                .any(|c| c.name == "token" && c.detail.contains("hub user build-1 (seat)"))
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn console_configuration() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        let secret = f.env.home.join(".config/hgl-ai/console/github.secret");
+        std::fs::create_dir_all(secret.parent().unwrap()).unwrap();
+        std::fs::write(&secret, "s\n").unwrap();
+        std::fs::set_permissions(&secret, std::os::unix::fs::PermissionsExt::from_mode(0o644))
+            .unwrap();
+        cfg.console = Some(hgl_ai_config::Console {
+            url: "https://hub.example.com".into(),
+            github: Some(hgl_ai_config::GithubOAuth::new("Iv1.example")),
+            ..hgl_ai_config::Console::default()
+        });
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        let get = |n: &str| {
+            cs.iter()
+                .find(|c| c.name == n)
+                .unwrap_or_else(|| panic!("{n}"))
+        };
+        assert_eq!(get("console users").level, Level::Warn, "nobody");
+        let mut with_old = cfg.clone();
+        with_old.console.as_mut().unwrap().users = vec![
+            hgl_ai_config::User::Plain("hhenson".into()),
+            hgl_ai_config::User::person("o@example.com", "This Dude"),
+        ];
+        crate::save_config(&f, &f.env, &with_old).unwrap();
+        let cs2 = run(&f, &FakeHub::up()).await;
+        let users = cs2.iter().find(|c| c.name == "console users").unwrap();
+        assert_eq!(users.level, Level::Fail, "an earlier form: no email");
+        assert!(
+            users.detail.contains("no email for github:hhenson"),
+            "{users:?}"
+        );
+        assert!(
+            users
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("{ email = \"<email>\", handle = \"<name>\", github = \"hhenson\" }"),
+            "{users:?}"
+        );
+        with_old.console.as_mut().unwrap().users =
+            vec![hgl_ai_config::User::Person(hgl_ai_config::Person {
+                email: "o@example.com".into(),
+                handle: None,
+                github: None,
+                apple: None,
+                google: None,
+            })];
+        crate::save_config(&f, &f.env, &with_old).unwrap();
+        let cs3 = run(&f, &FakeHub::up()).await;
+        let users = cs3.iter().find(|c| c.name == "console users").unwrap();
+        assert_eq!(users.level, Level::Warn, "no handle");
+        with_old.console.as_mut().unwrap().users = vec![hgl_ai_config::User::person(
+            "o@example.com",
+            "Somebody Rather Long",
+        )];
+        crate::save_config(&f, &f.env, &with_old).unwrap();
+        let cs4 = run(&f, &FakeHub::up()).await;
+        let users = cs4.iter().find(|c| c.name == "console users").unwrap();
+        assert_eq!(users.level, Level::Ok, "a long handle is only noted");
+        assert!(users.detail.contains("shorter handle reads better"));
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        assert_eq!(get("console github").level, Level::Fail);
+        assert!(
+            get("console github")
+                .fix
+                .as_deref()
+                .unwrap()
+                .contains("chmod 600")
+        );
+        assert_eq!(get("console tls").level, Level::Ok);
+        assert_eq!(get("console notify").level, Level::Warn);
+    }
+
+    /// The client side of a hub host whose server side runs as `hgl-ai`.
+    #[tokio::test]
+    async fn server_user_and_the_console_credential() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.server_user = Some(hgl_ai_config::ServerUser {
+            name: "hgl-ai".into(),
+            home: "/var/lib/hgl-ai".into(),
+            console_url: None,
+        });
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let stat = std::rc::Rc::new(std::cell::RefCell::new("hgl-ai 700".to_string()));
+        let st = stat.clone();
+        f.on(move |c| {
+            let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
+            match (c.program.as_str(), a.as_slice()) {
+                (_, ["auth", "status", "--json"]) => Output::success(r#"{"loggedIn": true}"#),
+                ("id", _) => Output::success("1000\n"),
+                ("loginctl", _) => Output::success("yes\n"),
+                ("systemctl", [_, "is-active", _]) => Output::success("active\n"),
+                ("systemctl", ["show", ..]) => {
+                    Output::success("LoadState=loaded\nActiveState=active\n")
+                }
+                ("stat", _) => Output::success(format!("{}\n", st.borrow())),
+                ("df", _) => Output::success(DF),
+                _ => Output::success(""),
+            }
+        });
+        let cs = run(&f, &FakeHub::up()).await;
+        let get = |cs: &[Check], n: &str| cs.iter().find(|c| c.name == n).cloned().unwrap();
+        assert_eq!(get(&cs, "server user").level, Level::Ok);
+        assert_eq!(get(&cs, "console credential").level, Level::Ok);
+        assert_eq!(get(&cs, "service hub").detail, "running (system)");
+        assert!(
+            !any_fail(&cs),
+            "{:?}",
+            cs.iter()
+                .filter(|c| c.level == Level::Fail)
+                .collect::<Vec<_>>()
+        );
+
+        // The console credential within the client user's reach, or a home open to others.
+        f.readable
+            .borrow_mut()
+            .insert("/var/lib/hgl-ai/.config/hgl-ai/hub-users/console.cred".into());
+        *stat.borrow_mut() = "hgl-ai 755".into();
+        let cs = run(&f, &FakeHub::up()).await;
+        assert_eq!(get(&cs, "console credential").level, Level::Fail);
+        let su = get(&cs, "server user");
+        assert_eq!(su.level, Level::Fail);
+        assert!(su.fix.unwrap().contains("sudo chmod 700 /var/lib/hgl-ai"));
+    }
+
+    /// The server user's own side: its secrets are mode 0600 and its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn server_side_secrets() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.seats.clear();
+        cfg.server = Some(hgl_ai_config::Server {
+            units: hgl_ai_config::Units::System,
+            ..hgl_ai_config::Server::default()
+        });
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let dir = f.env.home.join(".config/hgl-ai/hub-users");
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::sys::write_atomic(&dir.join("console.cred"), b"x", 0o644).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        let bad = cs
+            .iter()
+            .find(|c| c.name.ends_with("hub-users/console.cred"))
+            .unwrap();
+        assert_eq!(bad.level, Level::Fail);
+        assert!(bad.fix.as_deref().unwrap().contains("chmod 600"));
+        assert!(
+            !cs.iter().any(|c| c.name == "service bridge"),
+            "the server user runs no bridge"
+        );
+        for n in ["skill claude", "cli codex", "tmux"] {
+            assert!(!cs.iter().any(|c| c.name == n), "{n} on the server side");
+        }
+        assert_eq!(
+            cs.iter().find(|c| c.name == "work_root").unwrap().level,
+            Level::Ok
+        );
+
+        // The coordinator's GitHub token: mode 0600, and passed to `gh auth status`.
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.github.token_file = Some("~/.config/hgl-ai/github.token".into());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let tok = f.env.home.join(".config/hgl-ai/github.token");
+        crate::sys::write_atomic(&tok, b"github_pat_example\n", 0o644).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        assert_eq!(
+            cs.iter().find(|c| c.name == "github token").unwrap().level,
+            Level::Fail
+        );
+        crate::sys::write_atomic(&tok, b"github_pat_example\n", 0o600).unwrap();
+        run(&f, &FakeHub::up()).await;
+        let with_token = f.cmds.borrow().iter().any(|(_, c)| {
+            c.args == ["auth", "status"]
+                && c.env
+                    .iter()
+                    .any(|(k, v)| k == "GH_TOKEN" && v == "github_pat_example")
+        });
+        assert!(with_token, "gh auth status ran with the token");
+        assert!(
+            !cs.iter()
+                .any(|c| c.name == "console credential" && c.level == Level::Warn)
+        );
+    }
+
+    #[tokio::test]
+    async fn warns_on_a_shared_token() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        crate::sys::write_atomic(
+            &f.env.home.join(".config/hgl-ai/hub.token"),
+            b"c0ffee\n",
+            0o600,
+        )
+        .unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        let auth = cs.iter().find(|c| c.name == "hub auth").unwrap();
+        assert_eq!(auth.level, Level::Warn);
+        assert!(auth.detail.contains("publish as the owner"), "{auth:?}");
+        assert!(!any_fail(&cs));
     }
 
     #[cfg(unix)]

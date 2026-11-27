@@ -29,21 +29,33 @@
 //!   on send and terminated on receipt; buckets refuse values over
 //!   [`MAX_VALUE_BYTES`].
 //!
+//! - [`Bus::publish_event`], [`Bus::owner_feed`], [`Bus::history`] and the `thread_*` and
+//!   `metrics*` calls carry the owner channel (docs/owner.md §4); [`cred`] reads a hub
+//!   credential: the legacy shared token or a hub user's NKey seed (OWN-5).
+//! - A publish the connection's hub user may not make fails with [`BusError::Denied`].
+//!
 //! Nothing here starts a hub; the operations other than `connect*` and
 //! `provision` fail with a hint to run `hgl-ai init` when the stream or a
 //! bucket is missing.
 
+pub mod cred;
+mod feed;
+
 use std::path::Path;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+pub use cred::{Credential, parse_credential, read_credential};
+pub use feed::{Feed, StreamMsg};
 
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
 use async_nats::jetstream::{self, AckKind, context::Publish, kv, stream};
 use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
-    BROADCAST, EndedRecord, HostRecord, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_STATE, KV_TREES,
-    LockRecord, Note, STREAM_NOTES, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord, ended_key,
-    utc_now_stamp,
+    BROADCAST, CONSOLE_PREFIX, EndedRecord, HostRecord, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS,
+    KV_METRICS, KV_STATE, KV_THREADS, KV_TREES, LockRecord, Note, OWNER_PREFIX, STREAM_NOTES,
+    STREAM_OWNER, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord, ended_key, utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -76,6 +88,9 @@ pub enum BusError {
     /// [`Lease::refresh`]: the lease expired or another holder took it.
     #[error("the lease {name} is no longer ours (it expired or was taken)")]
     LeaseLost { name: String },
+    /// The hub refused a publish this connection's hub user may not make (OWN-5).
+    #[error("the hub refused {subject}: this hub user ({who}) may not publish there")]
+    Denied { subject: String, who: String },
     #[error("{0}")]
     Nats(String),
 }
@@ -100,6 +115,10 @@ pub const STATE_HISTORY: i64 = 5;
 pub const HOSTS_TTL: Duration = Duration::from_secs(120);
 /// Revisions kept per `HGL_TREES` key.
 pub const TREES_HISTORY: i64 = 1;
+/// Revisions kept per `HGL_THREADS` record.
+pub const THREADS_HISTORY: i64 = 5;
+/// `HGL_OWNER` drops a resent event within this window.
+pub const OWNER_DUPLICATE_WINDOW: Duration = Duration::from_secs(86_400);
 /// A lease in `HGL_LOCKS` expires this long after its last write (§3).
 pub const LOCKS_MAX_AGE: Duration = Duration::from_secs(30 * 60);
 /// An `HGL_ENDED` record outlives every note sent before it: the stream's `max_age` and a day.
@@ -201,31 +220,73 @@ pub struct Bus {
     client: async_nats::Client,
     js: jetstream::Context,
     url: String,
+    who: String,
+    /// The hub's permissions violations on this connection, newest last (a few kept).
+    denied: Arc<Mutex<Vec<String>>>,
+    /// Woken on each violation, so a refused publish fails at once.
+    denied_tick: Arc<tokio::sync::Notify>,
     state: OnceCell<kv::Store>,
     hosts: OnceCell<kv::Store>,
     trees: OnceCell<kv::Store>,
     locks: OnceCell<kv::Store>,
     ended: OnceCell<kv::Store>,
+    threads: OnceCell<kv::Store>,
+    metrics: OnceCell<kv::Store>,
+    console: OnceCell<kv::Store>,
 }
 
 impl Bus {
-    /// Connect with the host configuration (`hub.url`, `hub.token_file`).
+    /// Connect with the host configuration: `hub.url` and the credential in
+    /// `hub.token_file` (or `HGL_AI_HUB_CREDENTIAL`, see [`Config::token_file`]).
     pub async fn connect(cfg: &Config) -> Result<Bus> {
-        let token = read_token(&cfg.token_file()?)?;
-        Bus::open(&cfg.hub.url, token, format!("hgl-ai {}", cfg.host)).await
+        let cred = read_credential(&cfg.token_file()?)?;
+        Bus::open(&cfg.hub.url, cred, format!("hgl-ai {}", cfg.host)).await
     }
 
     /// Connect to `url`, with an optional token.
     pub async fn connect_url(url: &str, token: Option<String>) -> Result<Bus> {
-        Bus::open(url, token, "hgl-ai".to_string()).await
+        Bus::open(url, token.map(Credential::Token), "hgl-ai".to_string()).await
     }
 
-    async fn open(url: &str, token: Option<String>, name: String) -> Result<Bus> {
+    /// Connect to `url` with a credential.
+    pub async fn connect_with(url: &str, cred: Option<Credential>) -> Result<Bus> {
+        Bus::open(url, cred, "hgl-ai".to_string()).await
+    }
+
+    async fn open(url: &str, cred: Option<Credential>, name: String) -> Result<Bus> {
+        let denied: Arc<Mutex<Vec<String>>> = Arc::default();
+        let denied_tick = Arc::new(tokio::sync::Notify::new());
+        let seen = denied.clone();
+        let tick = denied_tick.clone();
         let mut opts = async_nats::ConnectOptions::new()
             .name(name)
-            .connection_timeout(CONNECT_TIMEOUT);
-        if let Some(t) = token {
-            opts = opts.token(t);
+            .connection_timeout(CONNECT_TIMEOUT)
+            .event_callback(move |ev| {
+                let seen = seen.clone();
+                let tick = tick.clone();
+                async move {
+                    if let async_nats::Event::ServerError(async_nats::ServerError::Other(m)) = &ev
+                        && m.to_ascii_lowercase().contains("permissions violation")
+                    {
+                        tracing::warn!("hub: {m}");
+                        if let Ok(mut d) = seen.lock() {
+                            d.push(m.clone());
+                            let n = d.len();
+                            if n > 16 {
+                                d.drain(..n - 16);
+                            }
+                        }
+                        tick.notify_waiters();
+                    }
+                }
+            });
+        let who = cred
+            .as_ref()
+            .map_or_else(|| "no credential".to_string(), Credential::describe);
+        match cred {
+            Some(Credential::Token(t)) => opts = opts.token(t),
+            Some(Credential::Nkey { seed, .. }) => opts = opts.nkey(seed),
+            None => {}
         }
         let client = opts.connect(url).await.map_err(|e| BusError::Unreachable {
             url: url.to_string(),
@@ -236,12 +297,77 @@ impl Bus {
             client,
             js,
             url: url.to_string(),
+            who,
+            denied,
+            denied_tick,
             state: OnceCell::new(),
             hosts: OnceCell::new(),
             trees: OnceCell::new(),
             locks: OnceCell::new(),
             ended: OnceCell::new(),
+            threads: OnceCell::new(),
+            metrics: OnceCell::new(),
+            console: OnceCell::new(),
         })
+    }
+
+    /// Who this connection is: `hub user NAME (ROLE)` or `shared token`.
+    pub fn who(&self) -> &str {
+        &self.who
+    }
+
+    /// Take a recorded violation for `subject`, if the hub reported one.
+    fn take_denied(&self, subject: &str) -> bool {
+        let Ok(mut d) = self.denied.lock() else {
+            return false;
+        };
+        let quoted = format!("\"{subject}\"");
+        match d.iter().position(|m| m.contains(&quoted)) {
+            Some(i) => {
+                d.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// `err`, unless the hub reported a permissions violation for `subject`: then
+    /// [`BusError::Denied`].
+    pub(crate) fn denied_or(&self, subject: &str, err: BusError) -> BusError {
+        if self.take_denied(subject) {
+            self.denial(subject)
+        } else {
+            err
+        }
+    }
+
+    fn denial(&self, subject: &str) -> BusError {
+        BusError::Denied {
+            subject: subject.to_string(),
+            who: self.who.clone(),
+        }
+    }
+
+    /// Run a publish to `subject`, failing at once with [`BusError::Denied`] when the hub
+    /// reports a permissions violation for it, instead of waiting out the reply timeout.
+    pub(crate) async fn guarded<T>(
+        &self,
+        subject: &str,
+        fut: impl std::future::Future<Output = Result<T>>,
+    ) -> Result<T> {
+        let refused = async {
+            loop {
+                let woken = self.denied_tick.notified();
+                if self.take_denied(subject) {
+                    return;
+                }
+                woken.await;
+            }
+        };
+        tokio::select! {
+            r = fut => r.map_err(|e| self.denied_or(subject, e)),
+            () = refused => Err(self.denial(subject)),
+        }
     }
 
     /// The hub URL this connection was opened with.
@@ -280,6 +406,20 @@ impl Bus {
             })
             .await
             .map_err(|e| nats(&format!("provisioning stream {STREAM_NOTES}"), e))?;
+        self.js
+            .create_or_update_stream(stream::Config {
+                name: STREAM_OWNER.to_string(),
+                description: Some("hgl-ai owner channel".to_string()),
+                subjects: vec![format!("{OWNER_PREFIX}.>"), format!("{CONSOLE_PREFIX}.>")],
+                retention: stream::RetentionPolicy::Limits,
+                discard: stream::DiscardPolicy::Old,
+                storage: stream::StorageType::File,
+                duplicate_window: OWNER_DUPLICATE_WINDOW,
+                max_message_size: (MAX_NOTE_BYTES + (64 << 10)) as i32,
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| nats(&format!("provisioning stream {STREAM_OWNER}"), e))?;
         let buckets = [
             (
                 KV_STATE,
@@ -316,6 +456,27 @@ impl Bus {
                 1,
                 ENDED_MAX_AGE,
             ),
+            (
+                KV_THREADS,
+                "hgl-ai owner threads",
+                stream::StorageType::File,
+                THREADS_HISTORY,
+                Duration::ZERO,
+            ),
+            (
+                KV_METRICS,
+                "hgl-ai daily metrics",
+                stream::StorageType::File,
+                1,
+                Duration::ZERO,
+            ),
+            (
+                KV_CONSOLE,
+                "hgl-ai console state",
+                stream::StorageType::File,
+                1,
+                Duration::ZERO,
+            ),
         ];
         for (bucket, description, storage, history, max_age) in buckets {
             self.js
@@ -334,11 +495,12 @@ impl Bus {
         Ok(())
     }
 
-    /// Validate and publish a note to `hgl.notes.<recipient>` with its message id,
-    /// and wait for the hub's acknowledgement.
+    /// Validate and publish a note to its subject ([`Note::subject`]: `hgl.notes.<recipient>`,
+    /// or `hgl.notes.owner.<recipient>` for the owner's) with its message id, and wait for
+    /// the hub's acknowledgement.
     pub async fn send(&self, note: &Note) -> Result<SendReceipt> {
         note.validate()?;
-        let subject = note.recipient.subject();
+        let subject = note.subject();
         let payload = serde_json::to_vec(note).map_err(|e| nats("encoding the note", e))?;
         if payload.len() > MAX_NOTE_BYTES {
             return Err(BusError::Nats(format!(
@@ -350,12 +512,15 @@ impl Bus {
             .payload(payload.into())
             .message_id(note.msg_id());
         let ack = self
-            .js
-            .send_publish(subject.clone(), publish)
-            .await
-            .map_err(|e| publish_error(&subject, e))?
-            .await
-            .map_err(|e| publish_error(&subject, e))?;
+            .guarded(&subject, async {
+                self.js
+                    .send_publish(subject.clone(), publish)
+                    .await
+                    .map_err(|e| publish_error(&subject, e))?
+                    .await
+                    .map_err(|e| publish_error(&subject, e))
+            })
+            .await?;
         Ok(SendReceipt {
             seq: ack.sequence,
             duplicate: ack.duplicate,
@@ -388,7 +553,11 @@ impl Bus {
                 ack_policy: AckPolicy::Explicit,
                 ack_wait: opts.ack_wait,
                 max_deliver: opts.max_deliver,
-                filter_subjects: vec![seat.subject(), Seat::broadcast().subject()],
+                filter_subjects: vec![
+                    seat.subject(),
+                    Seat::broadcast().subject(),
+                    seat.owner_subject(),
+                ],
                 ..Default::default()
             })
             .await
@@ -562,10 +731,13 @@ impl Bus {
         check_state_key(key)?;
         check_value_size(key, value.len())?;
         let store = self.store(&self.state, KV_STATE).await?;
-        store
-            .put(key, value.as_bytes().to_vec().into())
-            .await
-            .map_err(|e| nats(&format!("writing state {key}"), e))
+        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+            store
+                .put(key, value.as_bytes().to_vec().into())
+                .await
+                .map_err(|e| nats(&format!("writing state {key}"), e))
+        })
+        .await
     }
 
     /// Create `key` only if it is absent (a deleted key counts as absent).
@@ -1045,7 +1217,10 @@ async fn take_read(
     Ok(n)
 }
 
-/// Parse and check one inbox payload; the error says why it is rejected.
+/// Parse and check one inbox payload; the error says why it is rejected. The subject is
+/// the one the hub stored it under, which only a publisher allowed on it can choose: a note
+/// with sender `owner` is accepted only from `hgl.notes.owner.<recipient>`, and a note
+/// there only with sender `owner` (OWN-5).
 fn parse_note(subject: &str, payload: &[u8]) -> std::result::Result<Note, String> {
     if payload.len() > MAX_NOTE_BYTES {
         return Err(format!(
@@ -1055,7 +1230,14 @@ fn parse_note(subject: &str, payload: &[u8]) -> std::result::Result<Note, String
     }
     let note: Note = serde_json::from_slice(payload).map_err(|e| format!("not a note: {e}"))?;
     note.validate().map_err(|e| e.to_string())?;
-    if subject != note.recipient.subject() {
+    if subject != note.subject() {
+        if note.sender.is_owner() || subject == note.recipient.owner_subject() {
+            return Err(format!(
+                "sender {} on {subject}: owner notes come only from the console on {}",
+                note.sender,
+                note.recipient.owner_subject()
+            ));
+        }
         return Err(format!(
             "recipient {} does not match subject {subject}",
             note.recipient
@@ -1350,6 +1532,25 @@ mod tests {
         big.body = "x".repeat(MAX_NOTE_BYTES);
         let err = parse_note("hgl.notes.claude", &serde_json::to_vec(&big).unwrap()).unwrap_err();
         assert!(err.contains("byte limit"), "{err}");
+    }
+
+    #[test]
+    fn owner_notes_only_on_the_owner_subject() {
+        let mut n = note("claude");
+        n.sender = Seat::owner();
+        n.kind = Kind::Answer;
+        let bytes = serde_json::to_vec(&n).unwrap();
+        assert_eq!(
+            parse_note("hgl.notes.owner.claude", &bytes).unwrap().sender,
+            Seat::owner()
+        );
+        let err = parse_note("hgl.notes.claude", &bytes).unwrap_err();
+        assert!(err.contains("only from the console"), "{err}");
+        let agent = serde_json::to_vec(&note("claude")).unwrap();
+        let err = parse_note("hgl.notes.owner.claude", &agent).unwrap_err();
+        assert!(err.contains("only from the console"), "{err}");
+        let err = parse_note("hgl.notes.owner.w2", &bytes).unwrap_err();
+        assert!(err.contains("only from the console"), "{err}");
     }
 
     #[test]

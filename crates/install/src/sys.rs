@@ -171,6 +171,27 @@ pub trait System {
     fn remove_dir_all(&self, p: &Path) -> io::Result<()>;
     /// Run a command that changes the host.
     fn run(&self, cmd: &Cmd) -> io::Result<Output>;
+    /// Ask the person at the terminal; `false` without one.
+    fn confirm(&self, _question: &str) -> bool {
+        false
+    }
+    /// Whether this process may read `p` (a probe; nothing is read).
+    fn can_read(&self, p: &Path) -> bool {
+        std::fs::File::open(p).is_ok()
+    }
+    /// The numeric owner of `p`.
+    fn owner_uid(&self, p: &Path) -> io::Result<u32> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt as _;
+            std::fs::metadata(p).map(|m| m.uid())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = p;
+            Ok(0)
+        }
+    }
 }
 
 /// The host itself.
@@ -239,6 +260,18 @@ impl System for RealSystem {
     fn run(&self, cmd: &Cmd) -> io::Result<Output> {
         exec(cmd)
     }
+    fn confirm(&self, question: &str) -> bool {
+        use std::io::{BufRead as _, IsTerminal as _, Write as _};
+        if !std::io::stdin().is_terminal() {
+            println!("{question} [y/N] no (no terminal; --print-root-steps prints them)");
+            return false;
+        }
+        print!("{question} [y/N] ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        let _ = std::io::stdin().lock().read_line(&mut line);
+        matches!(line.trim(), "y" | "Y" | "yes")
+    }
 }
 
 /// Reports changes instead of making them; reads and queries go to `inner`.
@@ -305,6 +338,16 @@ impl System for DryRun<'_> {
             self.say(&format!("would remove {}/", p.display()));
         }
         Ok(())
+    }
+    fn owner_uid(&self, p: &Path) -> io::Result<u32> {
+        self.inner.owner_uid(p)
+    }
+    fn confirm(&self, question: &str) -> bool {
+        self.say(&format!("would ask: {question}"));
+        true
+    }
+    fn can_read(&self, p: &Path) -> bool {
+        self.inner.can_read(p)
     }
     fn run(&self, cmd: &Cmd) -> io::Result<Output> {
         self.say(&format!("would run: {cmd}"));
@@ -516,6 +559,10 @@ pub(crate) mod fake {
         pub said: RefCell<Vec<String>>,
         pub respond: RefCell<Responder>,
         pub ports_open: std::cell::Cell<bool>,
+        /// The answer to every confirmation.
+        pub confirms: std::cell::Cell<bool>,
+        /// Paths outside the fake's root this process may read.
+        pub readable: RefCell<std::collections::BTreeSet<PathBuf>>,
     }
 
     impl Fake {
@@ -531,6 +578,8 @@ pub(crate) mod fake {
                 said: RefCell::new(Vec::new()),
                 respond: RefCell::new(Box::new(|_| Output::success(""))),
                 ports_open: std::cell::Cell::new(true),
+                confirms: std::cell::Cell::new(true),
+                readable: RefCell::new(std::collections::BTreeSet::new()),
             }
         }
         pub fn tool(&self, name: &str) -> PathBuf {
@@ -615,6 +664,17 @@ pub(crate) mod fake {
             match std::fs::remove_dir_all(p) {
                 Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
                 r => r,
+            }
+        }
+        fn confirm(&self, question: &str) -> bool {
+            self.say(&format!("ask: {question}"));
+            self.confirms.get()
+        }
+        fn can_read(&self, p: &Path) -> bool {
+            if p.starts_with(&self.root) {
+                std::fs::File::open(p).is_ok()
+            } else {
+                self.readable.borrow().contains(p)
             }
         }
         fn run(&self, cmd: &Cmd) -> io::Result<Output> {
