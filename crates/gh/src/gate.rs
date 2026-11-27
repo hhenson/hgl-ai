@@ -280,8 +280,9 @@ pub struct Opts {
     /// A pull request the tool made, not an agent (the wrapper's pin pull requests): it has
     /// no author family for a review receipt to differ from, so none is asked for.
     pub tool_made: bool,
-    /// The latest an accepted merge is polled until; else [`crate::merge::POLL_LIMIT`]
-    /// from the merge.
+    /// The landing's deadline: the latest an accepted merge is polled until, and no later
+    /// than the landing lock's lease from the merge; else [`crate::merge::POLL_LIMIT`]
+    /// from the merge ([`crate::merge::until`]).
     pub merge_until: Option<tokio::time::Instant>,
 }
 
@@ -1051,9 +1052,12 @@ pub async fn evaluate<G: Gh>(
                 if let Some(b) = bus {
                     progress::write(b, repo, number, &Progress::new(&f.pr.head, None)).await?;
                 }
-                let until = opts
-                    .merge_until
-                    .unwrap_or_else(|| tokio::time::Instant::now() + merge::POLL_LIMIT);
+                // The lease as it is now, just confirmed: not as it was when the landing began.
+                let lease = match (lock, bus) {
+                    (Some(_), Some(b)) => Some(b.locks_max_age().await?),
+                    _ => None,
+                };
+                let until = merge::until(tokio::time::Instant::now(), opts.merge_until, lease);
                 let res = merge::merge(
                     gh,
                     &s.full(repo),
@@ -2034,6 +2038,21 @@ mod tests {
             &["pr-open.json", "pr-open.json", "pr-merged.json"],
         );
         let (o, gh) = run(gh, None).await;
+        assert_eq!(o.kind, Kind::Merged, "{}", o.line);
+        let polls = gh.calls().iter().filter(|c| c.contains("u-9")).count();
+        assert_eq!(polls, 2);
+        // A landing whose gate waited past the lease's max age (30 min) before the merge:
+        // the bound comes from its deadline at the merge, so the poll still runs.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(50 * 60);
+        tokio::time::advance(std::time::Duration::from_secs(40 * 60)).await;
+        let gh = fake_with(
+            FakeGh::default()
+                .on("merge-async --input", pending)
+                .once("merge-async/u-9", pending)
+                .on("merge-async/u-9", MERGED_ASYNC),
+            &["pr-open.json", "pr-merged.json"],
+        );
+        let (o, gh) = run(gh, Some(deadline)).await;
         assert_eq!(o.kind, Kind::Merged, "{}", o.line);
         let polls = gh.calls().iter().filter(|c| c.contains("u-9")).count();
         assert_eq!(polls, 2);

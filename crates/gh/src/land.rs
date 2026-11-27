@@ -213,7 +213,7 @@ async fn land_locked<G: Gh>(
         return Ok(done);
     }
     let deadline = Instant::now() + o.timeout;
-    let gate_opts = merge_bound(bus, &o.gate, deadline).await?;
+    let gate_opts = with_deadline(&o.gate, deadline);
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
     {
         let after = Vec::new();
@@ -306,20 +306,13 @@ async fn resume_recorded<G: Gh>(
     Ok(Some((Landing { outcome, after }, what)))
 }
 
-/// The gate's options with the poll of an accepted merge bounded by the landing's
-/// `deadline` and by the landing lock's lease from now, whichever comes first.
-async fn merge_bound(bus: &Bus, gate: &gate::Opts, deadline: Instant) -> Result<gate::Opts> {
-    // A `max_age` of zero is no expiry.
-    let lease = bus.locks_max_age().await?;
-    let until = if lease.is_zero() {
-        deadline
-    } else {
-        deadline.min(Instant::now() + lease)
-    };
-    Ok(gate::Opts {
-        merge_until: Some(tokio::time::Instant::from_std(until)),
+/// The gate's options with the landing's `deadline`, which bounds the poll of an accepted
+/// merge (with the lock's lease, taken at the merge: [`crate::merge::until`]).
+fn with_deadline(gate: &gate::Opts, deadline: Instant) -> gate::Opts {
+    gate::Opts {
+        merge_until: Some(tokio::time::Instant::from_std(deadline)),
         ..*gate
-    })
+    }
 }
 
 /// After the gate decided, under the lock: a merge's steps; a pull request found merged
@@ -426,7 +419,7 @@ pub(crate) async fn merge_locked<G: Gh>(
         match resume_recorded(gh, s, bus, repo, number, o, lock).await? {
             Some(done) => done,
             None => {
-                let gate_opts = merge_bound(bus, &o.gate, Instant::now() + o.timeout).await?;
+                let gate_opts = with_deadline(&o.gate, Instant::now() + o.timeout);
                 let outcome = gate::evaluate(
                     gh,
                     s,

@@ -19,6 +19,18 @@ pub const POLL_EVERY: Duration = Duration::from_secs(3);
 /// How long an accepted merge is polled when the caller gives no deadline.
 pub const POLL_LIMIT: Duration = Duration::from_secs(600);
 
+/// The latest an accepted merge started `now` is polled until: the landing's `deadline`
+/// (else [`POLL_LIMIT`] from now), and no later than the landing lock's `lease` from now
+/// (its `max_age`; zero is no expiry). Taken at the merge, so that a gate that waited
+/// longer than the lease does not start the merge already past its bound.
+pub fn until(now: Instant, deadline: Option<Instant>, lease: Option<Duration>) -> Instant {
+    let u = deadline.unwrap_or(now + POLL_LIMIT);
+    match lease.filter(|l| !l.is_zero()) {
+        Some(l) => u.min(now + l),
+        None => u,
+    }
+}
+
 /// What a merge request came to.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Merge {
@@ -350,6 +362,41 @@ mod tests {
             );
             assert_eq!(calls(&gh, POLL), 0, "not polled");
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_bound_is_taken_at_the_merge() {
+        let min = |m: u64| Duration::from_secs(60 * m);
+        let start = Instant::now();
+        let deadline = start + min(50);
+        let lease = Some(min(30));
+        // The gate waited 40 minutes, longer than the lease's max age: the bound is the
+        // landing's deadline, 10 minutes on, not the lease from the start (already past).
+        tokio::time::advance(min(40)).await;
+        let now = Instant::now();
+        assert!(start + min(30) < now);
+        assert_eq!(until(now, Some(deadline), lease), deadline);
+        // The lease from now when it ends first; the default limit with no deadline; a
+        // zero max age is no expiry.
+        assert_eq!(until(now, Some(now + min(90)), lease), now + min(30));
+        assert_eq!(until(now, None, lease), now + POLL_LIMIT);
+        assert_eq!(until(now, Some(deadline), Some(Duration::ZERO)), deadline);
+        // And the merge started then polls until it is reported merged.
+        let gh = accepted()
+            .once(POLL, &pending())
+            .on(POLL, &answer("merged", "{\"message\":\"m\"}"));
+        let m = merge(
+            &gh,
+            "o/r",
+            7,
+            HEAD,
+            until(now, Some(deadline), lease),
+            POLL_EVERY,
+        )
+        .await
+        .unwrap();
+        assert_eq!(m, Merge::Merged);
+        assert_eq!(calls(&gh, POLL), 2);
     }
 
     #[tokio::test]
