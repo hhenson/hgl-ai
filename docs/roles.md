@@ -41,6 +41,13 @@ Status: proposed. Open decisions are issues in this repository.
   - *desk*: runs the fixed regression sets for each `ready` compiler head
     merged onto `main`, one run at a time, and sends a factual receipt.
   - *bridge*: delivers notes, runs agent turns, owns worktrees (protocol §5).
+  - *builder*: runs build recipes for local and remote requests and the merge queue,
+    and returns bounded summaries (`docs/build.md`). The desk's sets are recipe steps.
+  - *merge queue*: builds approved pull requests in batches on every platform and lands
+    them (`docs/build.md` §3).
+- **ROLE-6a — Build agent** (seat `build`). Writes and repairs recipes, provisions
+  toolchains and SDKs, diagnoses failures of the build itself; never changes the code
+  under build.
 
 ## 2. Gates
 
@@ -82,7 +89,8 @@ changes one file.
 | Review | frontier, xhigh | any family but the author's | the third family |
 | Triage | balanced, medium | claude | gemini |
 | Bulk mechanical edits (renames, label sweeps) | fast, medium | gemini | gpt |
-| Coordinator, desk, bridge | no model | — | — |
+| Build agent: recipes, toolchains, build failures | balanced, high | gpt | claude |
+| Coordinator, builder, merge queue, bridge | no model | — | — |
 
 - **ROLE-12 — Spread by subscription.** Implementors run mostly on `gpt`, so
   `claude` and `gemini` keep capacity for control, review and triage.
