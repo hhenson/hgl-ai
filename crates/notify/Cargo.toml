@@ -1,0 +1,22 @@
+[package]
+name = "hgl-ai-notify"
+description = "Owner console notifications: ntfy, Slack and email (docs/owner.md OWN-9)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hgl-ai-config.workspace = true
+lettre.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+tempfile.workspace = true
+tracing-subscriber.workspace = true
