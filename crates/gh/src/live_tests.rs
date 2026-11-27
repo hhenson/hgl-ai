@@ -683,6 +683,7 @@ async fn authored_and_reviewed(b: &Bus) {
         class: None,
         class_seq: None,
         seq: None,
+        handoff_seq: None,
     };
     b.tree_put(&tree).await.unwrap();
     let controller = Seat::new("controller").unwrap();

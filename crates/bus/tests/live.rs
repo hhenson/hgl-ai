@@ -550,6 +550,7 @@ async fn hosts_and_trees_round_trip() {
         class: None,
         class_seq: None,
         seq: None,
+        handoff_seq: None,
     };
     let a = tree("w1", 992, false);
     let b = tree("r1", 992, true);

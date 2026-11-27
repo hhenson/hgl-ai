@@ -198,6 +198,7 @@ mod tests {
             },
             sessions: BTreeMap::new(),
             seq: None,
+            handoff_seq: None,
             families: Vec::new(),
             class: None,
             class_seq: None,
