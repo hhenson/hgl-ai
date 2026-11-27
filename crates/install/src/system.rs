@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use crate::env::Os;
 use crate::service::{self, Service, Spec};
-use crate::sys::{Cmd, System};
+use crate::sys::{Cmd, System, shell_quote};
 use crate::{Result, io_at, load_config, other, save_config};
 
 /// The server user's name.
@@ -49,6 +49,9 @@ pub struct SystemOpts {
     pub console: bool,
     /// `--console-url`, recorded so a later reinstall keeps the console.
     pub console_url: Option<String>,
+    /// The OS user this host's client runs as, when not the installer: the client
+    /// credential goes to it, never to the installer.
+    pub client_user: Option<String>,
     pub wait: Duration,
 }
 
@@ -62,6 +65,7 @@ pub struct Previous {
     pub user: Option<String>,
     pub home: Option<String>,
     pub console_url: Option<String>,
+    pub client_user: Option<String>,
 }
 
 pub fn previous(sys: &dyn System) -> Previous {
@@ -89,6 +93,7 @@ pub fn previous(sys: &dyn System) -> Previous {
         user: Some(su.name),
         home: Some(su.home),
         console_url: su.console_url,
+        client_user: su.client_user,
     }
 }
 
@@ -126,9 +131,10 @@ struct Root<'a> {
 }
 
 impl Root<'_> {
-    /// Show `cmd`, then run it with `sudo` once confirmed (or only print it).
+    /// Show `cmd`, then run it with `sudo` once confirmed (or only print it). The line
+    /// is quoted for a POSIX shell: the script runs as it reads.
     fn step(&mut self, why: &str, cmd: Cmd) -> Result<()> {
-        let line = format!("sudo {}", cmd.line());
+        let line = format!("sudo {cmd}");
         if self.print_only {
             self.script.push(format!("# {why}\n{line}"));
             return Ok(());
@@ -175,13 +181,61 @@ fn server_exe(sys: &dyn System) -> (PathBuf, bool) {
     }
 }
 
-/// `nats-server` for the hub unit: on `PATH` outside the owner's home, else the pinned
-/// release the server user's step downloads into its data directory.
+/// `nats-server` for the hub unit: on the server user's `PATH`, else the pinned release
+/// the server user's step downloads into its data directory. Chosen here only: the
+/// server user's step is told it (`--nats-server`).
 fn nats_for(sys: &dyn System, layout: &Layout) -> PathBuf {
-    sys.which("nats-server")
+    sys.which_on(&server_path(sys), "nats-server")
         .filter(|p| !p.starts_with(&sys.env().home))
-        .unwrap_or_else(|| layout.data().join("bin/nats-server"))
+        .unwrap_or_else(|| crate::nats::release_path(&layout.data()))
 }
+
+/// The client user's home and group, from the account database.
+fn account(sys: &dyn System, name: &str) -> Result<(PathBuf, String)> {
+    let out = |c: Cmd| {
+        sys.query(&c)
+            .ok()
+            .filter(|o| o.ok())
+            .map(|o| o.stdout.trim().to_string())
+            .filter(|s| !s.is_empty())
+    };
+    let home = match sys.env().os {
+        Os::Linux => out(Cmd::new("getent").args(["passwd", name]))
+            .and_then(|l| l.split(':').nth(5).map(str::to_string)),
+        Os::MacOs => out(Cmd::new("dscl").args([
+            ".",
+            "-read",
+            &format!("/Users/{name}"),
+            "NFSHomeDirectory",
+        ]))
+        .and_then(|l| {
+            l.strip_prefix("NFSHomeDirectory:")
+                .map(|h| h.trim().to_string())
+        }),
+    }
+    .filter(|h| h.starts_with('/'))
+    .ok_or_else(|| other(format!("--client-user {name}: no such user (or no home)")))?;
+    let group = out(Cmd::new("id").args(["-gn", name]))
+        .ok_or_else(|| other(format!("--client-user {name}: `id -gn {name}` failed")))?;
+    Ok((PathBuf::from(home), group))
+}
+
+/// A `sh -c` program that reads the coordinator's GitHub token from the terminal
+/// without echoing it and writes it to `file` (mode 0600); an empty answer keeps the
+/// file as it is.
+fn token_reader(file: &Path) -> String {
+    format!(
+        "f={}; umask 077; trap 'stty echo </dev/tty 2>/dev/null' EXIT; \
+         printf 'GitHub token for the coordinator (Enter keeps the current one): ' >/dev/tty; \
+         stty -echo </dev/tty; IFS= read -r t </dev/tty; stty echo </dev/tty; echo >/dev/tty; \
+         [ -n \"$t\" ] || exit 0; printf '%s\\n' \"$t\" >\"$f\" && chmod 600 \"$f\"",
+        shell_quote(&file.display().to_string())
+    )
+}
+
+/// The token the coordinator reads GitHub with.
+const TOKEN_SCOPE: &str = "a fine-grained, read-only token (Metadata, Contents, Issues, \
+     Pull requests, Checks, Actions, Commit statuses: read) for the repositories";
 
 fn sudo_as(
     user: &str,
@@ -287,6 +341,15 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
             "run this as yourself, not as {user}: the client side stays yours"
         )));
     }
+    let client_user = o.client_user.as_deref().filter(|c| *c != owner);
+    if client_user == Some(user) {
+        return Err(other(format!(
+            "--client-user {user} is the server user: the client side runs as another user"
+        )));
+    }
+    let client = client_user
+        .map(|c| account(sys, c).map(|(h, g)| (c, h, g)))
+        .transpose()?;
     let mut root = Root {
         sys,
         print_only: o.print_only,
@@ -342,6 +405,8 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
         )?;
     }
     let path = server_path(sys);
+    let token_file = layout.github_token().display().to_string();
+    let nats = nats_for(sys, &layout).display().to_string();
     let mut inner = sudo_as(user, &layout, &path, &exe, &[]).args([
         "server",
         "install",
@@ -351,7 +416,9 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
         "--units",
         "system",
         "--github-token-file",
-        "~/.config/hgl-ai/github.token",
+        &token_file,
+        "--nats-server",
+        &nats,
         "--host",
         &o.host,
     ]);
@@ -455,29 +522,90 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
         &format!("provision the streams and buckets as {user}'s admin hub user"),
         Cmd::new(init.program.clone()).args(init.args.iter().cloned()),
     )?;
+    if o.coord {
+        root.step(
+            &format!(
+                "the coordinator's GitHub token, {TOKEN_SCOPE}: read without echo, \
+                 written as {user} (mode 0600)"
+            ),
+            Cmd::new("-u").args([user, "sh", "-c", &token_reader(&layout.github_token())]),
+        )?;
+    }
     for s in names.iter().copied().filter(|s| *s != Service::Hub) {
         start(&mut root, s)?;
     }
-    // The hub host's own client is the owner's: its seat credential comes over to them.
-    let mine = env.client_token_path();
-    if !o.print_only {
-        let dir = env.config_dir();
-        sys.mkdir(&dir).map_err(io_at(&dir))?;
-    }
-    root.step(
-        "this host's client credential, for you (mode 0600)",
-        Cmd::new("install").args([
-            "-m",
-            "0600",
-            "-o",
-            &owner,
-            "-g",
-            &group,
-            &layout.client_cred().display().to_string(),
-            &mine.display().to_string(),
-        ]),
-    )?;
+    // This host's seat credential goes to the user its client runs as: the installer,
+    // or `--client-user`.
+    let cred = layout.client_cred().display().to_string();
+    let (to, shown) = match &client {
+        Some((name, home, cgroup)) => {
+            let dir = home.join(".config/hgl-ai");
+            let config = home.join(".config").display().to_string();
+            root.step(
+                &format!("~/.config/hgl-ai for {name}, mode 0700"),
+                Cmd::new("install").args([
+                    "-d",
+                    "-o",
+                    name,
+                    "-g",
+                    cgroup,
+                    "-m",
+                    "0700",
+                    &config,
+                    &dir.display().to_string(),
+                ]),
+            )?;
+            let mine = dir.join("hub.token");
+            root.step(
+                &format!("this host's client credential, for {name} (mode 0600)"),
+                Cmd::new("install").args([
+                    "-m",
+                    "0600",
+                    "-o",
+                    name,
+                    "-g",
+                    cgroup,
+                    &cred,
+                    &mine.display().to_string(),
+                ]),
+            )?;
+            (name.to_string(), "~/.config/hgl-ai/hub.token".to_string())
+        }
+        None => {
+            let mine = env.client_token_path();
+            if !o.print_only {
+                let dir = env.config_dir();
+                sys.mkdir(&dir).map_err(io_at(&dir))?;
+            }
+            root.step(
+                "this host's client credential, for you (mode 0600)",
+                Cmd::new("install").args([
+                    "-m",
+                    "0600",
+                    "-o",
+                    &owner,
+                    "-g",
+                    &group,
+                    &cred,
+                    &mine.display().to_string(),
+                ]),
+            )?;
+            (owner.clone(), env.contract(&mine))
+        }
+    };
+    let next = format!(
+        "hgl-ai client install --hub {} --token-file {} --host {}",
+        crate::server::local_url(&o.listen, o.port),
+        shown,
+        o.host
+    );
+    let who = if client.is_some() {
+        format!("as {to}")
+    } else {
+        "as yourself".to_string()
+    };
     if o.print_only {
+        root.note(&format!("next, {who}: {next}"));
         return Ok(Some(root.script.join("\n")));
     }
     // The client's configuration names the server user, for `server status` and `doctor`.
@@ -487,27 +615,13 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
         name: user.to_string(),
         home: home.clone(),
         console_url: o.console_url.clone().filter(|_| o.console),
+        client_user: client_user.map(str::to_string),
     });
     cfg.hub.url = crate::server::local_url(&o.listen, o.port);
     save_config(sys, env, &cfg)?;
     sys.say("");
-    sys.say("Next, on this host:");
-    sys.say(&format!(
-        "  hgl-ai client install --hub {} --token-file {} --host {}",
-        cfg.hub.url,
-        env.contract(&mine),
-        o.host
-    ));
-    if o.coord {
-        sys.say(&format!(
-            "The coordinator reads GitHub with its own token: make a fine-grained, read-only token \
-             (Metadata, Contents, Issues, Pull requests, Checks: read) for the repositories, and write it as {user}:"
-        ));
-        sys.say(&format!(
-            "  sudo -u {user} sh -c 'umask 077; cat > {}'",
-            layout.github_token().display()
-        ));
-    }
+    sys.say(&format!("Next, on this host, {who}:"));
+    sys.say(&format!("  {next}"));
     Ok(None)
 }
 
@@ -647,6 +761,14 @@ mod tests {
             match (c.program.as_str(), a.as_slice()) {
                 ("id", ["-un"]) => Output::success("owner\n"),
                 ("id", ["-gn"]) => Output::success("owner\n"),
+                ("id", ["-gn", "agents"]) => Output::success("agents\n"),
+                ("getent", ["passwd", "agents"]) => {
+                    Output::success("agents:x:1001:1001::/home/agents:/bin/bash\n")
+                }
+                ("dscl", [".", "-read", "/Users/agents", "NFSHomeDirectory"]) => {
+                    Output::success("NFSHomeDirectory: /Users/agents\n")
+                }
+                ("getent", _) | ("dscl", _) => Output::failure(2, ""),
                 ("id", ["-u", _]) if user_exists => Output::success("990\n"),
                 ("id", ["-u", _]) => Output::failure(1, "no such user"),
                 _ => Output::success(""),
@@ -667,6 +789,7 @@ mod tests {
             coord: true,
             console: true,
             console_url: Some("https://console.example.com".into()),
+            client_user: None,
             wait: Duration::ZERO,
         }
     }
@@ -682,7 +805,7 @@ mod tests {
             "sudo install -d -o hgl-ai -m 0700 /var/lib/hgl-ai",
             "sudo install -m 0755 ", // hgl-ai, out of the owner's home
             "sudo -u hgl-ai env HOME=/var/lib/hgl-ai",
-            "server install --same-user --no-services --no-brew --units system --github-token-file ~/.config/hgl-ai/github.token --host hub --listen 192.0.2.10",
+            "server install --same-user --no-services --no-brew --units system --github-token-file /var/lib/hgl-ai/.config/hgl-ai/github.token --nats-server /usr/bin/nats-server --host hub --listen 192.0.2.10",
             "sudo install -m 0644 ",
             "/etc/systemd/system/hgl-ai-hub.service",
             "sudo systemctl daemon-reload",
@@ -692,6 +815,8 @@ mod tests {
             " init",
             "sudo systemctl restart hgl-ai-console.service",
             "sudo install -m 0600 -o owner -g owner /var/lib/hgl-ai/.config/hgl-ai/hub.token",
+            "sudo -u hgl-ai sh -c ",
+            "# next, as yourself: hgl-ai client install --hub nats://192.0.2.10:4222 --token-file ~/.config/hgl-ai/hub.token --host hub",
         ] {
             assert!(script.contains(want), "missing {want:?} in\n{script}");
         }
@@ -752,9 +877,12 @@ mod tests {
         assert_eq!(asks, runs.len(), "one confirmation per root step");
         let cfg = load_config(&f, &f.env).unwrap().unwrap();
         assert_eq!(cfg.server_user.unwrap().name, "hgl-ai");
-        assert!(f.output().contains(
-            "sudo -u hgl-ai sh -c 'umask 077; cat > /var/lib/hgl-ai/.config/hgl-ai/github.token'"
-        ));
+        assert!(
+            runs.iter()
+                .any(|r| r.starts_with("sudo -u hgl-ai sh -c f=")),
+            "the token step runs as the server user: {runs:?}"
+        );
+        assert!(f.output().contains("Next, on this host, as yourself:"));
     }
 
     #[test]
@@ -783,6 +911,233 @@ mod tests {
             Some("https://console.example.com")
         );
         assert_eq!(p.user.as_deref(), Some("hgl-ai"));
+    }
+
+    /// Run `script` in `sh` with `sudo` replaced by a function that records its words,
+    /// one step per paragraph: what root would run, as the shell parses it.
+    fn sudo_words(d: &Path, script: &str) -> Vec<Vec<String>> {
+        let rec = d.join("sudo.words");
+        let prog = format!(
+            "sudo() {{ for w in \"$@\"; do printf '%s\\n' \"$w\"; done >>{r}; echo >>{r}; }}\n{script}\n",
+            r = shell_quote(&rec.display().to_string())
+        );
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&prog)
+            // A decoy home: a `~` left in the script would expand to it.
+            .env("HOME", d.join("caller"))
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        std::fs::read_to_string(&rec)
+            .unwrap()
+            .split("\n\n")
+            .filter(|p| !p.is_empty())
+            .map(|p| p.lines().map(str::to_string).collect())
+            .collect()
+    }
+
+    /// The agents run as their own OS user: the client credential goes to it, the
+    /// script quotes every path, and nothing is handed to the installer.
+    #[test]
+    fn a_separate_client_user() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux, false);
+        let mut o = opts(true);
+        o.client_user = Some("agents".into());
+        o.home = PathBuf::from("/srv/hgl ai");
+        let script = install(&f, &o).unwrap().unwrap();
+        assert!(f.runs().is_empty(), "{:?}", f.runs());
+        let steps = sudo_words(d.path(), &script);
+        let has = |want: &[&str]| steps.iter().any(|s| s == want);
+        assert!(
+            has(&[
+                "install",
+                "-d",
+                "-o",
+                "agents",
+                "-g",
+                "agents",
+                "-m",
+                "0700",
+                "/home/agents/.config",
+                "/home/agents/.config/hgl-ai",
+            ]),
+            "{steps:#?}"
+        );
+        assert!(
+            has(&[
+                "install",
+                "-m",
+                "0600",
+                "-o",
+                "agents",
+                "-g",
+                "agents",
+                "/srv/hgl ai/.config/hgl-ai/hub.token",
+                "/home/agents/.config/hgl-ai/hub.token",
+            ]),
+            "{steps:#?}"
+        );
+        // Nothing for the installer: no step makes them an owner or writes into their
+        // home (their home is only read: the staged units, their hgl-ai).
+        for s in &steps {
+            assert!(!s.iter().any(|w| w == "owner"), "{s:?}");
+            let dest = Path::new(s.last().unwrap());
+            assert!(!dest.starts_with(&f.env.home), "{s:?}");
+        }
+        // The server user's step: absolute token path under its home, one word each.
+        let inner = steps
+            .iter()
+            .find(|s| s.contains(&"--no-services".to_string()))
+            .expect("the server user's step");
+        assert!(inner.contains(&"HOME=/srv/hgl ai".to_string()), "{inner:?}");
+        let at = inner
+            .iter()
+            .position(|w| w == "--github-token-file")
+            .unwrap();
+        assert_eq!(inner[at + 1], "/srv/hgl ai/.config/hgl-ai/github.token");
+        assert!(
+            !steps.iter().flatten().any(|w| w.starts_with('~')
+                || w.contains(&d.path().join("caller").display().to_string())),
+            "no `~` reaches the shell"
+        );
+        assert!(
+            script.contains("# next, as agents: hgl-ai client install"),
+            "{script}"
+        );
+
+        // Run, it records the client user; a reinstall without the flag keeps it.
+        let f = fake(d.path(), Os::Linux, true);
+        let mut o = opts(false);
+        o.client_user = Some("agents".into());
+        install(&f, &o).unwrap();
+        assert!(
+            !f.runs().iter().any(|r| r.contains("-o owner")),
+            "{:?}",
+            f.runs()
+        );
+        assert!(
+            !f.env.home.join(".config/hgl-ai/hub.token").exists(),
+            "the installer gets no credential"
+        );
+        assert!(f.output().contains("Next, on this host, as agents:"));
+        assert_eq!(previous(&f).client_user.as_deref(), Some("agents"));
+    }
+
+    #[test]
+    fn a_client_user_is_checked() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux, true);
+        let mut o = opts(true);
+        o.client_user = Some("nobody-here".into());
+        let e = install(&f, &o).unwrap_err().to_string();
+        assert!(e.contains("--client-user nobody-here: no such user"), "{e}");
+        o.client_user = Some("hgl-ai".into());
+        let e = install(&f, &o).unwrap_err().to_string();
+        assert!(e.contains("is the server user"), "{e}");
+        // The installer named as the client user: the plain install.
+        o.client_user = Some("owner".into());
+        let script = install(&f, &o).unwrap().unwrap();
+        assert!(script.contains("-o owner -g owner /var/lib/hgl-ai/.config/hgl-ai/hub.token"));
+    }
+
+    /// One `nats-server`, chosen once: the unit and the server user's step agree.
+    #[test]
+    fn nats_server_is_chosen_once() {
+        let d = tempfile::tempdir().unwrap();
+        let hub_unit = |f: &Fake| {
+            std::fs::read_to_string(
+                f.env
+                    .home
+                    .join(".local/share/hgl-ai/system-units/hgl-ai-hub.service"),
+            )
+            .unwrap()
+        };
+        // Installed system-wide: both use it.
+        let f = fake(d.path(), Os::Linux, true);
+        f.tool_at("nats-server", Path::new("/usr/local/bin"));
+        let script = install(&f, &opts(true)).unwrap().unwrap();
+        assert!(
+            script.contains("--nats-server /usr/local/bin/nats-server "),
+            "{script}"
+        );
+        assert!(hub_unit(&f).contains("ExecStart=/usr/local/bin/nats-server -c "));
+        // Only under the installer's home, which the server user cannot reach: the
+        // pinned release in its data directory, for both.
+        let mut f = fake(d.path(), Os::Linux, true);
+        let mine = f.env.home.join(".local/bin");
+        f.env.path_var = format!("{}:/usr/local/bin:/usr/bin", mine.display());
+        f.tool_at("nats-server", &mine);
+        let script = install(&f, &opts(true)).unwrap().unwrap();
+        let ours = "/var/lib/hgl-ai/.local/share/hgl-ai/bin/nats-server";
+        assert!(
+            script.contains(&format!("--nats-server {ours} ")),
+            "{script}"
+        );
+        assert!(hub_unit(&f).contains(&format!("ExecStart={ours} -c ")));
+    }
+
+    /// The coordinator's token: read without echo, written by the server user, 0600.
+    #[test]
+    fn the_token_step() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux, true);
+        let script = install(&f, &opts(true)).unwrap().unwrap();
+        let steps = sudo_words(d.path(), &script);
+        let tok = steps
+            .iter()
+            .find(|s| s.len() == 5 && s[..4] == ["-u", "hgl-ai", "sh", "-c"])
+            .expect("the token step");
+        let prog = &tok[4];
+        for want in [
+            "f=/var/lib/hgl-ai/.config/hgl-ai/github.token;",
+            "umask 077",
+            "stty -echo </dev/tty",
+            "read -r t </dev/tty",
+            "chmod 600",
+        ] {
+            assert!(prog.contains(want), "missing {want:?} in {prog}");
+        }
+        let i = |needle: &str| script.find(needle).unwrap();
+        assert!(
+            i("github.token;") < i("restart hgl-ai-coord.service"),
+            "before the coordinator starts"
+        );
+        assert!(script.contains("Actions, Commit statuses: read"));
+        // The program itself, with a file for the terminal: an answer is written 0600,
+        // and an empty one keeps the file.
+        let file = d.path().join("github.token");
+        let (tin, tout) = (d.path().join("tty.in"), d.path().join("tty.out"));
+        let run = |answer: &str| {
+            let p = token_reader(&file)
+                .replace("</dev/tty", &format!("<{}", tin.display()))
+                .replace(">/dev/tty", &format!(">{}", tout.display()));
+            std::fs::write(&tin, answer).unwrap();
+            let o = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(&p)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+        };
+        run("ghp_secret\n");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ghp_secret\n");
+        assert_eq!(crate::sys::file_mode(&file).unwrap(), 0o600);
+        run("\n");
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "ghp_secret\n");
+
+        let mut o = opts(true);
+        o.coord = false;
+        let script = install(&f, &o).unwrap().unwrap();
+        assert!(
+            !script.contains("github.token;"),
+            "no coordinator, no token step"
+        );
     }
 
     #[test]

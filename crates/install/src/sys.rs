@@ -157,6 +157,10 @@ pub trait System {
     fn mode(&self, p: &Path) -> io::Result<u32>;
     /// Find an executable on the environment's `PATH`.
     fn which(&self, name: &str) -> Option<PathBuf>;
+    /// Find an executable on another `PATH` (another user's).
+    fn which_on(&self, path_var: &str, name: &str) -> Option<PathBuf> {
+        which_in(path_var, name)
+    }
     /// Run a command that changes nothing (status, version, listing).
     fn query(&self, cmd: &Cmd) -> io::Result<Output>;
     fn port_open(&self, host: &str, port: u16) -> bool;
@@ -306,6 +310,9 @@ impl System for DryRun<'_> {
     }
     fn which(&self, name: &str) -> Option<PathBuf> {
         self.inner.which(name)
+    }
+    fn which_on(&self, path_var: &str, name: &str) -> Option<PathBuf> {
+        self.inner.which_on(path_var, name)
     }
     fn query(&self, cmd: &Cmd) -> io::Result<Output> {
         self.inner.query(cmd)
@@ -583,7 +590,11 @@ pub(crate) mod fake {
             }
         }
         pub fn tool(&self, name: &str) -> PathBuf {
-            let p = PathBuf::from(format!("/usr/bin/{name}"));
+            self.tool_at(name, Path::new("/usr/bin"))
+        }
+        /// `name` found in `dir`.
+        pub fn tool_at(&self, name: &str, dir: &Path) -> PathBuf {
+            let p = dir.join(name);
             self.tools.borrow_mut().insert(name.into(), p.clone());
             p
         }
@@ -632,6 +643,13 @@ pub(crate) mod fake {
         }
         fn which(&self, name: &str) -> Option<PathBuf> {
             self.tools.borrow().get(name).cloned()
+        }
+        fn which_on(&self, path_var: &str, name: &str) -> Option<PathBuf> {
+            self.tools.borrow().get(name).cloned().filter(|p| {
+                path_var
+                    .split(':')
+                    .any(|d| !d.is_empty() && p.parent() == Some(Path::new(d)))
+            })
         }
         fn query(&self, cmd: &Cmd) -> io::Result<Output> {
             self.cmds.borrow_mut().push((false, cmd.clone()));

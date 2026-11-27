@@ -13,7 +13,7 @@ pub struct Args {
 #[derive(clap::Subcommand)]
 enum Sub {
     /// Install nats-server, its configuration and token, and the hub service; provision the hub.
-    Install(InstallArgs),
+    Install(Box<InstallArgs>),
     /// Start the hub services.
     Start {
         /// Print the root steps of a system install; run none.
@@ -126,6 +126,10 @@ struct InstallArgs {
     /// That user's home (default /var/lib/hgl-ai; /Library/hgl-ai on macOS).
     #[arg(long, value_name = "DIR")]
     server_home: Option<std::path::PathBuf>,
+    /// The OS user this host's client (bridge, agents) runs as, when not you: this
+    /// host's client credential goes to its ~/.config/hgl-ai/hub.token, not to you.
+    #[arg(long, value_name = "NAME")]
+    client_user: Option<String>,
     /// Print the steps that need root as a script, and run none of them.
     #[arg(long)]
     print_root_steps: bool,
@@ -139,6 +143,9 @@ struct InstallArgs {
     units: Option<String>,
     #[arg(long, hide = true, value_name = "FILE")]
     github_token_file: Option<String>,
+    /// The `nats-server` the system install chose for the hub unit.
+    #[arg(long, hide = true, value_name = "FILE")]
+    nats_server: Option<std::path::PathBuf>,
 }
 
 impl InstallArgs {
@@ -242,6 +249,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 coord: !a.no_coord,
                 console: !a.no_console && console_url.is_some(),
                 console_url,
+                client_user: a.client_user.clone().or(prev.client_user),
                 wait: std::time::Duration::from_secs(install::HUB_WAIT_SECS),
             };
             if let Some(script) = install::system::install(&real, &o).map_err(lift)? {
@@ -270,6 +278,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 brew: !a.no_brew,
                 units,
                 github_token_file: a.github_token_file,
+                nats_server: a.nats_server,
                 ..server::ServerOpts::default()
             };
             server::install(pick(a.dry_run), &BusHub, &o)

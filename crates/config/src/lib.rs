@@ -86,6 +86,9 @@ pub struct ServerUser {
     /// The console's origin, when the server side runs one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console_url: Option<String>,
+    /// The OS user this host's client (bridge, agents) runs as, when not the installer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_user: Option<String>,
 }
 
 /// Where the hub's services are installed.
