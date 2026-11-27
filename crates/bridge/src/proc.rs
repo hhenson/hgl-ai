@@ -9,8 +9,11 @@
 //! returns only once none is left, so a note is never naked while an agent of the turn
 //! still runs.
 //!
-//! The leftovers of a turn (Linux) are the processes of its scope cgroup, those holding
-//! the turn lock, and those carrying its environment marker `HGL_AI_TURN`.
+//! The leftovers of a turn are the processes of its process group (the cap starts the
+//! agent as a group leader), and on Linux also those of its cgroup (the turn's slice, which
+//! holds the agent's scope and the scopes of the caps it runs), those holding the turn lock,
+//! and those carrying its environment marker `HGL_AI_TURN`. Elsewhere (macOS) the group and
+//! the turn lock's holders (`lsof`) are what is found.
 
 use std::ffi::OsString;
 use std::io::{BufRead, BufReader, Read, Write as _};
@@ -19,7 +22,7 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use hgl_ai_cap::{CapCommand, CapSpec, Method, Stopper};
+use hgl_ai_cap::{CapCommand, CapSpec, Method, Stopper, turn_slice};
 use tokio::sync::{mpsc, watch};
 use tokio::time::Instant;
 
@@ -101,12 +104,16 @@ pub struct Limits {
 /// How to find the processes of one turn.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TreeId {
-    /// The cap's scope cgroup directory.
+    /// The cap's cgroup directory: the turn's slice, or its scope when there is no slice.
     pub cgroup: Option<PathBuf>,
     /// Device and inode of the turn lock.
     pub lock: Option<(u64, u64)>,
+    /// The turn lock's path, for systems that find its holders by name (`lsof`).
+    pub lock_path: Option<PathBuf>,
     /// The value of [`MARKER`] in the turn's environment.
     pub marker: Option<String>,
+    /// The process group the agent leads.
+    pub pgid: Option<i32>,
 }
 
 /// Where a running turn publishes its [`TreeId`], so a caller can reap it after a panic.
@@ -157,14 +164,21 @@ pub async fn run(
     let mut c = CapCommand::new(cap, &cmd)
         .stdin(stdin)
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        .process_group();
     if let Some(m) = limits.method {
         c = c.method(m);
+    }
+    if c.get_method() == Method::Scope {
+        // A slice of its own, which the caps the agent runs join (`HGL_AI_SLICE`).
+        c = c.slice(turn_slice(marker));
     }
     let mut tree = TreeId {
         cgroup: None,
         lock: lock.and_then(FileLock::id),
+        lock_path: lock.map(|l| l.path().to_path_buf()),
         marker: Some(marker.to_string()),
+        pgid: None,
     };
     publish(slot, &tree);
     let mut child = match c.spawn() {
@@ -191,6 +205,9 @@ pub async fn run(
     }
     let root = child.id();
     let scoped = child.method() == Method::Scope;
+    let slice = child.slice().map(str::to_string);
+    tree.pgid = child.pgid().and_then(|g| i32::try_from(g).ok());
+    publish(slot, &tree);
     let stopper = child.stopper();
     let mut guard = Guard {
         stopper: Some(stopper.clone()),
@@ -254,7 +271,11 @@ pub async fn run(
             }
             _ = cg_tick.tick(), if scoped && tree.cgroup.is_none() => {
                 if let Some(cg) = scope_cgroup(root) {
-                    tree.cgroup = Some(cg);
+                    let in_slice = slice.as_deref().and_then(|s| {
+                        let p = cg.parent()?;
+                        (p.file_name()? == s).then(|| p.to_path_buf())
+                    });
+                    tree.cgroup = Some(in_slice.unwrap_or(cg));
                     publish(slot, &tree);
                     guard.tree = tree.clone();
                 }
@@ -422,24 +443,110 @@ fn scope_cgroup(pid: u32) -> Option<PathBuf> {
         .then(|| PathBuf::from(format!("/sys/fs/cgroup{theirs}")))
 }
 
+/// The processes of a cgroup and of every cgroup under it (a slice holds none itself).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cgroup_procs(dir: &std::path::Path) -> Vec<i32> {
+    let mut out = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        if let Ok(text) = std::fs::read_to_string(d.join("cgroup.procs")) {
+            out.extend(text.lines().filter_map(|l| l.trim().parse::<i32>().ok()));
+        }
+        if let Ok(rd) = std::fs::read_dir(&d) {
+            stack.extend(
+                rd.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .map(|e| e.path()),
+            );
+        }
+    }
+    out
+}
+
+/// Send `sig` to the turn's process group, if it has one.
+fn signal_group(t: &TreeId, sig: libc::c_int) {
+    if let Some(g) = t.pgid.filter(|g| *g > 1) {
+        // SAFETY: killpg(2) only sends a signal.
+        unsafe {
+            libc::killpg(g, sig);
+        }
+    }
+}
+
+/// Processes found through `ps` and `lsof`: what a system without `/proc` offers. Built
+/// everywhere (and tested on Linux); used where there is no `/proc`.
+#[cfg_attr(target_os = "linux", allow(dead_code))]
+pub(crate) mod ps {
+    use std::io::Read as _;
+    use std::path::Path;
+    use std::process::{Command, Stdio};
+
+    /// Bound on a listing read.
+    const LIST: u64 = 16 << 20;
+
+    fn listing(cmd: &mut Command) -> String {
+        let child = cmd
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else {
+            return String::new();
+        };
+        let mut buf = Vec::new();
+        if let Some(out) = child.stdout.take() {
+            let _ = out.take(LIST).read_to_end(&mut buf);
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        String::from_utf8_lossy(&buf).into_owned()
+    }
+
+    /// `(pid, pgid, zombie)` of every process.
+    pub fn table() -> Vec<(i32, i32, bool)> {
+        listing(Command::new("ps").args(["-A", "-o", "pid=", "-o", "pgid=", "-o", "stat="]))
+            .lines()
+            .filter_map(|l| {
+                let mut f = l.split_whitespace();
+                let pid = f.next()?.parse().ok()?;
+                let pgid = f.next()?.parse().ok()?;
+                let zombie = f.next().is_some_and(|s| s.starts_with('Z'));
+                Some((pid, pgid, zombie))
+            })
+            .collect()
+    }
+
+    /// Whether `pid` is a zombie (or gone).
+    pub fn zombie(pid: i32) -> bool {
+        let out = listing(Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]));
+        out.trim().is_empty() || out.trim_start().starts_with('Z')
+    }
+
+    /// The processes that have `path` open.
+    pub fn holders(path: &Path) -> Vec<i32> {
+        listing(Command::new("lsof").arg("-t").arg("--").arg(path))
+            .lines()
+            .filter_map(|l| l.trim().parse().ok())
+            .collect()
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod imp {
-    use super::{MARKER, TreeId};
+    use super::{MARKER, TreeId, cgroup_procs, signal_group};
     use std::collections::BTreeSet;
     use std::io::Read as _;
     use std::os::unix::fs::MetadataExt;
 
     pub fn members(t: &TreeId) -> Vec<i32> {
-        if t.cgroup.is_none() && t.lock.is_none() && t.marker.is_none() {
+        if t.cgroup.is_none() && t.lock.is_none() && t.marker.is_none() && t.pgid.is_none() {
             return Vec::new();
         }
         let me = std::process::id() as i32;
         let my_exe = std::fs::read_link("/proc/self/exe").ok();
         let mut out = BTreeSet::new();
-        if let Some(cg) = &t.cgroup
-            && let Ok(text) = std::fs::read_to_string(cg.join("cgroup.procs"))
-        {
-            out.extend(text.lines().filter_map(|l| l.trim().parse::<i32>().ok()));
+        if let Some(cg) = &t.cgroup {
+            out.extend(cgroup_procs(cg));
         }
         let marker = t
             .marker
@@ -453,7 +560,9 @@ mod imp {
                 if pid == me || out.contains(&pid) {
                     continue;
                 }
-                let Some((_, ppid)) = stat(pid) else { continue };
+                let Some((_, ppid, pgrp)) = stat(pid) else {
+                    continue;
+                };
                 // A child of this process between fork and exec holds a copy of every
                 // descriptor and this process's environment; it is not of the turn.
                 let forking = ppid == me
@@ -462,7 +571,8 @@ mod imp {
                 if forking {
                     continue;
                 }
-                if t.lock.is_some_and(|l| holds(pid, l))
+                if t.pgid.is_some_and(|g| g == pgrp)
+                    || t.lock.is_some_and(|l| holds(pid, l))
                     || marker.as_ref().is_some_and(|m| has_env(pid, m))
                 {
                     out.insert(pid);
@@ -470,19 +580,22 @@ mod imp {
             }
         }
         out.into_iter()
-            .filter(|p| *p != me && *p > 1 && stat(*p).is_some_and(|(s, _)| s != 'Z' && s != 'X'))
+            .filter(|p| {
+                *p != me && *p > 1 && stat(*p).is_some_and(|(s, _, _)| s != 'Z' && s != 'X')
+            })
             .collect()
     }
 
-    /// `(state, ppid)`.
-    fn stat(pid: i32) -> Option<(char, i32)> {
+    /// `(state, ppid, pgrp)`.
+    fn stat(pid: i32) -> Option<(char, i32, i32)> {
         let s = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        // `pid (comm) state ppid ...`; comm may hold spaces and parens.
+        // `pid (comm) state ppid pgrp ...`; comm may hold spaces and parens.
         let rest = &s[s.rfind(')')? + 1..];
         let mut f = rest.split_whitespace();
         let state = f.next()?.chars().next()?;
         let ppid = f.next()?.parse().ok()?;
-        Some((state, ppid))
+        let pgrp = f.next()?.parse().ok()?;
+        Some((state, ppid, pgrp))
     }
 
     fn holds(pid: i32, lock: (u64, u64)) -> bool {
@@ -511,17 +624,70 @@ mod imp {
                 libc::kill(pid, sig);
             }
         }
+        signal_group(t, sig);
     }
 }
 
 #[cfg(not(target_os = "linux"))]
 mod imp {
-    //! Without `/proc` the cap's own tree handling (descendants of the command) is all.
-    use super::TreeId;
-    pub fn members(_: &TreeId) -> Vec<i32> {
-        Vec::new()
+    //! Without `/proc`: the turn's process group (`ps`) and the turn lock's holders (`lsof`).
+    use super::{TreeId, ps, signal_group};
+    use std::collections::BTreeSet;
+
+    pub fn members(t: &TreeId) -> Vec<i32> {
+        let me = std::process::id() as i32;
+        let mut out = BTreeSet::new();
+        let table = if t.pgid.is_some() || t.lock_path.is_some() {
+            ps::table()
+        } else {
+            Vec::new()
+        };
+        if let Some(g) = t.pgid {
+            out.extend(
+                table
+                    .iter()
+                    .filter(|(_, pg, z)| *pg == g && !z)
+                    .map(|(p, _, _)| *p),
+            );
+        }
+        if let Some(p) = &t.lock_path {
+            let live: BTreeSet<i32> = table
+                .iter()
+                .filter(|(_, _, z)| !z)
+                .map(|(p, _, _)| *p)
+                .collect();
+            out.extend(ps::holders(p).into_iter().filter(|p| live.contains(p)));
+        }
+        out.into_iter().filter(|p| *p != me && *p > 1).collect()
     }
-    pub fn signal(_: &TreeId, _: libc::c_int) {}
+
+    pub fn signal(t: &TreeId, sig: libc::c_int) {
+        for pid in members(t) {
+            // SAFETY: kill(2) only sends a signal; no memory is shared.
+            unsafe {
+                libc::kill(pid, sig);
+            }
+        }
+        signal_group(t, sig);
+    }
+}
+
+/// Whether `pid` is a live process, not a zombie: what the tests check after a reap.
+#[cfg(test)]
+pub(crate) fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 checks existence only.
+    if unsafe { libc::kill(pid, 0) } != 0 {
+        return false;
+    }
+    if cfg!(target_os = "linux") {
+        std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| {
+            s.rfind(')')
+                .and_then(|i| s[i + 1..].split_whitespace().next())
+                .is_some_and(|st| st != "Z" && st != "X")
+        })
+    } else {
+        !ps::zombie(pid)
+    }
 }
 
 enum Line {
@@ -629,13 +795,7 @@ mod tests {
         watch::channel(Stop::None).1
     }
 
-    fn alive(pid: i32) -> bool {
-        // SAFETY: signal 0 checks existence only; a zombie does not count.
-        let exists = unsafe { libc::kill(pid, 0) == 0 };
-        exists
-            && std::fs::read_to_string(format!("/proc/{pid}/stat"))
-                .is_ok_and(|s| !s.contains(") Z "))
-    }
+    use super::alive;
 
     fn pids(p: &std::path::Path) -> Vec<i32> {
         std::fs::read_to_string(p)
@@ -651,6 +811,58 @@ mod tests {
             m.push(Method::Scope);
         }
         m
+    }
+
+    /// The `ps` and `lsof` reaper of systems without `/proc`, run here too.
+    #[test]
+    fn the_portable_listing_finds_a_group_and_a_lock_holder() {
+        use std::os::unix::process::CommandExt;
+        let d = tempfile::tempdir().unwrap();
+        let lp = d.path().join("turn.lock");
+        std::fs::write(&lp, "").unwrap();
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exec 3<\"$0\"; sleep 30", lp.to_str().unwrap()])
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        let end = std::time::Instant::now() + Duration::from_secs(5);
+        let table = loop {
+            let t = ps::table();
+            if t.iter().any(|(p, g, z)| *p == pid && *g == pid && !z) {
+                break t;
+            }
+            assert!(std::time::Instant::now() < end, "ps does not list {pid}");
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            table
+                .iter()
+                .any(|(p, _, _)| *p == std::process::id() as i32)
+        );
+        assert!(alive(pid) && !ps::zombie(pid));
+        if std::process::Command::new("lsof")
+            .arg("-v")
+            .output()
+            .is_ok()
+        {
+            let end = std::time::Instant::now() + Duration::from_secs(5);
+            while !ps::holders(&lp).contains(&pid) {
+                assert!(std::time::Instant::now() < end, "lsof does not name {pid}");
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        } else {
+            eprintln!("lsof is not installed; its part is not tested here");
+        }
+        let t = TreeId {
+            pgid: Some(pid),
+            ..TreeId::default()
+        };
+        assert!(members(&t).contains(&pid));
+        imp::signal(&t, libc::SIGKILL);
+        let _ = child.wait();
+        assert!(!alive(pid));
+        assert!(ps::zombie(pid), "gone counts as not running");
     }
 
     #[tokio::test]

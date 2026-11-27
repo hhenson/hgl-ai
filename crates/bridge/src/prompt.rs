@@ -178,7 +178,7 @@ mod tests {
             issue: 980,
             review,
             head: review.then(|| "a".repeat(40)),
-            branch: (!review).then(|| "codex/980-fix".to_string()),
+            branch: (!review).then(|| "codex/q980-fix".to_string()),
             base: "origin/main".into(),
             main: Some("b".repeat(40)),
             start: "c".repeat(40),
@@ -190,6 +190,7 @@ mod tests {
             },
             sessions: BTreeMap::new(),
             seq: None,
+            families: Vec::new(),
         }
     }
 
@@ -230,7 +231,7 @@ mod tests {
         let p = build(&c, &[(42, 1, &n), (43, 2, &q)]);
         for needle in [
             "You are seat `w1` (implementor) on host `build-1`, running codex with gpt model `gpt-6.1-sol`.",
-            "Task: hgl-compiler#980 on branch `codex/980-fix` from origin/main",
+            "Task: hgl-compiler#980 on branch `codex/q980-fix` from origin/main",
             "The controller is seat `boss`.",
             "`hgl-ai note send`",
             "Do not remove worktrees",

@@ -84,6 +84,9 @@ impl Hub {
         let mut cfg = hgl_ai_config::Config::new("test-host");
         cfg.hub.url = url.clone();
         cfg.hub.token_file = token_file.display().to_string();
+        // Seat locks and the host id stay in the scratch directory.
+        cfg.paths.data_dir = dir.0.join("data").display().to_string();
+        cfg.paths.work_root = dir.0.join("work").display().to_string();
         cfg.save(&config).unwrap();
         Some(Hub {
             child,
@@ -192,6 +195,10 @@ fn notes_send_wait_peek() {
         .unwrap();
     assert_eq!(ok(&child.wait_with_output().unwrap()), "seq 2\n");
 
+    // Peeks spend no delivery, however many (hgl-ai#5, Carbon's check 3).
+    for _ in 0..7 {
+        ok(&hub.run(&["note", "peek", "claude"]));
+    }
     let peeked = ok(&hub.run(&["note", "peek", "claude"]));
     let lines: Vec<&str> = peeked.lines().collect();
     assert_eq!(lines.len(), 4, "{peeked}");
@@ -214,8 +221,8 @@ fn notes_send_wait_peek() {
     assert_eq!(notes.len(), 2);
     assert_eq!(
         (notes[0]["seq"].as_u64(), notes[0]["delivered"].as_u64()),
-        (Some(1), Some(2)),
-        "peek counted"
+        (Some(1), Some(1)),
+        "the peeks spent no delivery"
     );
     assert_eq!(notes[1]["body"], "from stdin\n");
 
@@ -269,7 +276,7 @@ fn bridged_seats_refuse_interactive_waits() {
     });
     assert_eq!(
         ok(&hub.run(&["hosts"])),
-        "build-1 at 20261127T083000Z memcap 64G free 812G: w3 implementor/codex/gpt-6.1-sol\n"
+        "build-1 at 20261127T083000Z memcap 64G free 812 GB: w3 implementor/codex/gpt-6.1-sol\n"
     );
     let rec: serde_json::Value =
         serde_json::from_str(ok(&hub.run(&["--json", "hosts"])).trim()).unwrap();
@@ -287,7 +294,8 @@ fn bridged_seats_refuse_interactive_waits() {
     let forced = hub.run(&["note", "wait", "w3", "--timeout", "1s", "--force"]);
     assert_eq!(forced.status.code(), Some(3), "{}", err(&forced));
     assert!(
-        err(&forced).contains("warning: --force: receiving for seat w3 without its lease seat.w3"),
+        err(&forced)
+            .contains("warning: --force: receiving for seat w3 without its lock and lease seat.w3"),
         "{}",
         err(&forced)
     );
@@ -346,9 +354,9 @@ fn an_interactive_wait_holds_the_seat_lease() {
             .unwrap()
     };
     let held_by = |c: &Child| {
-        let want = format!("test-host pid {} (note wait)", c.id());
+        let want = format!("test-host pid {} (note wait) id ", c.id());
         let end = Instant::now() + Duration::from_secs(20);
-        while holder().as_deref() != Some(want.as_str()) {
+        while !holder().is_some_and(|h| h.starts_with(&want)) {
             assert!(
                 Instant::now() < end,
                 "the wait took no lease: {:?}",
@@ -356,15 +364,19 @@ fn an_interactive_wait_holds_the_seat_lease() {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        want
+        holder().unwrap()
     };
 
     let waiting = spawn_wait();
-    let want = held_by(&waiting);
+    held_by(&waiting);
+    // The seat's lock on this host refuses a second receive here (PROTO-6).
     let refused = hub.run(&["note", "peek", "w5"]);
     assert_eq!(refused.status.code(), Some(1));
     assert!(
-        err(&refused).contains(&format!("seat w5 is held by {want} (lease seat.w5 since")),
+        err(&refused).contains(&format!(
+            "seat w5 is served on this host by pid {}",
+            waiting.id()
+        )),
         "{}",
         err(&refused)
     );
@@ -389,6 +401,29 @@ fn an_interactive_wait_holds_the_seat_lease() {
     let done = waiting.wait_with_output().unwrap();
     assert_eq!(done.status.code(), Some(130), "{}", err(&done));
     assert_eq!(holder(), None, "released on SIGINT");
+
+    // Killed with SIGKILL it releases nothing; the next wait of this host takes the lease
+    // over at once instead of waiting for it to expire (Carbon's check 6).
+    let mut waiting = spawn_wait();
+    let stale = held_by(&waiting);
+    waiting.kill().unwrap();
+    waiting.wait().unwrap();
+    assert_eq!(holder().as_deref(), Some(stale.as_str()));
+    let again = hub.run(&["note", "wait", "w5", "--timeout", "1s"]);
+    assert_eq!(again.status.code(), Some(3), "{}", err(&again));
+    assert!(
+        err(&again).contains(&format!("taking over the seat lease seat.w5 from {stale}")),
+        "{}",
+        err(&again)
+    );
+    assert_eq!(holder(), None, "released by the wait that took it over");
+    // A holder of another machine that shares the label is not taken over.
+    let other = format!("test-host pid 999999999 (note wait) id {}", "f".repeat(16));
+    let lease = rt.block_on(bus.lock_acquire("seat.w5", &other)).unwrap();
+    let refused = hub.run(&["note", "wait", "w5", "--timeout", "1s"]);
+    assert_eq!(refused.status.code(), Some(1), "{}", err(&refused));
+    assert!(err(&refused).contains(&format!("seat w5 is held by {other}")));
+    rt.block_on(lease.release()).unwrap();
 }
 
 #[test]

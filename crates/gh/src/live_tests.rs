@@ -13,7 +13,7 @@ use crate::coord::{self, CoordOpts};
 use crate::exec::fake::FakeGh;
 use crate::lock::LandLock;
 use crate::table::Table;
-use crate::testutil::{fixture, settings};
+use crate::testutil::{fixture, settings, without_receipts};
 use crate::{Error, land, state, store};
 
 struct Hub {
@@ -485,7 +485,7 @@ async fn a_lost_landing_lock_stops_the_landing() {
     );
 
     // The gate would merge; the lost lock stops it before the merge call.
-    let s = settings();
+    let s = without_receipts(settings(), &["alpha"]);
     let gh = mergeable();
     let o = land::LandOpts::default();
     let r = land::merge_locked(&gh, &s, &a, "alpha", 7, HEAD, &o, &held).await;
@@ -510,7 +510,7 @@ async fn a_lost_landing_lock_stops_the_landing() {
         merge_commit: Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed".into()),
         head: HEAD.into(),
     };
-    let r = land::after_merge(&gh, &s, &a, "alpha", 7, &merged, &o, &held).await;
+    let r = land::after_merge(&gh, &s, &a, "alpha", 7, &merged, &o, &held, None).await;
     match r {
         Err(Error::LeaseLost(m)) => assert!(
             m.ends_with(
@@ -559,4 +559,334 @@ async fn a_hold_at_the_deadline_stops_the_landing() {
         .unwrap()
         .release()
         .await;
+}
+
+/// A JetStream API request over the plain NATS protocol (the hub here has no auth), for a
+/// test to change the hub under the code it tests. Returns the reply's payload.
+fn js_api(url: &str, subject: &str) -> String {
+    use std::io::{BufRead, BufReader, Write};
+    let addr = url.trim_start_matches("nats://");
+    let stream = std::net::TcpStream::connect(addr).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+    let mut w = stream.try_clone().unwrap();
+    let mut r = BufReader::new(stream);
+    let mut line = String::new();
+    r.read_line(&mut line).unwrap();
+    assert!(line.starts_with("INFO"), "{line}");
+    write!(
+        w,
+        "CONNECT {{\"verbose\":false,\"pedantic\":false}}\r\nSUB _INBOX.t 1\r\nPUB {subject} _INBOX.t 0\r\n\r\nPING\r\n"
+    )
+    .unwrap();
+    loop {
+        line.clear();
+        r.read_line(&mut line).unwrap();
+        if line.starts_with("MSG _INBOX.t") {
+            line.clear();
+            r.read_line(&mut line).unwrap();
+            return line.trim().to_string();
+        }
+        assert!(!line.starts_with("-ERR"), "{line}");
+    }
+}
+
+/// Carbon's check 8b (hgl-ai#8): a round whose alerts cannot be sent (the notes stream is
+/// gone) keeps them on the hub, and the next run sends them, though the table it compares
+/// with no longer shows the change.
+#[tokio::test]
+async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+    store::put_latest(&b, state::KEY_PRS, &fixture("coord-prev.prs"))
+        .await
+        .unwrap();
+    let gh = || {
+        FakeGh::default()
+            .on("auth status", "")
+            .on("graphql", &fixture("coord-batch.json"))
+    };
+    let o = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES");
+    assert!(reply.contains("\"success\":true"), "{reply}");
+    let r = coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new()).await;
+    assert!(r.is_err(), "the sends failed");
+    // The table moved on; the alerts wait on the hub.
+    let t = Table::parse(&b.state_get(state::KEY_PRS).await.unwrap().unwrap().value);
+    assert_eq!(t.rows.len(), 6);
+    let kept = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap().value;
+    let kept: Vec<hgl_ai_proto::Note> = serde_json::from_str(&kept).unwrap();
+    assert_eq!(kept.len(), 2);
+
+    // The stream is back; a new run (a restarted service) sends them.
+    b.provision().await.unwrap();
+    let controller = Seat::new("claude").unwrap();
+    let mut inbox = b.inbox(&controller).await.unwrap();
+    coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new())
+        .await
+        .unwrap();
+    let got = inbox.fetch(10, Duration::from_secs(5)).await.unwrap();
+    let firsts: Vec<String> = got
+        .iter()
+        .map(|d| d.note.body.lines().next().unwrap_or("").to_string())
+        .collect();
+    assert_eq!(got.len(), 2, "{firsts:?}");
+    assert!(
+        firsts[0].starts_with("[coord] Alert: alpha#11"),
+        "{firsts:?}"
+    );
+    assert!(b.state_get(coord::KEY_UNSENT).await.unwrap().is_none());
+    for d in &got {
+        d.ack().await.unwrap();
+    }
+    // Sent once: a third round sends nothing.
+    coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new())
+        .await
+        .unwrap();
+    assert!(
+        inbox
+            .fetch(10, Duration::from_millis(300))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+const MERGE: &str = "01e99ea5e46457bac035ca8a2699b6b6575b32ed";
+
+/// The hub as a landing of `alpha#7` (issue 980) finds it: the author's tree with its
+/// family, and a clean review receipt from another family among the controller's notes
+/// (with notes that are not one for it around it).
+async fn authored_and_reviewed(b: &Bus) {
+    let tree = hgl_ai_proto::TreeRecord {
+        host: "build-1".into(),
+        seat: Seat::new("w1").unwrap(),
+        task: hgl_ai_proto::TaskKey {
+            repo: "alpha".into(),
+            issue: 980,
+        },
+        review: false,
+        path: "/w/w1/alpha-980".into(),
+        branch: Some("codex/980-format-patterns".into()),
+        created_at: "20260101T000000Z".into(),
+        size_bytes: 0,
+        families: vec![hgl_ai_proto::Family::Gpt],
+    };
+    b.tree_put(&tree).await.unwrap();
+    let controller = Seat::new("claude").unwrap();
+    let note = |kind: Kind, from: &str, pr: u64, body: &str| {
+        let mut n =
+            hgl_ai_proto::Note::new(Seat::new(from).unwrap(), controller.clone(), kind, body);
+        n.repo = Some("alpha".into());
+        n.issue = pr;
+        if kind.needs_head() {
+            n.head = Some(HEAD.into());
+        }
+        n
+    };
+    let r = fixture("receipt.json");
+    for n in [
+        note(
+            Kind::Receipt,
+            "desk",
+            7,
+            "[desk] Sets: alpha#7 at 1f461fa7 on main 0a0a0a0a, exit 0: x",
+        ),
+        note(Kind::Receipt, "r1", 8, &r.replace("\"pr\": 7", "\"pr\": 8")),
+        note(Kind::Ready, "w1", 7, "[codex] Ready: alpha#7"),
+        note(
+            Kind::Receipt,
+            "r1",
+            7,
+            &format!("[claude] Receipt:\n```json\n{r}```\n"),
+        ),
+    ] {
+        b.send(&n).await.unwrap();
+    }
+    let seen = crate::gate::receipts(b, &settings(), "alpha", 7)
+        .await
+        .unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert_eq!(seen[0].sender, "r1");
+}
+
+/// Everything the gate and the steps after the merge read, for `alpha#7` at `HEAD`; the
+/// pull request reads `open` once (the gate), then `merged`. `after` goes first, so it can
+/// fail a call once.
+fn landing_gh(after: impl FnOnce(FakeGh) -> FakeGh) -> FakeGh {
+    let main = "{\"object\":{\"sha\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"}}";
+    let gh = FakeGh::default()
+        .on("pulls/7/merge", "{\"merged\":true}")
+        .on("pulls/7/files", &fixture("pr-files.json"))
+        .on(
+            "Accept: application/vnd.github.v3.diff",
+            &fixture("pr.diff"),
+        )
+        .on("issues/7/comments", &fixture("comments-clean.json"))
+        .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+        .on(
+            "graphql",
+            "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}",
+        )
+        .once("pulls/7", &fixture("pr-open.json"));
+    after(gh)
+        .once("git/ref/heads/main", main)
+        .on("pulls/7", &fixture("pr-merged.json"))
+        .on("git/ref/heads/main", main)
+}
+
+async fn landed_notes(b: &Bus) -> Vec<(String, u64)> {
+    let all = b
+        .read_notes(
+            &[Seat::new("w1").unwrap(), Seat::broadcast()],
+            1,
+            100,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    all.into_iter()
+        .filter(|n| n.note.kind == Kind::Landed)
+        .map(|n| (n.note.recipient.to_string(), n.note.issue))
+        .collect()
+}
+
+fn posts(gh: &FakeGh, what: &str) -> usize {
+    gh.calls()
+        .iter()
+        .filter(|c| c.contains(what) && (c.contains("-X POST") || c.contains("-X PUT")))
+        .count()
+}
+
+/// Carbon's check 4 (hgl-ai#7): the read right after the merge fails (one HTTP 502). The
+/// retry finds the pull request merged and finishes its landing (`landed.log`, `main`, the
+/// notes, the comment) instead of reporting it merged with nothing recorded; a third run
+/// finds it landed and does nothing.
+#[tokio::test]
+async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into()];
+    s.pins = vec![];
+    let o = land::LandOpts::default();
+    let gh = landing_gh(|g| g.push_fail_once("pulls/7", "gh: Server Error (HTTP 502)"));
+    let e = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("HTTP 502"), "{e}");
+    assert_eq!(posts(&gh, "pulls/7/merge"), 1, "merged");
+    let rec = crate::progress::read(&b, "alpha", 7)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (rec.head.as_str(), rec.merge.as_deref()),
+        (HEAD, None),
+        "the intent"
+    );
+    assert!(b.state_get(state::KEY_MAIN).await.unwrap().is_none());
+
+    let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Resumed,
+        "{}",
+        l.outcome.line
+    );
+    assert!(l.outcome.kind.satisfied());
+    assert_eq!(posts(&gh, "pulls/7/merge"), 1, "not merged again");
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(
+        log.trim_end().ends_with(&format!("alpha #7 {MERGE}")),
+        "{log}"
+    );
+    let main = b.state_get(state::KEY_MAIN).await.unwrap().unwrap().value;
+    assert!(main.contains("alpha main 0a0a0a0a"), "{main}");
+    assert_eq!(
+        landed_notes(&b).await,
+        [
+            ("w1".to_string(), 980),
+            ("all".into(), 980),
+            ("all".into(), 7)
+        ]
+    );
+    assert_eq!(posts(&gh, "issues/7/comments"), 1, "{:?}", l.after);
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none(),
+        "done"
+    );
+
+    let again = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(again.outcome.kind, crate::gate::Kind::AlreadyMerged);
+    assert!(
+        again.after[0].starts_with("landed earlier"),
+        "{:?}",
+        again.after
+    );
+    assert_eq!(posts(&gh, "issues/7/comments"), 1, "no second comment");
+    assert_eq!(landed_notes(&b).await.len(), 3);
+}
+
+/// `main` cannot be read after the merge (HTTP 502, three times): the landing fails rather
+/// than write a `main` without the repository; the retry finishes from where it stopped,
+/// without a second `landed.log` line.
+#[tokio::test]
+async fn a_landing_that_could_not_read_main_resumes_there() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into()];
+    s.pins = vec![];
+    let o = land::LandOpts::default();
+    let main = "{\"object\":{\"sha\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"}}";
+    let gh = landing_gh(|g| {
+        // The gate's read of main answers; the three of the steps after the merge do not.
+        g.once("git/ref/heads/main", main)
+            .push_fail_once("git/ref/heads/main", "gh: Server Error (HTTP 502)")
+            .push_fail_once("git/ref/heads/main", "gh: Server Error (HTTP 502)")
+            .push_fail_once("git/ref/heads/main", "gh: Server Error (HTTP 502)")
+    });
+    let e = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap_err();
+    assert!(e.to_string().contains("HTTP 502"), "{e}");
+    assert!(
+        b.state_get(state::KEY_MAIN).await.unwrap().is_none(),
+        "no partial main"
+    );
+    let rec = crate::progress::read(&b, "alpha", 7)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.merge.as_deref(), Some(MERGE));
+    assert_eq!(rec.done, [crate::progress::LANDED_LOG]);
+    assert!(landed_notes(&b).await.is_empty());
+
+    let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Resumed,
+        "{}",
+        l.outcome.line
+    );
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(b.state_get(state::KEY_MAIN).await.unwrap().is_some());
+    assert_eq!(landed_notes(&b).await.len(), 3);
+    assert_eq!(posts(&gh, "issues/7/comments"), 1);
+    assert_eq!(posts(&gh, "pulls/7/merge"), 1);
 }

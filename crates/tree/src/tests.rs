@@ -72,7 +72,7 @@ fn implementor_tree_on_a_new_branch() {
     for sub in ["src/README", "tmp", "build", "task.json"] {
         assert!(c.dir.join(sub).exists(), "{sub}");
     }
-    assert_eq!(c.file.branch.as_deref(), Some("codex/980-fix-the-thing"));
+    assert_eq!(c.file.branch.as_deref(), Some("codex/q980-fix-the-thing"));
     assert_eq!(c.file.base, "origin/main");
     assert_eq!(c.file.start, c.file.main.clone().unwrap());
     let src = c.dir.join("src");
@@ -81,7 +81,7 @@ fn implementor_tree_on_a_new_branch() {
             .run(&src, ["branch", "--show-current"])
             .unwrap()
             .trim(),
-        "codex/980-fix-the-thing"
+        "codex/q980-fix-the-thing"
     );
     let upstream = e
         .git
@@ -280,7 +280,7 @@ fn clean_removal_frees_everything() {
         .unwrap();
     assert_eq!(rm.salvage, None);
     assert_eq!(rm.key, "build-1.w1.demo-1");
-    assert_eq!(rm.branch.as_deref(), Some("codex/1-one"));
+    assert_eq!(rm.branch.as_deref(), Some("codex/q1-one"));
     assert!(rm.freed_bytes > 0);
     assert!(!c.dir.exists());
     let clone = e.root.join("work/clones/demo");
@@ -288,7 +288,12 @@ fn clean_removal_frees_everything() {
         !e.git
             .check(
                 &clone,
-                ["rev-parse", "--verify", "--quiet", "refs/heads/codex/1-one"]
+                [
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    "refs/heads/codex/q1-one"
+                ]
             )
             .unwrap()
     );
@@ -390,4 +395,127 @@ fn removal_refuses_a_link_out_of_work_root() {
         Err(TreeError::Escape(_))
     ));
     assert!(outside.join("src").exists());
+}
+
+/// Carbon's check 7a (hgl-ai PR 1): a git killed in the tree left `index.lock`; the tree is
+/// still salvaged and removed, and the lock no longer stops git in it.
+#[test]
+fn a_stale_index_lock_does_not_stop_the_removal() {
+    let e = env();
+    let c = e
+        .trees
+        .create(&seat("w1"), &task(1), &implement("One"))
+        .unwrap();
+    let src = c.dir.join("src");
+    std::fs::write(src.join("dirty.txt"), "wip\n").unwrap();
+    let gitdir = git_dir(&src).unwrap();
+    std::fs::write(gitdir.join("index.lock"), "").unwrap();
+    let rm = e
+        .trees
+        .remove(&seat("w1"), &task(1), false)
+        .unwrap()
+        .unwrap();
+    let text = std::fs::read_to_string(rm.salvage.expect("salvaged")).unwrap();
+    assert!(text.contains("+wip"), "{text}");
+    assert!(!c.dir.exists());
+    assert!(!gitdir.exists(), "the worktree's metadata went too");
+
+    // A kept tree with a stale lock: cleared when the next turn's tree is prepared.
+    let c = e
+        .trees
+        .create(&seat("w1"), &task(2), &implement("Two"))
+        .unwrap();
+    let lock = git_dir(&c.dir.join("src")).unwrap().join("index.lock");
+    std::fs::write(&lock, "").unwrap();
+    let again = e
+        .trees
+        .create(&seat("w1"), &task(2), &implement("Two"))
+        .unwrap();
+    assert!(again.reused);
+    assert!(!lock.exists());
+    assert!(again.record.size_bytes > 0, "a kept tree is measured too");
+    // One a live process holds is left alone.
+    std::fs::write(&lock, "").unwrap();
+    let _held = std::fs::File::open(&lock).unwrap();
+    assert!(!clear_stale_index_lock(&c.dir.join("src")));
+    assert!(lock.exists());
+}
+
+/// Carbon's check 7b: the task moves to another seat of the same host (ROLE-13) while the
+/// first still has its branch checked out: the new seat's tree shares the branch.
+#[test]
+fn a_task_moved_to_another_seat_of_the_host_keeps_its_branch() {
+    let e = env();
+    let w2 = e
+        .trees
+        .create(&seat("w2"), &task(3), &implement("Three"))
+        .unwrap();
+    commit(
+        &e.git,
+        &w2.dir.join("src"),
+        "w2.txt",
+        "w2 work\n",
+        "w2 work",
+    );
+    let w1 = e
+        .trees
+        .create(&seat("w1"), &task(3), &implement("A sendback title"))
+        .unwrap();
+    assert_eq!(w1.file.branch, w2.file.branch);
+    assert_eq!(w1.file.branch.as_deref(), Some("codex/q3-three"));
+    assert!(
+        w1.dir.join("src/w2.txt").exists(),
+        "the unpushed work follows"
+    );
+    // The first seat's removal leaves the branch the second still uses.
+    e.trees.remove(&seat("w2"), &task(3), false).unwrap();
+    assert_eq!(
+        e.git
+            .run(&w1.dir.join("src"), ["branch", "--show-current"])
+            .unwrap()
+            .trim(),
+        "codex/q3-three"
+    );
+}
+
+/// Carbon's check 7c: branches named as docs/work.md says (`codex/q<issue>-<short-name>`)
+/// are made and resumed, and so are older `codex/<issue>-<slug>` ones.
+#[test]
+fn q_branches_and_older_ones_are_resumed() {
+    let e = env();
+    for (issue, branch) in [(980, "codex/q980-fix"), (981, "codex/981-older")] {
+        e.git
+            .run(
+                &e.seed,
+                ["checkout", "--quiet", "-B", branch, "origin/main"],
+            )
+            .unwrap();
+        let pushed = commit(&e.git, &e.seed, "q.txt", &format!("{branch}\n"), "q work");
+        e.git
+            .run(&e.seed, ["push", "--quiet", "origin", branch])
+            .unwrap();
+        let c = e
+            .trees
+            .create(&seat("w1"), &task(issue), &implement("Sendback title"))
+            .unwrap();
+        assert_eq!(c.file.branch.as_deref(), Some(branch));
+        assert_eq!(c.file.start, pushed);
+    }
+}
+
+/// Carbon's check 7d: a repository whose name cannot be a bucket key part (`.github`) is
+/// refused before any tree is made.
+#[test]
+fn a_leading_dot_repository_is_refused_before_a_tree() {
+    let e = env();
+    remote(&e.git, &e.root, ".github");
+    let t = TaskKey {
+        repo: ".github".into(),
+        issue: 5,
+    };
+    assert!(matches!(
+        e.trees.create(&seat("w1"), &t, &implement("CI")),
+        Err(TreeError::Invalid(_))
+    ));
+    assert!(!e.root.join("work/w1").join(".github-5").exists());
 }

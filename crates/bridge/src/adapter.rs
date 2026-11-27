@@ -278,13 +278,13 @@ impl Parser {
         self.p.error = Some(msg);
     }
 
-    /// The verdict once the process ended (`exited_ok`: exit status 0).
-    pub fn finish(mut self, exited_ok: bool, stderr_tail: &str) -> Parsed {
+    /// The verdict once the process ended (`exited_ok`: exit status 0). A quota refusal is
+    /// known only from the runtime's structured output: an error event or result and its
+    /// status, never from free text on stderr, where a panic at `lib.rs:429` or a word in
+    /// a log line would pass for one.
+    pub fn finish(mut self, exited_ok: bool, _stderr_tail: &str) -> Parsed {
         let success = exited_ok && self.p.result_ok == Some(true);
         if !success {
-            if is_quota(stderr_tail) {
-                self.quota_hint = true;
-            }
             self.p.quota = self.quota_hint;
         }
         self.p
@@ -301,21 +301,23 @@ fn str_at<'a>(v: &'a Value, k: &str) -> Option<&'a str> {
     v.get(k).and_then(Value::as_str)
 }
 
-/// Quota and rate-limit wording of the three CLIs and their providers.
+/// Quota and rate-limit wording of the three CLIs and their providers, matched in the
+/// message of a structured error only (an error event or an error result). No bare status
+/// code or single word: those occur in ordinary errors.
 pub fn is_quota(text: &str) -> bool {
     const PATTERNS: [&str; 12] = [
         "usage limit",
         "rate limit",
         "rate_limit",
-        "quota",
+        "quota exceeded",
+        "exceeded your current quota",
+        "insufficient_quota",
         "resource_exhausted",
         "resource exhausted",
         "too many requests",
         "hit your limit",
-        "limit reached",
         "out of credits",
         "credit balance is too low",
-        "429",
     ];
     let t = text.to_lowercase();
     PATTERNS.iter().any(|p| t.contains(p))
@@ -326,6 +328,7 @@ mod tests {
     //! Fixtures: `*-ok.jsonl` are real captures of one `reply with OK` turn of each CLI
     //! (claude 2.1.332, codex-cli 0.155.1, agy 1.5.18), trimmed, ids and paths replaced.
     //! `*.synthetic.jsonl` are hand-written in the same shapes; no real refusal was triggered.
+    //! `*-crash.synthetic.jsonl` are ordinary failures that mention 429 or quota.
     use super::*;
     use hgl_ai_proto::Family;
 
@@ -335,6 +338,9 @@ mod tests {
     const CLAUDE_QUOTA: &str = include_str!("../fixtures/claude-quota.synthetic.jsonl");
     const CODEX_QUOTA: &str = include_str!("../fixtures/codex-quota.synthetic.jsonl");
     const AGY_QUOTA: &str = include_str!("../fixtures/agy-quota.synthetic.jsonl");
+    const CODEX_CRASH: &str = include_str!("../fixtures/codex-crash.synthetic.jsonl");
+    const CLAUDE_CRASH: &str = include_str!("../fixtures/claude-crash.synthetic.jsonl");
+    const AGY_CRASH: &str = include_str!("../fixtures/agy-crash.synthetic.jsonl");
 
     fn parse(rt: Runtime, text: &str, exited_ok: bool, stderr: &str) -> Parsed {
         let mut p = Parser::new(rt);
@@ -396,9 +402,9 @@ mod tests {
             r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#
         );
         assert!(!parse(Runtime::Claude, &warned, true, "").quota);
-        // Quota wording only on stderr, nothing structured.
+        // Quota wording only on stderr, nothing structured: not a refusal.
         assert!(
-            parse(
+            !parse(
                 Runtime::Codex,
                 "",
                 false,
@@ -406,6 +412,32 @@ mod tests {
             )
             .quota
         );
+    }
+
+    /// Carbon's false positives (hgl-ai PR 1): "429" or "quota" in ordinary failures.
+    #[test]
+    fn ordinary_failures_that_mention_429_or_quota_are_not_quota() {
+        for (rt, text) in [
+            (Runtime::Codex, CODEX_CRASH),
+            (Runtime::Claude, CLAUDE_CRASH),
+            (Runtime::Agy, AGY_CRASH),
+        ] {
+            let p = parse(
+                rt,
+                text,
+                false,
+                "thread 'main' panicked at src/lib.rs:429:5\nquota.rs: test failed; commit 8a5c429f",
+            );
+            assert!(!p.quota, "{rt}: {p:?}");
+            assert!(p.error.is_some(), "{rt}");
+        }
+        assert!(!is_quota("commit 8a5c429f failed"));
+        assert!(!is_quota("thread 'main' panicked at src/lib.rs:429:5"));
+        assert!(!is_quota("disk quota.rs check failed"));
+        assert!(is_quota("RESOURCE_EXHAUSTED: Quota exceeded for model"));
+        assert!(is_quota(
+            "You exceeded your current quota, please check your plan"
+        ));
     }
 
     #[test]

@@ -1,4 +1,5 @@
-//! Implementor branch names: `<branch_prefix><issue>-<slug>` (docs/design.md §5).
+//! Implementor branch names: `<branch_prefix>q<issue>-<slug>` (docs/work.md, docs/design.md
+//! §5), such as `codex/q980-fix-the-resolver`.
 
 /// Longest slug, in characters.
 pub const SLUG_MAX: usize = 40;
@@ -53,9 +54,15 @@ fn is_reference(w: &str) -> bool {
     }
 }
 
-/// `<prefix><issue>-<slug>`.
+/// `<prefix>q<issue>-<slug>`.
 pub fn branch_name(prefix: &str, issue: u64, title: &str) -> String {
-    format!("{prefix}{issue}-{}", slug(title))
+    format!("{prefix}q{issue}-{}", slug(title))
+}
+
+/// The starts of a task's branch names: `<prefix>q<issue>-`, and the older
+/// `<prefix><issue>-`, so a branch pushed under either is resumed.
+pub fn branch_starts(prefix: &str, issue: u64) -> [String; 2] {
+    [format!("{prefix}q{issue}-"), format!("{prefix}{issue}-")]
 }
 
 #[cfg(test)]
@@ -99,7 +106,8 @@ mod tests {
     fn branches() {
         assert_eq!(
             branch_name("codex/", 980, "[codex] Assign: Fix it"),
-            "codex/980-fix-it"
+            "codex/q980-fix-it"
         );
+        assert_eq!(branch_starts("codex/", 98), ["codex/q98-", "codex/98-"]);
     }
 }

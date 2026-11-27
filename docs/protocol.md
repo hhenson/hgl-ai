@@ -1,6 +1,7 @@
 # Protocol
 
-Status: proposed. Open decisions are issues in this repository.
+Status: proposed; implemented (this is what `hgl-ai` does). Open decisions are issues in
+this repository.
 
 ## 1. Records
 
@@ -31,13 +32,19 @@ Status: proposed. Open decisions are issues in this repository.
   (OWN-7); `bridge run` serves every other seat without being told. A seat is served by a bridge or
   interactively, never both: `note wait` and `note peek` refuse a seat that a
   live `HGL_HOSTS` record lists, unless given `--force`. On one host, whoever
-  serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`.
+  serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`: the bridge,
+  `note wait` and `note peek` alike.
   A bridge serves a seat only while it holds the lease `HGL_LOCKS/seat.<seat>`,
   refreshed with its heartbeat. `note wait` and `note peek` refuse a held one
-  and hold it themselves until they return; `--force` skips the lease, with a
-  warning. A restarted bridge takes over at once a lease that a dead bridge,
-  `note wait` or `note peek` of its own host held (same host label, the
-  recorded process gone); host labels are unique in a fleet.
+  and hold it themselves until they return; `--force` skips the lock and the
+  lease, with a warning. A lease holder is `<host> pid <pid> (<what>) id <host-id>`,
+  with a host id kept in `<data_dir>/host-id`. A bridge, `note wait` or `note
+  peek` takes over at once a lease that a dead bridge, `note wait` or `note peek`
+  of its own host held (same label and host id, the recorded process gone).
+  Host labels are unique in a fleet; a machine that shares a label by mistake
+  has another host id, so its leases are never taken.
+  `note peek` reads the stream after the inbox's acknowledged floor and spends
+  no delivery.
 
 ```sh
 hgl-ai note send --to claude --issue 980 --kind ready --body-file ready.md
@@ -56,7 +63,7 @@ before hub users takes one shared token until it moves.
 | Primitive | Name | Settings |
 | --- | --- | --- |
 | Stream | `HGL_NOTES`, subjects `hgl.notes.>` | file storage, `max_age` 14 d, dedup window 24 h |
-| Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>`, `hgl.notes.all` and `hgl.notes.owner.<seat>`; explicit ack; `ack_wait` 300 s; `max_deliver` 5 |
+| Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>`, `hgl.notes.all` and `hgl.notes.owner.<seat>`; explicit ack; `ack_wait` 300 s; `max_deliver` unlimited (PROTO-8) |
 | Owner | stream `HGL_OWNER`, KV `HGL_THREADS`, KV `HGL_METRICS`, KV `HGL_CONSOLE` | docs/owner.md §4 |
 | State | KV `HGL_STATE` | file storage, history 5 |
 | Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
@@ -69,11 +76,22 @@ before hub users takes one shared token until it moves.
   `all`, `owner` or `console`, and no note goes to `owner` or `console`. A seat is a logical address; the runtime and model bound
   to it can change (§6) without peers noticing.
 - **PROTO-8 — Ack after the turn.** The bridge sends `in_progress` every 60 s
-  while a turn runs, `ack` after a clean exit, and `nak` with a 15 s delay on a
-  crash, a memory or time limit, or a provider quota refusal. A turn that can
-  never start (the CLI is missing, or the command line is over the system's
-  limit) is not retried: the bridge sends `term` and tells the controller which
-  notes it dropped.
+  while a turn runs or a note is held, and `ack` after a clean exit. JetStream
+  never drops a note (`max_deliver` is unlimited); the bridge decides:
+  - *Held* (no delivery spent; kept alive and tried again on a timer): a quota
+    refusal with no binding left to move to (every 10 min), a tree that cannot
+    be prepared yet (from 60 s, doubling to 16 min; the controller is told once),
+    `HGL_ENDED` that cannot be read or written (every 15 s), the gates
+    (ROLE-16, ROLE-17), a turn lock another process holds.
+  - *Real failure* (a crash, a memory or time limit, a turn that could not be
+    started this time): counted per note in `<data_dir>/bridge/failures/<seat>.json`
+    and naked with a 15 s delay. At the fifth the bridge sends `term` and a
+    *dead letter* to the controller: a `note` whose body starts
+    `[bridge] Dead letter:`, gives the reason and quotes the note.
+  - A turn that can never start (the CLI is missing, or the command line is over
+    the system's limit) is not retried: the bridge sends `term` and tells the
+    controller which notes it dropped.
+  - At shutdown or a lost lease, held and running notes are naked (handed back).
 - **PROTO-9 — Idempotent sends.** Each note carries a `Nats-Msg-Id` of
   `<sender>-<created_at>-<sha256(envelope)[0:12]>` over recipient, kind, repo,
   issue, head, base and body, so a retried send is dropped and no other note is.
@@ -129,7 +147,7 @@ before hub users takes one shared token until it moves.
   bridge creates `<work_root>/<seat>/<repo>-<issue>/` with the checkout in
   `src/`, a scratch `tmp/` and a `build/` directory, and starts the agent's
   turn there with `TMPDIR`, `CARGO_TARGET_DIR` and `HGL_AI_TASK_DIR` pointing
-  inside it. Nothing of a task goes to `/tmp`.
+  inside it. Nothing of a task goes to `/tmp`, the caps' report files included.
 - **PROTO-13 — Every tree is registered** in `HGL_TREES` under
   `<host>.<seat>.<repo>-<issue>` with its path, branch, creation time and
   last measured size.
@@ -140,8 +158,8 @@ before hub users takes one shared token until it moves.
   `done` cleanup receipt to the controller. Agents do not remove trees. Before
   acknowledging the note it records the end in `HGL_ENDED` (§8); a note of that
   task to that seat with a lower stream sequence is then moot, on any host, and
-  is acknowledged without a turn. A note of a task is naked while `HGL_ENDED`
-  cannot be read, an ending note while its end cannot be recorded. An ending
+  is acknowledged without a turn. A note of a task is held while `HGL_ENDED`
+  cannot be read, an ending note while its end cannot be recorded (PROTO-8). An ending
   note whose end `HGL_ENDED` already holds (a redelivery) is acknowledged
   without action. An ending note acts only on a tree made for a note with a
   lower sequence than its own (`task.json` records it) and on that tree's turn;
@@ -157,13 +175,20 @@ before hub users takes one shared token until it moves.
 - **PROTO-16 — Binding.** A seat binds a role to a runtime (`claude`, `codex`
   or `agy`) and a model on one host, in that host's configuration. Its record
   in `HGL_HOSTS` advertises role, runtime, model family and memory budget.
-- **PROTO-17 — Failover.** A seat may list fallback bindings. On a quota
-  refusal the bridge naks the note and moves the seat to its next binding.
-  The independence rule (`docs/roles.md`, ROLE-9) still applies after the move.
+- **PROTO-17 — Failover.** A seat may list fallback bindings. A quota refusal
+  is known from the CLI's structured output (an error event or result and its
+  status), never from text on stderr. On one, the bridge holds the notes and
+  moves the seat to its next binding whose family keeps ROLE-9 for the refused
+  turn's task: a review keeps its family; an implementor's task keeps a live
+  reviewer family that is none of its authors' (the families its turns ran on).
+  It tells the controller, and returns the seat to its primary after
+  `limits.failover_cooldown` (default 1 h). With no such binding, the notes stay
+  held (PROTO-8). The merge gate checks ROLE-9 again (PROTO-19).
 
 ## 7. Receipts
 
-- **PROTO-18 — Desk receipt.** Facts only: exit code and report location.
+- **PROTO-18 — Desk receipt.** Facts only: exit code and report location. (The desk
+  is not part of this repository; the format is fixed here for its receipts.)
 
   `[desk] Sets: hgl-compiler#<PR> at <HEAD8> on main <MAIN8>, exit <CODE>: <report>`
 
@@ -194,6 +219,11 @@ before hub users takes one shared token until it moves.
 
   `verdict` is `clean` or `findings`. `family` is the model's vendor family
   (`claude`, `gpt`, `gemini`); the controller checks it against the author's.
+  The merge gate reads receipts from the controller's notes in `HGL_NOTES`
+  (14 days): `receipt` notes whose body holds this JSON (alone, or inside text or
+  a fenced block) for the pull request, whose `reviewer` is the seat that sent
+  the note. The authors' families are those the bridges record in the task's
+  implementor trees (`families` in `task.json` and `HGL_TREES`).
 
 ## 8. Shared state
 
@@ -208,6 +238,9 @@ before hub users takes one shared token until it moves.
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
 | `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
 | `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
+| `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
+| `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
+| `verdict.<repo>.<pr>.<name>` | local build hosts | `<head> <main> pass\|fail ...`: a local build verdict the gate reads where `[github.gate.<repo>] verdicts` names it. |
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.
@@ -217,6 +250,16 @@ rewritten every minute while held, deleted by their holder; one not rewritten
 within `max_age` expires. `lock.land.<repo>` is the landing lock: `gh land`,
 `gh merge-if-clean` and `gh release watch` hold it from before the gate until
 the merge, `landed.log`, `main` and the `landed` notes are done.
+
+Each step after the merge (`landed.log`, `main`, the `landed` notes, the comment;
+then, for `gh land`, the pins) is recorded in `landing.<repo>.<pr>` as it is done.
+The same command run again finds the pull request merged and does only the steps
+not done: no second `landed.log` line, the notes with their first `created_at`, no
+second comment. It reports success only when all are done; pins that did not land
+give `PARTIAL` (exit 3). A pull request found merged with neither a record nor a
+`landed.log` line has every step done then. `main` is written only whole: a failed
+read is tried three times, then the landing fails; a repository with no `main`
+(HTTP 404) is left out with a warning.
 
 `HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream
 sequence of the note that ended the task for the seat. A later end replaces an

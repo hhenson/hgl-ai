@@ -99,16 +99,17 @@ pub fn human_age(d: Duration) -> String {
 
 /// `1.2G`, `340M`, `12K`, `512B`.
 pub fn human_bytes(b: u64) -> String {
-    const K: f64 = 1024.0;
+    // Decimal units, as `min_free_gb` and the free space beside them (`df -H`).
+    const K: f64 = 1000.0;
     let f = b as f64;
     if f >= K * K * K {
-        format!("{:.1}G", f / (K * K * K))
+        format!("{:.1} GB", f / (K * K * K))
     } else if f >= K * K {
-        format!("{:.0}M", f / (K * K))
+        format!("{:.0} MB", f / (K * K))
     } else if f >= K {
-        format!("{:.0}K", f / K)
+        format!("{:.0} kB", f / K)
     } else {
-        format!("{b}B")
+        format!("{b} B")
     }
 }
 
@@ -131,6 +132,7 @@ mod tests {
             branch: None,
             created_at: created.into(),
             size_bytes: 0,
+            families: Vec::new(),
         }
     }
 
@@ -166,7 +168,9 @@ mod tests {
     fn humans() {
         assert_eq!(human_age(Duration::from_secs(3 * 86400 + 7200)), "3d2h");
         assert_eq!(human_age(Duration::from_secs(59)), "59s");
-        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024 / 2), "1.5G");
-        assert_eq!(human_bytes(100), "100B");
+        assert_eq!(human_bytes(1_500_000_000), "1.5 GB");
+        assert_eq!(human_bytes(3 * 1024 * 1024 * 1024 / 2), "1.6 GB");
+        assert_eq!(human_bytes(2_000_000), "2 MB");
+        assert_eq!(human_bytes(100), "100 B");
     }
 }

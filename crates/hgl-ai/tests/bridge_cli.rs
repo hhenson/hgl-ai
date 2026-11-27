@@ -217,7 +217,7 @@ fn trees_are_listed_and_removed_on_this_host() {
     assert!(o.status.success(), "{}", err(&o));
     let v: serde_json::Value = serde_json::from_str(&out(&o)).unwrap();
     assert_eq!(v.as_array().unwrap().len(), 2);
-    assert_eq!(v[0]["branch"], "codex/3-three");
+    assert_eq!(v[0]["branch"], "codex/q3-three");
     assert!(v[0]["size_bytes"].as_u64().unwrap() > 0);
 
     // Not stale: young, and closed-ness unknown without `gh`.
@@ -814,7 +814,7 @@ fn a_bridge_does_not_serve_a_seat_note_wait_holds() {
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
-    let holder = format!("host-a pid {} (note wait)", waiting.id());
+    let holder = format!("host-a pid {} (note wait) id ", waiting.id());
     let rt = tokio::runtime::Runtime::new().unwrap();
     let bus = rt.block_on(async {
         hgl_ai_bus::Bus::connect_url(&hub.url, Some(hub.token.clone()))
@@ -824,11 +824,15 @@ fn a_bridge_does_not_serve_a_seat_note_wait_holds() {
     until("the wait holds the seat lease", 20, &log, || {
         rt.block_on(bus.lock_get("seat.w1"))
             .unwrap()
-            .is_some_and(|r| r.holder == holder)
+            .is_some_and(|r| r.holder.starts_with(&holder))
     });
     let bridge = start_bridge(&d.0, &dir, &p);
-    until("the bridge waits on the seat lease", 20, &log, || {
-        log().contains(&format!("the seat lease seat.w1 is held by {holder}"))
+    // The wait holds the seat's lock on this host as well as its lease (PROTO-6).
+    until("the bridge waits on the seat lock", 20, &log, || {
+        log().contains(&format!(
+            "seat is served elsewhere on this host (holder Some({})",
+            waiting.id()
+        ))
     });
     std::thread::sleep(Duration::from_secs(2));
     let serving = || out(&hgl(&p, &["hosts"]).output().unwrap()).contains("w1 implementor/codex");
@@ -853,4 +857,79 @@ fn a_bridge_does_not_serve_a_seat_note_wait_holds() {
     );
     stop_bridge(bridge, &log);
     drop(hub);
+}
+
+/// Carbon's probe of hgl-ai PR 1: a turn capped at 128M runs `hgl-ai cap 512M`, which
+/// allocates 250M. The inner cap's scope is in the turn's slice, so the turn's limit holds
+/// and the allocation is killed; its report file stays in the turn's `TMPDIR`. It goes
+/// over a cap on purpose, so it runs only with `HGL_AI_OOM_TESTS=1` (CI sets it).
+#[test]
+fn a_cap_inside_a_turn_is_held_to_the_turn_cap() {
+    use hgl_ai_bridge::proc::{self, CmdSpec, Ended, Limits, Stop};
+    use hgl_ai_cap::Method;
+    if Method::detect() != Method::Scope {
+        eprintln!("skipped: systemd-run --user --scope is not available here");
+        return;
+    }
+    if !std::env::var_os("HGL_AI_OOM_TESTS").is_some_and(|v| v == "1") {
+        eprintln!(
+            "skipped: a_cap_inside_a_turn_is_held_to_the_turn_cap goes over a memory cap on purpose; set HGL_AI_OOM_TESTS=1 to run it"
+        );
+        return;
+    }
+    let d = Scratch::new("nested-cap");
+    let tmp = d.0.join("tmp");
+    std::fs::create_dir_all(&tmp).unwrap();
+    let out = d.0.join("out");
+    let script = format!(
+        "\"$HGL\" cap 512M -- sh -c 'ls \"$TMPDIR\"; exec dd if=/dev/zero of=/dev/null bs=250M count=1 iflag=fullblock' > {o}.ls 2>/dev/null; echo $? > {o}",
+        o = out.display()
+    );
+    let spec = CmdSpec {
+        program: "sh".into(),
+        args: vec!["-c".into(), script.into()],
+        env: vec![
+            ("HGL".into(), env!("CARGO_BIN_EXE_hgl-ai").into()),
+            ("TMPDIR".into(), tmp.clone().into()),
+        ],
+        cwd: d.0.clone(),
+        input: Vec::new(),
+    };
+    let limits = Limits {
+        mem_bytes: 128 << 20,
+        timeout: Duration::from_secs(60),
+        kill_grace: Duration::from_secs(1),
+        max_line: 1 << 20,
+        method: Some(Method::Scope),
+    };
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let marker = format!("nested-cap-{}", std::process::id());
+    let r = rt.block_on(proc::run(
+        &spec,
+        limits,
+        tokio::sync::watch::channel(Stop::None).1,
+        None,
+        &marker,
+        None,
+        |_| {},
+        None,
+        None,
+    ));
+    assert_eq!(r.ended, Ended::Exited(0), "{}", r.stderr_tail);
+    assert!(r.reaped);
+    assert_eq!(
+        std::fs::read_to_string(&out).unwrap().trim(),
+        "137",
+        "the 250M allocation is killed under the turn's 128M: {}",
+        r.stderr_tail
+    );
+    let listing = std::fs::read_to_string(format!("{}.ls", out.display())).unwrap();
+    assert_eq!(
+        listing
+            .lines()
+            .filter(|l| l.starts_with("hgl-ai-cap-"))
+            .count(),
+        2,
+        "both caps' report files in the turn's TMPDIR: {listing:?}"
+    );
 }

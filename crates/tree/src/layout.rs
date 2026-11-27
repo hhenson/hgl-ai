@@ -124,12 +124,15 @@ pub fn parse_task_dir_name(name: &str) -> Option<(TaskKey, bool)> {
     ))
 }
 
-/// A GitHub repository name: `[A-Za-z0-9._-]`, at most 100, not `.` or `..`.
+/// A GitHub repository name: `[A-Za-z0-9._-]`, at most 100, with no leading, trailing or
+/// doubled dot. Names go into bucket keys whose dot-separated parts must not be empty
+/// (`HGL_TREES`, `HGL_ENDED`), so `.github` is refused here rather than at registration.
 pub fn check_repo(name: &str) -> Result<()> {
     let ok = !name.is_empty()
         && name.len() <= 100
-        && name != "."
-        && name != ".."
+        && !name.starts_with('.')
+        && !name.ends_with('.')
+        && !name.contains("..")
         && name
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
@@ -190,13 +193,14 @@ mod tests {
         );
         assert_eq!(parse_task_dir_name("hgl-compiler-980"), Some((t, false)));
         assert_eq!(parse_task_dir_name("_inbox"), None);
+        assert!(check_repo("hgl.github.io").is_ok());
     }
 
     #[test]
     fn nothing_escapes_work_root() {
         let d = tempfile::tempdir().unwrap();
         let l = Layout::new(d.path().join("work")).unwrap();
-        for bad in ["..", ".", "a/b", "../x", "x y", ""] {
+        for bad in ["..", ".", "a/b", "../x", "x y", "", ".github", "x.", "a..b"] {
             let t = TaskKey {
                 repo: bad.into(),
                 issue: 1,

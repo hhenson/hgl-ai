@@ -1,6 +1,8 @@
 # Owner channel and console
 
-Status: proposed.
+Status: proposed — not implemented. Nothing here is built yet: today the controller is
+an interactive seat (`note wait`, PROTO-6), and the bus has one hub credential. The
+current rules are in `docs/protocol.md`, `docs/roles.md` and `docs/design.md`.
 
 The controller runs headless, like every other seat. The owner talks to it through a
 web console served beside the hub: status reports, questions, conversations, and
