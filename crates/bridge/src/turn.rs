@@ -57,18 +57,72 @@ pub struct Plan {
     pub create: Option<Create>,
 }
 
-/// Of a group's creates, by the stream sequence of the note asking: the last review
-/// (latest head), else the first implement.
+/// Of a group's creates, by the stream sequence of the note asking, whatever order they
+/// arrived in (a naked note comes back after later ones): the review sent last (the latest
+/// head), else the implement sent first.
 pub fn choose_create(creates: Vec<(u64, Option<Create>)>) -> Option<(u64, Create)> {
-    let (mut review, mut implement) = (None, None);
+    let mut review: Option<(u64, Create)> = None;
+    let mut implement: Option<(u64, Create)> = None;
     for (seq, c) in creates {
         match c {
-            Some(c @ Create::Review { .. }) => review = Some((seq, c)),
-            Some(c @ Create::Implement { .. }) if implement.is_none() => implement = Some((seq, c)),
+            Some(c @ Create::Review { .. }) if review.as_ref().is_none_or(|(s, _)| seq > *s) => {
+                review = Some((seq, c))
+            }
+            Some(c @ Create::Implement { .. })
+                if implement.as_ref().is_none_or(|(s, _)| seq < *s) =>
+            {
+                implement = Some((seq, c))
+            }
             _ => {}
         }
     }
     review.or(implement)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review(h: char) -> Option<Create> {
+        Some(Create::Review {
+            head: h.to_string().repeat(40),
+            base: None,
+        })
+    }
+
+    fn implement(t: &str) -> Option<Create> {
+        Some(Create::Implement {
+            title: t.into(),
+            base: None,
+        })
+    }
+
+    /// The bot's case (hgl-ai PR 1): an older review naked and delivered again after a
+    /// newer one; the newer head is reviewed.
+    #[test]
+    fn the_latest_review_and_the_first_implement_by_sequence() {
+        let head = |c: Option<(u64, Create)>| match c {
+            Some((s, Create::Review { head, .. })) => (s, head),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            head(choose_create(vec![(20, review('b')), (10, review('a'))])),
+            (20, "b".repeat(40))
+        );
+        assert_eq!(
+            head(choose_create(vec![
+                (10, review('a')),
+                (20, review('b')),
+                (15, None)
+            ])),
+            (20, "b".repeat(40))
+        );
+        match choose_create(vec![(20, implement("late")), (10, implement("first"))]) {
+            Some((10, Create::Implement { title, .. })) => assert_eq!(title, "first"),
+            other => panic!("{other:?}"),
+        }
+        assert!(choose_create(vec![(1, None)]).is_none());
+    }
 }
 
 pub struct Job {

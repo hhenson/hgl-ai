@@ -1491,6 +1491,11 @@ async fn a_note_that_fails_five_times_is_dead_lettered() {
         "{events:?}"
     );
     assert_eq!(h.calls("codex").len(), 5);
+    // The note is terminated first, then the dead letter is sent: wait for it.
+    eventually("the dead letter", || {
+        !h.bus.sent_containing("[bridge] Dead letter:").is_empty()
+    })
+    .await;
     let dead = h.bus.sent_containing("[bridge] Dead letter:");
     assert_eq!(dead.len(), 1);
     let d = &dead[0];
@@ -1737,5 +1742,132 @@ async fn a_tree_that_cannot_be_prepared_yet_is_tried_again() {
     // The repository appears: the next try makes the tree and runs.
     remote(&h.git, &h.root, "later");
     eventually("run once it heals", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+}
+
+/// The bot's P1 (hgl-ai PR 1): the hub stops answering (a partition), so no refresh says
+/// the lease is lost while it runs out. The seat stops, its turn and notes with it, once the
+/// lease has gone unrefreshed for half the bucket's `max_age`: before it can expire and
+/// another host take it. When the hub answers again the bridge serves the seat again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
+    let h = harness();
+    let max_age = Duration::from_secs(3);
+    h.bus.set_lease_max_age(max_age);
+    let pid = h.calls.join("pid");
+    h.script(
+        "codex",
+        &format!(
+            "if [ \"$n\" -eq 1 ]; then echo $$ > '{p}'; sleep 60; fi\ncat '{f}'",
+            p = pid.display(),
+            f = fixture("codex-ok.jsonl")
+        ),
+    );
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 60, "[claude] Assign: demo#60 Sixty"),
+    );
+    eventually("the turn runs", || pid.exists()).await;
+    let agent = pid_in(&pid);
+    h.bus.refresh_down(true);
+    let cut = std::time::Instant::now();
+    eventually("the turn stopped", || !alive(agent)).await;
+    let took = cut.elapsed();
+    // The last confirmed refresh was at most one refresh (max_age / 6) before the cut.
+    assert!(
+        took < max_age - max_age / 6,
+        "stopped after {took:?}, when the lease could have expired"
+    );
+    assert!(
+        took >= max_age / 2 - max_age / 6,
+        "not before the deadline: {took:?}"
+    );
+    eventually("its note handed back", || {
+        h.bus.events(a).first() == Some(&Ev::Nak(Duration::from_millis(50)))
+    })
+    .await;
+    assert_eq!(h.bus.sent_containing("was not refreshed for").len(), 1);
+    h.bus.refresh_down(false);
+    eventually("served again, the note run", || {
+        h.bus.events(a).last() == Some(&Ev::Ack)
+    })
+    .await;
+    stop(tx, j).await;
+}
+
+/// The bot's P2: a removal on `landed` that fails (here the salvage patch cannot be written)
+/// is not forgotten once the end is recorded: it is tried again until it works, and
+/// reported then.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_removal_is_tried_again_until_it_works() {
+    let mut h = harness();
+    h.opts.cleanup_retry = Duration::from_millis(200);
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 61, "[claude] Assign: demo#61 Sixty-one"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    let dir = h.work().join("w1/demo-61");
+    std::fs::write(dir.join("src/wip.txt"), "unsaved\n").unwrap();
+    // No salvage directory can be made: the patch cannot be written, so nothing is removed.
+    let salvage = h.work().join("salvage");
+    std::fs::write(&salvage, "not a directory").unwrap();
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 61, "[claude] Landed: demo#61"),
+    );
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    assert_eq!(h.bus.ended("w1", "demo", 61), Some(l), "the end stands");
+    let told = h.bus.sent_containing("Cleanup: demo#61");
+    assert_eq!(told.len(), 1);
+    assert!(told[0].body.contains("tried again"), "{}", told[0].body);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(dir.exists(), "still owed");
+    assert!(h.bus.trees().contains_key("build-1.w1.demo-61"));
+    // It can be written again: the next try removes the tree, salvages the work, says so.
+    std::fs::remove_file(&salvage).unwrap();
+    eventually("removed on a later try", || !dir.exists()).await;
+    eventually("reported", || {
+        !h.bus.sent_containing("removed demo-61 at try").is_empty()
+    })
+    .await;
+    assert!(!h.bus.trees().contains_key("build-1.w1.demo-61"));
+    let patches: Vec<_> = std::fs::read_dir(&salvage).unwrap().flatten().collect();
+    assert_eq!(patches.len(), 1);
+    stop(tx, j).await;
+    let owed = h.root.join("data/bridge/cleanup/w1.json");
+    assert_eq!(std::fs::read_to_string(owed).unwrap().trim(), "[]");
+}
+
+/// The bot's P2: under `drain` and low disk at once, low disk rules: a review, which drain
+/// lets through, makes no tree on the full disk.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn low_disk_holds_new_trees_under_drain_too() {
+    let h = harness();
+    h.script("claude", &format!("cat '{}'", fixture("claude-ok.jsonl")));
+    h.bus.set_state("mode", "drain");
+    h.disk.0.store(crate::disk::GB, Ordering::SeqCst);
+    let (tx, j) = h.start(&["r1"]);
+    let mut rv = note(Kind::Review, "r1", 62, "[claude] Review: demo#62");
+    rv.head = Some(
+        h.git
+            .run(&h.seed, ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string(),
+    );
+    let r = h.bus.push("r1", rv);
+    eventually("the review held", || h.bus.progressed(r)).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(h.calls("claude").is_empty());
+    assert!(!h.work().join("r1/demo-62-review").exists());
+    assert_eq!(h.bus.sent_containing("below min_free_gb").len(), 1);
+    assert!(h.bus.sent_containing("mode is drain").is_empty());
+    // Room again, still draining: the review is in-flight work and runs.
+    h.disk.0.store(1000 * crate::disk::GB, Ordering::SeqCst);
+    eventually("reviewed under drain", || h.bus.events(r) == [Ev::Ack]).await;
     stop(tx, j).await;
 }

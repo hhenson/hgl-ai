@@ -1,4 +1,4 @@
-//! Host-level duties: heartbeat (§9, with the seat leases' refresh), the `assign` gate (ROLE-16, ROLE-17), the daily
+//! Host-level duties: heartbeat (§9), the seat leases' refresh, the `assign` gate (ROLE-16, ROLE-17), the daily
 //! report of stale trees and disk use (PROTO-15), and the cleanup receipt's text.
 
 use std::fmt::Write as _;
@@ -36,10 +36,12 @@ impl<B: BusApi> Bridge<B> {
         let mode = self.bus.state_get("mode").await.ok().flatten();
         let free = self.free_gb();
         let min = self.cfg.limits.min_free_gb;
-        let g = if mode.as_deref().map(str::trim) == Some("drain") {
-            Gate::Drain
-        } else if free.is_some_and(|f| f < min) {
+        // Low disk first: it holds every new tree, drain only `assign` notes, so drain must
+        // not hide it.
+        let g = if free.is_some_and(|f| f < min) {
             Gate::LowDisk
+        } else if mode.as_deref().map(str::trim) == Some("drain") {
+            Gate::Drain
         } else {
             Gate::Open
         };
@@ -97,11 +99,22 @@ impl<B: BusApi> Bridge<B> {
 
     pub(crate) async fn heartbeat_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         loop {
-            self.refresh_leases().await;
             self.beat().await;
             self.gate_check().await;
             tokio::select! {
                 _ = tokio::time::sleep(self.opts.heartbeat_every) => {}
+                _ = down(&mut shutdown) => return,
+            }
+        }
+    }
+
+    /// The seat leases' refresh, on its own: other hub calls that hang in a partition do
+    /// not delay it past its deadline (PROTO-6).
+    pub(crate) async fn lease_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
+        loop {
+            self.refresh_leases().await;
+            tokio::select! {
+                _ = tokio::time::sleep(self.lease_every()) => {}
                 _ = down(&mut shutdown) => return,
             }
         }
