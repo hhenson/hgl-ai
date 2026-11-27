@@ -270,6 +270,10 @@ A model's family comes from the `[models.<family>]` table that names it; an
   salvage/<seat>-<repo>-<issue>-<UTC>.patch
 ```
 
+`<slug>` comes from the issue's GitHub title (the `assign` note's first line when the
+title cannot be read or during a hold). A pushed or local `<branch_prefix>q<issue>-*`
+branch is resumed whatever its slug.
+
 Reviewer tasks use `<seat>/<repo>-<pr>-review/` with a detached checkout of
 `head` merged onto `main`.
 

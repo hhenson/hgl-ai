@@ -43,6 +43,7 @@ async fn serve(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
     let trees = Trees::new(&cfg, Git::default())?;
     let deps = Deps {
         closed: Arc::new(super::tree::GhClosed::new(&cfg)),
+        title: Arc::new(super::tree::GhTitle::new(&cfg)),
         disk: Arc::new(Statvfs),
     };
     let opts = Options::from_config(&cfg);

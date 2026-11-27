@@ -133,10 +133,23 @@ impl TaskFile {
 /// What to create.
 #[derive(Debug, Clone)]
 pub enum Create {
-    /// An implementor tree on `<prefix><issue>-<slug(title)>`, from `base` (default `main`).
+    /// An implementor tree on `<prefix>q<issue>-<slug(title)>`, from `base` (default `main`);
+    /// a pushed or local `<prefix>q<issue>-*` branch is resumed whatever its slug.
     Implement { title: String, base: Option<String> },
     /// A reviewer tree: `head` merged onto `base` (default `main`), detached.
     Review { head: String, base: Option<String> },
+}
+
+/// Answers an issue's title, which names a new implementor branch (WORK §2 step 3).
+/// `None` when it cannot tell; the caller falls back to the note's first line.
+pub trait IssueTitle {
+    fn issue_title(&self, repo: &str, issue: u64) -> Option<String>;
+}
+
+impl<F: Fn(&str, u64) -> Option<String>> IssueTitle for F {
+    fn issue_title(&self, repo: &str, issue: u64) -> Option<String> {
+        self(repo, issue)
+    }
 }
 
 /// A tree that exists after [`Trees::create`].

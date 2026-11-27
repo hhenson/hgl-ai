@@ -29,7 +29,7 @@ use std::time::Duration;
 use hgl_ai_bus::BusError;
 use hgl_ai_config::{Binding, Config, SeatConfig};
 use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskKey, seat_lock_key};
-use hgl_ai_tree::{Create, IsClosed, Trees};
+use hgl_ai_tree::{Create, IsClosed, IssueTitle, Trees};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
@@ -130,9 +130,10 @@ impl Options {
     }
 }
 
-/// What the bridge needs from outside: GitHub's closed-ness and free space.
+/// What the bridge needs from outside: GitHub's closed-ness and issue titles, and free space.
 pub struct Deps {
     pub closed: Arc<dyn IsClosed + Send + Sync>,
+    pub title: Arc<dyn IssueTitle + Send + Sync>,
     pub disk: Arc<dyn DiskProbe>,
 }
 

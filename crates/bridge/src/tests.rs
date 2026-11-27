@@ -38,6 +38,9 @@ struct H {
     cfg: Config,
     opts: Options,
     disk: Arc<FixedDisk>,
+    /// Issue titles by number, as GitHub would answer; an issue not here is unknown.
+    titles: Arc<std::sync::Mutex<HashMap<u64, String>>>,
+    title: Arc<dyn hgl_ai_tree::IssueTitle + Send + Sync>,
 }
 
 struct Call {
@@ -102,6 +105,12 @@ fn harness() -> H {
         opts.bins.insert(*rt, bin.join(rt.as_str()));
     }
     let disk = Arc::new(FixedDisk(AtomicU64::new(1000 * crate::disk::GB)));
+    let titles: Arc<std::sync::Mutex<HashMap<u64, String>>> = Arc::default();
+    let t = titles.clone();
+    let title = Arc::new(move |repo: &str, issue: u64| {
+        assert_eq!(repo, "demo");
+        t.lock().unwrap().get(&issue).cloned()
+    });
     let h = H {
         _dir: dir,
         root,
@@ -113,6 +122,8 @@ fn harness() -> H {
         cfg,
         opts,
         disk,
+        titles,
+        title,
     };
     for rt in ["claude", "codex", "agy"] {
         h.script(rt, "echo no fake set >&2; exit 9");
@@ -212,6 +223,7 @@ impl H {
         );
         let deps = Deps {
             closed: Arc::new(|_: &str, _: u64, _: bool| None),
+            title: self.title.clone(),
             disk: self.disk.clone(),
         };
         let bridge = Bridge::new(
@@ -561,6 +573,69 @@ async fn a_classed_task_fails_over_as_any_other() {
     assert_eq!(agy[0].args[i + 1], "claude-opus-5-5");
     let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-31")).unwrap();
     assert_eq!(f.class, Some(TaskClass::Simple));
+    stop(tx, j).await;
+}
+
+/// hgl-ai#27: a new branch is named from the issue's GitHub title, not the note's first
+/// line; a pushed `codex/q<issue>-*` branch is resumed whatever the title; with the title
+/// unknown, or during a hold, the note's first line names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_branch_is_named_from_the_issue_title_and_a_pushed_one_is_kept() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    {
+        let mut t = h.titles.lock().unwrap();
+        t.insert(40, "Name task branches from the issue title".into());
+        t.insert(41, "A renamed issue".into());
+        t.insert(43, "Not asked during a hold".into());
+    }
+    // Issue 41's branch was pushed earlier, under the issue's old title.
+    h.git
+        .run(
+            &h.seed,
+            [
+                "checkout",
+                "--quiet",
+                "-B",
+                "codex/q41-old-title",
+                "origin/main",
+            ],
+        )
+        .unwrap();
+    let pushed = commit(&h.git, &h.seed, "q41.txt", "earlier\n", "q41 work");
+    h.git
+        .run(
+            &h.seed,
+            ["push", "--quiet", "origin", "codex/q41-old-title"],
+        )
+        .unwrap();
+    let (tx, j) = h.start(&["w1"]);
+    let branch = |issue: u64| {
+        hgl_ai_tree::read_task(&h.work().join(format!("w1/demo-{issue}")))
+            .unwrap()
+            .branch
+            .unwrap()
+    };
+    let from_note = "class-standard-docs-roles-md-3";
+    for (issue, want) in [
+        (
+            40,
+            "codex/q40-name-task-branches-from-the-issue-title".to_string(),
+        ),
+        (41, "codex/q41-old-title".into()),
+        (42, format!("codex/q42-{from_note}")),
+        (43, format!("codex/q43-{from_note}")),
+    ] {
+        if issue == 43 {
+            h.bus.set_state("hold", "rate limit");
+        }
+        let body = format!("Class: standard (docs/roles.md §3)\n\nFollow demo#{issue}.");
+        let a = h.bus.push("w1", note(Kind::Assign, "w1", issue, &body));
+        eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+        assert_eq!(branch(issue), want, "issue {issue}");
+    }
+    let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-41")).unwrap();
+    assert_eq!(f.start, pushed, "the pushed branch is resumed");
     stop(tx, j).await;
 }
 
@@ -1420,6 +1495,7 @@ fn controllers_are_not_served_unless_named() {
     );
     let deps = Deps {
         closed: Arc::new(|_: &str, _: u64, _: bool| None),
+        title: h.title.clone(),
         disk: h.disk.clone(),
     };
     let b = Bridge::new(cfg, h.bus.clone(), trees, deps, h.opts.clone());
@@ -1445,6 +1521,7 @@ fn controllers_are_not_served_unless_named() {
     );
     let deps = Deps {
         closed: Arc::new(|_: &str, _: u64, _: bool| None),
+        title: h.title.clone(),
         disk: h.disk.clone(),
     };
     let b = Bridge::new(cfg, h.bus.clone(), trees, deps, h.opts.clone());

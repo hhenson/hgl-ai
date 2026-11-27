@@ -319,6 +319,31 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
+    /// An implementor tree to make anew is named from its issue's GitHub title (WORK §2
+    /// step 3), not the note's first line; the note's line stays when the title cannot be
+    /// read, or while the GitHub allowance is on hold (ROLE-19). A pushed or local
+    /// branch of the task is resumed whatever its name ([`hgl_ai_tree::Trees::create`]).
+    async fn titled(&self, task: &TaskKey, c: &Create) -> Create {
+        let Create::Implement { base, .. } = c else {
+            return c.clone();
+        };
+        if self.bus.state_get("hold").await.ok().flatten().is_some() {
+            return c.clone();
+        }
+        let lookup = self.deps.title.clone();
+        let (repo, issue) = (task.repo.clone(), task.issue);
+        match tokio::task::spawn_blocking(move || lookup.issue_title(&repo, issue)).await {
+            Ok(Some(t)) if !t.trim().is_empty() => Create::Implement {
+                title: t,
+                base: base.clone(),
+            },
+            _ => {
+                tracing::warn!(%task, "issue title unknown; naming the branch from the note");
+                c.clone()
+            }
+        }
+    }
+
     /// The task's class in `HGL_TREES`: of its implementor trees on any host and seat (a task
     /// moves with its seat, or to another seat), the one a note set last, by stream sequence.
     /// `(None, None)` when the hub has none or cannot be read.
@@ -401,8 +426,13 @@ impl<B: BusApi> Bridge<B> {
                 let mut inherited: Option<(Classed, u64)> = None;
                 let file = match &job.create {
                     Some((seq, c)) => {
+                        let c = if dir.join(TASK_FILE).exists() {
+                            c.clone()
+                        } else {
+                            self.titled(task, c).await
+                        };
                         let trees = self.trees.clone();
-                        let (s, t, c, seq) = (name.clone(), task.clone(), c.clone(), *seq);
+                        let (s, t, seq) = (name.clone(), task.clone(), *seq);
                         match tokio::task::spawn_blocking(move || trees.create_for(&s, &t, &c, seq))
                             .await
                         {
