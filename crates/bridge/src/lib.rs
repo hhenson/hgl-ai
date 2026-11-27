@@ -130,9 +130,22 @@ impl Options {
     }
 }
 
-/// What the bridge needs from outside: GitHub's closed-ness and free space.
+/// Answers an issue's GitHub title, which names a new implementor branch (WORK §2 step 3);
+/// else why not (a failed or timed-out `gh`, its stderr), and the note's line names it.
+pub trait IssueTitle {
+    fn issue_title(&self, repo: &str, issue: u64) -> std::result::Result<String, String>;
+}
+
+impl<F: Fn(&str, u64) -> std::result::Result<String, String>> IssueTitle for F {
+    fn issue_title(&self, repo: &str, issue: u64) -> std::result::Result<String, String> {
+        self(repo, issue)
+    }
+}
+
+/// What the bridge needs from outside: GitHub's closed-ness and issue titles, and free space.
 pub struct Deps {
     pub closed: Arc<dyn IsClosed + Send + Sync>,
+    pub title: Arc<dyn IssueTitle + Send + Sync>,
     pub disk: Arc<dyn DiskProbe>,
 }
 

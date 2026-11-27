@@ -19,7 +19,7 @@ Open decisions are issues in this repository.
 
 - **ROLE-1 — Owner.** Decides language and specification questions, release
   tags, priorities, and the fleet's budget and mode.
-- **ROLE-2 — Controller** (seat `claude`, or `[github] controller`; whatever
+- **ROLE-2 — Controller** (seat `controller` by default, or `[github] controller`; whatever
   runtime holds it). The only role that approves, merges and updates wrapper
   pins. Judges receipts, adds a few probes of its own, sends back or approves,
   lands one change at a time against the current `main`, and updates `main`

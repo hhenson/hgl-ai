@@ -130,7 +130,7 @@ repos = ["hgl-compiler", "hgl_spec", "hgl_core", "hgl-project", "homebrew-hgraph
 branch_prefix = "codex/"
 wrapper = "hgl-project"
 clone_url = "https://github.com/{owner}/{repo}.git"   # default
-controller = "claude"                  # default; the seat that gets the bridge's and coordinator's notes
+controller = "controller"              # default; the seat that gets the bridge's and coordinator's notes
 
 [github.gate.hgl-compiler]             # per repository; every key optional
 review_receipt = true                  # default: a clean receipt from another family (ROLE-11)
@@ -243,11 +243,14 @@ A model's family comes from the `[models.<family>]` table that names it; an
 - A seat keeps one session per task, so context carries across that task's
   turns and is dropped when the task ends. Reviewers always start fresh.
 - The bridge runs each turn under `cap` with the seat's limit, in its own slice,
-  in the task's worktree. `codex` runs in its `workspace-write` sandbox over the
-  task directory and the clone; `claude` (`--permission-mode bypassPermissions`,
-  `--add-dir`) and `agy` (`--dangerously-skip-permissions`) run with the user's
-  own permissions. A turn that exceeds `turn_timeout` is stopped and counted as a
-  failure (PROTO-8).
+  in the task's worktree. `codex` runs under a named permission profile
+  (`default_permissions`, `permissions.hgl_task`): the disk readable, the task
+  directory and the clone writable, the network on. Not `workspace-write` with
+  `writable_roots`: that makes each root's `.git`, and a `gitdir:` pointer's
+  target, read-only, so a worktree could not commit (hgl-ai#29). `claude`
+  (`--permission-mode bypassPermissions`, `--add-dir`) and `agy`
+  (`--dangerously-skip-permissions`) run with the user's own permissions. A turn
+  that exceeds `turn_timeout` is stopped and counted as a failure (PROTO-8).
 - A quota refusal is recognised only from the runtime's structured output (error
   events and results and their status), never from stderr; the patterns live in
   the adapter, with fixtures of refusals and of ordinary failures that mention
@@ -269,6 +272,10 @@ A model's family comes from the `[models.<family>]` table that names it; an
   clones/<repo>/  one bare-ish clone per repository and host, shared by seats
   salvage/<seat>-<repo>-<issue>-<UTC>.patch
 ```
+
+A pushed or local `<branch_prefix>q<issue>-*` branch is resumed whatever its slug. Only a
+new branch asks GitHub for the issue's title, every word kept in `<slug>`; when `gh` fails
+or times out, or during a hold, the note's first line names it, less its `[runtime] Head:`.
 
 Reviewer tasks use `<seat>/<repo>-<pr>-review/` with a detached checkout of
 `head` merged onto `main`.

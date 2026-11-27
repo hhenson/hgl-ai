@@ -136,6 +136,7 @@ mod tests {
             class: None,
             class_seq: None,
             seq: None,
+            handoff_seq: None,
         }
     }
 

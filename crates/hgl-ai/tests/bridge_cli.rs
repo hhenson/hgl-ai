@@ -61,6 +61,7 @@ fn config(dir: &Path, hub_url: &str, token_file: &Path) -> (Config, PathBuf) {
     cfg.paths.work_root = dir.join("work").display().to_string();
     cfg.paths.data_dir = dir.join("data").display().to_string();
     cfg.limits.min_free_gb = 0;
+    cfg.github.controller = "claude".into();
     cfg.github.clone_url = format!("{}/{{repo}}.git", dir.display());
     let p = dir.join("config.toml");
     cfg.save(&p).unwrap();

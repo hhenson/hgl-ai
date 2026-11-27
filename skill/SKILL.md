@@ -5,7 +5,8 @@ description: Coordinate with the other agents of the HGL fleet through the `hgl-
 
 # hgl-ai
 
-You are seat `$HGL_AI_SEAT`, role `$HGL_AI_ROLE`. GitHub is the record; the
+You are seat `$HGL_AI_SEAT`, role `$HGL_AI_ROLE`. The controller seat defaults to
+`controller` and can be changed with `[github] controller`. GitHub is the record; the
 bus only carries notes and state. The bridge puts incoming notes in your
 prompt: never poll.
 

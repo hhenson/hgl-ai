@@ -157,7 +157,7 @@ repository per day.
 
 ## 5. The headless controller
 
-- **OWN-7 — Seat.** The controller is seat `claude` served by a bridge like any other
+- **OWN-7 — Seat.** The controller is seat `controller` by default (configurable via `[github] controller`), served by a bridge like any other
   (`role = "controller"`, `headless = true`; without it the controller stays
   interactive, PROTO-6, until a controller runbook exists). Its turns start on notes,
   on owner answers and messages, and on the status schedule (a `tick` note from the
