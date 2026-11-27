@@ -5,13 +5,19 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use anyhow::{Context as _, bail};
-use hgl_ai_bus::{Bus, Delivery, MAX_NOTE_BYTES};
-use hgl_ai_proto::{Kind, Note, Seat};
+use hgl_ai_bus::{Bus, BusError, Delivery, Lease, MAX_NOTE_BYTES};
+use hgl_ai_proto::{Kind, Note, Seat, seat_lock_key};
+use tokio::signal::unix::{Signal, SignalKind, signal};
+use tokio::sync::{oneshot, watch};
+use tokio::task::JoinHandle;
 
 use super::{Ctx, EXIT_OK, NotReady};
 
 /// How long `note peek` waits for a note.
 const PEEK_WAIT: Duration = Duration::from_secs(1);
+/// How often an interactive receive writes its seat lease again, well within the
+/// `max_age` of `HGL_LOCKS` (docs/protocol.md §8).
+const LEASE_REFRESH: Duration = Duration::from_secs(60);
 
 #[derive(clap::Args)]
 pub struct Args {
@@ -73,7 +79,7 @@ struct WaitArgs {
     /// Most notes to print at once.
     #[arg(long, value_name = "N", default_value_t = 10)]
     max: usize,
-    /// Wait even though a bridge serves the seat or holds its lease.
+    /// Wait without the seat lease, even though a bridge serves the seat or holds it.
     #[arg(long)]
     force: bool,
 }
@@ -83,7 +89,7 @@ struct PeekArgs {
     seat: Seat,
     #[arg(long, value_name = "N", default_value_t = 10)]
     max: usize,
-    /// Peek even though a bridge serves the seat or holds its lease.
+    /// Peek without the seat lease, even though a bridge serves the seat or holds it.
     #[arg(long)]
     force: bool,
 }
@@ -150,6 +156,9 @@ async fn send(ctx: &Ctx, a: SendArgs) -> anyhow::Result<i32> {
 }
 
 /// `wait` (acknowledge after printing) and `peek` (hand back at once, unacknowledged).
+/// Either holds the seat lease `HGL_LOCKS/seat.<seat>` from before the first fetch until it
+/// returns (PROTO-6), so a bridge started meanwhile does not serve the seat; `--force` goes
+/// without it.
 async fn receive(
     ctx: &Ctx,
     seat: &Seat,
@@ -158,26 +167,63 @@ async fn receive(
     force: bool,
     ack: bool,
 ) -> anyhow::Result<i32> {
-    let bus = Bus::connect(&ctx.load_config()?).await?;
-    if !force {
-        if let Some(host) = bus.bridge_host(seat).await? {
-            bail!(
-                "seat {seat} is served by the bridge on host {host}; a seat is served by a bridge \
-                 or interactively, never both (--force to override)"
-            );
-        }
-        let key = hgl_ai_proto::seat_lock_key(seat);
-        if let Some(l) = bus.lock_get(&key).await? {
-            bail!(
-                "seat {seat} is held by {} (lease {key} since {}); a seat is served by a bridge \
-                 or interactively, never both (--force to override)",
-                l.holder,
-                l.acquired_at
-            );
-        }
+    let cfg = ctx.load_config()?;
+    let bus = Bus::connect(&cfg).await?;
+    // Caught from here on, so an interrupted receive still gives the lease up.
+    let mut sigs = Interrupts::install();
+    let key = seat_lock_key(seat);
+    if force {
+        eprintln!(
+            "warning: --force: receiving for seat {seat} without its lease {key}; a bridge may \
+             serve the seat at the same time"
+        );
+        return receive_held(ctx, &bus, seat, max, wait, ack, None, &mut sigs).await;
     }
+    served_by_bridge(&bus, seat).await?;
+    let what = if ack { "note wait" } else { "note peek" };
+    let holder = format!("{} pid {} ({what})", cfg.host, std::process::id());
+    let mut lease = SeatLease::take(&bus, seat, &holder).await?;
+    // Checked again under the lease: a bridge that advertised the seat meanwhile.
+    let r = match served_by_bridge(&bus, seat).await {
+        Ok(()) => receive_held(ctx, &bus, seat, max, wait, ack, Some(&mut lease), &mut sigs).await,
+        Err(e) => Err(e),
+    };
+    lease.release().await;
+    r
+}
+
+/// Refuse a seat that a live host record lists as served by its bridge.
+async fn served_by_bridge(bus: &Bus, seat: &Seat) -> anyhow::Result<()> {
+    if let Some(host) = bus.bridge_host(seat).await? {
+        bail!(
+            "seat {seat} is served by the bridge on host {host}; a seat is served by a bridge \
+             or interactively, never both (--force to override)"
+        );
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn receive_held(
+    ctx: &Ctx,
+    bus: &Bus,
+    seat: &Seat,
+    max: usize,
+    wait: Duration,
+    ack: bool,
+    lease: Option<&mut SeatLease>,
+    sigs: &mut Interrupts,
+) -> anyhow::Result<i32> {
     let mut inbox = bus.inbox(seat).await?;
-    let got = inbox.fetch(max.max(1), wait).await?;
+    let got = tokio::select! {
+        r = inbox.fetch(max.max(1), wait) => r?,
+        _ = lost(lease) => bail!(
+            "the seat lease {} is no longer ours (it expired or another holder took it); \
+             stopped waiting",
+            seat_lock_key(seat)
+        ),
+        sig = sigs.recv() => return Ok(128 + sig),
+    };
     if got.is_empty() {
         let within = if wait == Duration::MAX {
             String::new()
@@ -202,6 +248,119 @@ async fn receive(
         }
     }
     Ok(EXIT_OK)
+}
+
+/// The seat lease of an interactive receive: written again every [`LEASE_REFRESH`] in the
+/// background, released by [`SeatLease::release`] (or, dropped, in the background).
+struct SeatLease {
+    stop: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<()>>,
+    lost: watch::Receiver<bool>,
+}
+
+impl SeatLease {
+    /// Take `seat.<seat>`; refused, naming the holder, when it is held.
+    async fn take(bus: &Bus, seat: &Seat, holder: &str) -> anyhow::Result<SeatLease> {
+        let key = seat_lock_key(seat);
+        let lease = match bus.lock_acquire(&key, holder).await {
+            Ok(l) => l,
+            Err(BusError::Held { holder, since, .. }) => bail!(
+                "seat {seat} is held by {holder} (lease {key} since {since}); a seat is served \
+                 by a bridge or interactively, never both (--force to override)"
+            ),
+            Err(e) => return Err(e.into()),
+        };
+        let (lost_tx, lost) = watch::channel(false);
+        let (stop, stopped) = oneshot::channel();
+        let task = tokio::spawn(keep_lease(lease, LEASE_REFRESH, stopped, lost_tx));
+        Ok(SeatLease {
+            stop: Some(stop),
+            task: Some(task),
+            lost,
+        })
+    }
+
+    /// Stop refreshing and delete the lease if it is still ours; returns once the hub answered.
+    async fn release(mut self) {
+        if let Some(stop) = self.stop.take() {
+            let _ = stop.send(());
+        }
+        if let Some(task) = self.task.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+/// Resolves once a refresh found the lease no longer ours; never without a lease.
+async fn lost(lease: Option<&mut SeatLease>) {
+    if let Some(l) = lease
+        && l.lost.wait_for(|lost| *lost).await.is_ok()
+    {
+        return;
+    }
+    std::future::pending().await
+}
+
+async fn keep_lease(
+    mut lease: Lease,
+    every: Duration,
+    mut stopped: oneshot::Receiver<()>,
+    lost: watch::Sender<bool>,
+) {
+    loop {
+        tokio::select! {
+            _ = &mut stopped => break,
+            _ = tokio::time::sleep(every) => match lease.refresh().await {
+                Ok(()) => {}
+                Err(BusError::LeaseLost { .. }) => {
+                    lost.send_replace(true);
+                    // Keep the sender until told to stop, so the loss stays visible.
+                    let _ = stopped.await;
+                    return;
+                }
+                Err(e) => eprintln!("warning: refreshing the seat lease {}: {e}; trying again", lease.name()),
+            },
+        }
+    }
+    let name = lease.name().to_string();
+    match lease.release().await {
+        Ok(true) => {}
+        Ok(false) => eprintln!("warning: the seat lease {name} was no longer ours at release"),
+        Err(e) => eprintln!("warning: releasing the seat lease {name}: {e}; it expires on its own"),
+    }
+}
+
+/// SIGINT, SIGTERM and SIGHUP, caught while a receive runs.
+struct Interrupts([(i32, Option<Signal>); 3]);
+
+impl Interrupts {
+    fn install() -> Interrupts {
+        let on = |k| signal(k).ok();
+        // The numbers are the same on Linux and macOS.
+        Interrupts([
+            (2, on(SignalKind::interrupt())),
+            (15, on(SignalKind::terminate())),
+            (1, on(SignalKind::hangup())),
+        ])
+    }
+
+    /// Resolves with the number of the first of them received.
+    async fn recv(&mut self) -> i32 {
+        async fn one(n: i32, s: &mut Option<Signal>) -> i32 {
+            if let Some(s) = s
+                && s.recv().await.is_some()
+            {
+                return n;
+            }
+            std::future::pending().await
+        }
+        let [(a, sa), (b, sb), (c, sc)] = &mut self.0;
+        tokio::select! {
+            n = one(*a, sa) => n,
+            n = one(*b, sb) => n,
+            n = one(*c, sc) => n,
+        }
+    }
 }
 
 fn print_delivery(

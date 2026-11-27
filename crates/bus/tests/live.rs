@@ -177,6 +177,15 @@ async fn provision_is_idempotent_and_corrects_settings() {
             Duration::from_secs(30 * 60)
         )
     );
+    let ended = kv("HGL_ENDED").await;
+    assert_eq!(
+        (ended.max_messages_per_subject, ended.storage, ended.max_age),
+        (
+            1,
+            jetstream::stream::StorageType::File,
+            Duration::from_secs(15 * 86_400)
+        )
+    );
 }
 
 #[tokio::test]
@@ -814,6 +823,47 @@ async fn a_released_lease_can_be_taken_again() {
         bus.lock_acquire("bad..name", "x").await,
         Err(BusError::Nats(_))
     ));
+}
+
+#[tokio::test]
+async fn ended_tasks_are_shared_and_a_later_end_stands() {
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let other = hub.bus().await;
+    let t = TaskKey {
+        repo: "hgl-compiler".into(),
+        issue: 992,
+    };
+    assert_eq!(bus.ended_get(&seat("w1"), &t).await.unwrap(), None);
+    assert_eq!(bus.ended_put(&seat("w1"), &t, 10).await.unwrap(), 10);
+    // Another connection (another host) reads it.
+    let r = other.ended_get(&seat("w1"), &t).await.unwrap().unwrap();
+    assert_eq!(r.seq, 10);
+    assert_eq!(r.ended_at.len(), "20261127T041100Z".len());
+    assert_eq!(other.ended_put(&seat("w1"), &t, 8).await.unwrap(), 10);
+    assert_eq!(
+        bus.ended_get(&seat("w1"), &t).await.unwrap().unwrap().seq,
+        10
+    );
+    assert_eq!(other.ended_put(&seat("w1"), &t, 12).await.unwrap(), 12);
+    assert_eq!(
+        bus.ended_get(&seat("w1"), &t).await.unwrap().unwrap().seq,
+        12
+    );
+    // Per seat.
+    assert_eq!(bus.ended_get(&seat("w2"), &t).await.unwrap(), None);
+    // Concurrent ends: the later one stands.
+    let u = TaskKey {
+        repo: "hgl_spec".into(),
+        issue: 3,
+    };
+    let w1 = seat("w1");
+    let (a, b) = tokio::join!(bus.ended_put(&w1, &u, 20), other.ended_put(&w1, &u, 21));
+    assert!(a.unwrap() >= 20 && b.unwrap() == 21);
+    assert_eq!(
+        bus.ended_get(&seat("w1"), &u).await.unwrap().unwrap().seq,
+        21
+    );
 }
 
 /// Wait until `f` holds, or fail after `secs`.

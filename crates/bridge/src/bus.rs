@@ -5,7 +5,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use hgl_ai_bus::Result;
-use hgl_ai_proto::{HostRecord, Note, Seat};
+use hgl_ai_proto::{HostRecord, Note, Seat, TaskKey};
 use hgl_ai_tree::Registry;
 
 pub trait BusApi: Registry + Send + Sync + 'static {
@@ -33,6 +33,19 @@ pub trait BusApi: Registry + Send + Sync + 'static {
         holder: &str,
         stale: &str,
     ) -> impl Future<Output = Result<Self::Lease>> + Send;
+    /// The stream sequence of the note that ended `task` for `seat` (`HGL_ENDED`), if any.
+    fn ended_get(
+        &self,
+        seat: &Seat,
+        task: &TaskKey,
+    ) -> impl Future<Output = Result<Option<u64>>> + Send;
+    /// Record that `task` ended for `seat` at `seq`; a later end already recorded stands.
+    fn ended_put(
+        &self,
+        seat: &Seat,
+        task: &TaskKey,
+        seq: u64,
+    ) -> impl Future<Output = Result<()>> + Send;
 }
 
 /// A held lease: refreshed at its revision (`BusError::LeaseLost` once it is not ours),
@@ -91,6 +104,16 @@ impl BusApi for hgl_ai_bus::Bus {
     }
     async fn lock_take_over(&self, name: &str, holder: &str, stale: &str) -> Result<Self::Lease> {
         hgl_ai_bus::Bus::lock_take_over(self, name, holder, stale).await
+    }
+    async fn ended_get(&self, seat: &Seat, task: &TaskKey) -> Result<Option<u64>> {
+        Ok(hgl_ai_bus::Bus::ended_get(self, seat, task)
+            .await?
+            .map(|r| r.seq))
+    }
+    async fn ended_put(&self, seat: &Seat, task: &TaskKey, seq: u64) -> Result<()> {
+        hgl_ai_bus::Bus::ended_put(self, seat, task, seq)
+            .await
+            .map(drop)
     }
 }
 

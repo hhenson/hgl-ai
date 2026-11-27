@@ -135,8 +135,11 @@ pub struct Bridge<B: BusApi> {
     served: Mutex<BTreeMap<Seat, Arc<SeatRt>>>,
     /// The seat leases held (PROTO-6), refreshed with the heartbeat.
     leases: tokio::sync::Mutex<BTreeMap<Seat, HeldLease<B::Lease>>>,
-    turns: AtomicU64,
 }
+
+/// Turns started by this process, for [`Bridge::next_marker`]: counted per process, not per
+/// bridge, so two bridges of one process (tests) never share a marker and reap each other.
+static TURNS: AtomicU64 = AtomicU64::new(0);
 
 struct HeldLease<L> {
     lease: L,
@@ -212,7 +215,6 @@ impl<B: BusApi> Bridge<B> {
             gate: Mutex::new(Gate::Open),
             served: Mutex::default(),
             leases: tokio::sync::Mutex::default(),
-            turns: AtomicU64::new(0),
         })
     }
 
@@ -222,7 +224,7 @@ impl<B: BusApi> Bridge<B> {
 
     /// A value of `HGL_AI_TURN` no other turn of any bridge has.
     fn next_marker(&self, seat: &Seat) -> String {
-        let n = self.turns.fetch_add(1, Ordering::Relaxed);
+        let n = TURNS.fetch_add(1, Ordering::Relaxed);
         format!("{}-{seat}-{}-{n}", self.cfg.host, std::process::id())
     }
 
@@ -398,30 +400,37 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// Take the seat lease, under the seat lock. A lease that names a bridge of this host
-    /// whose process is gone (a crash; or this process, after a refresh whose answer was
-    /// lost) is taken over at once rather than left to expire: no live bridge of this host
-    /// can serve the seat without the seat lock held here.
+    /// Take the seat lease, under the seat lock. A lease that names a holder of this host
+    /// whose process is gone (a crashed bridge or `note wait`; or this process, after a
+    /// refresh whose answer was lost) is taken over at once rather than left to expire.
     async fn acquire_seat_lease(&self, key: &str, holder: &str) -> hgl_ai_bus::Result<B::Lease> {
         match self.bus.lock_acquire(key, holder).await {
-            Err(BusError::Held { holder: h, .. }) if self.dead_own_bridge(&h) => {
-                tracing::warn!(lease = key, stale = %h, "taking over the seat lease of a bridge of this host that is gone");
+            Err(BusError::Held { holder: h, .. }) if self.dead_own_holder(&h) => {
+                tracing::warn!(lease = key, stale = %h, "taking over the seat lease of a holder of this host that is gone");
                 self.bus.lock_take_over(key, holder, &h).await
             }
             r => r,
         }
     }
 
-    /// `<host> pid <pid> (bridge)` of this host, with `pid` this process or a dead one.
-    fn dead_own_bridge(&self, holder: &str) -> bool {
-        let pid = holder
+    /// `<host> pid <pid> (bridge|note wait|note peek)` of this host, with `pid` a dead
+    /// process (or, for a bridge, this one).
+    fn dead_own_holder(&self, holder: &str) -> bool {
+        let Some((pid, what)) = holder
             .strip_prefix(&format!("{} pid ", self.cfg.host))
-            .and_then(|r| r.strip_suffix(" (bridge)"))
-            .and_then(|p| p.parse::<u32>().ok());
-        match pid {
-            Some(p) if p == std::process::id() => true,
-            Some(p) => !proc_alive(p),
-            None => false,
+            .and_then(|r| r.split_once(' '))
+        else {
+            return false;
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            return false;
+        };
+        match what {
+            "(bridge)" if pid == std::process::id() => true,
+            "(bridge)" | "(note wait)" | "(note peek)" => {
+                pid != std::process::id() && !proc_alive(pid)
+            }
+            _ => false,
         }
     }
 
@@ -445,7 +454,9 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// Serve until shutdown or a lost lease; the notes held at the end are naked.
+    /// Serve until shutdown or a lost lease; the notes held at the end are naked. This loop
+    /// stops the inbox fetcher when it starts stopping: the fetcher does not watch the
+    /// shutdown, so its channel cannot close first and leave a running turn unstopped.
     async fn seat_loop(
         self: Arc<Self>,
         seat: &Arc<SeatRt>,
@@ -454,11 +465,7 @@ impl<B: BusApi> Bridge<B> {
         let mut lost = seat.lost.subscribe();
         let mut end = LoopEnd { lost: None };
         let (tx, mut rx) = mpsc::channel::<B::Delivery>(64);
-        let fetcher = tokio::spawn(self.clone().fetch_loop(
-            seat.name().clone(),
-            tx,
-            shutdown.clone(),
-        ));
+        let fetcher = tokio::spawn(self.clone().fetch_loop(seat.name().clone(), tx));
         let mut pending: Vec<Arc<B::Delivery>> = Vec::new();
         let mut running: Option<Running<B::Delivery>> = None;
         let mut busy: HashMap<Target, Instant> = HashMap::new();
@@ -476,22 +483,25 @@ impl<B: BusApi> Bridge<B> {
             tokio::select! {
                 _ = down(&mut shutdown), if !stopping => {
                     stopping = true;
-                    if let Some(r) = &running {
-                        let _ = r.stop.send(Stop::Graceful(self.opts.shutdown_grace));
-                    }
+                    fetcher.abort();
+                    stop_turn(&running, Stop::Graceful(self.opts.shutdown_grace));
                 }
                 _ = down(&mut lost), if !stopping => {
                     // Another bridge may serve the seat now: start nothing more, stop the
                     // running turn at once, hand every note back.
                     stopping = true;
+                    fetcher.abort();
                     end.lost = Some(running.is_some());
-                    if let Some(r) = &running {
-                        let _ = r.stop.send(Stop::Graceful(Duration::ZERO));
-                    }
+                    stop_turn(&running, Stop::Graceful(Duration::ZERO));
                 }
                 d = rx.recv(), if !stopping => match d {
                     Some(d) => self.on_delivery(seat, Arc::new(d), &mut pending, &mut running, &mut busy).await,
-                    None => stopping = true,
+                    None => {
+                        // The fetcher failed: stop as at shutdown.
+                        tracing::error!(seat = %seat.name(), "the inbox fetcher ended; stopping the seat");
+                        stopping = true;
+                        stop_turn(&running, Stop::Graceful(self.opts.shutdown_grace));
+                    }
                 },
                 out = join(&mut running) => {
                     let r = running.take().expect("a running turn");
@@ -515,29 +525,20 @@ impl<B: BusApi> Bridge<B> {
         end
     }
 
-    async fn fetch_loop(
-        self: Arc<Self>,
-        seat: Seat,
-        tx: mpsc::Sender<B::Delivery>,
-        mut shutdown: watch::Receiver<bool>,
-    ) {
+    /// Fetch the seat's inbox into `tx` until the seat loop aborts it (or drops the receiver).
+    /// It does not watch the shutdown itself: ending on its own, it would close the channel
+    /// and race the seat loop's own shutdown branch, which stops the running turn.
+    async fn fetch_loop(self: Arc<Self>, seat: Seat, tx: mpsc::Sender<B::Delivery>) {
         let pause = Duration::from_secs(5);
         let mut inbox = loop {
             match self.bus.inbox(&seat).await {
                 Ok(i) => break i,
                 Err(e) => tracing::warn!(%seat, "opening the inbox: {e}"),
             }
-            tokio::select! {
-                _ = tokio::time::sleep(pause) => {}
-                _ = down(&mut shutdown) => return,
-            }
+            tokio::time::sleep(pause).await;
         };
         loop {
-            let got = tokio::select! {
-                r = inbox.fetch(self.opts.fetch_max, self.opts.fetch_wait) => r,
-                _ = down(&mut shutdown) => return,
-            };
-            match got {
+            match inbox.fetch(self.opts.fetch_max, self.opts.fetch_wait).await {
                 Ok(ds) => {
                     for d in ds {
                         if tx.send(d).await.is_err() {
@@ -547,10 +548,7 @@ impl<B: BusApi> Bridge<B> {
                 }
                 Err(e) => {
                     tracing::warn!(%seat, "fetching: {e}");
-                    tokio::select! {
-                        _ = tokio::time::sleep(pause) => {}
-                        _ = down(&mut shutdown) => return,
-                    }
+                    tokio::time::sleep(pause).await;
                 }
             }
         }
@@ -578,13 +576,23 @@ impl<B: BusApi> Bridge<B> {
             }
         }
         tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, from = %d.note().sender, "note");
-        if let Some(task) = d.note().task()
-            && lock(&seat.ended).moot(&task, seq)
-        {
-            // Sent before its task ended, delivered after (hgl-ai#2): moot.
-            tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, %task, "a note of an ended task sent before its end; acked");
-            let _ = d.ack().await;
-            return;
+        // Every note passes here before it can start a turn.
+        if let Some(task) = d.note().task() {
+            match self.ended_before(seat, &task, seq).await {
+                Ok(false) => {}
+                Ok(true) => {
+                    // Sent before its task ended, delivered after (hgl-ai#2): moot.
+                    tracing::info!(seat = %seat.name(), seq, kind = %d.note().kind, %task, "a note of an ended task sent before its end; acked");
+                    let _ = d.ack().await;
+                    return;
+                }
+                Err(e) => {
+                    // Without the hub's answer the note may be moot: no turn, try again later.
+                    tracing::warn!(seat = %seat.name(), seq, %task, "reading {}: {e}; naked", hgl_ai_proto::KV_ENDED);
+                    let _ = d.nak(self.opts.nak_delay).await;
+                    return;
+                }
+            }
         }
         if d.note().kind.ends_task() {
             self.end_task(seat, d, pending, running, busy).await;
@@ -593,8 +601,28 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
+    /// Whether a note of `task` at stream sequence `seq` was sent before the task ended for
+    /// the seat. The hub's `HGL_ENDED` is the authority, so a seat moved from another host
+    /// knows the ends seen there; the local record is a cache of this host's ends.
+    async fn ended_before(
+        &self,
+        seat: &SeatRt,
+        task: &TaskKey,
+        seq: u64,
+    ) -> std::result::Result<bool, BusError> {
+        if lock(&seat.ended).moot(task, seq) {
+            return Ok(true);
+        }
+        Ok(self
+            .bus
+            .ended_get(seat.name(), task)
+            .await?
+            .is_some_and(|end| seq < end))
+    }
+
     /// `landed` / `closed` (PROTO-14): stop the task's turn, drop its queued notes, remove
-    /// the seat's trees of it, send a cleanup receipt; no agent turn.
+    /// the seat's trees of it, record the end on the hub, send a cleanup receipt; no agent
+    /// turn. The note is acked once the end is recorded, else naked to try again.
     async fn end_task(
         &self,
         seat: &Arc<SeatRt>,
@@ -670,8 +698,9 @@ impl<B: BusApi> Bridge<B> {
             }
         }
         if let Err(e) = lock(&seat.ended).end(task.clone(), d.seq()) {
-            tracing::warn!(seat = %seat.name(), %task, "recording the end of the task: {e}");
+            tracing::warn!(seat = %seat.name(), %task, "caching the end of the task: {e}");
         }
+        let recorded = self.bus.ended_put(seat.name(), &task, d.seq()).await;
         if !removed.is_empty() || stopped || !errors.is_empty() {
             let body = service::cleanup_body(
                 &self.cfg.host,
@@ -685,7 +714,16 @@ impl<B: BusApi> Bridge<B> {
             );
             self.tell(seat.name(), Kind::Done, Some(&task), body).await;
         }
-        let _ = d.ack().await;
+        match recorded {
+            Ok(()) => {
+                let _ = d.ack().await;
+            }
+            Err(e) => {
+                // Redelivered, the note finds nothing left to remove and records the end.
+                tracing::warn!(seat = %seat.name(), %task, "recording the end in {}: {e}; naked", hgl_ai_proto::KV_ENDED);
+                let _ = d.nak(self.opts.nak_delay).await;
+            }
+        }
     }
 
     /// Start the next turn from `pending`: the first group of notes sharing a target that
@@ -927,6 +965,13 @@ fn proc_alive(_: u32) -> bool {
 /// Resolves once `shutdown` is true (the guard of `wait_for` is not held past it).
 pub(crate) async fn down(shutdown: &mut watch::Receiver<bool>) {
     let _ = shutdown.wait_for(|d| *d).await;
+}
+
+/// Ask the running turn, if any, to stop.
+fn stop_turn<D>(running: &Option<Running<D>>, how: Stop) {
+    if let Some(r) = running {
+        let _ = r.stop.send(how);
+    }
 }
 
 async fn nak_all<D: DeliveryApi>(ds: &[Arc<D>], delay: Duration) {
