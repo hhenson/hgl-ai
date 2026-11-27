@@ -247,6 +247,28 @@ pub fn utc_now_stamp() -> String {
     utc_stamp(chrono::Utc::now())
 }
 
+/// A compact stamp read back: exactly `YYYYMMDDTHHMMSSZ`, ASCII digits, a real time.
+pub fn parse_stamp(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let b = s.as_bytes();
+    let shape = b.len() == 16
+        && b[8] == b'T'
+        && b[15] == b'Z'
+        && b[..8].iter().chain(&b[9..15]).all(u8::is_ascii_digit);
+    if !shape {
+        return None;
+    }
+    chrono::NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ")
+        .ok()
+        .map(|n| n.and_utc())
+}
+
+/// Validate a compact stamp (`created_at`, an event's `at`).
+pub fn check_stamp(s: &str) -> Result<(), ProtoError> {
+    parse_stamp(s)
+        .map(drop)
+        .ok_or_else(|| ProtoError::Note(format!("time {s:?}: expected YYYYMMDDTHHMMSSZ")))
+}
+
 /// The note envelope (§4).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Note {
@@ -325,6 +347,7 @@ impl Note {
         if self.sender.is_broadcast() {
             return Err(ProtoError::Note("sender cannot be `all`".into()));
         }
+        check_stamp(&self.created_at)?;
         if self.recipient.is_owner() || self.recipient.as_str() == CONSOLE {
             return Err(ProtoError::Note(format!(
                 "`{}` has no inbox; ask the owner with `hgl-ai ask`",
@@ -628,6 +651,26 @@ mod tests {
 
         let b = Note::new(Seat::broadcast(), seat("w1"), Kind::Note, "x");
         assert!(b.validate().is_err());
+    }
+
+    #[test]
+    fn stamps_are_strict() {
+        assert!(parse_stamp("20261127T041100Z").is_some());
+        for bad in [
+            "aaa\u{e9}105T090000Z",
+            "20261327T041100Z",
+            "2026112T7041100Z",
+            "x",
+            "",
+        ] {
+            assert!(parse_stamp(bad).is_none(), "{bad:?}");
+        }
+        let mut n = Note::new(seat("w1"), seat("claude"), Kind::Note, "x");
+        n.created_at = "aaa\u{e9}105T090000Z".into();
+        assert!(
+            n.validate().is_err(),
+            "a note with a malformed time is refused"
+        );
     }
 
     #[test]

@@ -293,12 +293,12 @@ pub async fn conversations(
                     .filter(|t| {
                         since
                             .as_deref()
-                            .is_none_or(|d| t.created_at[..8.min(t.created_at.len())] >= *d)
+                            .is_none_or(|d| t.created_at.get(..8).is_some_and(|c| c >= d))
                     })
                     .filter(|t| {
                         until
                             .as_deref()
-                            .is_none_or(|d| t.created_at[..8.min(t.created_at.len())] <= *d)
+                            .is_none_or(|d| t.created_at.get(..8).is_some_and(|c| c <= d))
                     })
                     .collect();
                 let _ = write!(

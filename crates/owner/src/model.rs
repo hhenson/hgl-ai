@@ -127,34 +127,19 @@ impl Message {
     }
 }
 
-const MONTHS: [&str; 12] = [
-    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-];
-
-/// `<who>, 27 Nov 14:05` from a compact UTC stamp (OWN-10).
+/// `<who>, 27 Nov 14:05` from a compact UTC stamp (OWN-10); another text as it is.
 pub fn signed(who: &str, stamp: &str) -> String {
-    let b = stamp.as_bytes();
-    let short = if b.len() == 16 && b[8] == b'T' {
-        let m: usize = stamp[4..6].parse().unwrap_or(0);
-        let day = stamp[6..8].trim_start_matches('0');
-        match MONTHS.get(m.wrapping_sub(1)) {
-            Some(mon) => format!("{day} {mon} {}:{}", &stamp[9..11], &stamp[11..13]),
-            None => stamp.to_string(),
-        }
-    } else {
-        stamp.to_string()
-    };
+    let short = hgl_ai_proto::parse_stamp(stamp)
+        .map(|t| t.format("%-d %b %H:%M").to_string())
+        .unwrap_or_else(|| stamp.to_string());
     format!("{who}, {short}")
 }
 
 /// `2026-11-27` from a compact UTC stamp: the date an agent quotes with a handle.
 pub fn quote_date(stamp: &str) -> String {
-    match stamp.get(0..8) {
-        Some(d) if d.chars().all(|c| c.is_ascii_digit()) => {
-            format!("{}-{}-{}", &d[0..4], &d[4..6], &d[6..8])
-        }
-        _ => stamp.to_string(),
-    }
+    hgl_ai_proto::parse_stamp(stamp)
+        .map(|t| t.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| stamp.to_string())
 }
 
 /// `HGL_THREADS/<id>`
@@ -371,5 +356,14 @@ mod tests {
         assert_eq!(signed("HPH", "20261127T140500Z"), "HPH, 27 Nov 14:05");
         assert_eq!(signed("HPH", "20260105T090000Z"), "HPH, 5 Jan 09:00");
         assert_eq!(quote_date("20261127T140500Z"), "2026-11-27");
+        // A malformed time is shown as it is, never sliced.
+        assert_eq!(
+            signed("H", "aaa\u{e9}105T090000Z"),
+            "H, aaa\u{e9}105T090000Z"
+        );
+        assert_eq!(
+            quote_date("\u{e9}\u{e9}\u{e9}\u{e9}xxxxxxxx"),
+            "\u{e9}\u{e9}\u{e9}\u{e9}xxxxxxxx"
+        );
     }
 }

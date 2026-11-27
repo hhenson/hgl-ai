@@ -217,6 +217,7 @@ pub fn fold(
     if ev.v != EVENT_VERSION {
         return Err(refuse(format!("unsupported event version {}", ev.v)));
     }
+    hgl_ai_proto::check_stamp(&ev.at).map_err(|e| refuse(e.to_string()))?;
     // OWN-5: owner events only from the owner's subject, agent events never from it.
     if ev.body.origin() != origin {
         return Err(refuse(format!(

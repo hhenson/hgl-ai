@@ -21,19 +21,9 @@ pub fn esc(s: &str) -> String {
 
 /// `20261127T041100Z` → `2026-11-27 04:11 UTC`; other text as it is.
 pub fn when(stamp: &str) -> String {
-    let b = stamp.as_bytes();
-    if b.len() == 16 && b[8] == b'T' && b[15] == b'Z' {
-        format!(
-            "{}-{}-{} {}:{} UTC",
-            &stamp[0..4],
-            &stamp[4..6],
-            &stamp[6..8],
-            &stamp[9..11],
-            &stamp[11..13]
-        )
-    } else {
-        stamp.to_string()
-    }
+    hgl_ai_proto::parse_stamp(stamp)
+        .map(|t| t.format("%Y-%m-%d %H:%M UTC").to_string())
+        .unwrap_or_else(|| stamp.to_string())
 }
 
 /// A `<time>` element for a compact stamp.
@@ -127,6 +117,11 @@ mod tests {
         );
         assert_eq!(when("20261127T041100Z"), "2026-11-27 04:11 UTC");
         assert_eq!(when("soon"), "soon");
+        assert_eq!(
+            when("aaa\u{e9}105T090000Z"),
+            "aaa\u{e9}105T090000Z",
+            "never sliced"
+        );
         let p = page("T<x>", None, Some("down"), "<p>b</p>");
         assert!(p.contains("<title>T&lt;x&gt; · hgl-ai console</title>"));
         assert!(p.contains("role=\"alert\">down</p>"));

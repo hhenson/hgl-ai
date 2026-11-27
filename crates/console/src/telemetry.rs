@@ -167,9 +167,7 @@ impl From<&QueueRow> for QueueRowOut {
 }
 
 fn parse_stamp(s: &str) -> Option<DateTime<Utc>> {
-    chrono::NaiveDateTime::parse_from_str(s.trim(), "%Y%m%dT%H%M%SZ")
-        .ok()
-        .map(|n| n.and_utc())
+    hgl_ai_proto::parse_stamp(s)
 }
 
 /// Per repository, the last [`BURNDOWN_DAYS`] samples, oldest first.
