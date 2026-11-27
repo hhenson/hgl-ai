@@ -6,14 +6,15 @@ use std::collections::BTreeMap;
 
 use async_nats::jetstream::context::Publish;
 use async_nats::jetstream::kv;
+use async_nats::jetstream::stream::LastRawMessageErrorKind;
 use futures::StreamExt;
 use hgl_ai_proto::{
-    KV_USAGE, UsageLabel, UsageRecord, check_account, check_label, parse_stamp, usage_label_key,
-    utc_now_stamp,
+    KV_USAGE, STREAM_USAGE, UsageLabel, UsageRecord, check_account, check_label, parse_stamp,
+    usage_label_key, utc_now_stamp,
 };
 
 use crate::{
-    APPEND_ATTEMPTS, Bus, BusError, MAX_VALUE_BYTES, Result, backoff, live_entry, nats,
+    APPEND_ATTEMPTS, Bus, BusError, MAX_VALUE_BYTES, Result, backoff, live_entry, missing, nats,
     publish_error, put_json,
 };
 
@@ -54,10 +55,9 @@ impl Bus {
                         && let Some(old_at) = parse_stamp(&old.observed_at)
                         && Some(old_at) >= new_at
                     {
-                        if Some(old_at) == new_at {
-                            // The history may have missed it (a stop between the two
-                            // writes): send the held record again; its message id drops
-                            // a copy the history has.
+                        if Some(old_at) == new_at && !self.usage_in_history(&old).await? {
+                            // The history missed it (a stop between the two writes):
+                            // send the held record now.
                             self.usage_history(&old, e.value.to_vec()).await?;
                         }
                         return Ok(UsagePut::Stale {
@@ -106,6 +106,23 @@ impl Bus {
             revision,
             history_seq: self.usage_history(rec, value).await?,
         })
+    }
+
+    /// Whether the history's last record for `rec`'s key is this observation. Read from
+    /// the stream, not left to its deduplication window, so an idle login collected days
+    /// later is not appended again.
+    async fn usage_in_history(&self, rec: &UsageRecord) -> Result<bool> {
+        let stream = self
+            .js
+            .get_stream(STREAM_USAGE)
+            .await
+            .map_err(|e| missing(&format!("stream {STREAM_USAGE}"), e))?;
+        match stream.get_last_raw_message_by_subject(&rec.subject()).await {
+            Ok(m) => Ok(serde_json::from_slice::<UsageRecord>(&m.payload)
+                .is_ok_and(|h| h.observed_at == rec.observed_at)),
+            Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => Ok(false),
+            Err(e) => Err(nats(&format!("reading the history of {}", rec.key()), e)),
+        }
     }
 
     /// Publish `value` (the encoded `rec`) to the history, message id

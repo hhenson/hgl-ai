@@ -363,7 +363,7 @@ command or file, never a prompt (no model turn):
   record stays fresh while any of those hosts is up. Each record that replaces its key
   is also published to `hgl.usage.<runtime>.<account>` (message id
   `<key>.<observed_at>`), the history for burn-down; the same observation again is sent
-  to the history again, which keeps one copy. `usage show` gives each record the label
+  to the history only when the history's last record for the key is not it. `usage show` gives each record the label
   in force. Seat and coordinator users may publish both, and every role reads the
   history; a host is to publish only the accounts its registration lists
   (#36).

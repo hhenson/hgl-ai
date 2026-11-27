@@ -1194,3 +1194,46 @@ async fn usage_labels_come_off_and_history_catches_up() {
     }
     assert_eq!(count().await, 2, "sent once, the second deduplicated");
 }
+
+/// Bot round 2: an equal observation collected after the history's dedup window is not
+/// appended again; the history's last record for the key is checked, not the window.
+#[tokio::test]
+async fn usage_history_never_repeats_an_observation() {
+    use hgl_ai_bus::UsagePut;
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let js = hub.raw().await;
+    let mut cfg = js
+        .get_stream(hgl_ai_proto::STREAM_USAGE)
+        .await
+        .unwrap()
+        .info()
+        .await
+        .unwrap()
+        .config
+        .clone();
+    cfg.duplicate_window = Duration::from_millis(200);
+    js.update_stream(&cfg).await.unwrap();
+    let rec = usage("host-1", "20261127T100000Z");
+    assert!(matches!(
+        bus.usage_put(&rec).await.unwrap(),
+        UsagePut::Written { .. }
+    ));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    for _ in 0..2 {
+        assert!(matches!(
+            bus.usage_put(&rec).await.unwrap(),
+            UsagePut::Stale { .. }
+        ));
+    }
+    let history = bus
+        .history(
+            hgl_ai_proto::STREAM_USAGE,
+            "hgl.usage.>",
+            chrono::DateTime::UNIX_EPOCH,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(history.len(), 1);
+}
