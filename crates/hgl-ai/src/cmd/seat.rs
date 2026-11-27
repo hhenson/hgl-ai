@@ -87,6 +87,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                     effort: a.effort,
                 },
                 fallback: a.fallback,
+                class: Default::default(),
                 memcap_gb: None,
                 headless: a.headless,
             });

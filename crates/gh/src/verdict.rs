@@ -4,7 +4,7 @@
 //! author's seat.
 
 use hgl_ai_bus::Bus;
-use hgl_ai_proto::{Kind, Note, Seat};
+use hgl_ai_proto::{Kind, Note, Seat, TaskClass};
 
 use crate::exec::{self, Gh};
 use crate::{Result, Settings, gate, invalid, land, short, state};
@@ -18,6 +18,8 @@ pub struct VerdictOpts {
     /// The task's issue; else the one in the branch name, else the pull request's number.
     pub issue: Option<u64>,
     pub body: String,
+    /// A `sendback`'s new class (ROLE-15).
+    pub class: Option<TaskClass>,
     pub comment: bool,
     pub dry_run: bool,
 }
@@ -74,6 +76,9 @@ pub async fn verdict<G: Gh>(
     if o.body.trim().is_empty() {
         return Err(invalid("empty verdict body"));
     }
+    if o.class.is_some() && o.kind != Kind::Sendback {
+        return Err(invalid("only a sendback moves a task's class (ROLE-15)"));
+    }
     let pr = gate::fetch_pr(gh, s, repo, number).await?;
     if pr.merged || pr.state != "open" {
         return Ok(VerdictOutcome::Refused(format!(
@@ -109,8 +114,9 @@ pub async fn verdict<G: Gh>(
             } else {
                 String::new()
             };
+            let class = o.class.map(|c| format!(" (class {c})")).unwrap_or_default();
             return Ok(VerdictOutcome::Would(format!(
-                "would {comment}send {} for {repo}-{issue} at {} to {to}",
+                "would {comment}send {}{class} for {repo}-{issue} at {} to {to}",
                 o.kind,
                 short(head)
             )));
@@ -142,6 +148,7 @@ pub async fn verdict<G: Gh>(
         n.repo = Some(repo.to_string());
         n.issue = issue;
         n.head = Some(head.to_string());
+        n.class = o.class;
         bus.send(&n).await?;
         sent.push(seat.to_string());
     }
@@ -193,6 +200,7 @@ mod tests {
             to: vec![],
             issue: None,
             body: "ok".into(),
+            class: None,
             comment: true,
             dry_run: true,
         }
@@ -234,5 +242,13 @@ mod tests {
                 .await
                 .is_err()
         );
+        let mut up = opts(Kind::Sendback);
+        up.class = Some(TaskClass::Complex);
+        assert_eq!(
+            verdict(&gh, &s, None, "alpha", 7, HEAD, &up).await.unwrap(),
+            VerdictOutcome::Would("would comment on alpha#7 and send sendback (class complex) for alpha-980 at 1f461fa7 to the author's seat".into())
+        );
+        up.kind = Kind::Approved;
+        assert!(verdict(&gh, &s, None, "alpha", 7, HEAD, &up).await.is_err());
     }
 }

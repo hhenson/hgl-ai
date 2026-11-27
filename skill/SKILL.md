@@ -12,7 +12,7 @@ prompt: never poll.
 ## Commands
 
 ```
-hgl-ai note send --to SEAT --kind KIND [--repo R] [--issue N] [--head SHA] --body-file F
+hgl-ai note send --to SEAT --kind KIND [--repo R] [--issue N] [--head SHA] [--class C] --body-file F
 hgl-ai note wait SEAT [--timeout DUR]   interactive controller only: block, print, ack
 hgl-ai state get KEY                    main, prs, landed.log, hold, mode
 hgl-ai hosts                            live hosts and their seats
@@ -38,6 +38,7 @@ hgl-ai note peek SEAT                   print what is not acked yet; takes nothi
 hgl-ai state put KEY VALUE|- [--if-revision N]
 hgl-ai state append KEY LINE|-
 hgl-ai gh approve|sendback REPO PR HEAD --body-file F   one GitHub comment, then the note
+                                        (sendback: --class C moves the task up, ROLE-15)
 hgl-ai gh merge-if-clean REPO PR HEAD   one gate attempt; merges if every gate holds
 hgl-ai gh land REPO PR HEAD             the gate until it decides; then landed.log, main,
                                         the landed notes, the comment and the pins
@@ -61,7 +62,7 @@ retry later, never work around it.
 | `receipt` | reviewer → controller | your verdict at `head` |
 | `done` | any → controller | a bounded non-PR assignment finished |
 | `note` | any → any | an operational fact (alert) |
-| `assign` | controller, triage → seat | take `repo#issue` |
+| `assign` | controller, triage → seat | take `repo#issue`; `--class` gives its class |
 | `review` | controller → reviewer | review `repo#pr` at `head` |
 | `sendback`, `approved` | controller → implementor | findings at `head`; sign-off for `head` |
 | `landed`, `closed` | controller → seat, `all` | merged or closed; the bridge removes its trees |

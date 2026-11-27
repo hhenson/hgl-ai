@@ -547,6 +547,7 @@ async fn hosts_and_trees_round_trip() {
         created_at: "20261127T083000Z".into(),
         size_bytes: 42,
         families: Vec::new(),
+        class: None,
     };
     let a = tree("w1", 992, false);
     let b = tree("r1", 992, true);

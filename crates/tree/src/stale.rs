@@ -133,6 +133,7 @@ mod tests {
             created_at: created.into(),
             size_bytes: 0,
             families: Vec::new(),
+            class: None,
         }
     }
 

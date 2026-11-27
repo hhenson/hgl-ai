@@ -680,6 +680,7 @@ async fn authored_and_reviewed(b: &Bus) {
         created_at: "20260101T000000Z".into(),
         size_bytes: 0,
         families: vec![hgl_ai_proto::Family::Gpt],
+        class: None,
     };
     b.tree_put(&tree).await.unwrap();
     let controller = Seat::new("claude").unwrap();

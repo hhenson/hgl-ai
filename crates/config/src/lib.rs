@@ -4,7 +4,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use hgl_ai_proto::{Family, Role, Runtime, Seat, Tier};
+use hgl_ai_proto::{Family, Role, Runtime, Seat, TaskClass, Tier};
 use serde::{Deserialize, Serialize};
 
 pub mod console;
@@ -362,6 +362,11 @@ pub struct SeatConfig {
     pub binding: Binding,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<Binding>,
+    /// A binding per task class (`[seat.class.simple]`, docs/roles.md §3): a task of that
+    /// class runs on it while the seat is on its primary binding. A class without one keeps
+    /// the seat's binding.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub class: BTreeMap<TaskClass, Binding>,
     /// Per-seat memory cap; defaults to `limits.memcap_gb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memcap_gb: Option<u64>,
@@ -571,7 +576,10 @@ impl Config {
                     s.name
                 )));
             }
-            for b in std::iter::once(&s.binding).chain(&s.fallback) {
+            for b in std::iter::once(&s.binding)
+                .chain(&s.fallback)
+                .chain(s.class.values())
+            {
                 self.resolve(b)
                     .map_err(|e| ConfigError::Invalid(format!("seat {}: {e}", s.name)))?;
             }
@@ -763,6 +771,34 @@ model = "claude-opus-5-5-high"
             Family::Claude,
             "slug with an effort suffix maps to its family"
         );
+    }
+
+    #[test]
+    fn class_bindings() {
+        let text = format!(
+            "{SAMPLE}\n[seat.class.simple]\nruntime = \"agy\"\nmodel = \"gemini-4-hydrogen\"\neffort = \"high\"\n"
+        );
+        let c: Config = toml::from_str(&text).unwrap();
+        c.validate().unwrap();
+        let r1 = c.seat("r1").unwrap();
+        let simple = c.resolve(&r1.class[&TaskClass::Simple]).unwrap();
+        assert_eq!(
+            (simple.family, simple.model.as_str()),
+            (Family::Gemini, "gemini-4-hydrogen")
+        );
+        assert!(c.seat("w1").unwrap().class.is_empty());
+        let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back, c, "class bindings survive a rewrite");
+        let bad = format!(
+            "{SAMPLE}\n[seat.class.complex]\nruntime = \"codex\"\nfamily = \"claude\"\ntier = \"frontier\"\n"
+        );
+        let c: Config = toml::from_str(&bad).unwrap();
+        assert!(
+            c.validate().is_err(),
+            "a class binding is checked like the primary"
+        );
+        let unknown = format!("{SAMPLE}\n[seat.class.huge]\nruntime = \"agy\"\ntier = \"fast\"\n");
+        assert!(toml::from_str::<Config>(&unknown).is_err());
     }
 
     #[test]

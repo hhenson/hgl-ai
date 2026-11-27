@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use hgl_ai_proto::{Kind, Note, Role, TaskKey};
+use hgl_ai_config::{Binding, SeatConfig};
+use hgl_ai_proto::{Kind, Note, Role, TaskClass, TaskKey};
 use hgl_ai_tree::{Create, TASK_FILE};
 use tokio::sync::watch;
 
@@ -79,9 +80,119 @@ pub fn choose_create(creates: Vec<(u64, Option<Create>)>) -> Option<(u64, Create
     review.or(implement)
 }
 
+/// The task's class after these notes (docs/roles.md §3), in stream order: an `assign`
+/// sets it (triage may reclass a task by assigning it again); a `sendback` only moves it up
+/// (ROLE-15).
+pub fn task_class(recorded: Option<TaskClass>, notes: &[(u64, u64, Note)]) -> Option<TaskClass> {
+    let mut by_seq: Vec<&(u64, u64, Note)> = notes.iter().collect();
+    by_seq.sort_by_key(|(seq, _, _)| *seq);
+    by_seq
+        .iter()
+        .fold(recorded, |c, (_, _, n)| match (n.kind, n.class) {
+            (Kind::Assign, Some(new)) => Some(new),
+            (Kind::Sendback, Some(new)) => Some(c.map_or(new, |c| c.max(new))),
+            _ => c,
+        })
+}
+
+/// The binding a turn runs on, and whether its class chose it: the seat's binding for the
+/// class while the seat is on its primary (`idx` 0); otherwise the seat's binding at `idx`.
+/// A fallback is a quota move (PROTO-17) and keeps its own binding whatever the class.
+pub fn turn_binding(seat: &SeatConfig, idx: usize, class: Option<TaskClass>) -> (Binding, bool) {
+    match class.and_then(|c| seat.class.get(&c)) {
+        Some(b) if idx == 0 => (b.clone(), true),
+        _ if idx == 0 => (seat.binding.clone(), false),
+        _ => (seat.fallback[idx - 1].clone(), false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn classed(seq: u64, kind: Kind, class: Option<TaskClass>) -> (u64, u64, Note) {
+        let s = |x: &str| hgl_ai_proto::Seat::new(x).unwrap();
+        let mut n = Note::new(s("claude"), s("w1"), kind, "x");
+        n.class = class;
+        (seq, 1, n)
+    }
+
+    #[test]
+    fn assign_sets_the_class_and_a_sendback_only_moves_it_up() {
+        use TaskClass::*;
+        let a = |seq, c| classed(seq, Kind::Assign, Some(c));
+        let sb = |seq, c| classed(seq, Kind::Sendback, c);
+        assert_eq!(task_class(None, &[a(1, Simple)]), Some(Simple));
+        assert_eq!(
+            task_class(Some(Standard), &[sb(5, None)]),
+            Some(Standard),
+            "kept"
+        );
+        assert_eq!(
+            task_class(None, &[sb(5, None)]),
+            None,
+            "an unclassed task stays so"
+        );
+        assert_eq!(
+            task_class(Some(Simple), &[sb(5, Some(Standard))]),
+            Some(Standard)
+        );
+        assert_eq!(
+            task_class(Some(Complex), &[sb(5, Some(Simple))]),
+            Some(Complex),
+            "never down"
+        );
+        assert_eq!(task_class(None, &[sb(5, Some(Standard))]), Some(Standard));
+        assert_eq!(
+            task_class(Some(Complex), &[a(9, Simple)]),
+            Some(Simple),
+            "a new assign reclasses"
+        );
+        // Stream order, whatever order the batch arrived in.
+        assert_eq!(
+            task_class(None, &[sb(7, Some(Complex)), a(3, Simple)]),
+            Some(Complex)
+        );
+        let note = classed(2, Kind::Question, None);
+        assert_eq!(task_class(Some(Simple), &[note]), Some(Simple));
+        assert_eq!(Simple.up(), Standard);
+        assert_eq!(Standard.up(), Complex);
+        assert_eq!(Complex.up(), Complex);
+    }
+
+    #[test]
+    fn a_class_binding_runs_only_on_the_primary() {
+        let b = |model: &str| Binding {
+            runtime: hgl_ai_proto::Runtime::Agy,
+            family: None,
+            tier: None,
+            model: Some(model.into()),
+            effort: None,
+        };
+        let seat = SeatConfig {
+            name: hgl_ai_proto::Seat::new("w1").unwrap(),
+            role: Role::Implementor,
+            binding: b("primary"),
+            fallback: vec![b("fallback")],
+            class: [(TaskClass::Simple, b("light"))].into(),
+            memcap_gb: None,
+            headless: false,
+        };
+        let model = |idx, c| {
+            let (b, by) = turn_binding(&seat, idx, c);
+            (b.model.unwrap(), by)
+        };
+        assert_eq!(model(0, Some(TaskClass::Simple)), ("light".into(), true));
+        assert_eq!(
+            model(0, Some(TaskClass::Standard)),
+            ("primary".into(), false)
+        );
+        assert_eq!(model(0, None), ("primary".into(), false));
+        assert_eq!(
+            model(1, Some(TaskClass::Simple)),
+            ("fallback".into(), false)
+        );
+    }
 
     fn review(h: char) -> Option<Create> {
         Some(Create::Review {
@@ -313,30 +424,43 @@ impl<B: BusApi> Bridge<B> {
             Stop::Graceful(_) => return Outcome::Shutdown,
             Stop::None => {}
         }
-        let binding = seat.binding_at(job.binding_idx);
+        // The task's class (docs/roles.md §3), recorded in its tree; an inbox turn has none.
+        let mut file = file;
+        let class = file.as_ref().and_then(|f| task_class(f.class, &job.notes));
+        let (binding, by_class) = turn_binding(&seat.cfg, job.binding_idx, class);
         let r = match self.cfg.resolve(&binding) {
             Ok(r) => r,
             Err(e) => return Outcome::PrepFailed(format!("seat binding: {e}")),
         };
         // The task's authors (ROLE-11): every family whose turns run in an implementor
         // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
-        let mut file = file;
-        if let (Some(f), Target::Tree { review: false, .. }) = (file.as_mut(), &job.target)
-            && !f.families.contains(&r.family)
-        {
-            f.families.push(r.family);
-            match hgl_ai_tree::write_task(&dir, f) {
-                Ok(()) => {
-                    let d = dir.clone();
-                    let size = tokio::task::spawn_blocking(move || hgl_ai_tree::dir_size(&d))
-                        .await
-                        .unwrap_or(0);
-                    let rec = self.trees.record(&dir, f, size);
-                    if let Err(e) = self.bus.tree_put(&rec).await {
-                        tracing::warn!(key = %rec.key(), "registering the task's families: {e}");
+        if let Some(f) = file.as_mut() {
+            let author = !matches!(job.target, Target::Tree { review: true, .. })
+                && !f.families.contains(&r.family);
+            if author {
+                f.families.push(r.family);
+            }
+            let reclassed = f.class != class;
+            if reclassed {
+                tracing::info!(seat = %name, target = %job.target, from = ?f.class, to = ?class, "task class");
+                f.class = class;
+            }
+            if author || reclassed {
+                match hgl_ai_tree::write_task(&dir, f) {
+                    Ok(()) => {
+                        let d = dir.clone();
+                        let size = tokio::task::spawn_blocking(move || hgl_ai_tree::dir_size(&d))
+                            .await
+                            .unwrap_or(0);
+                        let rec = self.trees.record(&dir, f, size);
+                        if let Err(e) = self.bus.tree_put(&rec).await {
+                            tracing::warn!(key = %rec.key(), "registering the task's families and class: {e}");
+                        }
+                    }
+                    Err(e) => {
+                        return Outcome::PrepFailed(format!("recording the family and class: {e}"));
                     }
                 }
-                Err(e) => return Outcome::PrepFailed(format!("recording the family: {e}")),
             }
         }
         let (cwd, writable) = match &job.target {
@@ -364,6 +488,7 @@ impl<B: BusApi> Bridge<B> {
                 runtime: r.runtime,
                 family: r.family,
                 model: &r.model,
+                class: class.map(|c| (c, by_class)),
                 task: file.as_ref(),
                 hold: job.hold.as_deref(),
                 mode: job.mode.as_deref(),

@@ -8,7 +8,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use hgl_ai_config::{Binding, Config, SeatConfig};
-use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, Tier};
+use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskClass, Tier};
 use hgl_ai_tree::testing::{commit, git, remote};
 use hgl_ai_tree::{Git, Layout, Trees};
 use tokio::sync::watch;
@@ -69,6 +69,7 @@ fn harness() -> H {
             role: Role::Implementor,
             binding: b(Runtime::Codex, None, Tier::Frontier, Some("high")),
             fallback: vec![b(Runtime::Agy, Some(Family::Claude), Tier::Frontier, None)],
+            class: Default::default(),
             memcap_gb: None,
             headless: false,
         },
@@ -77,6 +78,7 @@ fn harness() -> H {
             role: Role::Reviewer,
             binding: b(Runtime::Claude, None, Tier::Frontier, Some("xhigh")),
             fallback: vec![],
+            class: Default::default(),
             memcap_gb: None,
             headless: false,
         },
@@ -259,6 +261,91 @@ fn note(kind: Kind, to: &str, issue: u64, body: &str) -> Note {
 }
 
 use crate::proc::alive;
+
+/// docs/roles.md §3: the `assign` note's class picks the seat's binding for it, the tree
+/// records the class, and a `sendback` only moves it up (ROLE-15).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_task_class_picks_the_model_and_a_sendback_moves_it_up() {
+    let mut h = harness();
+    let light = Binding {
+        runtime: Runtime::Codex,
+        family: None,
+        tier: Some(Tier::Fast),
+        model: None,
+        effort: Some("high".into()),
+    };
+    h.cfg.seats[0].class.insert(TaskClass::Simple, light);
+    h.cfg.validate().unwrap();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let dir = h.work().join("w1/demo-980");
+    let recorded = || {
+        (
+            hgl_ai_tree::read_task(&dir).unwrap().class,
+            h.bus.trees()["build-1.w1.demo-980"].class,
+        )
+    };
+
+    let mut n = note(
+        Kind::Assign,
+        "w1",
+        980,
+        "[claude] Assign: demo#980 Rename it",
+    );
+    n.class = Some(TaskClass::Simple);
+    let a = h.bus.push("w1", n);
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    let calls = h.calls("codex");
+    assert_eq!(&calls[0].args[..4], ["exec", "--json", "-m", "gpt-6-luna"]);
+    assert!(
+        calls[0]
+            .stdin
+            .contains("Task class: simple (the seat's binding for it")
+    );
+    let simple = Some(TaskClass::Simple);
+    assert_eq!(recorded(), (simple, simple));
+
+    // A sendback without a class keeps it.
+    let s = h.bus.push(
+        "w1",
+        note(Kind::Sendback, "w1", 980, "[claude] Sendback: once"),
+    );
+    eventually("first sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    assert!(h.calls("codex")[1].args.contains(&"gpt-6-luna".to_string()));
+    assert_eq!(recorded(), (simple, simple));
+
+    // The second for the same finding moves it up; the seat has no binding for
+    // `standard`, so its own binding runs the task.
+    let mut n = note(Kind::Sendback, "w1", 980, "[claude] Sendback: again");
+    n.class = Some(TaskClass::Standard);
+    let s = h.bus.push("w1", n);
+    eventually("second sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    let c = &h.calls("codex")[2];
+    assert!(
+        c.args.contains(&"gpt-6.2-astra".to_string()),
+        "{:?}",
+        c.args
+    );
+    assert!(
+        c.stdin
+            .contains("Task class: standard (the seat's own binding runs it).")
+    );
+    let standard = Some(TaskClass::Standard);
+    assert_eq!(recorded(), (standard, standard));
+
+    // A sendback never moves a class down.
+    let mut n = note(Kind::Sendback, "w1", 980, "[claude] Sendback: lower");
+    n.class = Some(TaskClass::Simple);
+    let s = h.bus.push("w1", n);
+    eventually("third sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    assert!(
+        h.calls("codex")[3]
+            .args
+            .contains(&"gpt-6.2-astra".to_string())
+    );
+    assert_eq!(recorded(), (standard, standard));
+    stop(tx, j).await;
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn assign_then_sendback_resumes_then_landed_cleans_up() {
@@ -1105,6 +1192,7 @@ fn controllers_are_not_served_unless_named() {
             effort: None,
         },
         fallback: vec![],
+        class: Default::default(),
         memcap_gb: None,
         headless: false,
     });
@@ -1216,6 +1304,7 @@ async fn a_note_at_the_bus_limit_reaches_each_cli_whole_on_stdin() {
             effort: None,
         },
         fallback: vec![],
+        class: Default::default(),
         memcap_gb: None,
         headless: false,
     });

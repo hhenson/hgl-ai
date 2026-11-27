@@ -111,6 +111,10 @@ pub struct TaskFile {
     /// which a review's family must differ from (ROLE-11).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub families: Vec<hgl_ai_proto::Family>,
+    /// The task's class (docs/roles.md §3): from its `assign`, moved up by a `sendback`
+    /// that carries a higher one (ROLE-15).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub class: Option<hgl_ai_proto::TaskClass>,
 }
 
 impl TaskFile {
@@ -411,6 +415,7 @@ impl Trees {
             sessions: BTreeMap::new(),
             seq: None,
             families: Vec::new(),
+            class: None,
         })
     }
 
@@ -494,6 +499,7 @@ impl Trees {
             sessions: BTreeMap::new(),
             seq: None,
             families: Vec::new(),
+            class: None,
         })
     }
 
@@ -665,6 +671,7 @@ impl Trees {
                         created_at: mtime_stamp(&dir),
                         size_bytes: size,
                         families: Vec::new(),
+                        class: None,
                     },
                 };
                 out.push(LocalTree { dir, record, file });
@@ -686,6 +693,7 @@ impl Trees {
             created_at: f.created_at.clone(),
             size_bytes,
             families: f.families.clone(),
+            class: f.class,
         }
     }
 

@@ -108,6 +108,9 @@ async fn list(ctx: &Ctx, a: ListArgs) -> anyhow::Result<i32> {
             human_bytes(r.size_bytes),
             r.branch.as_deref().unwrap_or("-")
         );
+        if let Some(c) = r.class {
+            line.push_str(&format!(" class={c}"));
+        }
         if let Some(w) = why {
             line.push(' ');
             line.push_str(w);

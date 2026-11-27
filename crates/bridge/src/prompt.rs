@@ -2,7 +2,7 @@
 
 use std::fmt::Write as _;
 
-use hgl_ai_proto::{Family, Note, Role, Runtime, Seat};
+use hgl_ai_proto::{Family, Note, Role, Runtime, Seat, TaskClass};
 use hgl_ai_tree::TaskFile;
 
 /// Upper bound of the whole prompt, which goes on the agent's stdin: one note at the bus's
@@ -18,6 +18,9 @@ pub struct Context<'a> {
     pub runtime: Runtime,
     pub family: Family,
     pub model: &'a str,
+    /// The task's class (docs/roles.md §3), and whether the seat's binding for it chose
+    /// the model.
+    pub class: Option<(TaskClass, bool)>,
     /// The task's `task.json`; `None` for a turn in the seat's inbox directory.
     pub task: Option<&'a TaskFile>,
     /// `HGL_STATE/hold`, when present.
@@ -66,6 +69,14 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
         None => {
             let _ = writeln!(s, "No task: this turn runs in the seat's inbox directory.");
         }
+    }
+    if let Some((class, by_class)) = c.class {
+        let how = if by_class {
+            "the seat's binding for it chose the model"
+        } else {
+            "the seat's own binding runs it"
+        };
+        let _ = writeln!(s, "Task class: {class} ({how}).");
     }
     if let Some(c) = c.controller {
         let _ = writeln!(s, "The controller is seat `{c}`.");
@@ -120,6 +131,9 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
         }
         if let Some(b) = &n.base {
             let _ = write!(s, ", base {b}");
+        }
+        if let Some(c) = n.class {
+            let _ = write!(s, ", class {c}");
         }
         let _ = writeln!(
             s,
@@ -191,6 +205,7 @@ mod tests {
             sessions: BTreeMap::new(),
             seq: None,
             families: Vec::new(),
+            class: None,
         }
     }
 
@@ -203,6 +218,7 @@ mod tests {
             runtime: Runtime::Codex,
             family: Family::Gpt,
             model: "gpt-6.1-sol",
+            class: None,
             task: t,
             hold: None,
             mode: None,
@@ -244,6 +260,20 @@ mod tests {
         ] {
             assert!(p.contains(needle), "missing {needle:?} in\n{p}");
         }
+        assert!(
+            !p.contains("Task class"),
+            "a class only when the task has one"
+        );
+        n.class = Some(TaskClass::Simple);
+        c.class = Some((TaskClass::Simple, true));
+        let p = build(&c, &[(42, 1, &n)]);
+        assert!(p.contains("Task class: simple (the seat's binding for it chose the model)."));
+        assert!(p.contains("hgl-compiler#980, class simple, created"), "{p}");
+        c.class = Some((TaskClass::Standard, false));
+        assert!(
+            build(&c, &[(42, 1, &n)])
+                .contains("Task class: standard (the seat's own binding runs it).")
+        );
         let plain = build(&ctx(None, &s), &[(1, 1, &q)]);
         assert!(plain.contains("No task"));
         assert!(!plain.contains("State "), "hold and mode only when set");

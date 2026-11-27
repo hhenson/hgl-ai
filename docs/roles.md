@@ -134,6 +134,10 @@ Triage classes each task when it labels it ready, and the `assign` note carries 
 A task whose work turns out to change behaviour is reclassed by its seat with a `blocked`
 note; triage reassigns it. ROLE-15 moves a class up after two sendbacks.
 
+`hgl-ai note send --kind assign --class C` carries the class. A seat whose host binds a
+class (`[seat.class.<class>]`, PROTO-21) runs that class's tasks on it; any other seat keeps
+its binding, and the bridge still records the class.
+
 The gate's reviewer is never of the author's family (ROLE-11). The GitHub review bot is
 a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the gate.
 
@@ -141,7 +145,9 @@ a GPT model, so for a change a GPT model wrote a Neon or Carbon receipt is the g
   subscriptions (GPT implements runtime work, Claude refactors and tooling, Gemini
   reviews and checker work); when one runs out, its rows move to their second choice.
 - **ROLE-15 — Escalate once.** A task whose work is sent back twice for the same
-  finding moves up a class (simple to standard, standard to complex).
+  finding moves up a class (simple to standard, standard to complex). The controller
+  judges "the same finding" and sends that second sendback with the next class
+  (`hgl-ai gh sendback ... --class C`); the bridge never moves a class down.
 - **ROLE-16 — Record the model.** `ready` notes and receipts name the family
   and model that did the work, so ROLE-11 can be checked.
 
