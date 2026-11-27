@@ -13,7 +13,9 @@ pub fn parse(xml: &[u8], source: Option<&str>) -> Parsed {
         .unwrap_or(xml.len());
     let mut r = Reader { b: xml, pos: from };
     let mut case: Option<Case> = None;
-    let mut in_result: Option<(Outcome, String, String)> = None;
+    // An open `<failure>`/`<error>`/`<skipped>`: outcome, message, type, and its text so
+    // far, apart from the case's message (a second failure must not touch the first's).
+    let mut in_result: Option<(Outcome, String, String, String)> = None;
     while let Some(tok) = r.next() {
         match tok {
             Tok::Open {
@@ -62,25 +64,20 @@ pub fn parse(xml: &[u8], source: Option<&str>) -> Parsed {
                     if empty {
                         apply(case.as_mut(), outcome, &msg, &kind, "");
                     } else {
-                        in_result = Some((outcome, msg, kind));
+                        in_result = Some((outcome, msg, kind, String::new()));
                     }
                 }
                 _ => {}
             },
             Tok::Text(t) => {
-                if in_result.is_some()
-                    && let Some(c) = case.as_mut()
-                {
-                    c.message.push_str(&t);
+                if let Some((_, _, _, text)) = in_result.as_mut() {
+                    text.push_str(&t);
                 }
             }
             Tok::Close { name, end } => match name.as_str() {
                 "failure" | "error" | "skipped" => {
-                    if let Some((outcome, msg, kind)) = in_result.take()
-                        && let Some(c) = case.as_mut()
-                    {
-                        let text = std::mem::take(&mut c.message);
-                        apply(Some(c), outcome, &msg, &kind, &text);
+                    if let Some((outcome, msg, kind, text)) = in_result.take() {
+                        apply(case.as_mut(), outcome, &msg, &kind, &text);
                     }
                 }
                 "testcase" => {

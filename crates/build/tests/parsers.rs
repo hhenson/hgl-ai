@@ -134,6 +134,39 @@ fn cargo_tests_in_two_binaries() {
     );
 }
 
+/// Rust 1.89 and later print the thread id: `thread 'name' (1234) panicked at ...`
+/// (output of the workspace's own toolchain).
+#[test]
+fn cargo_tests_with_thread_ids() {
+    let (p, _) = run(ParserKind::Cargo, "cargo-test-rust-1.98.txt");
+    let failed: Vec<_> = p
+        .tests
+        .iter()
+        .filter(|t| t.outcome == Outcome::Fail)
+        .collect();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].name, "tests::checks_math");
+    assert_eq!(
+        failed[0].message,
+        "assertion `left == right` failed\n  left: 41\n right: 42\nat src/lib.rs:11:9"
+    );
+}
+
+/// A test case with two failures keeps the first one's message.
+#[test]
+fn junit_two_failures_in_one_case() {
+    let (p, _) = run(ParserKind::Junit, "gtest-two-failures.xml");
+    assert_eq!(p.tests.len(), 1);
+    assert_eq!(p.tests[0].outcome, Outcome::Fail);
+    assert!(
+        p.tests[0]
+            .message
+            .starts_with("/work/src/tests/clock.cpp:40\nExpected equality"),
+        "{:?}",
+        p.tests[0].message
+    );
+}
+
 #[test]
 fn gcc() {
     let (p, log) = run(ParserKind::Gcc, "gcc.txt");

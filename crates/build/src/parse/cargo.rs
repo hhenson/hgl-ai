@@ -20,11 +20,14 @@ static RUNNING: LazyLock<Regex> = LazyLock::new(|| {
 });
 static SECTION: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^---- (?P<name>.+?) stdout ----$").unwrap());
-/// `thread 'x' panicked at src/lib.rs:3:5:` (Rust 1.73+), or the older
+/// `thread 'x' (1234) panicked at src/lib.rs:3:5:` (Rust 1.89+ name the thread id),
+/// `thread 'x' panicked at src/lib.rs:3:5:` (1.73+), or the older
 /// `thread 'x' panicked at 'msg', src/lib.rs:3:5`.
 static PANIC: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^thread '(?P<thread>[^']*)' panicked at (?:'(?P<old>.*)', )?(?P<at>\S+?):?$")
-        .unwrap()
+    Regex::new(
+        r"^thread '(?P<thread>[^']*)'(?: \(\d+\))? panicked at (?:'(?P<old>.*)', )?(?P<at>\S+?):?$",
+    )
+    .unwrap()
 });
 static HUMAN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?P<sev>error|warning)(?:\[(?P<code>[^\]]+)\])?: (?P<msg>.+)$").unwrap()
