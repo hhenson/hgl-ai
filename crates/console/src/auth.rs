@@ -96,6 +96,8 @@ pub enum Persist {
     Del(String),
     /// The pending `p2` batch: thread ids and titles.
     P2(Vec<(String, String)>),
+    /// The `p1` notifications no channel took yet: thread ids and titles.
+    P1(Vec<(String, String)>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

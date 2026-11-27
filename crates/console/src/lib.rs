@@ -46,6 +46,8 @@ pub struct App {
     pub(crate) notifier: Option<hgl_ai_notify::Notifier>,
     /// `p2` questions waiting for the hourly notification: id and title.
     pub(crate) pending_p2: Mutex<Vec<(String, String)>>,
+    /// `p1` notifications no channel took yet, retried with backoff: id and title.
+    pub(crate) unsent_p1: Mutex<Vec<(String, String)>>,
     /// The state kept on the hub has been taken back.
     pub(crate) restored: std::sync::atomic::AtomicBool,
 }
@@ -79,6 +81,7 @@ impl App {
             telemetry: tokio::sync::watch::channel(Arc::new(telemetry::Snapshot::default())).0,
             notifier,
             pending_p2: Mutex::default(),
+            unsent_p1: Mutex::default(),
             restored: std::sync::atomic::AtomicBool::new(false),
         })
     }

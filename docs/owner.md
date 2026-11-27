@@ -80,7 +80,10 @@ live telemetry. GitHub stays the record (PROTO-1).
   accepts is used: a phone push (an ntfy topic) or a Slack incoming webhook, then
   email as the last resort. A notification carries the title, priority and a link to
   the thread, never the context. An email channel without `to` goes to every user's
-  `email`. The pending `p2` batch is kept in `HGL_CONSOLE` across restarts.
+  `email`. The pending `p2` batch is kept in `HGL_CONSOLE` across restarts and cleared
+  once a channel took it. A `p1` that no channel took is kept there too, shown on every
+  console page as not delivered, and retried from 30 s, doubling to 30 min, until one
+  takes it or the question closes.
 - **OWN-10 — Handles.** Each user signs the owner's words with a handle of their own
   choosing (`handle`, 1 to 31 letters, digits, spaces or `-_.'`, unique ignoring case
   and repeated spaces; shorter reads better). Every owner event records it; owner notes
@@ -124,7 +127,7 @@ repository per day.
 | Stream | `HGL_OWNER`, subjects `hgl.owner.>`, `hgl.console.>` | status reports, thread events; no age limit; dedup 24 h |
 | KV | `HGL_THREADS` | one record per thread: id, kind, title, issue, priority, state, times, options, suggested, answer, messages |
 | KV | `HGL_METRICS` | daily samples per repository |
-| KV | `HGL_CONSOLE` | the console's sessions and pending `p2` batch; the console's user only |
+| KV | `HGL_CONSOLE` | the console's sessions, pending `p2` batch and undelivered `p1`s; the console's user only |
 
 | Subject | Publisher | Event |
 | --- | --- | --- |
@@ -138,7 +141,9 @@ repository per day.
   flight and folds them in order; a failed fold stops the feed until that event folds.
   A fold sends the owner's notes, appends an answer to `decisions.log` (once), then
   writes the record; each step is idempotent, and the stream sequence in the record
-  makes a refold a no-op. Until the console has folded an `ask`, `thread show` does not
+  makes a refold a no-op. A record stays within 256 KiB: the newest 50 messages, long
+  texts shortened, a count of what it leaves out; `thread show` and the console read a
+  long thread whole by folding its events again from `HGL_OWNER`. Until the console has folded an `ask`, `thread show` does not
   find it.
 - `decisions.log`: `HGL_STATE`, newest 2000 lines and at most 768 KiB, trimmed in the
   same compare-and-set as the append; a line per owner answer (from the console) and per

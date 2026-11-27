@@ -112,11 +112,13 @@ async fn framed(
         open_questions: open_questions(app).await,
         current,
     };
-    let banner = banner.or_else(|| {
-        app.hub()
-            .is_none()
-            .then(|| "The hub is not reachable; the console retries every few seconds.".to_string())
-    });
+    let banner = banner
+        .or_else(|| {
+            app.hub().is_none().then(|| {
+                "The hub is not reachable; the console retries every few seconds.".to_string()
+            })
+        })
+        .or_else(|| crate::service::undelivered(app));
     Html(page(title, Some(&nav), banner.as_deref(), body)).into_response()
 }
 

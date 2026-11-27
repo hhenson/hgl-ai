@@ -400,6 +400,11 @@ async fn sessions_and_the_p2_batch_survive_a_restart() {
     let providers = Providers::start(public).await;
     let mut h = Harness::new(&providers, &pem);
     h.cfg.hub.url = hub.url.clone();
+    // A channel that takes nothing: an urgent notification stays undelivered.
+    h.cfg.console.as_mut().unwrap().notify = vec![hgl_ai_config::Notify::Ntfy {
+        url: "http://127.0.0.1:1/nobody".into(),
+        token_file: None,
+    }];
     let start = || async {
         let app = Arc::new(App::new(h.cfg.clone()).unwrap());
         let bus = Arc::new(
@@ -437,12 +442,23 @@ async fn sessions_and_the_p2_batch_survive_a_restart() {
         cut: false,
     };
     assert!(hgl_ai_console::service::on_new_question(&first, &t).is_none());
+    let mut urgent = t.clone();
+    urgent.id = "q-0000000c".into();
+    urgent.title = "Now".into();
+    urgent.priority = Some(Priority::P1);
+    hgl_ai_console::service::tell_new_question(&first, &urgent).await;
+    assert!(hgl_ai_console::service::undelivered(&first).is_some());
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     // The console restarts: the same cookie is still signed in, the batch still waits.
     let (second, base2) = start().await;
     b.base = base2;
     assert_eq!(b.get("/telemetry").await.status(), 200, "still signed in");
+    let page = b.get("/questions").await.text().await.unwrap();
+    assert!(
+        page.contains("Not delivered yet") && page.contains("p1 Now"),
+        "kept across the restart"
+    );
     let batch = hgl_ai_console::service::p2_batch(&second).unwrap();
     assert_eq!(batch.title, "p2 question: Later");
     hgl_ai_console::service::p2_sent(&second, &["q-0000000a".into()]);

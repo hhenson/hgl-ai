@@ -92,6 +92,90 @@ pub fn p2_batch(app: &App) -> Option<Notification> {
     }
 }
 
+/// Notify the owner of a new question by its priority; a `p1` no channel took is kept,
+/// on the hub too, and retried with backoff ([`p1_retry`]).
+pub async fn tell_new_question(app: &App, t: &Thread) {
+    let Some(n) = on_new_question(app, t) else {
+        return;
+    };
+    if !notify(app, n).await {
+        let mut u = app.unsent_p1.lock().expect("unsent");
+        if !u.iter().any(|(id, _)| id == &t.id) {
+            u.push((t.id.clone(), t.title.clone()));
+        }
+        app.auth.persist(crate::auth::Persist::P1(u.clone()));
+    }
+}
+
+/// Send the kept `p1` notifications again; those of questions no longer open are dropped.
+/// Returns how many are still undelivered.
+pub async fn p1_retry(app: &App, bus: Option<&Bus>) -> usize {
+    let kept = app.unsent_p1.lock().expect("unsent").clone();
+    let mut left = Vec::new();
+    for (id, title) in &kept {
+        if let Some(b) = bus
+            && let Ok(t) = owner::show(b, id).await
+            && !t.as_ref().is_some_and(Thread::is_open)
+        {
+            continue;
+        }
+        let n = Notification {
+            title: format!("p1 question: {title}"),
+            priority: NPriority::Urgent,
+            link: app.thread_link(id),
+        };
+        if !notify(app, n).await {
+            left.push((id.clone(), title.clone()));
+        }
+    }
+    let mut u = app.unsent_p1.lock().expect("unsent");
+    // Keep any added while this round ran.
+    u.retain(|x| !kept.contains(x) || left.contains(x));
+    if *u != kept {
+        app.auth.persist(crate::auth::Persist::P1(u.clone()));
+    }
+    u.len()
+}
+
+/// The first wait before an undelivered `p1` is tried again; it doubles up to the max.
+pub const P1_RETRY_MIN: Duration = Duration::from_secs(30);
+pub const P1_RETRY_MAX: Duration = Duration::from_secs(30 * 60);
+
+/// The next wait: doubled after a failed round, back to the minimum once all went.
+pub fn p1_backoff(prev: Duration, left: usize) -> Duration {
+    if left == 0 {
+        P1_RETRY_MIN
+    } else {
+        (prev * 2).min(P1_RETRY_MAX)
+    }
+}
+
+async fn p1_loop(app: Arc<App>, bus: Arc<Bus>) {
+    let mut wait = P1_RETRY_MIN;
+    loop {
+        tokio::time::sleep(wait).await;
+        if app.unsent_p1.lock().expect("unsent").is_empty() {
+            wait = P1_RETRY_MIN;
+            continue;
+        }
+        let left = p1_retry(&app, Some(&bus)).await;
+        wait = p1_backoff(wait, left);
+    }
+}
+
+/// What the console shows while urgent notifications are undelivered.
+pub fn undelivered(app: &App) -> Option<String> {
+    let u = app.unsent_p1.lock().expect("unsent");
+    if u.is_empty() {
+        return None;
+    }
+    let titles: Vec<&str> = u.iter().map(|(_, t)| t.as_str()).collect();
+    Some(format!(
+        "Not delivered yet (no channel took it; retrying): p1 {}",
+        titles.join("; ")
+    ))
+}
+
 /// The questions of a sent batch leave it (and the hub's copy).
 pub fn p2_sent(app: &App, sent: &[String]) {
     let mut p = app.pending_p2.lock().expect("pending");
@@ -167,10 +251,8 @@ pub async fn fold_batch(
                 new_question,
             }) => {
                 tracing::info!(thread = %thread.id, seq = m.seq, "folded");
-                if new_question.is_some()
-                    && let Some(n) = on_new_question(app, &thread)
-                {
-                    let _ = notify(app, n).await;
+                if new_question.is_some() {
+                    tell_new_question(app, &thread).await;
                 }
                 m.ack().await?;
             }
@@ -287,6 +369,8 @@ fn snap_view(s: &Arc<crate::telemetry::Snapshot>) -> Arc<crate::telemetry::Snaps
 
 /// The key of the pending `p2` batch in `HGL_CONSOLE`.
 const P2_KEY: &str = "p2.pending";
+/// The key of the undelivered `p1` notifications in `HGL_CONSOLE`.
+const P1_KEY: &str = "p1.unsent";
 
 /// Take the sessions and the pending `p2` batch kept on the hub, then keep them there.
 pub async fn restore(app: &Arc<App>, bus: &Arc<Bus>) {
@@ -309,12 +393,28 @@ pub async fn restore(app: &Arc<App>, bus: &Arc<Bus>) {
         Ok(None) => {}
         Err(e) => tracing::warn!("reading the pending p2 batch: {e}"),
     }
+    match bus.console_get::<Vec<(String, String)>>(P1_KEY).await {
+        Ok(Some(v)) => {
+            let mut u = app.unsent_p1.lock().expect("unsent");
+            for x in v {
+                if !u.contains(&x) {
+                    u.push(x);
+                }
+            }
+        }
+        Ok(None) => {}
+        Err(e) => tracing::warn!("reading the undelivered p1 notifications: {e}"),
+    }
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     tracing::info!("{} sessions kept on the hub", stored.len());
     app.auth.attach(stored, tx);
     let pending = app.pending_p2.lock().expect("pending").clone();
     if !pending.is_empty() {
         app.auth.persist(crate::auth::Persist::P2(pending));
+    }
+    let unsent = app.unsent_p1.lock().expect("unsent").clone();
+    if !unsent.is_empty() {
+        app.auth.persist(crate::auth::Persist::P1(unsent));
     }
     let b = bus.clone();
     tokio::spawn(async move {
@@ -325,6 +425,8 @@ pub async fn restore(app: &Arc<App>, bus: &Arc<Bus>) {
                 Persist::Del(k) => b.console_del(k).await,
                 Persist::P2(v) if v.is_empty() => b.console_del(P2_KEY).await,
                 Persist::P2(v) => b.console_put(P2_KEY, v).await,
+                Persist::P1(v) if v.is_empty() => b.console_del(P1_KEY).await,
+                Persist::P1(v) => b.console_put(P1_KEY, v).await,
             };
             if let Err(e) = res {
                 tracing::warn!("keeping the console's state on the hub: {e}");
@@ -358,6 +460,7 @@ pub async fn start_background(app: Arc<App>) {
     tokio::spawn(fold_loop(app.clone(), bus.clone()));
     tokio::spawn(tick_loop(app.clone(), bus.clone()));
     tokio::spawn(batch_loop(app.clone(), bus.clone()));
+    tokio::spawn(p1_loop(app.clone(), bus.clone()));
     tokio::spawn(telemetry_loop(app, bus));
 }
 
@@ -701,6 +804,56 @@ pub(crate) mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// A `p1` no channel took is kept, shown and retried with backoff until one takes it.
+    #[tokio::test]
+    async fn an_undelivered_p1_is_kept_and_retried() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let down = Arc::new(AtomicBool::new(true));
+        let hits = Arc::new(AtomicUsize::new(0));
+        let (d2, h2) = (down.clone(), hits.clone());
+        let topic = axum::Router::new().route(
+            "/t",
+            axum::routing::post(move || {
+                let (d, h) = (d2.clone(), h2.clone());
+                async move {
+                    h.fetch_add(1, Ordering::SeqCst);
+                    if d.load(Ordering::SeqCst) {
+                        axum::http::StatusCode::INTERNAL_SERVER_ERROR
+                    } else {
+                        axum::http::StatusCode::OK
+                    }
+                }
+            }),
+        );
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = l.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(l, topic).await });
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = hgl_ai_config::Config::new("hub");
+        cfg.paths.data_dir = dir.path().display().to_string();
+        cfg.console = Some(hgl_ai_config::Console {
+            url: "https://console.example.com".into(),
+            notify: vec![hgl_ai_config::Notify::Ntfy {
+                url: format!("http://{addr}/t"),
+                token_file: None,
+            }],
+            ..hgl_ai_config::Console::default()
+        });
+        let a = App::new(cfg).unwrap();
+        tell_new_question(&a, &q("q-00000001", Priority::P1)).await;
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+        assert_eq!(a.unsent_p1.lock().unwrap().len(), 1, "kept");
+        assert!(undelivered(&a).unwrap().contains("title q-00000001"));
+        assert_eq!(p1_retry(&a, None).await, 1, "still down");
+        assert_eq!(p1_backoff(P1_RETRY_MIN, 1), P1_RETRY_MIN * 2);
+        assert_eq!(p1_backoff(P1_RETRY_MAX, 1), P1_RETRY_MAX);
+        down.store(false, Ordering::SeqCst);
+        assert_eq!(p1_retry(&a, None).await, 0, "delivered");
+        assert!(undelivered(&a).is_none());
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_eq!(p1_backoff(P1_RETRY_MAX, 0), P1_RETRY_MIN);
     }
 
     /// A batch that no channel took waits for the next hour; a sent one is cleared.
