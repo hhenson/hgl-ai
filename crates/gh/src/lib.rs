@@ -268,7 +268,7 @@ mod tests {
     #[test]
     fn settings_from_defaults() {
         let s = testutil::settings();
-        assert_eq!(s.controller.as_str(), "claude");
+        assert_eq!(s.controller.as_str(), "controller");
         assert_eq!(s.coord_interval, Duration::from_secs(300));
         let g = s.gate_rules("hgl-compiler");
         assert!(g.global_paths.iter().any(|p| p == "spec/hgl_spec"));

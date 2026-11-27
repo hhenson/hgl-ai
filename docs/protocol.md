@@ -51,8 +51,8 @@ this repository.
   no delivery.
 
 ```sh
-hgl-ai note send --to claude --issue 980 --kind ready --body-file ready.md
-hgl-ai note wait claude          # blocks; prints the next notes
+hgl-ai note send --to controller --issue 980 --kind ready --body-file ready.md
+hgl-ai note wait controller          # blocks; prints the next notes
 hgl-ai state get prs
 hgl-ai tree list --stale
 ```
@@ -110,7 +110,7 @@ before hub users takes one shared token until it moves.
   "v": 1,
   "created_at": "20261127T041100Z",
   "sender": "w4",
-  "recipient": "claude",
+  "recipient": "controller",
   "repo": "hgl-compiler",
   "issue": 980,
   "kind": "ready",

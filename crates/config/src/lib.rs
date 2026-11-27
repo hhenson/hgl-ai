@@ -651,7 +651,7 @@ impl Config {
         self.seats.iter().find(|s| s.name.as_str() == name)
     }
 
-    /// The controller's seat, `[github] controller` (default `claude`).
+    /// The controller's seat, `[github] controller` (default `controller`).
     pub fn controller(&self) -> Result<Seat> {
         let invalid = |why: String| ConfigError::Invalid(format!("github.controller: {why}"));
         let s = Seat::new(self.github.controller.clone()).map_err(|e| invalid(e.to_string()))?;
@@ -824,7 +824,16 @@ model = "claude-opus-5-5-high"
     #[test]
     fn the_controller_seat() {
         let mut c = Config::new("h");
-        assert_eq!(c.controller().unwrap().as_str(), "claude", "the default");
+        assert_eq!(
+            c.controller().unwrap().as_str(),
+            "controller",
+            "the default"
+        );
+        let loaded: Config = toml::from_str("host = \"h\"\n[github]\n").unwrap();
+        assert_eq!(loaded.controller().unwrap().as_str(), "controller");
+        let explicit: Config =
+            toml::from_str("host = \"h\"\n[github]\ncontroller = \"claude\"\n").unwrap();
+        assert_eq!(explicit.controller().unwrap().as_str(), "claude");
         c.github.controller = "boss".into();
         assert_eq!(c.controller().unwrap().as_str(), "boss");
         assert!(c.validate().is_ok());
