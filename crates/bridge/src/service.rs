@@ -1,4 +1,4 @@
-//! Host-level duties: heartbeat (§9), the seat leases' refresh, the `assign` gate (ROLE-16, ROLE-17), the daily
+//! Host-level duties: heartbeat (§9), the seat leases' refresh, the `assign` gate (ROLE-18, ROLE-19), the daily
 //! report of stale trees and disk use (PROTO-15), and the cleanup receipt's text.
 
 use std::fmt::Write as _;
@@ -30,7 +30,7 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// The gate for notes that make a new tree (ROLE-16, ROLE-17), telling the controller
+    /// The gate for notes that make a new tree (ROLE-18, ROLE-19), telling the controller
     /// when it changes.
     pub(crate) async fn gate_check(&self) -> Gate {
         let mode = self.bus.state_get("mode").await.ok().flatten();

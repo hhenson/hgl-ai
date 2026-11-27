@@ -93,7 +93,7 @@ pub fn short(sha: &str) -> &str {
 /// The gate settings of one repository, compiled.
 #[derive(Debug, Clone)]
 pub struct GateRules {
-    /// A clean review receipt from another family is required (ROLE-9).
+    /// A clean review receipt from another family is required (ROLE-11).
     pub receipt: bool,
     pub global_paths: Vec<String>,
     pub verdicts: Vec<String>,
@@ -218,7 +218,7 @@ impl Settings {
         format!("{}/{}", self.owner, repo)
     }
 
-    /// Repositories whose merges are followed by a pin update of the wrapper (ROLE-10).
+    /// Repositories whose merges are followed by a pin update of the wrapper (ROLE-12).
     pub fn pin_sources(&self) -> Vec<&str> {
         self.pins.iter().filter_map(|p| p.repo.as_deref()).collect()
     }
@@ -240,7 +240,7 @@ pub(crate) mod testutil {
         s
     }
 
-    /// `s` with the review receipt (ROLE-9) turned off for `repos`, as `[github.gate.<repo>]
+    /// `s` with the review receipt (ROLE-11) turned off for `repos`, as `[github.gate.<repo>]
     /// review_receipt = false` does.
     pub fn without_receipts(mut s: Settings, repos: &[&str]) -> Settings {
         for r in repos {
@@ -277,7 +277,7 @@ mod tests {
         assert!(g.relax_configured());
         let other = s.gate_rules("hgl_spec");
         assert!(other.verdicts.is_empty() && !other.relax_configured());
-        assert!(g.receipt && other.receipt, "required by default (ROLE-9)");
+        assert!(g.receipt && other.receipt, "required by default (ROLE-11)");
         assert_eq!(s.pin_sources(), ["hgl-compiler"]);
         assert_eq!(short("0123456789abcdef"), "01234567");
     }
