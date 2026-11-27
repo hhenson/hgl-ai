@@ -50,6 +50,10 @@ struct Inner {
     ended_writes_down: AtomicBool,
     /// The next inbox fetch panics.
     inbox_broken: AtomicBool,
+    /// Lease refreshes fail as if the hub did not answer.
+    refresh_down: AtomicBool,
+    /// `HGL_LOCKS` max_age in milliseconds; 0 is the protocol's.
+    lease_max_age_ms: AtomicU64,
 }
 
 #[derive(Clone, Default)]
@@ -161,6 +165,18 @@ impl FakeBus {
         self.0.ended_writes_down.store(writes, Ordering::SeqCst);
     }
 
+    /// Lease refreshes fail without an answer (`true`), as in a partition, or work.
+    pub fn refresh_down(&self, down: bool) {
+        self.0.refresh_down.store(down, Ordering::SeqCst);
+    }
+
+    /// The `max_age` of `HGL_LOCKS` the bridge reads.
+    pub fn set_lease_max_age(&self, d: Duration) {
+        self.0
+            .lease_max_age_ms
+            .store(d.as_millis() as u64, Ordering::SeqCst);
+    }
+
     /// Make the next inbox fetch panic, ending the bridge's fetcher.
     pub fn break_inbox(&self) {
         self.0.inbox_broken.store(true, Ordering::SeqCst);
@@ -225,6 +241,12 @@ impl BusApi for FakeBus {
             .values()
             .find(|h| h.seats.iter().any(|s| &s.seat == seat))
             .map(|h| h.host.clone()))
+    }
+    async fn lease_max_age(&self) -> Result<Duration> {
+        Ok(match self.0.lease_max_age_ms.load(Ordering::SeqCst) {
+            0 => hgl_ai_bus::LOCKS_MAX_AGE,
+            ms => Duration::from_millis(ms),
+        })
     }
     async fn hosts(&self) -> Result<Vec<HostRecord>> {
         let hosts = g(&self.0.hosts);
@@ -292,6 +314,9 @@ pub struct FakeLease {
 
 impl LeaseApi for FakeLease {
     async fn refresh(&mut self) -> Result<()> {
+        if self.bus.0.refresh_down.load(Ordering::SeqCst) {
+            return Err(BusError::Nats("HGL_LOCKS: no responders".into()));
+        }
         let mut leases = g(&self.bus.0.leases);
         match leases.get_mut(&self.name) {
             Some((_, rev)) if *rev == self.rev => {
