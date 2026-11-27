@@ -149,7 +149,7 @@ fast = "gemini-3.8-flash"
 
 [[seat]]
 name = "w1"
-role = "implementor"                   # controller|architect|triage|implementor|reviewer|build
+role = "implementor"                   # controller|architect|triage|implementor|reviewer
 runtime = "codex"                      # claude|codex|agy
 tier = "frontier"                      # or `model = "<slug>"` to pin one
 effort = "high"

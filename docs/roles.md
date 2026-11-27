@@ -57,10 +57,12 @@ Open decisions are issues in this repository.
     too, once it exists), and returns bounded summaries (`docs/build.md`).
   - *merge queue* (proposed, not implemented): builds approved pull requests in
     batches on every platform and lands them (`docs/build.md` §3).
-- **ROLE-8 — Build agent** (seat role `build`). Writes and repairs recipes,
-  provisions toolchains and SDKs, diagnoses failures of the build itself; never
-  changes the code under build. Its hub user has the `build` role, the only one that
-  writes recipes (`docs/install.md`); a build that is *not run* goes to it.
+- **ROLE-8 — Build agent** (proposed, not implemented). Proposes recipe changes as
+  pull requests (a repository's recipe lives in its `recipes/`; the hub's admin imports
+  it), provisions toolchains and SDKs, diagnoses failures of the build itself; never
+  changes the code under build. It gets no seat role while seats share their host's
+  hub credential (hgl-ai#16); until then a build that is *not run* goes to the
+  controller.
 
 ## 2. Gates
 

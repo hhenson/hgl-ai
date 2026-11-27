@@ -46,7 +46,6 @@ impl Hub {
             ("build-1", Role::Seat),
             ("hub-coord", Role::Coord),
             ("console", Role::Console),
-            ("build-agent", Role::Build),
             ("hub-admin", Role::Admin),
         ] {
             let text = reg.issue(name, role, false).unwrap();
@@ -436,15 +435,10 @@ async fn seats_keep_build_runs_but_not_recipes() {
         admin.build_get("recipe.demo").await.unwrap().unwrap().value,
         recipe
     );
-    // The build agent's user writes recipes, and keeps runs as a seat does.
-    let agent = hub.bus("build-agent").await;
-    agent
-        .build_put("recipe.demo", b"repo = \"demo\"\n")
-        .await
-        .unwrap();
-    agent
-        .build_put("run.20261127-120000-bbbbbb", b"{}")
-        .await
-        .unwrap();
-    agent.build_del("recipe.demo").await.unwrap();
+    // No hub role but the admin writes recipes: seats share one host credential, so a
+    // recipe-writing seat role would hand every seat of its host the fleet's builders
+    // (Carbon's second review of #12, finding 1). Recipes change by pull request and the
+    // admin imports them.
+    assert!("build".parse::<Role>().is_err(), "no `build` hub role");
+    admin.build_del("recipe.demo").await.unwrap();
 }

@@ -53,12 +53,16 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   with named groups `file`, `line`, `col`, `code`, `message`.
 - Stored as written (comments kept) in `HGL_BUILD/recipe.<repo>`, history 64:
   `recipe show [--rev N]`, `recipe history`. `recipes/` in this repository holds the
-  first ones. Every builder runs them, so only the build agent's hub user writes them
-  (`hgl-ai server user add NAME --role build`); seats keep `run.*` and read recipes.
+  first ones. A repository's recipe is a file in its own `recipes/` directory (the drafts
+  for others start in this repository's), changed by pull request. Every builder runs
+  recipes, so on the hub only the admin user writes `HGL_BUILD/recipe.*`: `hgl-ai build
+  recipe import FILE`, run as the server user. Seats and builders read recipes and keep
+  `run.*`; no seat writes recipes while seats share their host's credential (hgl-ai#16).
 
-- **BUILD-3 — Who writes them.** The build agent (`docs/roles.md`) writes and repairs
-  recipes, provisions toolchains and SDKs on hosts, and diagnoses failures of the build
-  itself. It never changes the code under build.
+- **BUILD-3 — Who writes them.** The build agent (`docs/roles.md` ROLE-8, proposed)
+  proposes recipe changes as pull requests, provisions toolchains and SDKs on hosts, and
+  diagnoses failures of the build itself. It never changes the code under build. Until it
+  exists, a build that is *not run* goes to the controller.
 
 ## 2. Running a build
 

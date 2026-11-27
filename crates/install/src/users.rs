@@ -33,28 +33,18 @@ pub enum Role {
     Coord,
     /// The owner's console: the owner's subjects, `HGL_THREADS`, `tick` notes.
     Console,
-    /// The build agent (ROLE-8): a seat's rights and the recipes in `HGL_BUILD`, which
-    /// every builder runs.
-    Build,
     /// Everything: provisioning the stream and buckets (`hgl-ai init`, `server install`).
     Admin,
 }
 
 impl Role {
-    pub const ALL: [Role; 5] = [
-        Role::Seat,
-        Role::Coord,
-        Role::Console,
-        Role::Build,
-        Role::Admin,
-    ];
+    pub const ALL: [Role; 4] = [Role::Seat, Role::Coord, Role::Console, Role::Admin];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Seat => "seat",
             Role::Coord => "coord",
             Role::Console => "console",
-            Role::Build => "build",
             Role::Admin => "admin",
         }
     }
@@ -72,7 +62,7 @@ impl FromStr for Role {
         Role::ALL
             .into_iter()
             .find(|r| r.as_str() == s)
-            .ok_or_else(|| format!("unknown hub role {s:?}: seat, coord, console, build or admin"))
+            .ok_or_else(|| format!("unknown hub role {s:?}: seat, coord, console or admin"))
     }
 }
 
@@ -280,18 +270,16 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     ];
     let mut deny = Vec::new();
     match role {
-        Role::Seat | Role::Coord | Role::Build => {
+        Role::Seat | Role::Coord => {
             allow.push(format!("{SUBJECT_PREFIX}.*"));
             allow.push(format!("{CONSOLE_PREFIX}.>"));
             for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED] {
                 allow.push(format!("$KV.{b}.>"));
             }
-            // `HGL_BUILD`: the run summaries builders and `build run` keep; the recipes,
-            // which every builder runs, only the build agent's user writes.
+            // `HGL_BUILD`: the run summaries builders and `build run` keep. The recipes,
+            // which every builder runs, only the admin user writes: seats share their
+            // host's credential, so no seat may (docs/build.md BUILD-1).
             allow.push(format!("$KV.{KV_BUILD}.run.>"));
-            if role == Role::Build {
-                allow.push(format!("$KV.{KV_BUILD}.recipe.>"));
-            }
             if role == Role::Coord {
                 allow.push(format!("$KV.{KV_METRICS}.>"));
             }
@@ -443,7 +431,7 @@ mod tests {
             assert!(seat.publish_deny.iter().any(|x| x == d), "{d}");
         }
         // Builders and `build run` keep runs; a build job is a note; recipes are the
-        // build agent's.
+        // admin's.
         assert!(
             seat.publish_allow
                 .iter()
@@ -454,13 +442,6 @@ mod tests {
                 .publish_allow
                 .iter()
                 .any(|a| a.starts_with("$KV.HGL_BUILD.recipe"))
-        );
-        let build = permissions(Role::Build).unwrap();
-        assert!(
-            build
-                .publish_allow
-                .iter()
-                .any(|a| a == "$KV.HGL_BUILD.recipe.>")
         );
         assert!(
             seat.publish_allow

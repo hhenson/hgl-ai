@@ -83,7 +83,8 @@ The first body line names runtime and action: `[codex] Ready: hgl-compiler#980 a
   run). Read its summary, not the log; open the log by byte range only when the summary
   is not enough. A long or other-platform build: `--platform P --detach` (a builder runs
   it, so it outlives your turn), then `build wait ID`.
-  Not run (a missing SDK, tool or recipe) goes to the build agent; never work around it.
+  Not run (a missing SDK, tool or recipe) goes to the controller as `blocked`; never work
+  around it. A recipe change is a pull request to the repository's `recipes/`.
 - Every other build, test, probe and generated program runs under
   `hgl-ai cap SIZE --time DUR -- ...`: 32G for one compiler run or program,
   64G for a C++ build or a whole-workspace build or test. A hit cap is a finding;
@@ -134,10 +135,6 @@ only issues labelled ready. Write no code.
 the bridge made. Format, lint and test under `cap`, push, then send `ready`
 with the exact head. Answer `sendback` with new commits; never force-push
 reviewed history unless told.
-
-**Build agent.** Write and repair recipes (`hgl-ai build recipe edit|import`), provision
-toolchains and SDKs on builders (`[builder.sdk]`), diagnose failures of the build itself
-(`hgl-ai builder list` shows each builder's health). Never change the code under build.
 
 **Reviewer.** Fresh context per review; the bridge has merged `head` onto
 `main` in `$HGL_AI_TASK_DIR/src`. Write adversarial programs, accepting and
