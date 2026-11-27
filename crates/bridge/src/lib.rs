@@ -228,15 +228,15 @@ impl<B: BusApi> Bridge<B> {
         format!("{}-{seat}-{}-{n}", self.cfg.host, std::process::id())
     }
 
-    /// The seats to serve: the named ones, or every configured seat but controllers
-    /// (a controller is interactive, PROTO-6, unless named).
+    /// The seats to serve: the named ones, or every configured seat but interactive
+    /// controllers (PROTO-6); a controller with `headless = true` is served (OWN-7).
     pub fn select(&self, only: &[Seat]) -> Result<Vec<SeatConfig>> {
         if only.is_empty() {
             return Ok(self
                 .cfg
                 .seats
                 .iter()
-                .filter(|s| s.role != Role::Controller)
+                .filter(|s| s.role != Role::Controller || s.headless)
                 .cloned()
                 .collect());
         }

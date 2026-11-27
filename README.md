@@ -47,7 +47,8 @@ hgl-ai seat add w1 --role implementor --runtime codex --tier frontier --effort h
 hgl-ai doctor
 ```
 
-An interactive seat, such as the controller:
+An interactive seat, such as the controller (the default; `seat add --headless`
+lets the bridge serve a controller instead, docs/owner.md OWN-7):
 
 ```sh
 hgl-ai agent start claude

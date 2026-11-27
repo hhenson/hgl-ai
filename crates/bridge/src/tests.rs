@@ -70,6 +70,7 @@ fn harness() -> H {
             binding: b(Runtime::Codex, None, Tier::Frontier, Some("high")),
             fallback: vec![b(Runtime::Agy, Some(Family::Claude), Tier::Frontier, None)],
             memcap_gb: None,
+            headless: false,
         },
         SeatConfig {
             name: seat("r1"),
@@ -77,6 +78,7 @@ fn harness() -> H {
             binding: b(Runtime::Claude, None, Tier::Frontier, Some("xhigh")),
             fallback: vec![],
             memcap_gb: None,
+            headless: false,
         },
     ];
     cfg.validate().unwrap();
@@ -1092,6 +1094,7 @@ fn controllers_are_not_served_unless_named() {
         },
         fallback: vec![],
         memcap_gb: None,
+        headless: false,
     });
     let trees = Trees::with(
         Layout::new(h.work()).unwrap(),
@@ -1112,6 +1115,24 @@ fn controllers_are_not_served_unless_named() {
     assert_eq!(names(b.select(&[]).unwrap()), ["w1", "r1"]);
     assert_eq!(names(b.select(&[seat("claude")]).unwrap()), ["claude"]);
     assert!(b.select(&[seat("nope")]).is_err());
+
+    // A headless controller is served without being named (OWN-7).
+    let mut cfg = h.cfg.clone();
+    let mut ctl = b.cfg.seat("claude").unwrap().clone();
+    ctl.headless = true;
+    cfg.seats.push(ctl);
+    let trees = Trees::with(
+        Layout::new(h.work()).unwrap(),
+        "build-1",
+        &cfg.github,
+        h.git.clone(),
+    );
+    let deps = Deps {
+        closed: Arc::new(|_: &str, _: u64, _: bool| None),
+        disk: h.disk.clone(),
+    };
+    let b = Bridge::new(cfg, h.bus.clone(), trees, deps, h.opts.clone());
+    assert_eq!(names(b.select(&[]).unwrap()), ["w1", "r1", "claude"]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1184,6 +1205,7 @@ async fn a_note_at_the_bus_limit_reaches_each_cli_whole_on_stdin() {
         },
         fallback: vec![],
         memcap_gb: None,
+        headless: false,
     });
     cfg.validate().unwrap();
     for rt in ["claude", "codex", "agy"] {

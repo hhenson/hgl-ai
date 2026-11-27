@@ -47,7 +47,7 @@ hgl-ai init                               provision stream and buckets (idempote
 hgl-ai doctor                             check config, hub, CLIs, skills, services, disk
 
 hgl-ai seat add NAME --role ROLE --runtime claude|codex|agy (--tier T [--family F] | --model SLUG)
-                [--effort E] [--fallback RUNTIME:FAMILY:TIER[:EFFORT] ...]
+                [--effort E] [--fallback RUNTIME:FAMILY:TIER[:EFFORT] ...] [--headless]
 hgl-ai seat list|remove NAME
 hgl-ai agent start SEAT                   interactive session in tmux `hgl-SEAT`
 hgl-ai agent attach SEAT

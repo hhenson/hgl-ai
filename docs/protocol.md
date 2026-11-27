@@ -25,8 +25,10 @@ Status: proposed. Open decisions are issues in this repository.
   bridge holds the agent's inbox, starts one headless turn per batch of notes,
   and puts the notes in the turn's prompt. Agents never poll.
 - **PROTO-6 — Interactive seats.** A seat run by a person-facing session (the
-  controller) waits with `hgl-ai note wait SEAT`, which blocks until a note
-  arrives, prints it and acknowledges it. A seat is served by a bridge or
+  controller, by default) waits with `hgl-ai note wait SEAT`, which blocks until a
+  note arrives, prints it and acknowledges it. A controller seat with
+  `headless = true` is served by the bridge instead, a turn per batch of notes
+  (OWN-7); `bridge run` serves every other seat without being told. A seat is served by a bridge or
   interactively, never both: `note wait` and `note peek` refuse a seat that a
   live `HGL_HOSTS` record lists, unless given `--force`. On one host, whoever
   serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`.

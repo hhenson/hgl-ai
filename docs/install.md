@@ -189,8 +189,11 @@ you, checks that you (and so your agents) cannot read them.
 
 ## Agents
 
-The bridge starts headless turns by itself when notes arrive. An interactive
-session for a seat, for example the controller:
+The bridge starts headless turns by itself when notes arrive, for every seat but
+an interactive controller. The controller is interactive by default; with
+`hgl-ai seat add claude --role controller ... --headless` (`headless = true`) the
+bridge serves it too (OWN-7) and no session waits for it. An interactive session
+for a seat, for example the controller:
 
 ```sh
 hgl-ai agent start claude      # tmux session hgl-claude

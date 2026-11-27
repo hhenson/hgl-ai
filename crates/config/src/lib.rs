@@ -351,6 +351,10 @@ pub struct SeatConfig {
     /// Per-seat memory cap; defaults to `limits.memcap_gb`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub memcap_gb: Option<u64>,
+    /// A controller served by the bridge, a headless turn per batch of notes (OWN-7);
+    /// without it a controller is interactive (PROTO-6). Only for role `controller`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub headless: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -532,6 +536,12 @@ impl Config {
             if s.name.is_reserved() {
                 return Err(ConfigError::Invalid(format!(
                     "a seat cannot be named `{}`: `all`, `owner` and `console` are reserved",
+                    s.name
+                )));
+            }
+            if s.headless && s.role != Role::Controller {
+                return Err(ConfigError::Invalid(format!(
+                    "seat {}: `headless` is for a controller; the bridge serves every other seat",
                     s.name
                 )));
             }

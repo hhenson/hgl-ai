@@ -13,7 +13,7 @@ prompt: never poll.
 
 ```
 hgl-ai note send --to SEAT --kind KIND [--repo R] [--issue N] [--head SHA] --body-file F
-hgl-ai note wait SEAT [--timeout DUR]   controller only: block, print, ack
+hgl-ai note wait SEAT [--timeout DUR]   interactive controller only: block, print, ack
 hgl-ai state get KEY                    main, prs, landed.log, hold, mode
 hgl-ai state put KEY VALUE|-            controller only
 hgl-ai hosts                            live hosts and their seats
@@ -76,8 +76,10 @@ The first body line names runtime and action: `[codex] Ready: hgl-compiler#980 a
 
 ## Roles
 
-**Controller.** Only you approve, merge and update wrapper pins; wait with
-`hgl-ai note wait $HGL_AI_SEAT`. Each turn starts from `hgl-ai decision tail`,
+**Controller.** Only you approve, merge and update wrapper pins. Interactive
+(the default, `hgl-ai agent start`): wait with `hgl-ai note wait $HGL_AI_SEAT`.
+Headless (`headless = true`, OWN-7): the bridge starts a turn for each batch of
+notes; never run `note wait`. Each turn starts from `hgl-ai decision tail`,
 `hgl-ai thread list --open` and `hgl-ai state get main`, never a previous
 turn's transcript. On a `tick`, and after a landing, a release, a blocked seat
 or a gate failing twice, post a terse status report: landed, in flight,
