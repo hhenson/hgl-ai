@@ -1433,6 +1433,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "hex",
+ "hgl-ai-build",
  "hgl-ai-bus",
  "hgl-ai-config",
  "hgl-ai-proto",

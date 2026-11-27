@@ -109,6 +109,8 @@ struct Opts {
     remote: bool,
     /// Runs on the hub before the service starts.
     before: Option<Before>,
+    /// The service's hub user may not write verdicts (a seat's).
+    no_verdicts: bool,
 }
 
 fn fake_ssh() -> PathBuf {
@@ -228,6 +230,7 @@ impl Rig {
             clone_url: Arc::new(move |_| origin.clone()),
             toolchains: vec!["git".into()],
             heartbeat: Duration::from_millis(300),
+            verdicts: !o.no_verdicts,
         };
         let (stop, rx) = tokio::sync::watch::channel(false);
         let svc = tokio::spawn(service::serve(svc_bus, lanes, settings.clone(), rx));
@@ -256,6 +259,7 @@ impl Rig {
             steps: None,
             recipe_rev: None,
             keep_going: false,
+            verdict: None,
             reply_to: reply_seat(id).unwrap_or_else(|_| Seat::new("r-x").unwrap()),
             notify: None,
             requester: "w1".into(),
@@ -333,6 +337,104 @@ impl Rig {
     async fn stop(mut self) {
         self.halt().await;
     }
+}
+
+/// A gate build of `head` merged onto `main` for pull request 7.
+fn gate_job(r: &Rig, id: &str, head: &str, name: &str) -> BuildJob {
+    let mut j = r.job(id, head);
+    j.base = Some(r.heads[0].clone());
+    j.issue = 7;
+    j.verdict = Some(name.into());
+    j
+}
+
+async fn send_pr(r: &Rig, j: &BuildJob) {
+    let mut n = Note::new(
+        Seat::new("w1").unwrap(),
+        Seat::new("builder-lab1").unwrap(),
+        Kind::Build,
+        serde_json::to_string(j).unwrap(),
+    );
+    n.repo = Some(j.repo.clone());
+    n.head = Some(j.head.clone());
+    n.base = j.base.clone();
+    n.issue = j.issue;
+    r.bus.send(&n).await.unwrap();
+}
+
+/// hgl-ai#6: a builder writes only its own platform's verdict, binding the main it merged
+/// onto; a verdict for another platform is refused before anything runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_gate_build_writes_its_own_platforms_verdict() {
+    let Some(r) = Rig::start().await else { return };
+    let mine = hgl_ai_proto::build::Platform::current().unwrap().as_str();
+    let other = if mine == "windows" {
+        "linux"
+    } else {
+        "windows"
+    };
+    let foreign = gate_job(&r, "20261127-120000-aaaaaa", &r.heads[1], other);
+    send_pr(&r, &foreign).await;
+    let ok = gate_job(&r, "20261127-120000-bbbbbb", &r.heads[1], mine);
+    send_pr(&r, &ok).await;
+    let s = r.receipt(&ok.id).await;
+    assert_eq!(s.status, BuildStatus::Pass);
+    assert_eq!(s.base_sha.as_deref(), Some(r.heads[0].as_str()));
+    let v = r
+        .bus
+        .state_get(&format!("verdict.demo.7.{mine}"))
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    assert_eq!(
+        v,
+        format!("{} {} pass {} lab1", r.heads[1], r.heads[0], ok.id)
+    );
+    assert!(
+        r.bus
+            .state_get(&format!("verdict.demo.7.{other}"))
+            .await
+            .unwrap()
+            .is_none(),
+        "no verdict for another platform"
+    );
+    assert!(store::run_get(&r.bus, &foreign.id).await.unwrap().is_none());
+    r.stop().await;
+}
+
+/// hgl-ai#6: a builder whose hub user is a seat's does not run gate builds: they end not
+/// run, saying so, and no verdict passes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_builder_without_a_builder_user_runs_no_gate_build() {
+    let Some(r) = Rig::start_with(Opts {
+        no_verdicts: true,
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let mine = hgl_ai_proto::build::Platform::current().unwrap().as_str();
+    let j = gate_job(&r, "20261127-120000-cccccc", &r.heads[1], mine);
+    send_pr(&r, &j).await;
+    let s = r.receipt(&j.id).await;
+    assert_eq!(s.status, BuildStatus::NotRun);
+    assert!(s.reason.unwrap().contains("builder hub user"));
+    assert!(s.steps.is_empty(), "nothing built");
+    // This hub (one token) takes the not-run value; it never passes.
+    let v = r
+        .bus
+        .state_get(&format!("verdict.demo.7.{mine}"))
+        .await
+        .unwrap()
+        .unwrap()
+        .value;
+    assert!(
+        v.starts_with(&format!("{} - not-run {}", r.heads[1], j.id)),
+        "{v}"
+    );
+    r.stop().await;
 }
 
 /// Finding 1: an id that is not a build id (here a path out of the log directory).

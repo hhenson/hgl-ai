@@ -488,6 +488,7 @@ fn job(id: &str, head: &str) -> (Note, Seat) {
         steps: None,
         recipe_rev: None,
         keep_going: false,
+        verdict: None,
         reply_to: reply.clone(),
         notify: None,
         requester: "w1".into(),
@@ -531,6 +532,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         clone_url: Arc::new(move |_| origin.clone()),
         toolchains: vec!["git".into()],
         heartbeat: Duration::from_millis(300),
+        verdicts: true,
     };
     // A leftover job directory that cannot be removed yet: no job may start before the
     // startup cleanup is done.

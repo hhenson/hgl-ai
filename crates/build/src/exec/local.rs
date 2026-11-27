@@ -261,6 +261,7 @@ impl Executor for Local {
                 tmp: String::new(),
                 job: Some(e.path().display().to_string()),
                 clone: None,
+                base_sha: None,
             };
             self.remove(ws.job.as_deref().unwrap_or_default())?;
         }

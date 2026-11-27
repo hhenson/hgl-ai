@@ -223,6 +223,9 @@ pub struct Summary {
     pub head: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base: Option<String>,
+    /// The commit `base` resolved to when the checkout merged `head` onto it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
     /// The tree had uncommitted changes (a local run).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub dirty: bool,
@@ -284,6 +287,11 @@ pub struct BuildJob {
     pub recipe_rev: Option<u64>,
     #[serde(default)]
     pub keep_going: bool,
+    /// A gate build: write `verdict.<repo>.<issue>.<name>` from its result (docs/build.md
+    /// BUILD-15). Needs a pull request, a `base`, every step, and a builder of the
+    /// platform the name stands for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<String>,
     /// Where the `receipt` goes ([`reply_seat`]).
     pub reply_to: Seat,
     /// A seat that also gets the receipt, so its agent wakes when the build ends.
@@ -416,6 +424,25 @@ impl BuildJob {
         {
             return Err("the job's repo, head, base or issue differ from its note's".into());
         }
+        if let Some(v) = &self.verdict {
+            if self.issue == 0 || self.base.is_none() {
+                return Err(format!(
+                    "verdict {v}: a gate build needs a pull request and a base"
+                ));
+            }
+            if self.steps.is_some() || self.keep_going {
+                return Err(format!(
+                    "verdict {v}: a gate build runs every step, stopping at the first failure"
+                ));
+            }
+            if verdict_platform(v).is_none() {
+                return Err(format!(
+                    "verdict {v}: not a platform's name (linux, macos or mac, windows)"
+                ));
+            }
+            super::check_state_key(&verdict_key(&self.repo, self.issue, v))
+                .map_err(|e| e.to_string())?;
+        }
         if reply_seat(&self.id).ok().as_ref() != Some(&self.reply_to) {
             return Err(format!(
                 "reply_to {} is not the build's own address r-{}",
@@ -430,6 +457,148 @@ impl BuildJob {
             ));
         }
         Ok(())
+    }
+}
+
+/// `HGL_STATE/verdict.<repo>.<pr>.<name>`: a local build verdict the merge gate reads
+/// (docs/protocol.md §8).
+pub fn verdict_key(repo: &str, pr: u64, name: &str) -> String {
+    format!("verdict.{repo}.{pr}.{name}")
+}
+
+/// The platform a verdict name stands for: a platform's name, or `mac` for macOS.
+pub fn verdict_platform(name: &str) -> Option<Platform> {
+    match name {
+        "mac" => Some(Platform::Macos),
+        n => n.parse().ok(),
+    }
+}
+
+/// What a verdict says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VerdictWord {
+    Pass,
+    Fail,
+    /// The build did not judge the code: a missing prerequisite, a head that does not
+    /// merge onto `main`.
+    NotRun,
+    /// A builder is building it.
+    Running,
+}
+
+impl VerdictWord {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VerdictWord::Pass => "pass",
+            VerdictWord::Fail => "fail",
+            VerdictWord::NotRun => "not-run",
+            VerdictWord::Running => "running",
+        }
+    }
+    fn parse(s: &str) -> Option<VerdictWord> {
+        [
+            VerdictWord::Pass,
+            VerdictWord::Fail,
+            VerdictWord::NotRun,
+            VerdictWord::Running,
+        ]
+        .into_iter()
+        .find(|w| w.as_str() == s)
+    }
+    /// The word of a build that ended so.
+    pub fn of(status: BuildStatus) -> VerdictWord {
+        match status {
+            BuildStatus::Pass => VerdictWord::Pass,
+            BuildStatus::Fail => VerdictWord::Fail,
+            BuildStatus::Queued | BuildStatus::Running => VerdictWord::Running,
+            BuildStatus::NotRun | BuildStatus::Stopped => VerdictWord::NotRun,
+        }
+    }
+}
+
+/// A verdict value: `<head> <main> <word> [<build id> <builder> [<reason>]]`. `main` is the
+/// commit the head was merged onto, `-` where the build stopped before it knew one. Only
+/// `pass` and `fail` for this head on this `main` decide the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerdictValue {
+    pub head: String,
+    pub main: String,
+    pub word: VerdictWord,
+    pub id: Option<String>,
+    pub builder: Option<String>,
+    pub reason: Option<String>,
+}
+
+impl VerdictValue {
+    /// The value a build's summary gives, if it is the build of `head` merged onto a base.
+    pub fn of(s: &Summary) -> Option<VerdictValue> {
+        let head = s.head.clone()?;
+        let word = VerdictWord::of(s.status);
+        // A judged build always knows the main it judged.
+        let main = match (&s.base_sha, word) {
+            (Some(m), _) => m.clone(),
+            (None, VerdictWord::NotRun) => "-".into(),
+            (None, _) => return None,
+        };
+        let reason = match word {
+            VerdictWord::NotRun => s.reason.clone(),
+            VerdictWord::Fail => s
+                .steps
+                .iter()
+                .find(|x| x.status == StepStatus::Fail)
+                .map(|x| format!("step {} failed", x.name)),
+            _ => None,
+        };
+        Some(VerdictValue {
+            head,
+            main,
+            word,
+            id: Some(s.id.clone()),
+            builder: Some(s.host.clone()),
+            reason,
+        })
+    }
+
+    pub fn render(&self) -> String {
+        let mut v = format!("{} {} {}", self.head, self.main, self.word.as_str());
+        if let Some(id) = &self.id {
+            v.push_str(&format!(" {id} {}", self.builder.as_deref().unwrap_or("-")));
+            if let Some(r) = &self.reason {
+                // One line, bounded: the value is a state key's.
+                let r: String = r.split_whitespace().collect::<Vec<_>>().join(" ");
+                let r: String = r.chars().take(300).collect();
+                if !r.is_empty() {
+                    v.push_str(&format!(" {r}"));
+                }
+            }
+        }
+        v
+    }
+
+    pub fn parse(value: &str) -> Option<VerdictValue> {
+        let mut w = value.trim().splitn(6, char::is_whitespace);
+        let head = w.next()?.to_string();
+        let main = w.next()?.to_string();
+        let word = VerdictWord::parse(w.next()?)?;
+        let id = w.next().map(String::from);
+        let builder = w.next().map(String::from);
+        let reason = w
+            .next()
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty());
+        Some(VerdictValue {
+            head,
+            main,
+            word,
+            id,
+            builder,
+            reason,
+        })
+    }
+
+    /// For this head merged onto this main.
+    pub fn is_for(&self, head: &str, main: &str) -> bool {
+        self.head == head && self.main == main
     }
 }
 
@@ -514,6 +683,7 @@ mod tests {
             steps: None,
             recipe_rev: None,
             keep_going: false,
+            verdict: None,
             reply_to: reply_seat(&id).unwrap(),
             notify: Some(Seat::new("w1").unwrap()),
             requester: "w1".into(),
@@ -540,8 +710,65 @@ mod tests {
         assert!(bad(&|j| j.notify = Some(Seat::broadcast())).contains("notify"));
         assert!(bad(&|j| j.notify = Some(Seat::new("r-x").unwrap())).contains("notify"));
         assert!(bad(&|j| j.head = "b".repeat(40)).contains("differ"));
+        // A gate build: a pull request, a base, every step, a platform's name.
+        let mut gate = job.clone();
+        gate.issue = 7;
+        gate.verdict = Some("mac".into());
+        n.issue = 7;
+        gate.check(&n).unwrap();
+        let bad_gate = |f: &dyn Fn(&mut BuildJob)| {
+            let mut j = gate.clone();
+            f(&mut j);
+            j.check(&n).unwrap_err()
+        };
+        assert!(bad_gate(&|j| j.verdict = Some("freebsd".into())).contains("platform"));
+        assert!(bad_gate(&|j| j.steps = Some(vec!["test".into()])).contains("every step"));
+        assert!(bad_gate(&|j| j.keep_going = true).contains("every step"));
+        let mut no_pr = gate.clone();
+        no_pr.issue = 0;
+        n.issue = 0;
+        assert!(no_pr.check(&n).unwrap_err().contains("pull request"));
         assert!(is_build_address(&Seat::new("builder-lab1").unwrap()));
         assert!(!may_receive_receipts(&Seat::console()));
+    }
+
+    #[test]
+    fn verdict_values() {
+        let (h, m) = ("h".repeat(40), "m".repeat(40));
+        assert_eq!(
+            verdict_key("hgl-compiler", 1037, "mac"),
+            "verdict.hgl-compiler.1037.mac"
+        );
+        assert_eq!(verdict_platform("mac"), Some(Platform::Macos));
+        assert_eq!(verdict_platform("macos"), Some(Platform::Macos));
+        assert_eq!(verdict_platform("linux"), Some(Platform::Linux));
+        assert_eq!(verdict_platform("arm"), None);
+        // The form the gate has always read.
+        let v = VerdictValue::parse(&format!("{h} {m} pass")).unwrap();
+        assert_eq!(v.word, VerdictWord::Pass);
+        assert!(v.is_for(&h, &m) && !v.is_for(&h, &h));
+        assert_eq!(v.render(), format!("{h} {m} pass"));
+        let v = VerdictValue {
+            head: h.clone(),
+            main: "-".into(),
+            word: VerdictWord::NotRun,
+            id: Some("20261127-083000-3fa9c1".into()),
+            builder: Some("lab1".into()),
+            reason: Some("head does not\nmerge onto main".into()),
+        };
+        let text = v.render();
+        assert_eq!(
+            text,
+            format!("{h} - not-run 20261127-083000-3fa9c1 lab1 head does not merge onto main")
+        );
+        let back = VerdictValue::parse(&text).unwrap();
+        assert_eq!(
+            back.reason.as_deref(),
+            Some("head does not merge onto main")
+        );
+        assert_eq!(back.id.as_deref(), Some("20261127-083000-3fa9c1"));
+        assert!(VerdictValue::parse("junk").is_none());
+        assert!(VerdictValue::parse(&format!("{h} {m} maybe")).is_none());
     }
 
     #[test]
@@ -570,6 +797,7 @@ mod tests {
             repo: "hgl-ai".into(),
             head: None,
             base: None,
+            base_sha: None,
             dirty: false,
             host: "lab1".into(),
             platform: Platform::Linux,

@@ -10,6 +10,7 @@
 //! | [`coord`] | `gh coord run`: the batched pull request table `HGL_STATE/prs`, `hold`, alerts |
 //! | [`backlog`] | `gh coord run`, every 15 min: the claimable queue `HGL_STATE/backlog`, daily `HGL_METRICS` |
 //! | [`gate`] | `gh merge-if-clean`: the merge gate |
+//! | [`builds`] | the gate builds that write the local build verdicts (BUILD-15) |
 //! | [`land`] | `gh land`: the gate in a loop, then `main`, `landed.log`, `landed` notes, pins |
 //! | [`progress`] | `HGL_STATE/landing.<repo>.<pr>`: what a landing has done, so a retry resumes |
 //! | [`pins`] | `gh pins sync`: the wrapper's submodule pins |
@@ -19,6 +20,7 @@
 
 pub mod backlog;
 pub mod bot;
+pub mod builds;
 pub mod coord;
 pub mod exec;
 pub mod gate;

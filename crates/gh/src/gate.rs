@@ -31,6 +31,7 @@ use hgl_ai_proto::{Family, Kind as NoteKind, ReviewReceipt, Verdict};
 use serde_json::Value;
 
 use crate::bot::{BotView, Comment, Review};
+pub use crate::builds::{GateBuilds, VerdictState};
 use crate::exec::{self, Gh};
 use crate::lock::LandLock;
 use crate::progress::{self, Progress};
@@ -198,8 +199,8 @@ pub fn lines_matching(diff: &str, patterns: &[regex::Regex]) -> usize {
         .count()
 }
 
-/// One local build verdict: its name and, for this head on this main, pass or fail.
-pub type VerdictResult = (String, Option<(bool, String)>);
+/// One local build verdict: its name and what it is for this head on this main.
+pub type VerdictResult = (String, VerdictState);
 
 /// A review receipt as the gate saw it: the seat that sent the note, and its body.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -491,8 +492,10 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         let v = need!(f.verdicts, Need::Verdicts);
         let failed: Vec<&str> = v
             .iter()
-            .filter_map(|(n, r)| r.as_ref().filter(|r| !r.0).map(|r| (n, r)))
-            .map(|(_, r)| r.1.as_str())
+            .filter_map(|(_, r)| match r {
+                VerdictState::Fail(d) => Some(d.as_str()),
+                _ => None,
+            })
             .collect();
         if !failed.is_empty() {
             return done(
@@ -501,15 +504,45 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
                 false,
             );
         }
-        let missing: Vec<&str> = v
+        let not_run: Vec<String> = v
             .iter()
-            .filter(|(_, r)| r.is_none())
-            .map(|(n, _)| n.as_str())
+            .filter_map(|(n, r)| match r {
+                VerdictState::NotRun(d) => Some(format!("{n} {d}")),
+                _ => None,
+            })
             .collect();
-        if !missing.is_empty() || v.len() < rules.verdicts.len() {
+        if !not_run.is_empty() {
+            return done(
+                Kind::Blocked,
+                format!("{line} local build not run: {} BLOCKED", not_run.join("; ")),
+                false,
+            );
+        }
+        let pending: Vec<(&str, Option<&str>)> = v
+            .iter()
+            .filter_map(|(n, r)| match r {
+                VerdictState::Building(d) => Some((n.as_str(), Some(d.as_str()))),
+                VerdictState::Missing(d) => Some((n.as_str(), d.as_deref())),
+                _ => None,
+            })
+            .collect();
+        if !pending.is_empty() || v.len() < rules.verdicts.len() {
+            let names: Vec<&str> = pending.iter().map(|p| p.0).collect();
+            let details: Vec<String> = pending
+                .iter()
+                .filter_map(|(n, d)| d.map(|d| format!("{n}: {d}")))
+                .collect();
+            let details = if details.is_empty() {
+                String::new()
+            } else {
+                format!(" [{}]", details.join("; "))
+            };
             return done(
                 Kind::Wait,
-                format!("{line} no-local-build-verdict ({}) WAIT", missing.join(",")),
+                format!(
+                    "{line} no-local-build-verdict ({}){details} WAIT",
+                    names.join(",")
+                ),
                 true,
             );
         }
@@ -780,6 +813,7 @@ async fn fill<G: Gh>(
     f: &mut Facts,
     need: Need,
     issue: u64,
+    builds: Option<&GateBuilds>,
 ) -> Result<()> {
     let r = s.full(repo);
     let n = f.pr.number;
@@ -834,17 +868,9 @@ async fn fill<G: Gh>(
             let main = f.main.clone().unwrap_or_default();
             let mut out = Vec::new();
             for name in &s.gate_rules(repo).verdicts {
-                let value = match bus {
-                    Some(b) => b
-                        .state_get(&state::verdict_key(repo, n, name))
-                        .await?
-                        .map(|e| e.value),
-                    None => None,
-                };
-                out.push((
-                    name.clone(),
-                    state::verdict_for(value.as_deref(), &head, &main),
-                ));
+                let st =
+                    crate::builds::verdict_state(bus, builds, repo, n, name, &head, &main).await?;
+                out.push((name.clone(), st));
             }
             f.verdicts = Some(out);
         }
@@ -913,8 +939,9 @@ async fn fill<G: Gh>(
 }
 
 /// Run the gate on `repo#number` for the head `asked`. With `act`, bring the branch up to
-/// date or merge where the gate says so; without, say what it would do. Under a landing
-/// lock, the lock is confirmed ours right before the merge ([`LandLock::confirm`]).
+/// date or merge where the gate says so, and ask `builds` for the local build verdicts it
+/// lacks; without, say what it would do. Under a landing lock, the lock is confirmed ours
+/// right before the merge ([`LandLock::confirm`]).
 #[allow(clippy::too_many_arguments)]
 pub async fn evaluate<G: Gh>(
     gh: &G,
@@ -926,8 +953,10 @@ pub async fn evaluate<G: Gh>(
     opts: &Opts,
     act: bool,
     lock: Option<&LandLock>,
+    builds: Option<&GateBuilds>,
 ) -> Result<Outcome> {
     hgl_ai_proto::check_head(asked)?;
+    let builds = builds.filter(|_| act);
     let rules = s.gate_rules(repo);
     let mut f = Facts {
         pr: fetch_pr(gh, s, repo, number).await?,
@@ -939,7 +968,7 @@ pub async fn evaluate<G: Gh>(
         .unwrap_or(number);
     loop {
         match decide(&f, repo, asked, &rules, opts) {
-            Step::Need(n) => fill(gh, s, bus, repo, &mut f, n, issue).await?,
+            Step::Need(n) => fill(gh, s, bus, repo, &mut f, n, issue, builds).await?,
             Step::Done(o) => return Ok(o),
             Step::Update(line) if !act => {
                 return Ok(Outcome::new(
@@ -1552,12 +1581,14 @@ mod tests {
     }
 
     fn verdict(name: &str, pass: bool) -> VerdictResult {
+        let v = format!("{HEAD} {MAIN} {}", if pass { "pass" } else { "fail" });
         (
             name.into(),
-            Some((
-                pass,
-                format!("{HEAD} {MAIN} {}", if pass { "pass" } else { "fail" }),
-            )),
+            if pass {
+                VerdictState::Pass(v)
+            } else {
+                VerdictState::Fail(v)
+            },
         )
     }
 
@@ -1573,13 +1604,52 @@ mod tests {
         );
         f.verdicts = Some(vec![
             verdict("linux", true),
-            ("mac".into(), None),
+            ("mac".into(), VerdictState::Missing(None)),
             verdict("windows", true),
         ]);
         let o = outcome(&f, &r, &Opts::default());
         assert_eq!(o.kind, Kind::Wait);
         assert!(
             o.line.contains("no-local-build-verdict (mac)"),
+            "{}",
+            o.line
+        );
+        // Asked for, or being built: wait, saying where.
+        f.verdicts = Some(vec![
+            verdict("linux", true),
+            (
+                "mac".into(),
+                VerdictState::Building("asked 20261127-083000-3fa9c1 of mac1".into()),
+            ),
+            (
+                "windows".into(),
+                VerdictState::Missing(Some("for main 0b0b0b0b".into())),
+            ),
+        ]);
+        let o = outcome(&f, &r, &Opts::default());
+        assert!(o.kind == Kind::Wait && o.retry, "{}", o.line);
+        assert!(
+            o.line.contains(
+                "no-local-build-verdict (mac,windows) [mac: asked 20261127-083000-3fa9c1 of mac1; windows: for main 0b0b0b0b] WAIT"
+            ),
+            "{}",
+            o.line
+        );
+        // A gate build that did not judge the code stops the landing: nothing to wait for.
+        f.verdicts = Some(vec![
+            verdict("linux", true),
+            (
+                "mac".into(),
+                VerdictState::NotRun("20261127-083000-3fa9c1 on mac1: no recipe".into()),
+            ),
+            verdict("windows", true),
+        ]);
+        let o = outcome(&f, &r, &Opts::default());
+        assert!(
+            o.kind == Kind::Blocked
+                && !o.retry
+                && o.line
+                    .contains("local build not run: mac 20261127-083000-3fa9c1 on mac1: no recipe"),
             "{}",
             o.line
         );
@@ -1736,18 +1806,40 @@ mod tests {
         let s = without_receipts(settings(), &[REPO]);
         // A dry run on a read-only runner: the decision, and no write.
         let gh = crate::exec::ReadOnly(fake().on("pulls/7", &fixture("pr-open.json")));
-        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), false, None)
-            .await
-            .unwrap();
+        let o = evaluate(
+            &gh,
+            &s,
+            None,
+            REPO,
+            7,
+            HEAD,
+            &Opts::default(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(o.kind, Kind::WouldMerge, "{}", o.line);
         assert!(gh.0.calls().iter().all(|c| !c.contains("-X PUT")));
         // Acting: merged at the head, and the merge commit read back.
         let gh = fake()
             .once("pulls/7", &fixture("pr-open.json"))
             .on("pulls/7", &fixture("pr-merged.json"));
-        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true, None)
-            .await
-            .unwrap();
+        let o = evaluate(
+            &gh,
+            &s,
+            None,
+            REPO,
+            7,
+            HEAD,
+            &Opts::default(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(o.kind, Kind::Merged, "{}", o.line);
         assert_eq!(
             o.merge_commit.as_deref(),
@@ -1767,10 +1859,21 @@ mod tests {
         // A merged pull request is reported as such; a short head is refused before any call.
         let gh = fake().on("pulls/7", &fixture("pr-merged.json"));
         assert_eq!(
-            evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true, None)
-                .await
-                .unwrap()
-                .kind,
+            evaluate(
+                &gh,
+                &s,
+                None,
+                REPO,
+                7,
+                HEAD,
+                &Opts::default(),
+                true,
+                None,
+                None
+            )
+            .await
+            .unwrap()
+            .kind,
             Kind::AlreadyMerged
         );
         assert!(
@@ -1783,6 +1886,7 @@ mod tests {
                 "1f461fa7",
                 &Opts::default(),
                 true,
+                None,
                 None
             )
             .await
@@ -1810,9 +1914,20 @@ mod tests {
                 "graphql",
                 &fixture("threads-page2.json").replace("false", "true"),
             );
-        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true, None)
-            .await
-            .unwrap();
+        let o = evaluate(
+            &gh,
+            &s,
+            None,
+            REPO,
+            7,
+            HEAD,
+            &Opts::default(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(o.kind, Kind::Updated, "{}", o.line);
         assert!(o.retry);
         let up = gh

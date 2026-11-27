@@ -134,7 +134,7 @@ controller = "controller"              # default; the seat that gets the bridge'
 
 [github.gate.hgl-compiler]             # per repository; every key optional
 review_receipt = true                  # default: a clean receipt from another family (ROLE-11)
-verdicts = ["linux", "mac", "windows"] # local build verdicts the merge needs
+verdicts = ["linux", "mac", "windows"] # local build verdicts the merge needs (a platform; `mac` is macOS)
 
 [models.claude]
 frontier = "claude-opus-5-5"
@@ -163,6 +163,7 @@ fallback = [{ runtime = "agy", family = "claude", tier = "frontier" }]
 concurrency = 1                        # builds at a time on this host
 sdk = { hgraph = "~/sdk/hgraph" }      # needs = ["sdk:hgraph"]; steps see HGL_SDK_HGRAPH
 local = true                           # false: only drive the remotes
+credential = "~/.config/hgl-ai/hub-users/lab1-builder.cred"  # a `builder` hub user: writes verdicts
 
 [[builder.remote]]                     # a proxy builder's remote (docs/build.md §2a)
 platform = "windows"

@@ -31,15 +31,42 @@ enum Cmd {
 
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     let cfg = ctx.load_config()?;
-    let bus = Bus::connect(&cfg).await?;
+    // The builder's own hub user, where it has one: it alone writes the verdicts.
+    let builder_cred =
+        match (&args.cmd, &cfg.builder.credential) {
+            (Cmd::Run, Some(p)) => {
+                let path = hgl_ai_config::expand(p)?;
+                Some(hgl_ai_bus::read_credential(&path)?.ok_or_else(|| {
+                    anyhow::anyhow!("[builder] credential {}: empty", path.display())
+                })?)
+            }
+            _ => None,
+        };
+    let bus = match &builder_cred {
+        Some(c) => Bus::connect_with(&cfg.hub.url, Some(c.clone())).await?,
+        None => Bus::connect(&cfg).await?,
+    };
     match args.cmd {
         Cmd::Run => {
+            // A `builder` hub user writes verdicts; so does any client of a hub with one
+            // shared token. A seat's user does not (docs/build.md BUILD-15).
+            let may = |c: &hgl_ai_bus::Credential| c.is_token() || c.role() == Some("builder");
+            let verdicts = match &builder_cred {
+                Some(c) => may(c),
+                None => hgl_ai_bus::read_credential(&cfg.token_file()?)?.is_some_and(|c| may(&c)),
+            };
+            if !verdicts {
+                tracing::warn!(
+                    "no builder hub user ([builder] credential): gate builds are reported not run"
+                );
+            }
             let lanes = service::lanes(&cfg, service::ssh_program())?;
             let github = cfg.github.clone();
             let settings = Settings {
                 clone_url: Arc::new(move |r: &str| github.clone_url_for(r)),
                 toolchains: cfg.builder.toolchains.clone(),
                 heartbeat: service::HEARTBEAT,
+                verdicts,
             };
             let (tx, rx) = watch::channel(false);
             tokio::spawn(async move {

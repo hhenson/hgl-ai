@@ -7,6 +7,7 @@ pub mod exec;
 pub mod lock;
 pub mod parse;
 pub mod recipe;
+pub mod request;
 pub mod service;
 pub mod store;
 pub mod summary;

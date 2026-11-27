@@ -1,7 +1,8 @@
 # Builds
 
-Status: proposed. §1, §2 and §2a are implemented (`crates/build`); §3, the merge queue,
-is not: today the controller lands with `hgl-ai gh land` (`docs/protocol.md` §8). The
+Status: proposed. §1, §2, §2a and BUILD-15 are implemented (`crates/build`, `crates/gh`);
+§3, the merge queue, is not: today the controller lands with `hgl-ai gh land`
+(`docs/protocol.md` §8). The
 current rules are in `docs/protocol.md`, `docs/roles.md` and `docs/design.md`.
 
 Building and testing is deterministic work: a tool runs it, an agent only writes and
@@ -113,6 +114,24 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   repository, step and platform. The hub keeps the first 20 errors and failures of each
   run, rewritten as steps finish, and the newest 1000 runs; `hgl-ai build list [--repo R]
   [--failed]`.
+
+- **BUILD-15 — Gate builds.** Where `[github.gate.<repo>] verdicts` names local build
+  verdicts, `gh land` and `gh merge-if-clean` ask for each one that has no `pass` or
+  `fail` for the pull request's head on the current `main`: a `build` job with `verdict =
+  "<name>"`, `issue` the pull request and `base` the `main` commit the gate read, to a
+  ready builder of the platform the name stands for (`linux`, `macos` or `mac`,
+  `windows`). Each pair of head and `main` is asked once per command; the gate waits
+  while it builds, is blocked by a `fail` or a `not-run`, and asks again when `main` has
+  moved (a verdict for another `main` never passes). Dry runs only read.
+  - The builder refuses a verdict for another platform, a job without a pull request or
+    `base`, or one limited to some steps. It merges the head onto `base` and runs every
+    step, recording the commit it merged onto (`base_sha` in the summary).
+  - It writes `HGL_STATE/verdict.<repo>.<pr>.<name>` (`docs/protocol.md` §8): `running`
+    once checked out, then `pass`, `fail` (the failing step) or `not-run` (why), with the
+    build id and its label, before the final `run.<id>`.
+  - Only a `builder` hub user writes verdicts; seats are refused (hgl-ai#16). `builder
+    run` connects with `[builder] credential`, which must be readable only by the OS user
+    that runs it, not by the agents'. A builder without one reports gate builds not run.
 
 ## 2a. Proxy builders
 

@@ -532,6 +532,11 @@ pub fn user_add(
                     "copy {shown} to host {name}, then there: hgl-ai client install --hub <hub url> --token-file <copied file> --host {name}"
                 ));
             }
+            if role == Role::Builder {
+                sys.say(&format!(
+                    "copy {shown} to the builder's host, readable only by the OS user that runs `hgl-ai builder run`; there set [builder] credential = <copied file>"
+                ));
+            }
             Some(cred)
         }
     };

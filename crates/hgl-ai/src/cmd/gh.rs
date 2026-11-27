@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use hgl_ai_bus::Bus;
 use hgl_ai_gh::exec::{GhCli, ReadOnly};
+use hgl_ai_gh::gate::GateBuilds;
 use hgl_ai_gh::gate::{Kind, Opts};
 use hgl_ai_gh::land::{LandOpts, Landing};
 use hgl_ai_gh::{Settings, coord, land, pins, release, tap, verdict};
@@ -285,6 +286,19 @@ async fn dry_run_bus(cfg: &hgl_ai_config::Config) -> Option<Bus> {
     }
 }
 
+/// The gate builds a landing asks for (BUILD-15), sent as this seat (the controller), else
+/// this host.
+fn gate_builds(cfg: &hgl_ai_config::Config) -> anyhow::Result<std::sync::Arc<GateBuilds>> {
+    let me = std::env::var("HGL_AI_SEAT")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| cfg.host.clone());
+    Ok(std::sync::Arc::new(GateBuilds::new(
+        hgl_ai_proto::Seat::new(me.clone())?,
+        me,
+    )))
+}
+
 /// A bus error stays a bus error, so an unreachable hub exits 10.
 fn lift(e: hgl_ai_gh::Error) -> anyhow::Error {
     match e {
@@ -357,7 +371,8 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
             Ok(EXIT_OK)
         }
         Cmd::MergeIfClean(a) => {
-            let o = a.opts();
+            let mut o = a.opts();
+            o.builds = Some(gate_builds(&cfg)?);
             let l = if a.dry_run {
                 let bus = dry_run_bus(&cfg).await;
                 land::plan(&ReadOnly(gh), &s, bus.as_ref(), &a.repo, a.pr, &a.head, &o).await
@@ -375,6 +390,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
             o.trailer = a.trailer.clone();
             o.footer = a.footer.clone();
             o.lock_wait = a.gate.lock_wait.unwrap_or(LandOpts::default().lock_wait);
+            o.builds = Some(gate_builds(&cfg)?);
             let g = &a.gate;
             let l = if g.dry_run {
                 let bus = dry_run_bus(&cfg).await;

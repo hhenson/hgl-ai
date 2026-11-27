@@ -24,6 +24,8 @@ pub struct Meta {
     pub repo: String,
     pub head: Option<String>,
     pub base: Option<String>,
+    /// The commit `base` resolved to (a job's checkout).
+    pub base_sha: Option<String>,
     pub dirty: bool,
     /// Label of the builder or host that runs it.
     pub host: String,
@@ -51,6 +53,7 @@ pub fn start(meta: &Meta, exec: &dyn Executor, log_dir: &Path, status: BuildStat
         repo: meta.repo.clone(),
         head: meta.head.clone(),
         base: meta.base.clone(),
+        base_sha: meta.base_sha.clone(),
         dirty: meta.dirty,
         host: meta.host.clone(),
         platform: exec.platform(),

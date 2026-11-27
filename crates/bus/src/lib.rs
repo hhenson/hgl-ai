@@ -871,10 +871,13 @@ impl Bus {
     pub async fn state_del(&self, key: &str) -> Result<()> {
         check_state_key(key)?;
         let store = self.store(&self.state, KV_STATE).await?;
-        store
-            .purge(key)
-            .await
-            .map_err(|e| nats(&format!("deleting state {key}"), e))
+        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+            store
+                .purge(key)
+                .await
+                .map_err(|e| nats(&format!("deleting state {key}"), e))
+        })
+        .await
     }
 
     /// Write `HGL_HOSTS/<host>`; it expires [`HOSTS_TTL`] after the last write.

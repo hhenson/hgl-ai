@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use hgl_ai_bus::{Bus, BusError};
-use hgl_ai_proto::build::{Summary, recipe_key, run_key};
+use hgl_ai_proto::build::{
+    BuildJob, Summary, VerdictValue, VerdictWord, recipe_key, run_key, verdict_key,
+};
 use hgl_ai_proto::{Kind, Note, Seat};
 
 use crate::recipe::{Recipe, RecipeError};
@@ -97,6 +99,38 @@ pub async fn run_put(bus: &Bus, s: &Summary) -> Result<(), StoreError> {
     if s.status.is_final() {
         trim(bus, RUN_RETENTION).await?;
     }
+    Ok(())
+}
+
+/// Write a gate build's verdict (BUILD-15): `HGL_STATE/verdict.<repo>.<pr>.<name>` from
+/// its summary, or `running` while it builds. Nothing for a job that is no gate build, or
+/// a summary that has no value (a judged build that does not know its main).
+pub async fn verdict_put(
+    bus: &Bus,
+    job: &BuildJob,
+    s: &Summary,
+    running: bool,
+) -> Result<(), StoreError> {
+    let Some(name) = &job.verdict else {
+        return Ok(());
+    };
+    let value = if running {
+        s.base_sha.as_ref().map(|m| VerdictValue {
+            head: job.head.clone(),
+            main: m.clone(),
+            word: VerdictWord::Running,
+            id: Some(s.id.clone()),
+            builder: Some(s.host.clone()),
+            reason: None,
+        })
+    } else {
+        VerdictValue::of(s)
+    };
+    let Some(v) = value else {
+        return Ok(());
+    };
+    bus.state_put(&verdict_key(&job.repo, job.issue, name), &v.render())
+        .await?;
     Ok(())
 }
 

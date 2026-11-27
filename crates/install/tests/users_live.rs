@@ -45,6 +45,7 @@ impl Hub {
         for (name, role) in [
             ("build-1", Role::Seat),
             ("hub-coord", Role::Coord),
+            ("lab1-builder", Role::Builder),
             ("console", Role::Console),
             ("hub-admin", Role::Admin),
         ] {
@@ -481,4 +482,46 @@ async fn seats_keep_build_runs_but_not_recipes() {
     // admin imports them.
     assert!("build".parse::<Role>().is_err(), "no `build` hub role");
     admin.build_del("recipe.demo").await.unwrap();
+}
+
+/// hgl-ai#6: only a builder's hub user writes the local build verdicts the merge gate
+/// reads; a seat's and the coordinator's are refused, and a builder keeps a seat's limits
+/// otherwise.
+#[tokio::test]
+async fn only_builders_write_verdicts() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let h = "a".repeat(40);
+    let key = "verdict.hgl-compiler.7.linux";
+    let builder = hub.bus("lab1-builder").await;
+    builder
+        .state_put(key, &format!("{h} {h} pass 20261127-120000-aaaaaa lab1"))
+        .await
+        .unwrap();
+    for who in ["build-1", "hub-coord"] {
+        let b = hub.bus(who).await;
+        denied(b.state_put(key, &format!("{h} {h} pass forged")).await);
+        denied(b.state_del(key).await);
+        denied(b.state_put("verdict.hgl-compiler.8.mac", "x").await);
+        // The rest of `HGL_STATE` stays a seat's.
+        b.state_put("mode", "normal").await.unwrap();
+        assert!(
+            b.state_get(key).await.unwrap().is_some(),
+            "{who} reads verdicts"
+        );
+    }
+    assert!(
+        admin
+            .state_get(key)
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .ends_with("lab1")
+    );
+    // A builder sends notes (its receipts) but writes no recipe.
+    let n = Note::new(seat("builder-lab1"), seat("controller"), Kind::Note, "x");
+    builder.send(&n).await.unwrap();
+    denied(builder.build_put("recipe.demo", b"repo = \"evil\"").await);
 }

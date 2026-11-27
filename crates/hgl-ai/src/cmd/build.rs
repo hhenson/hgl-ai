@@ -14,11 +14,11 @@ use hgl_ai_build::recipe::{Recipe, sdk_var};
 use hgl_ai_build::{store, summary};
 use hgl_ai_bus::Bus;
 use hgl_ai_config::Config;
+use hgl_ai_proto::Seat;
 use hgl_ai_proto::build::{
-    BUILD_VERSION, BuildJob, BuildStatus, BuilderRecord, Platform, Summary, Tests, check_build_id,
-    new_build_id, reply_seat,
+    BUILD_VERSION, BuildJob, BuildStatus, Platform, Summary, check_build_id, new_build_id,
+    reply_seat,
 };
-use hgl_ai_proto::{Kind, Note, Seat, utc_now_stamp};
 use hgl_ai_tree::Git;
 
 use super::note::{duration, read_bounded};
@@ -454,6 +454,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         tmp: std::env::temp_dir().display().to_string(),
         job: None,
         clone: None,
+        base_sha: None,
     };
     let work_root = cfg
         .as_ref()
@@ -471,6 +472,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         repo: repo.clone(),
         head,
         base: None,
+        base_sha: None,
         dirty,
         host: host_label(cfg.as_ref()),
         proxy: None,
@@ -530,32 +532,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
     Ok(s.status.exit_code())
 }
 
-/// The builder of `platform` to send to: `label` if given, else a ready one (the least
-/// busy), else a reachable one, else any active one (the job waits for it).
-pub fn choose(
-    builders: &[BuilderRecord],
-    platform: Platform,
-    label: Option<&str>,
-) -> Option<BuilderRecord> {
-    let mut c: Vec<&BuilderRecord> = builders
-        .iter()
-        .filter(|b| b.platform == platform && b.state != "retired")
-        .filter(|b| label.is_none_or(|l| b.label == l))
-        .collect();
-    if label.is_some() {
-        return c.first().map(|b| (*b).clone());
-    }
-    c.retain(|b| b.state == "active");
-    c.sort_by_key(|b| {
-        (
-            !b.ready(),
-            !b.reachable,
-            b.busy * 1000 / b.slots.max(1),
-            b.label.clone(),
-        )
-    });
-    c.first().map(|b| (*b).clone())
-}
+pub use hgl_ai_build::request::choose;
 
 async fn run_remote(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
     let platform = a.platform.expect("checked");
@@ -616,48 +593,12 @@ async fn run_remote(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         steps: a.steps.clone(),
         recipe_rev: None,
         keep_going: a.keep_going,
+        verdict: None,
         reply_to: reply.clone(),
         notify: a.notify.clone(),
         requester: requester(Some(&cfg)),
     };
-    let queued = Summary {
-        v: BUILD_VERSION,
-        id: id.clone(),
-        repo: repo.clone(),
-        head: Some(head.clone()),
-        base: a.base.clone(),
-        dirty: false,
-        host: b.label.clone(),
-        platform,
-        executor: b.executor.clone(),
-        proxy: b.proxy.clone(),
-        requester: Some(job.requester.clone()),
-        status: BuildStatus::Queued,
-        reason: None,
-        recipe_rev: None,
-        started_at: utc_now_stamp(),
-        ended_at: None,
-        wall_ms: 0,
-        log_dir: String::new(),
-        steps: Vec::new(),
-        errors: Vec::new(),
-        errors_total: 0,
-        tests: Tests::default(),
-        warnings_total: 0,
-        warnings: Default::default(),
-    };
-    store::run_put(&bus, &queued).await?;
-    let mut n = Note::new(
-        sender(&cfg)?,
-        b.inbox.clone(),
-        Kind::Build,
-        serde_json::to_string(&job)?,
-    );
-    n.repo = Some(repo);
-    n.head = Some(head);
-    n.base = a.base.clone();
-    n.issue = issue;
-    bus.send(&n).await?;
+    hgl_ai_build::request::send(&bus, sender(&cfg)?, &b, &job).await?;
     if a.detach {
         if ctx.json {
             println!("{}", serde_json::json!({ "id": id, "builder": b.label }));
@@ -1154,6 +1095,8 @@ fn tempfile_dir(cfg: &Config) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use hgl_ai_proto::build::BuilderRecord;
 
     fn rec(label: &str, platform: Platform, reachable: bool, busy: u32) -> BuilderRecord {
         BuilderRecord {

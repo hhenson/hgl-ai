@@ -895,3 +895,201 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
     assert_eq!(posts(&gh, "issues/7/comments"), 1);
     assert_eq!(posts(&gh, "pulls/7/merge"), 1);
 }
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let o = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// A commit on branch `branch` of the seed from `from`, writing `file`, pushed.
+fn commit_on(seed: &std::path::Path, branch: &str, from: &str, file: &str, text: &str) -> String {
+    git(seed, &["checkout", "--quiet", "-B", branch, from]);
+    std::fs::write(seed.join(file), text).unwrap();
+    git(seed, &["add", file]);
+    git(
+        seed,
+        &["commit", "--quiet", "-m", &format!("{branch} {file}")],
+    );
+    git(seed, &["push", "--quiet", "--force", "origin", branch]);
+    git(seed, &["rev-parse", "HEAD"])
+}
+
+/// Ask until the verdict is judged (pass, fail) or the gate build did not run.
+async fn judged(
+    b: &Bus,
+    builds: &crate::builds::GateBuilds,
+    name: &str,
+    head: &str,
+    main: &str,
+) -> crate::builds::VerdictState {
+    use crate::builds::{VerdictState, verdict_state};
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let st = verdict_state(Some(b), Some(builds), "demo", 7, name, head, main)
+            .await
+            .unwrap();
+        match st {
+            VerdictState::Building(_) => {}
+            VerdictState::Missing(ref why) => panic!("nothing asked: {why:?}"),
+            other => return other,
+        }
+        assert!(Instant::now() < deadline, "no verdict for {name}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// hgl-ai#6: the gate asks a builder for the local build verdict of the head merged onto
+/// the `main` it saw; the builder writes `<head> <main> pass|fail ...`; a verdict for a
+/// `main` that has moved does not pass the gate and is asked again; a build that fails or
+/// does not merge says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_builds_write_verdicts_and_a_moved_main_is_built_again() {
+    use crate::builds::{GateBuilds, VerdictState, verdict_state};
+    use hgl_ai_build::service::{self, Settings};
+    use std::sync::Arc;
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().to_path_buf();
+    let bare = root.join("origin.git");
+    std::fs::create_dir_all(&bare).unwrap();
+    git(&bare, &["init", "--quiet", "--bare", "-b", "main"]);
+    git(&root, &["clone", "--quiet", bare.to_str().unwrap(), "seed"]);
+    let seed = root.join("seed");
+    git(&seed, &["checkout", "--quiet", "-b", "main"]);
+    std::fs::write(seed.join("f.txt"), "one\n").unwrap();
+    git(&seed, &["add", "f.txt"]);
+    git(&seed, &["commit", "--quiet", "-m", "c0"]);
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    let m1 = git(&seed, &["rev-parse", "HEAD"]);
+    let head = commit_on(&seed, "feature", &m1, "g.txt", "g\n");
+    let recipe = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"test -f g.txt -o -f bad.txt && test ! -f bad.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
+    hgl_ai_build::store::recipe_put(&b, recipe, None)
+        .await
+        .unwrap();
+    // A local builder of this host's platform.
+    let platform = hgl_ai_proto::build::Platform::current().unwrap();
+    let name = platform.as_str();
+    let mut cfg = hgl_ai_config::Config::new("lab1");
+    cfg.paths.work_root = root.join("work").display().to_string();
+    cfg.paths.data_dir = root.join("data").display().to_string();
+    let lanes = service::lanes(&cfg, std::path::PathBuf::from("ssh")).unwrap();
+    let origin = bare.display().to_string();
+    let settings = Settings {
+        clone_url: Arc::new(move |_| origin.clone()),
+        toolchains: vec!["git".into()],
+        heartbeat: Duration::from_millis(300),
+        verdicts: true,
+    };
+    let svc_bus = Arc::new(Bus::connect_url(&h.url, None).await.unwrap());
+    let (stop, rx) = tokio::sync::watch::channel(false);
+    let svc = tokio::spawn(service::serve(svc_bus, lanes, settings, rx));
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while b.builders().await.unwrap().is_empty() {
+        assert!(Instant::now() < deadline, "the builder did not register");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    let key = state::verdict_key("demo", 7, name);
+    // Nothing there and nothing asked (a dry run): missing.
+    assert_eq!(
+        verdict_state(Some(&b), None, "demo", 7, name, &head, &m1)
+            .await
+            .unwrap(),
+        VerdictState::Missing(None)
+    );
+    let builds = GateBuilds::new(Seat::new("controller").unwrap(), "controller");
+    let first = judged(&b, &builds, name, &head, &m1).await;
+    let VerdictState::Pass(v) = &first else {
+        panic!("{first:?}")
+    };
+    assert!(v.starts_with(&format!("{head} {m1} pass ")), "{v}");
+    assert!(v.ends_with(" lab1"), "{v}");
+    let value = b.state_get(&key).await.unwrap().unwrap().value;
+    let id = hgl_ai_proto::build::VerdictValue::parse(&value)
+        .unwrap()
+        .id
+        .unwrap();
+    let run = hgl_ai_build::store::run_get(&b, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        run.base_sha.as_deref(),
+        Some(m1.as_str()),
+        "it built onto m1"
+    );
+    // Asked once: judged now, it is not asked again.
+    assert_eq!(
+        verdict_state(Some(&b), Some(&builds), "demo", 7, name, &head, &m1)
+            .await
+            .unwrap(),
+        first
+    );
+    // `main` moves: the verdict for m1 no longer passes, and is asked again for m2.
+    git(&seed, &["checkout", "--quiet", "main"]);
+    std::fs::write(seed.join("h.txt"), "h\n").unwrap();
+    git(&seed, &["add", "h.txt"]);
+    git(&seed, &["commit", "--quiet", "-m", "c1"]);
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    let m2 = git(&seed, &["rev-parse", "HEAD"]);
+    assert_eq!(state::verdict_for(Some(&value), &head, &m2), None);
+    match verdict_state(Some(&b), None, "demo", 7, name, &head, &m2)
+        .await
+        .unwrap()
+    {
+        VerdictState::Missing(Some(w)) => assert!(w.contains(&m1[..8]), "{w}"),
+        other => panic!("a stale verdict counted: {other:?}"),
+    }
+    match verdict_state(Some(&b), Some(&builds), "demo", 7, name, &head, &m2)
+        .await
+        .unwrap()
+    {
+        VerdictState::Building(w) => assert!(w.starts_with("asked "), "{w}"),
+        other => panic!("not asked again: {other:?}"),
+    }
+    let second = judged(&b, &builds, name, &head, &m2).await;
+    let VerdictState::Pass(v2) = &second else {
+        panic!("{second:?}")
+    };
+    assert!(v2.starts_with(&format!("{head} {m2} pass ")), "{v2}");
+    let now = b.state_get(&key).await.unwrap().unwrap().value;
+    assert_eq!(state::verdict_for(Some(&now), &head, &m1), None);
+    assert_eq!(
+        state::verdict_for(Some(&now), &head, &m2).map(|v| v.0),
+        Some(true)
+    );
+    // A head whose build fails: fail, naming the step.
+    let bad = commit_on(&seed, "feature", &m1, "bad.txt", "x\n");
+    match judged(&b, &builds, name, &bad, &m2).await {
+        VerdictState::Fail(v) => {
+            assert!(v.starts_with(&format!("{bad} {m2} fail ")), "{v}");
+            assert!(v.ends_with("step check failed"), "{v}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // A head that does not merge onto main: not run, and the gate is told why.
+    let clash = commit_on(&seed, "feature", &m1, "h.txt", "clash\n");
+    match judged(&b, &builds, name, &clash, &m2).await {
+        VerdictState::NotRun(why) => assert!(why.contains("does not merge"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    let _ = stop.send(true);
+    tokio::time::timeout(Duration::from_secs(60), svc)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}

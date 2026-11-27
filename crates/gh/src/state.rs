@@ -41,21 +41,21 @@ pub fn render_main(
 
 /// State key of one local build verdict: `verdict.<repo>.<pr>.<name>`.
 pub fn verdict_key(repo: &str, pr: u64, name: &str) -> String {
-    format!("verdict.{repo}.{pr}.{name}")
+    hgl_ai_proto::build::verdict_key(repo, pr, name)
 }
 
 /// A verdict value `<head> <main> pass|fail [detail]` for this head on this main:
-/// `Some(true)` pass, `Some(false)` fail, `None` absent or for another pair.
+/// `Some(true)` pass, `Some(false)` fail, `None` absent, for another pair, or not a
+/// judgement (`running`, `not-run`).
 pub fn verdict_for(value: Option<&str>, head: &str, main: &str) -> Option<(bool, String)> {
-    let v = value?.trim();
-    let mut w = v.split_whitespace();
-    let (h, m, r) = (w.next()?, w.next()?, w.next()?);
-    if h != head || m != main {
+    use hgl_ai_proto::build::{VerdictValue, VerdictWord};
+    let v = VerdictValue::parse(value?)?;
+    if !v.is_for(head, main) {
         return None;
     }
-    match r {
-        "pass" => Some((true, v.to_string())),
-        "fail" => Some((false, v.to_string())),
+    match v.word {
+        VerdictWord::Pass => Some((true, value?.trim().to_string())),
+        VerdictWord::Fail => Some((false, value?.trim().to_string())),
         _ => None,
     }
 }

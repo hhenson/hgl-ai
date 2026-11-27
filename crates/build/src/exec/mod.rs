@@ -103,6 +103,8 @@ pub struct Workspace {
     pub job: Option<String>,
     /// The clone the checkout is a worktree of.
     pub clone: Option<String>,
+    /// The commit the checkout merged `head` onto, where it had a base.
+    pub base_sha: Option<String>,
 }
 
 /// Why a checkout did not happen.
@@ -342,6 +344,7 @@ pub(crate) fn checkout(h: &dyn HostOps, root: &str, c: &Checkout) -> Result<Work
         tmp: format!("{job}/tmp"),
         job: Some(job.clone()),
         clone: Some(clone.clone()),
+        base_sha: c.base.as_ref().map(|_| start.clone()),
     };
     let add = h.git(
         &clone,
