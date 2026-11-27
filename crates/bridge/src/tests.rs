@@ -419,13 +419,7 @@ async fn a_sendback_to_another_seat_moves_the_task_there_at_its_class() {
 
     // hgl-ai#44: a sendback moves the task back to w1, into its older tree, kept: that
     // tree now holds the newest handoff, so verdicts without `--to` reach w1 again.
-    // After the startup report, whose listing would otherwise race the turn's record.
-    let reports = h.bus.sent_containing("work_root uses").len();
     let (tx, j) = h.start(&["w1"]);
-    eventually("startup report", || {
-        h.bus.sent_containing("work_root uses").len() > reports
-    })
-    .await;
     let back = h.bus.push(
         "w1",
         note(
@@ -444,6 +438,60 @@ async fn a_sendback_to_another_seat_moves_the_task_there_at_its_class() {
         "the kept tree keeps its seq and takes the newer handoff"
     );
     assert!(w1.handoff_seq > trees["build-1.w2.demo-41"].handoff_seq);
+    stop(tx, j).await;
+}
+
+/// hgl-ai#51: the report lists the trees, then a handoff turn registers a fresher record
+/// before the report writes its listing. The report keeps the turn's `handoff_seq`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_listed_before_a_handoff_turn_keeps_the_turns_record() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+    let key = "build-1.w1.demo-41";
+    assert_eq!(h.bus.trees()[key].handoff_seq, Some(a));
+
+    // The startup report has listed the tree (handoff `a`) and waits to write it.
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its listing", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let back = h.bus.push(
+        "w1",
+        note(
+            Kind::Sendback,
+            "w1",
+            41,
+            "[claude] Sent back: demo#41 at 1f461fa7",
+        ),
+    );
+    eventually("sendback acked", || h.bus.events(back) == [Ev::Ack]).await;
+    assert_eq!(
+        h.bus.trees()[key].handoff_seq,
+        Some(back),
+        "the turn's record"
+    );
+
+    h.bus.release_tree_merges();
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    let rec = &h.bus.trees()[key];
+    assert_eq!(
+        (rec.seq, rec.handoff_seq),
+        (Some(a), Some(back)),
+        "the report did not take the handoff back"
+    );
     stop(tx, j).await;
 }
 

@@ -38,6 +38,10 @@ struct Inner {
     hosts: Mutex<Vec<HostRecord>>,
     deleted_hosts: Mutex<Vec<String>>,
     trees: Mutex<BTreeMap<String, TreeRecord>>,
+    /// While set, each `tree_merge` waits for a permit ([`FakeBus::hold_tree_merges`]).
+    merge_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// `tree_merge` calls waiting at the gate.
+    merges_held: AtomicU64,
     events: Mutex<Vec<(u64, Ev)>>,
     seq: AtomicU64,
     /// name -> (holder, revision)
@@ -135,6 +139,22 @@ impl FakeBus {
         g(&self.0.trees).clone()
     }
 
+    /// Hold every `tree_merge` before it reads the record, until [`FakeBus::release_tree_merges`].
+    pub fn hold_tree_merges(&self) {
+        *g(&self.0.merge_gate) = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    }
+
+    pub fn release_tree_merges(&self) {
+        if let Some(s) = g(&self.0.merge_gate).take() {
+            s.close();
+        }
+    }
+
+    /// `tree_merge` calls waiting at the gate now.
+    pub fn tree_merges_held(&self) -> u64 {
+        self.0.merges_held.load(Ordering::SeqCst)
+    }
+
     pub fn last_host(&self) -> Option<HostRecord> {
         g(&self.0.hosts).last().cloned()
     }
@@ -194,6 +214,21 @@ impl Registry for FakeBus {
     async fn tree_put(&self, rec: &TreeRecord) -> Result<()> {
         g(&self.0.trees).insert(rec.key(), rec.clone());
         Ok(())
+    }
+    async fn tree_merge(&self, rec: &TreeRecord) -> Result<TreeRecord> {
+        let gate = g(&self.0.merge_gate).clone();
+        if let Some(s) = gate {
+            self.0.merges_held.fetch_add(1, Ordering::SeqCst);
+            let _ = s.acquire().await;
+            self.0.merges_held.fetch_sub(1, Ordering::SeqCst);
+        }
+        let mut trees = g(&self.0.trees);
+        let mut merged = rec.clone();
+        if let Some(held) = trees.get(&rec.key()) {
+            merged.merge_held(held);
+        }
+        trees.insert(rec.key(), merged.clone());
+        Ok(merged)
     }
     async fn tree_del(&self, key: &str) -> Result<()> {
         g(&self.0.trees).remove(key);

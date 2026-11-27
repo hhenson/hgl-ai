@@ -584,6 +584,26 @@ impl TreeRecord {
     pub fn key(&self) -> String {
         tree_key(&self.host, &self.seat, &self.task, self.review)
     }
+
+    /// Fold in `held`, the record already registered under this key, keeping what is
+    /// fresher there: `families` only grow, and `handoff_seq` and `class` (by `class_seq`)
+    /// never go back (hgl-ai#51). A record of another tree made at this path (another
+    /// `created_at` or `seq`) is not merged: this one replaces it.
+    pub fn merge_held(&mut self, held: &TreeRecord) {
+        if (&held.created_at, held.seq) != (&self.created_at, self.seq) {
+            return;
+        }
+        for f in &held.families {
+            if !self.families.contains(f) {
+                self.families.push(*f);
+            }
+        }
+        self.handoff_seq = self.handoff_seq.max(held.handoff_seq);
+        if held.class_seq > self.class_seq {
+            self.class = held.class;
+            self.class_seq = held.class_seq;
+        }
+    }
 }
 
 pub fn tree_key(host: &str, seat: &Seat, task: &TaskKey, review: bool) -> String {
@@ -885,5 +905,53 @@ mod tests {
         assert_eq!(land_lock_key("hgl-compiler"), "lock.land.hgl-compiler");
         assert_eq!(seat_lock_key(&seat("w1")), "seat.w1");
         assert_eq!(ended_key(&seat("w1"), &t), "w1.hgl-compiler-992");
+    }
+
+    /// hgl-ai#51: a stale listing merged with the fresher registered record loses nothing.
+    #[test]
+    fn a_stale_tree_record_keeps_the_held_records_fresher_fields() {
+        let listed = TreeRecord {
+            host: "build-1".into(),
+            seat: seat("w1"),
+            task: TaskKey {
+                repo: "demo".into(),
+                issue: 41,
+            },
+            review: false,
+            path: "work/w1/demo-41".into(),
+            branch: Some("codex/q41-x".into()),
+            created_at: "20261127T083000Z".into(),
+            size_bytes: 7,
+            families: vec![Family::Gpt],
+            class: Some(TaskClass::Simple),
+            class_seq: Some(3),
+            seq: Some(3),
+            handoff_seq: Some(3),
+        };
+        let mut held = listed.clone();
+        held.families = vec![Family::Claude, Family::Gpt];
+        held.class = Some(TaskClass::Standard);
+        held.class_seq = Some(9);
+        held.handoff_seq = Some(9);
+        held.size_bytes = 1;
+
+        let mut m = listed.clone();
+        m.merge_held(&held);
+        assert_eq!(m.families, [Family::Gpt, Family::Claude]);
+        assert_eq!((m.class, m.class_seq), (Some(TaskClass::Standard), Some(9)));
+        assert_eq!(m.handoff_seq, Some(9));
+        assert_eq!(m.size_bytes, 7, "the listing measures the size");
+
+        // A fresher listing is kept whole.
+        let mut m = held.clone();
+        m.merge_held(&listed);
+        assert_eq!(m, held);
+
+        // Another tree made at this path is replaced, not merged.
+        let mut other = held.clone();
+        other.seq = Some(1);
+        let mut m = listed.clone();
+        m.merge_held(&other);
+        assert_eq!(m, listed);
     }
 }

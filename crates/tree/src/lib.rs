@@ -176,6 +176,11 @@ pub struct LocalTree {
 /// `HGL_TREES` access (PROTO-13); implemented for the hub connection.
 pub trait Registry: Send + Sync {
     fn tree_put(&self, rec: &TreeRecord) -> impl Future<Output = hgl_ai_bus::Result<()>> + Send;
+    /// Put `rec` merged with the record held, never losing a fresher one (hgl-ai#51).
+    fn tree_merge(
+        &self,
+        rec: &TreeRecord,
+    ) -> impl Future<Output = hgl_ai_bus::Result<TreeRecord>> + Send;
     fn tree_del(&self, key: &str) -> impl Future<Output = hgl_ai_bus::Result<()>> + Send;
     fn trees(&self) -> impl Future<Output = hgl_ai_bus::Result<Vec<TreeRecord>>> + Send;
 }
@@ -183,6 +188,9 @@ pub trait Registry: Send + Sync {
 impl Registry for hgl_ai_bus::Bus {
     async fn tree_put(&self, rec: &TreeRecord) -> hgl_ai_bus::Result<()> {
         hgl_ai_bus::Bus::tree_put(self, rec).await
+    }
+    async fn tree_merge(&self, rec: &TreeRecord) -> hgl_ai_bus::Result<TreeRecord> {
+        hgl_ai_bus::Bus::tree_merge(self, rec).await
     }
     async fn tree_del(&self, key: &str) -> hgl_ai_bus::Result<()> {
         hgl_ai_bus::Bus::tree_del(self, key).await
