@@ -14,7 +14,7 @@ use crate::adapter::{self, Parser, TurnInput};
 use crate::bus::BusApi;
 use crate::lock::{self, FileLock};
 use crate::proc::{self, Ended, Limits, Stop, TreeId, TreeSlot};
-use crate::{Bridge, SeatRt, prompt};
+use crate::{Bridge, IssueTitle, SeatRt, prompt};
 
 /// Where a turn runs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -290,6 +290,29 @@ pub struct TurnOut {
     pub binding_idx: usize,
 }
 
+/// The title naming a new branch of `task` (WORK §2 step 3), trimmed; `None`, with the
+/// reason logged, names it from the note's line.
+pub(crate) fn new_title(
+    lookup: Option<&(dyn IssueTitle + Send + Sync)>,
+    task: &TaskKey,
+) -> Option<String> {
+    let Some(lookup) = lookup else {
+        tracing::info!(%task, "hold: naming the new branch from the note");
+        return None;
+    };
+    match lookup.issue_title(&task.repo, task.issue) {
+        Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+        Ok(_) => {
+            tracing::warn!(%task, "the issue title is empty; naming the new branch from the note");
+            None
+        }
+        Err(why) => {
+            tracing::warn!(%task, %why, "issue title unknown; naming the new branch from the note");
+            None
+        }
+    }
+}
+
 fn first_line(body: &str) -> String {
     body.lines().next().unwrap_or("").to_string()
 }
@@ -428,8 +451,12 @@ impl<B: BusApi> Bridge<B> {
                     Some((seq, c)) => {
                         let trees = self.trees.clone();
                         let (s, t, c, seq) = (name.clone(), task.clone(), c.clone(), *seq);
-                        match tokio::task::spawn_blocking(move || trees.create_for(&s, &t, &c, seq))
-                            .await
+                        // No GitHub call during a hold (ROLE-19).
+                        let lookup = job.hold.is_none().then(|| self.deps.title.clone());
+                        match tokio::task::spawn_blocking(move || {
+                            trees.create_for(&s, &t, &c, seq, &|| new_title(lookup.as_deref(), &t))
+                        })
+                        .await
                         {
                             Ok(Ok(created)) => {
                                 // Read before this tree's own record replaces the old one.
