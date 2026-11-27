@@ -1469,6 +1469,11 @@ async fn a_note_that_fails_five_times_is_dead_lettered() {
         "{events:?}"
     );
     assert_eq!(h.calls("codex").len(), 5);
+    // The note is terminated first, then the dead letter is sent: wait for it.
+    eventually("the dead letter", || {
+        !h.bus.sent_containing("[bridge] Dead letter:").is_empty()
+    })
+    .await;
     let dead = h.bus.sent_containing("[bridge] Dead letter:");
     assert_eq!(dead.len(), 1);
     let d = &dead[0];
