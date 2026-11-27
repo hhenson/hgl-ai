@@ -234,17 +234,15 @@ pub async fn fold_batch(
     let msgs: Vec<_> = feed.next(wait).await?.into_iter().collect();
     for (i, m) in msgs.iter().enumerate() {
         #[cfg(test)]
-        let applied = match tests::FAIL_ONCE.compare_exchange(
-            m.seq,
-            0,
-            std::sync::atomic::Ordering::SeqCst,
-            std::sync::atomic::Ordering::SeqCst,
-        ) {
-            Ok(_) => Err(hgl_ai_owner::Error::Invalid("injected failure".into())),
-            Err(_) => owner::apply(bus, &app.controller, m).await,
+        let applied = if app.fold_probe.fails(m.seq) {
+            Err(hgl_ai_owner::Error::Invalid("injected failure".into()))
+        } else {
+            owner::apply(bus, &app.controller, m).await
         };
         #[cfg(not(test))]
         let applied = owner::apply(bus, &app.controller, m).await;
+        #[cfg(test)]
+        app.fold_probe.saw(m.seq, applied.is_ok());
         match applied {
             Ok(Applied::Folded {
                 thread,
@@ -534,9 +532,35 @@ pub async fn run(cfg: hgl_ai_config::Config) -> Result<(), Error> {
 pub(crate) mod tests {
     use super::*;
 
-    /// A fold of the event at this sequence fails once (a transient hub error).
-    pub(crate) static FAIL_ONCE: std::sync::atomic::AtomicU64 =
-        std::sync::atomic::AtomicU64::new(0);
+    /// One app's fold, for its own test: tests run at once, each on its own hub, and
+    /// their sequences coincide, so nothing here is shared between apps.
+    #[derive(Default)]
+    pub(crate) struct FoldProbe {
+        /// The fold of the event at this sequence fails once (a transient hub error).
+        fail_once: std::sync::Mutex<Option<u64>>,
+        /// Every event the fold was handed, in order, and whether it folded.
+        seen: std::sync::Mutex<Vec<(u64, bool)>>,
+    }
+
+    impl FoldProbe {
+        pub(crate) fn fail_once(&self, seq: u64) {
+            *self.fail_once.lock().unwrap() = Some(seq);
+        }
+        pub(crate) fn fails(&self, seq: u64) -> bool {
+            let mut f = self.fail_once.lock().unwrap();
+            if *f == Some(seq) {
+                *f = None;
+                return true;
+            }
+            false
+        }
+        pub(crate) fn saw(&self, seq: u64, folded: bool) {
+            self.seen.lock().unwrap().push((seq, folded));
+        }
+        pub(crate) fn seen(&self) -> Vec<(u64, bool)> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
 
     struct Server(std::process::Child, #[allow(dead_code)] tempfile::TempDir);
     impl Drop for Server {
@@ -692,7 +716,7 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        owner::owner_event(
+        let later = owner::owner_event(
             &bus,
             &id,
             "owner@example.com",
@@ -703,32 +727,36 @@ pub(crate) mod tests {
         )
         .await
         .unwrap();
-        FAIL_ONCE.store(answer, std::sync::atomic::Ordering::SeqCst);
+        a.fold_probe.fail_once(answer);
         let filters = vec![format!("{CONSOLE_PREFIX}.>"), format!("{OWNER_PREFIX}.>")];
         let mut feed = bus.owner_feed(owner::FEED, filters).await.unwrap();
-        let mut seen_answer_fail = false;
+        // Fetches go on while the answer waits out its retry: none hands over the message.
         for _ in 0..40 {
-            let before = owner::show(&bus, &id).await.unwrap();
             fold_batch(&a, &bus, &mut feed, Duration::from_millis(500))
                 .await
                 .unwrap();
-            if FAIL_ONCE.load(std::sync::atomic::Ordering::SeqCst) == 0 && !seen_answer_fail {
-                seen_answer_fail = true;
-                let t = owner::show(&bus, &id).await.unwrap().unwrap();
-                assert_eq!(
-                    t.seq,
-                    before.map(|t| t.seq).unwrap_or(0),
-                    "nothing folded past the failed answer"
-                );
-                assert!(t.messages.is_empty(), "the later message waited");
-            }
             let t = owner::show(&bus, &id).await.unwrap();
-            if t.as_ref().is_some_and(|t| t.messages.len() == 2) {
+            if let Some(t) = &t {
+                assert!(
+                    t.messages.is_empty() || t.answer.is_some(),
+                    "the message folded before the answer: {t:?}"
+                );
+            }
+            if t.is_some_and(|t| t.seq >= later) {
                 break;
             }
         }
+        // What the fold was handed, in order: the ask, the answer (failed), the answer
+        // again, then the message; never the message while the answer waited.
+        let seen = a.fold_probe.seen();
+        let (before, held) = seen.split_at(seen.len().saturating_sub(3));
+        assert!(before.iter().all(|&(s, ok)| s < answer && ok), "{seen:?}");
+        assert_eq!(
+            held,
+            [(answer, false), (answer, true), (later, true)],
+            "{seen:?}"
+        );
         let t = owner::show(&bus, &id).await.unwrap().unwrap();
-        assert!(seen_answer_fail);
         assert_eq!(t.state, owner::ThreadState::Answered, "{t:?}");
         assert_eq!(t.messages.last().unwrap().body, "And thanks.");
         let log = owner::decisions_tail(&bus, 5).await.unwrap();

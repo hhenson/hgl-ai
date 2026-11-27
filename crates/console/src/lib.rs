@@ -50,6 +50,9 @@ pub struct App {
     pub(crate) unsent_p1: Mutex<Vec<(String, String)>>,
     /// The state kept on the hub has been taken back.
     pub(crate) restored: std::sync::atomic::AtomicBool,
+    /// This app's fold, watched and steered by its own test only.
+    #[cfg(test)]
+    pub(crate) fold_probe: service::tests::FoldProbe,
 }
 
 impl App {
@@ -83,6 +86,8 @@ impl App {
             pending_p2: Mutex::default(),
             unsent_p1: Mutex::default(),
             restored: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            fold_probe: Default::default(),
         })
     }
 
