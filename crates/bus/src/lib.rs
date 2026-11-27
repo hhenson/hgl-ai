@@ -410,9 +410,31 @@ impl Bus {
         max: usize,
         wait: Duration,
     ) -> Result<Vec<StreamNote>> {
+        Ok(self.read(seats, from, max, wait).await?.0)
+    }
+
+    /// One page of a whole-history read: at most `max` messages for `seats` from stream
+    /// sequence `from` on, without waiting, and the sequence of the last message read
+    /// (`None`: there was none), so a reader goes on from after it whatever it skipped.
+    pub async fn read_page(
+        &self,
+        seats: &[Seat],
+        from: u64,
+        max: usize,
+    ) -> Result<(Vec<StreamNote>, Option<u64>)> {
+        self.read(seats, from, max, Duration::ZERO).await
+    }
+
+    async fn read(
+        &self,
+        seats: &[Seat],
+        from: u64,
+        max: usize,
+        wait: Duration,
+    ) -> Result<(Vec<StreamNote>, Option<u64>)> {
         let mut out = Vec::new();
         if max == 0 || seats.is_empty() {
-            return Ok(out);
+            return Ok((out, None));
         }
         let stream = self
             .js
@@ -433,21 +455,28 @@ impl Bus {
             .await
             .map_err(|e| nats("opening a stream reader", e))?;
         let name = reader.cached_info().name.clone();
-        let read = self.read_with(&reader, max, wait, &mut out).await;
+        let mut last = None;
+        let read = self
+            .read_with(&reader, max, wait, &mut out, &mut last)
+            .await;
         if let Err(e) = stream.delete_consumer(&name).await {
             tracing::debug!("deleting the stream reader {name}: {e}");
         }
-        read.map(|()| out)
+        read.map(|()| (out, last))
     }
 
+    /// Read up to `max` messages (malformed ones count, and are skipped); `last` is the
+    /// stream sequence of the last one read.
     async fn read_with(
         &self,
         reader: &jetstream::consumer::PullConsumer,
         max: usize,
         wait: Duration,
         out: &mut Vec<StreamNote>,
+        last: &mut Option<u64>,
     ) -> Result<()> {
         let deadline = Instant::now().checked_add(wait);
+        let mut seen = 0;
         // Wait for the first, as an inbox fetch does; then read what is there without waiting.
         loop {
             let remaining = match deadline {
@@ -464,22 +493,25 @@ impl Bus {
                 .messages()
                 .await
                 .map_err(|e| nats("reading the stream", e))?;
-            if take_read(batch, out).await? > 0 {
+            let n = take_read(batch, out, last).await?;
+            seen += n;
+            if n > 0 {
                 break;
             }
         }
-        while out.len() < max {
+        while seen < max {
             let batch = reader
                 .fetch()
-                .max_messages((max - out.len()).min(READ_BATCH))
+                .max_messages((max - seen).min(READ_BATCH))
                 .messages()
                 .await
                 .map_err(|e| nats("reading the stream", e))?;
-            if take_read(batch, out).await? == 0 {
+            let n = take_read(batch, out, last).await?;
+            if n == 0 {
                 break;
             }
+            seen += n;
         }
-        out.truncate(max);
         Ok(())
     }
 
@@ -982,12 +1014,17 @@ impl Inbox {
 }
 
 /// Collect one batch of a stream reader; returns how many messages it held.
-async fn take_read(mut batch: pull::Batch, out: &mut Vec<StreamNote>) -> Result<usize> {
+async fn take_read(
+    mut batch: pull::Batch,
+    out: &mut Vec<StreamNote>,
+    last: &mut Option<u64>,
+) -> Result<usize> {
     let mut n = 0;
     while let Some(m) = batch.next().await {
         let msg = m.map_err(|e| nats("reading the stream", e))?;
         n += 1;
         let seq = msg.info().map(|i| i.stream_sequence).unwrap_or(0);
+        *last = Some(last.map_or(seq, |l| l.max(seq)));
         match parse_note(msg.subject.as_str(), &msg.payload) {
             Ok(note) => out.push(StreamNote { seq, note }),
             Err(why) => tracing::debug!(seq, "skipping a malformed note: {why}"),

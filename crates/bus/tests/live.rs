@@ -994,3 +994,27 @@ async fn peeks_spend_no_delivery_and_naks_never_drop() {
     assert_eq!(d[0].delivered, 21);
     d[0].ack().await.unwrap();
 }
+
+/// A whole-history read goes on past a message it cannot read: each page names the last
+/// sequence read, a skipped one included.
+#[tokio::test]
+async fn pages_go_on_past_a_malformed_message() {
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let js = hub.raw().await;
+    let bad = js
+        .publish("hgl.notes.claude", "not json".into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    let good = bus.send(&note("w1", "claude", "good")).await.unwrap();
+    let c = [seat("claude")];
+    let (notes, last) = bus.read_page(&c, 1, 1).await.unwrap();
+    assert!(notes.is_empty());
+    assert_eq!(last, Some(bad.sequence));
+    let (notes, last) = bus.read_page(&c, bad.sequence + 1, 1).await.unwrap();
+    assert_eq!((notes.len(), last), (1, Some(good.seq)));
+    let (notes, last) = bus.read_page(&c, good.seq + 1, 10).await.unwrap();
+    assert_eq!((notes.len(), last), (0, None));
+}

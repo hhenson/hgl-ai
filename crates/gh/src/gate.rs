@@ -744,17 +744,15 @@ pub async fn receipts(bus: &Bus, s: &Settings, repo: &str, pr: u64) -> Result<Ve
     let mut out = Vec::new();
     let mut from = 1;
     loop {
-        let got = bus
-            .read_notes(
-                std::slice::from_ref(&s.controller),
-                from,
-                RECEIPT_WINDOW,
-                std::time::Duration::ZERO,
-            )
+        let (got, last) = bus
+            .read_page(std::slice::from_ref(&s.controller), from, RECEIPT_WINDOW)
             .await?;
-        let n = got.len();
+        // From after the last message read, a malformed one skipped included.
+        let Some(last) = last else {
+            return Ok(out);
+        };
+        from = last + 1;
         for sn in got {
-            from = sn.seq + 1;
             if sn.note.kind != NoteKind::Receipt {
                 continue;
             }
@@ -767,9 +765,6 @@ pub async fn receipts(bus: &Bus, s: &Settings, repo: &str, pr: u64) -> Result<Ve
                     receipt: r,
                 });
             }
-        }
-        if n < RECEIPT_WINDOW {
-            return Ok(out);
         }
     }
 }
