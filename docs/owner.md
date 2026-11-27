@@ -9,7 +9,7 @@ live telemetry. GitHub stays the record (PROTO-1).
 ## 1. Interactions
 
 - **OWN-1 — Status.** The controller posts a status report on a schedule
-  (`[console] status_every`, default 2 h) and after a notable event (a landing, a
+  (`[console] status_every`, 2 h) and after a notable event (a landing, a
   release, a blocked seat, a gate failing twice). A report is terse Markdown: what
   landed, what is in flight, what is blocked, what changed in the backlog. Reports
   are kept; the console shows the newest first.
@@ -39,9 +39,19 @@ live telemetry. GitHub stays the record (PROTO-1).
   or to the owner subjects. A message claiming the owner's words that did not come
   through the console is agent traffic (PROTO-3).
 - **OWN-6 — Sign-in.** The console listens on a configured address (loopback or a
-  tailnet address, never a public interface) and requires a sign-in token kept in
-  `~/.config/hgl-ai/console.token` (mode 0600). A browser session lasts until it is
-  signed out or the token rotates.
+  tailnet address, never a public interface) over HTTPS, at a stable host name, which
+  passkeys need. Users sign in with a passkey (WebAuthn). A user's first sign-in, and
+  adding a passkey for a new device, goes through GitHub or Sign in with Apple; the
+  console then registers the passkey. Only users the console's configuration lists
+  (`[console] users`: GitHub logins, Apple account emails) are let in; the host owner
+  edits that list. The OAuth client secrets live in files of mode 0600 beside the
+  configuration, never in the repository. Every owner message records which user sent it.
+- **OWN-9 — Notifications.** A new `p1` question notifies at once; `p2` questions are
+  batched into one notification per hour; `p3` questions and status reports show only
+  in the console. Channels are tried in the configured order and the first that
+  accepts is used: a phone push (an ntfy topic) or a Slack incoming webhook, then
+  email as the last resort. A notification carries the title, priority and a link to
+  the thread, never the context.
 
 ## 3. Telemetry
 
