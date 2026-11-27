@@ -1331,6 +1331,7 @@ dependencies = [
 name = "hgl-ai-build"
 version = "0.1.0"
 dependencies = [
+ "async-nats",
  "base64 0.22.1",
  "chrono",
  "hgl-ai-bus",

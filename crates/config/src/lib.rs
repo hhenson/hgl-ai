@@ -564,6 +564,12 @@ impl Config {
                     s.name
                 )));
             }
+            if hgl_ai_proto::build::is_build_address(&s.name) {
+                return Err(ConfigError::Invalid(format!(
+                    "a seat cannot be named `{}`: `builder-*` and `r-*` are builders' and builds' addresses",
+                    s.name
+                )));
+            }
             if s.headless && s.role != Role::Controller {
                 return Err(ConfigError::Invalid(format!(
                     "seat {}: `headless` is for a controller; the bridge serves every other seat",
@@ -840,7 +846,13 @@ model = "claude-opus-5-5-high"
 
     #[test]
     fn reserved_seat_names() {
-        for name in ["all", "owner", "console"] {
+        for name in [
+            "all",
+            "owner",
+            "console",
+            "builder-lab1",
+            "r-20261127-083000-3fa9c1",
+        ] {
             let t = format!(
                 "host = \"h\"\n[[seat]]\nname = \"{name}\"\nrole = \"reviewer\"\nruntime = \"codex\"\ntier = \"fast\"\n"
             );

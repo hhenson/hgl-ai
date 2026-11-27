@@ -687,6 +687,8 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         .lines()
         .count();
     let (note, reply) = job("20261127-090000-dddddd", &w.head);
+    // The same request was taken before: its log directory holds it.
+    std::fs::write(saved.join("request.json"), note.body.trim()).unwrap();
     bus.send(&note).await.unwrap();
     let r = bus
         .reply_wait(&reply, Duration::from_secs(30))

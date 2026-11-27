@@ -316,6 +316,16 @@ async fn lane_loop(
                     continue;
                 }
             };
+            // Before anything touches a path or the hub with it.
+            let claimed = job.check(&d.note).and_then(|()| claim(&lane, &job));
+            let claim = match claimed {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::warn!(builder = %lane.label, seq = d.seq, from = %d.note.sender, "terminating a build job: {e}");
+                    let _ = d.term().await;
+                    continue;
+                }
+            };
             lane.busy.fetch_add(1, Ordering::SeqCst);
             let cancel = Cancel::default();
             running
@@ -342,9 +352,9 @@ async fn lane_loop(
                 };
                 // A redelivered job that ended before (its receipt not yet published):
                 // publish that result, build nothing again.
-                let out = match saved_result(&lane, &job.id) {
-                    Some(s) => Some(s),
-                    None => run_job(&bus, &lane, &settings, &job, &cancel).await,
+                let out = match claim {
+                    Claim::Saved(s) => Some(*s),
+                    Claim::Run => run_job(&bus, &lane, &settings, &job, &cancel).await,
                 };
                 // Acknowledged only once the result is published; until then the job
                 // stays ours (kept alive), and a crash redelivers it.
@@ -450,11 +460,6 @@ async fn run_job(
     };
     let log_dir = lane.logs.join(&job.id);
     let mut s0 = driver::start(&meta, lane.exec.as_ref(), &log_dir, BuildStatus::Running);
-    if hgl_ai_proto::build::check_build_id(&job.id).is_err()
-        || hgl_ai_proto::check_head(&job.head).is_err()
-    {
-        return Some(driver::not_run(s0, "the job's id or head is malformed"));
-    }
     let _ = store::run_put(bus, &s0).await;
     let stored = match store::recipe_get(bus, &job.repo, job.recipe_rev).await {
         Ok(Some(r)) => r,
@@ -577,6 +582,59 @@ async fn run_job(
     }
 }
 
+/// The request a log directory belongs to: the job as it came.
+const REQUEST_FILE: &str = "request.json";
+
+/// What to do with a checked job.
+enum Claim {
+    /// Build it (a new request, or one stopped before its end).
+    Run,
+    /// The same request ended here before (a redelivery): publish that result.
+    Saved(Box<Summary>),
+}
+
+/// Bind the job's id to this request: a new id gets a log directory holding the request;
+/// a known id is this request again only if the request is the same (a redelivery or a
+/// retry), and is refused when it is another, so no result answers a request it was not
+/// built for.
+fn claim(lane: &Lane, job: &BuildJob) -> Result<Claim, String> {
+    let dir = lane.logs.join(&job.id);
+    let req = dir.join(REQUEST_FILE);
+    match std::fs::read(&req) {
+        Ok(b) => {
+            let prev: BuildJob =
+                serde_json::from_slice(&b).map_err(|e| format!("{}: {e}", req.display()))?;
+            if prev != *job {
+                return Err(format!("build id {} was used for another request", job.id));
+            }
+            Ok(saved_result(lane, &job.id)
+                .map(|s| Claim::Saved(Box::new(s)))
+                .unwrap_or(Claim::Run))
+        }
+        Err(_) if dir.exists() => Err(format!(
+            "build id {} has a log directory of another request",
+            job.id
+        )),
+        Err(_) => {
+            let bytes = serde_json::to_vec(job).map_err(|e| e.to_string())?;
+            std::fs::create_dir_all(&dir)
+                .and_then(|()| std::fs::write(&req, bytes))
+                .map_err(|e| format!("{}: {e}", req.display()))?;
+            Ok(Claim::Run)
+        }
+    }
+}
+
+/// Worth trying again: the hub did not answer, not a refusal or a malformed value.
+fn transient(e: &store::StoreError) -> bool {
+    matches!(
+        e,
+        store::StoreError::Bus(
+            hgl_ai_bus::BusError::Unreachable { .. } | hgl_ai_bus::BusError::Nats(_)
+        )
+    )
+}
+
 /// The saved result of a job that ended on this lane before: `summary.json` in its log
 /// directory.
 fn saved_result(lane: &Lane, id: &str) -> Option<Summary> {
@@ -602,19 +660,23 @@ async fn finish(bus: &Bus, lane: &Lane, job: &BuildJob, s: &Summary, cancel: &Ca
         if !run_kept {
             match store::run_put(bus, s).await {
                 Ok(()) => run_kept = true,
-                Err(e) => tracing::warn!("writing run {}: {e}", s.id),
+                Err(e) if transient(&e) => tracing::warn!("writing run {}: {e}; retrying", s.id),
+                // A refusal or a malformed value stays so: not retried.
+                Err(e) => {
+                    tracing::warn!("writing run {}: {e}; not retried", s.id);
+                    run_kept = true;
+                }
             }
         }
         let mut left = Vec::new();
         for seat in to {
             match store::send_receipt(bus, &lane.inbox, &seat, s, job.issue).await {
                 Ok(()) => {}
-                // A summary that cannot be a receipt never will be.
-                Err(store::StoreError::Other(e)) => tracing::warn!("{e}"),
-                Err(e) => {
+                Err(e) if transient(&e) => {
                     tracing::warn!("sending the receipt of {} to {seat}: {e}; retrying", s.id);
                     left.push(seat);
                 }
+                Err(e) => tracing::warn!("the receipt of {} to {seat}: {e}; not retried", s.id),
             }
         }
         to = left;

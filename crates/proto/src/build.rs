@@ -344,6 +344,95 @@ pub fn builder_key(label: &str) -> String {
     format!("{BUILDER_PREFIX}{label}")
 }
 
+/// An address of the build machinery: a builder's inbox (`builder-*`) or a build's reply
+/// address (`r-*`). No configured seat takes such a name.
+pub fn is_build_address(seat: &Seat) -> bool {
+    seat.as_str().starts_with("builder-") || seat.as_str().starts_with("r-")
+}
+
+/// A seat a build receipt may go to (`notify`): a configured seat's name, not `all`,
+/// `owner`, `console`, a builder or a reply address.
+pub fn may_receive_receipts(seat: &Seat) -> bool {
+    !seat.is_reserved() && !is_build_address(seat)
+}
+
+/// A repository name as recipes and checkouts use it: `[A-Za-z0-9_.-]`, not starting
+/// with `.` (it names a key and a directory).
+pub fn check_repo(repo: &str) -> Result<(), ProtoError> {
+    let ok = !repo.is_empty()
+        && repo.len() <= 100
+        && !repo.starts_with('.')
+        && repo
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c));
+    if ok {
+        Ok(())
+    } else {
+        Err(ProtoError::Unknown {
+            what: "repository name",
+            value: repo.to_string(),
+        })
+    }
+}
+
+/// A git branch or commit as a job's `base`: no option, space or path escape.
+pub fn check_base(base: &str) -> Result<(), ProtoError> {
+    let ok = !base.is_empty()
+        && base.len() <= 200
+        && !base.starts_with(['-', '/', '.'])
+        && !base.contains("..")
+        && !base.contains("//")
+        && base
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "_./-".contains(c));
+    if ok {
+        Ok(())
+    } else {
+        Err(ProtoError::Unknown {
+            what: "base",
+            value: base.to_string(),
+        })
+    }
+}
+
+impl BuildJob {
+    /// Why this job, from the note `n`, cannot be run (it is then terminated): a version,
+    /// id, head, repository or base of the wrong form, a disagreement with the note, a
+    /// reply address other than its own, or a `notify` seat that may not get receipts.
+    pub fn check(&self, n: &super::Note) -> Result<(), String> {
+        if self.v != BUILD_VERSION {
+            return Err(format!("job version {}", self.v));
+        }
+        check_build_id(&self.id).map_err(|e| e.to_string())?;
+        super::check_head(&self.head).map_err(|e| e.to_string())?;
+        check_repo(&self.repo).map_err(|e| e.to_string())?;
+        if let Some(b) = &self.base {
+            check_base(b).map_err(|e| e.to_string())?;
+        }
+        if n.repo.as_deref() != Some(self.repo.as_str())
+            || n.head.as_deref() != Some(self.head.as_str())
+            || n.base != self.base
+            || n.issue != self.issue
+        {
+            return Err("the job's repo, head, base or issue differ from its note's".into());
+        }
+        if reply_seat(&self.id).ok().as_ref() != Some(&self.reply_to) {
+            return Err(format!(
+                "reply_to {} is not the build's own address r-{}",
+                self.reply_to, self.id
+            ));
+        }
+        if let Some(s) = &self.notify
+            && !may_receive_receipts(s)
+        {
+            return Err(format!(
+                "notify {s}: not a seat that may get build receipts"
+            ));
+        }
+        Ok(())
+    }
+}
+
 /// The inbox of the builder `label`: `builder-<label>`.
 pub fn builder_inbox(label: &str) -> Result<Seat, ProtoError> {
     Seat::new(format!("builder-{label}"))
@@ -409,6 +498,50 @@ mod tests {
         assert_eq!(run_key(&a), format!("run.{a}"));
         assert_eq!(recipe_key("hgl_spec"), "recipe.hgl_spec");
         assert_eq!(builder_key("lab1"), "builder.lab1");
+    }
+
+    #[test]
+    fn job_checks() {
+        let id = new_build_id();
+        let head = "8a5c3d264c2edbbdaa61530d810bff276c3eebba";
+        let job = BuildJob {
+            v: BUILD_VERSION,
+            id: id.clone(),
+            repo: "demo".into(),
+            head: head.into(),
+            base: Some("main".into()),
+            issue: 0,
+            steps: None,
+            recipe_rev: None,
+            keep_going: false,
+            reply_to: reply_seat(&id).unwrap(),
+            notify: Some(Seat::new("w1").unwrap()),
+            requester: "w1".into(),
+        };
+        let mut n = crate::Note::new(
+            Seat::new("w1").unwrap(),
+            builder_inbox("lab1").unwrap(),
+            crate::Kind::Build,
+            "{}",
+        );
+        n.repo = Some("demo".into());
+        n.head = Some(head.into());
+        n.base = Some("main".into());
+        job.check(&n).unwrap();
+        let bad = |f: &dyn Fn(&mut BuildJob)| {
+            let mut j = job.clone();
+            f(&mut j);
+            j.check(&n).unwrap_err()
+        };
+        assert!(bad(&|j| j.id = "../x".into()).contains("build id"));
+        assert!(bad(&|j| j.repo = "../demo".into()).contains("repository"));
+        assert!(bad(&|j| j.base = Some("--upload-pack=x".into())).contains("base"));
+        assert!(bad(&|j| j.reply_to = Seat::owner()).contains("reply_to"));
+        assert!(bad(&|j| j.notify = Some(Seat::broadcast())).contains("notify"));
+        assert!(bad(&|j| j.notify = Some(Seat::new("r-x").unwrap())).contains("notify"));
+        assert!(bad(&|j| j.head = "b".repeat(40)).contains("differ"));
+        assert!(is_build_address(&Seat::new("builder-lab1").unwrap()));
+        assert!(!may_receive_receipts(&Seat::console()));
     }
 
     #[test]
