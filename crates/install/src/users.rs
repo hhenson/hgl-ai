@@ -278,6 +278,10 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             if role == Role::Coord {
                 allow.push(format!("$KV.{KV_METRICS}.>"));
             }
+            // Read `HGL_OWNER` (`status list`) through short-lived consumers, which take no
+            // acknowledgement; the console's durable feed stays the console's.
+            allow.push(format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}"));
+            allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.*"));
             deny = owner;
             deny.extend(
                 [
@@ -290,6 +294,12 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 ]
                 .map(String::from),
             );
+            deny.extend([
+                format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}.>"),
+                format!("$JS.API.CONSUMER.DURABLE.CREATE.{STREAM_OWNER}.*"),
+                format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.console"),
+                format!("$JS.ACK.{STREAM_OWNER}.>"),
+            ]);
             // The console's own state (sessions) is not for agents to read.
             let c = kv(KV_CONSOLE);
             deny.extend([

@@ -191,6 +191,39 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
         .publish_event("hgl.console.status", b"{}", "s-1")
         .await
         .unwrap();
+    // Status reports are for everyone to read; the console's feed is the console's.
+    hgl_ai_owner::status_post(&seat_bus, &seat("claude"), "all quiet")
+        .await
+        .unwrap();
+    let st = hgl_ai_owner::statuses(
+        &seat_bus,
+        chrono::Utc::now() - chrono::Duration::hours(1),
+        10,
+    )
+    .await
+    .unwrap();
+    assert_eq!(st[0].1.body, "all quiet");
+    let coord_bus = hub.bus("hub-coord").await;
+    assert_eq!(
+        hgl_ai_owner::statuses(
+            &coord_bus,
+            chrono::Utc::now() - chrono::Duration::hours(1),
+            10
+        )
+        .await
+        .unwrap()
+        .len(),
+        1
+    );
+    let stolen = tokio::time::timeout(
+        Duration::from_secs(8),
+        seat_bus.owner_feed("console", vec!["hgl.owner.>".into()]),
+    )
+    .await;
+    assert!(
+        !matches!(stolen, Ok(Ok(_))),
+        "a seat opened the console's feed"
+    );
     assert!(
         seat_bus
             .threads::<serde_json::Value>()

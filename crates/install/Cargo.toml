@@ -23,3 +23,5 @@ nkeys = "0.4"
 tempfile.workspace = true
 tokio.workspace = true
 futures.workspace = true
+hgl-ai-owner.workspace = true
+chrono.workspace = true
