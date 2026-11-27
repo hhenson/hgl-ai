@@ -510,8 +510,19 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         });
     }
 
-    let clis = skill::installed_clis(sys);
-    for rt in Runtime::ALL.iter().copied() {
+    // The server user (a system install) runs no agents: no CLIs, skills, work_root
+    // or tmux to check there.
+    let server_side = cfg.as_ref().is_some_and(|c| {
+        c.server
+            .as_ref()
+            .is_some_and(|s| s.units == hgl_ai_config::Units::System)
+    });
+    let clis = if server_side {
+        Vec::new()
+    } else {
+        skill::installed_clis(sys)
+    };
+    for rt in Runtime::ALL.iter().copied().filter(|_| !server_side) {
         let name = format!("cli {rt}");
         let used = seat_uses(cfg.as_ref(), rt);
         let Some((_, bin)) = clis.iter().find(|(r, _)| *r == rt) else {
@@ -623,7 +634,9 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
 
         let wr = env.expand(&c.paths.work_root);
         let shown = &c.paths.work_root;
-        out.push(if !sys.exists(&wr) {
+        out.push(if server_side {
+            Check::ok("work_root", "none on the server side")
+        } else if !sys.exists(&wr) {
             Check::fail(
                 "work_root",
                 format!("no {shown}"),
@@ -651,29 +664,69 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
     }
 
     let tool = |name: &str| sys.which(name);
-    out.push(match tool("tmux") {
-        Some(p) => Check::ok("tmux", p.display().to_string()),
-        None => Check::warn(
-            "tmux",
-            "not on PATH; `hgl-ai agent start` needs it",
-            "install tmux",
-        ),
-    });
+    if !server_side {
+        out.push(match tool("tmux") {
+            Some(p) => Check::ok("tmux", p.display().to_string()),
+            None => Check::warn(
+                "tmux",
+                "not on PATH; `hgl-ai agent start` needs it",
+                "install tmux",
+            ),
+        });
+    }
+    // `gh` with the token the coordinator uses (`[github] token_file`), when there is one.
+    let token_file = cfg.as_ref().and_then(|c| c.github.token_file.clone());
+    let mut gh_token = None;
+    if let Some(tf) = &token_file {
+        let p = env.expand(tf);
+        out.push(match sys.mode(&p) {
+            Err(_) => Check::fail(
+                "github token",
+                format!("no {tf}"),
+                "write a fine-grained read-only token there, mode 0600 (docs/install.md)",
+            ),
+            Ok(m) if !token::mode_ok(m) => Check::fail(
+                "github token",
+                format!("{tf} has mode {m:o}"),
+                format!("`chmod 600 {tf}`"),
+            ),
+            Ok(_) => match sys.read_to_string(&p) {
+                Ok(t) if !t.trim().is_empty() => {
+                    gh_token = Some(t.trim().to_string());
+                    Check::ok("github token", format!("{tf} (mode 600)"))
+                }
+                _ => Check::fail(
+                    "github token",
+                    format!("{tf} is empty"),
+                    "write the token there",
+                ),
+            },
+        });
+    }
     out.push(match tool("git") {
         Some(p) => Check::ok("git", p.display().to_string()),
         None => Check::fail("git", "not on PATH", "install git"),
     });
     out.push(match tool("gh") {
         None => Check::fail("gh", "not on PATH", "install gh"),
-        Some(p) => match sys.query(
-            &Cmd::new(p.display().to_string())
+        Some(p) => match sys.query(&{
+            let c = Cmd::new(p.display().to_string())
                 .args(["auth", "status"])
-                .timeout(PROBE),
-        ) {
+                .timeout(PROBE);
+            match &gh_token {
+                Some(t) => c.env("GH_TOKEN", t.clone()),
+                None => c,
+            }
+        }) {
             Ok(o) if o.ok() => Check::ok("gh", format!("{} (authenticated)", p.display())),
             Ok(o) if o.timed_out => {
                 Check::new("gh", Level::Warn, "`gh auth status` timed out", None)
             }
+            _ if token_file.is_some() => Check::fail(
+                "gh",
+                "`gh auth status` failed with the token in [github] token_file",
+                "renew the token",
+            ),
             _ => Check::fail("gh", "`gh auth status` failed", "`gh auth login`"),
         },
     });
@@ -948,6 +1001,34 @@ mod tests {
             !cs.iter().any(|c| c.name == "service bridge"),
             "the server user runs no bridge"
         );
+        for n in ["skill claude", "cli codex", "tmux"] {
+            assert!(!cs.iter().any(|c| c.name == n), "{n} on the server side");
+        }
+        assert_eq!(
+            cs.iter().find(|c| c.name == "work_root").unwrap().level,
+            Level::Ok
+        );
+
+        // The coordinator's GitHub token: mode 0600, and passed to `gh auth status`.
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.github.token_file = Some("~/.config/hgl-ai/github.token".into());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let tok = f.env.home.join(".config/hgl-ai/github.token");
+        crate::sys::write_atomic(&tok, b"github_pat_example\n", 0o644).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        assert_eq!(
+            cs.iter().find(|c| c.name == "github token").unwrap().level,
+            Level::Fail
+        );
+        crate::sys::write_atomic(&tok, b"github_pat_example\n", 0o600).unwrap();
+        run(&f, &FakeHub::up()).await;
+        let with_token = f.cmds.borrow().iter().any(|(_, c)| {
+            c.args == ["auth", "status"]
+                && c.env
+                    .iter()
+                    .any(|(k, v)| k == "GH_TOKEN" && v == "github_pat_example")
+        });
+        assert!(with_token, "gh auth status ran with the token");
         assert!(
             !cs.iter()
                 .any(|c| c.name == "console credential" && c.level == Level::Warn)
