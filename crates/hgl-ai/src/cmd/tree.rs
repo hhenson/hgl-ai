@@ -10,7 +10,7 @@ use hgl_ai_bus::Bus;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{Seat, TaskKey, TreeRecord};
 use hgl_ai_tree::stale::{self, human_age, human_bytes};
-use hgl_ai_tree::{Git, IsClosed, IssueTitle, Trees};
+use hgl_ai_tree::{Git, IsClosed, Trees};
 
 use super::{Ctx, EXIT_FAIL, EXIT_OK};
 
@@ -219,42 +219,5 @@ impl IsClosed for GhClosed {
         }
         let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
         Some(v.get("state")?.as_str()? != "OPEN")
-    }
-}
-
-/// An issue's title from GitHub through `gh issue view`. `None` when `gh` cannot tell.
-pub struct GhTitle {
-    owner: String,
-}
-
-impl GhTitle {
-    pub fn new(cfg: &Config) -> Self {
-        GhTitle {
-            owner: cfg.github.owner.clone(),
-        }
-    }
-}
-
-impl IssueTitle for GhTitle {
-    fn issue_title(&self, repo: &str, issue: u64) -> Option<String> {
-        let out = Command::new("gh")
-            .args([
-                "issue",
-                "view",
-                &issue.to_string(),
-                "--repo",
-                &format!("{}/{repo}", self.owner),
-                "--json",
-                "title",
-            ])
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .output()
-            .ok()?;
-        if !out.status.success() {
-            return None;
-        }
-        let v: serde_json::Value = serde_json::from_slice(&out.stdout).ok()?;
-        Some(v.get("title")?.as_str()?.to_string())
     }
 }

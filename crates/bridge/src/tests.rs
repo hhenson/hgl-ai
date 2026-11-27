@@ -39,8 +39,10 @@ struct H {
     opts: Options,
     disk: Arc<FixedDisk>,
     /// Issue titles by number, as GitHub would answer; an issue not here is unknown.
-    titles: Arc<std::sync::Mutex<HashMap<u64, String>>>,
-    title: Arc<dyn hgl_ai_tree::IssueTitle + Send + Sync>,
+    titles: Arc<std::sync::Mutex<HashMap<u64, Result<String, String>>>>,
+    /// The issues whose title was asked for, in order.
+    asked: Arc<std::sync::Mutex<Vec<u64>>>,
+    title: Arc<dyn crate::IssueTitle + Send + Sync>,
 }
 
 struct Call {
@@ -105,11 +107,19 @@ fn harness() -> H {
         opts.bins.insert(*rt, bin.join(rt.as_str()));
     }
     let disk = Arc::new(FixedDisk(AtomicU64::new(1000 * crate::disk::GB)));
-    let titles: Arc<std::sync::Mutex<HashMap<u64, String>>> = Arc::default();
-    let t = titles.clone();
+    let titles: Arc<std::sync::Mutex<HashMap<u64, Result<String, String>>>> = Arc::default();
+    let asked: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+    let (t, a) = (titles.clone(), asked.clone());
     let title = Arc::new(move |repo: &str, issue: u64| {
-        assert_eq!(repo, "demo");
-        t.lock().unwrap().get(&issue).cloned()
+        if repo != "demo" {
+            return Err(format!("gh: no repository {repo}"));
+        }
+        a.lock().unwrap().push(issue);
+        t.lock()
+            .unwrap()
+            .get(&issue)
+            .cloned()
+            .unwrap_or_else(|| Err("gh: Could not resolve to an issue".into()))
     });
     let h = H {
         _dir: dir,
@@ -123,6 +133,7 @@ fn harness() -> H {
         opts,
         disk,
         titles,
+        asked,
         title,
     };
     for rt in ["claude", "codex", "agy"] {
@@ -576,18 +587,56 @@ async fn a_classed_task_fails_over_as_any_other() {
     stop(tx, j).await;
 }
 
-/// hgl-ai#27: a new branch is named from the issue's GitHub title, not the note's first
-/// line; a pushed `codex/q<issue>-*` branch is resumed whatever the title; with the title
-/// unknown, or during a hold, the note's first line names it.
+/// Every log line of the test binary, for tests that check what the bridge logs; set once.
+fn logs() -> &'static Arc<std::sync::Mutex<Vec<u8>>> {
+    static LOGS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        #[derive(Clone)]
+        struct W(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for W {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::<std::sync::Mutex<Vec<u8>>>::default();
+        let w = W(buf.clone());
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || w.clone())
+            .try_init();
+        buf
+    })
+}
+
+fn logged(text: &str) -> Vec<String> {
+    String::from_utf8_lossy(&logs().lock().unwrap())
+        .lines()
+        .filter(|l| l.contains(text))
+        .map(String::from)
+        .collect()
+}
+
+/// hgl-ai#27: a new branch is named from the issue's GitHub title (trimmed, every word
+/// kept), not the note's first line; a pushed `codex/q<issue>-*` branch is resumed with no
+/// title asked for; with the title unknown (the reason logged), empty, or during a hold
+/// (nothing asked), the note's first line names it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_new_branch_is_named_from_the_issue_title_and_a_pushed_one_is_kept() {
+    logs();
     let h = harness();
     h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
     {
         let mut t = h.titles.lock().unwrap();
-        t.insert(40, "Name task branches from the issue title".into());
-        t.insert(41, "A renamed issue".into());
-        t.insert(43, "Not asked during a hold".into());
+        t.insert(40, Ok("  [P-F1] Parser: reject a trailing comma \n".into()));
+        t.insert(41, Ok("A renamed issue".into()));
+        t.insert(42, Err("HTTP 502: Bad Gateway (gh issue view 42)".into()));
+        t.insert(43, Ok(" \t ".into()));
+        t.insert(44, Ok("Not asked during a hold".into()));
     }
     // Issue 41's branch was pushed earlier, under the issue's old title.
     h.git
@@ -620,13 +669,14 @@ async fn a_new_branch_is_named_from_the_issue_title_and_a_pushed_one_is_kept() {
     for (issue, want) in [
         (
             40,
-            "codex/q40-name-task-branches-from-the-issue-title".to_string(),
+            "codex/q40-p-f1-parser-reject-a-trailing-comma".to_string(),
         ),
         (41, "codex/q41-old-title".into()),
         (42, format!("codex/q42-{from_note}")),
         (43, format!("codex/q43-{from_note}")),
+        (44, format!("codex/q44-{from_note}")),
     ] {
-        if issue == 43 {
+        if issue == 44 {
             h.bus.set_state("hold", "rate limit");
         }
         let body = format!("Class: standard (docs/roles.md §3)\n\nFollow demo#{issue}.");
@@ -636,6 +686,22 @@ async fn a_new_branch_is_named_from_the_issue_title_and_a_pushed_one_is_kept() {
     }
     let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-41")).unwrap();
     assert_eq!(f.start, pushed, "the pushed branch is resumed");
+    assert_eq!(
+        *h.asked.lock().unwrap(),
+        [40, 42, 43],
+        "asked only for new branches, never during a hold"
+    );
+    let why = logged("task=demo-42");
+    assert!(
+        why.iter()
+            .any(|l| l.contains("issue title unknown") && l.contains("HTTP 502: Bad Gateway")),
+        "the reason is logged: {why:?}"
+    );
+    assert!(
+        logged("task=demo-43")
+            .iter()
+            .any(|l| l.contains("the issue title is empty"))
+    );
     stop(tx, j).await;
 }
 

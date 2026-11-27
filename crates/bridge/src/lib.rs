@@ -29,7 +29,7 @@ use std::time::Duration;
 use hgl_ai_bus::BusError;
 use hgl_ai_config::{Binding, Config, SeatConfig};
 use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskKey, seat_lock_key};
-use hgl_ai_tree::{Create, IsClosed, IssueTitle, Trees};
+use hgl_ai_tree::{Create, IsClosed, Trees};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
@@ -127,6 +127,18 @@ impl Options {
                 .collect(),
             cap_method: None,
         }
+    }
+}
+
+/// Answers an issue's GitHub title, which names a new implementor branch (WORK §2 step 3);
+/// else why not (a failed or timed-out `gh`, its stderr), and the note's line names it.
+pub trait IssueTitle {
+    fn issue_title(&self, repo: &str, issue: u64) -> std::result::Result<String, String>;
+}
+
+impl<F: Fn(&str, u64) -> std::result::Result<String, String>> IssueTitle for F {
+    fn issue_title(&self, repo: &str, issue: u64) -> std::result::Result<String, String> {
+        self(repo, issue)
     }
 }
 
