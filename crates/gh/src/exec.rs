@@ -249,16 +249,21 @@ async fn text_in<G: Gh>(gh: &G, args: Vec<String>, stdin: Option<Vec<u8>>) -> Re
     if out.ok {
         return Ok(out.stdout);
     }
+    Err(failure(shown, &out))
+}
+
+/// The error for a failed run: a rate limit, refused credentials, or the command's message.
+pub(crate) fn failure(shown: String, out: &Output) -> Error {
     let msg = first_lines(&format!("{}\n{}", out.stderr, out.stdout));
     if is_rate_limit_text(&msg) {
-        return Err(Error::RateLimited(msg));
+        return Error::RateLimited(msg);
     }
     if is_auth_text(&msg) {
-        return Err(Error::Auth(format!(
+        return Error::Auth(format!(
             "`gh {shown}`: {msg}; run `gh auth login` or set GH_TOKEN"
-        )));
+        ));
     }
-    Err(Error::Command { args: shown, msg })
+    Error::Command { args: shown, msg }
 }
 
 /// Parse a sequence of JSON values, as `gh api --paginate` prints them (`[..][..]`).

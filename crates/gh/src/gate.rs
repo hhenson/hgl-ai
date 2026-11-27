@@ -980,14 +980,7 @@ pub async fn evaluate<G: Gh>(
                 if let Some(b) = bus {
                     progress::write(b, repo, number, &Progress::new(&f.pr.head, None)).await?;
                 }
-                let path = format!("repos/{}/pulls/{number}/merge", s.full(repo));
-                let res = exec::write(
-                    gh,
-                    "PUT",
-                    &path,
-                    &[("merge_method", "merge"), ("sha", &f.pr.head)],
-                )
-                .await;
+                let res = crate::merge::merge(gh, &s.full(repo), number, &f.pr.head).await;
                 let after = fetch_pr(gh, s, repo, number).await?;
                 if after.merged {
                     let m = after.merge_commit.clone().unwrap_or_default();
@@ -1788,6 +1781,46 @@ mod tests {
             .await
             .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn evaluate_merges_a_stacked_pull_request_async() {
+        let s = without_receipts(settings(), &[REPO]);
+        let rest = fake();
+        let gh = FakeGh::default()
+            .fail(
+                "pulls/7/merge -f",
+                "gh: Pull request is part of a stack and must be merged using the asynchronous merge REST API (HTTP 405)",
+            )
+            .on(
+                "pulls/7/merge-async -f",
+                "{\"status\":\"pending\",\"details\":{\"uuid\":\"u-9\"}}",
+            )
+            .on(
+                "pulls/7/merge-async/u-9",
+                "{\"status\":\"merged\",\"details\":{\"message\":\"m\"}}",
+            )
+            .once("pulls/7", &fixture("pr-open.json"))
+            .on("pulls/7", &fixture("pr-merged.json"));
+        // The common answers after the merge rules, so that they do not shadow them.
+        gh.rules
+            .lock()
+            .unwrap()
+            .extend(rest.rules.into_inner().unwrap().into_iter().skip(1));
+        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), true, None)
+            .await
+            .unwrap();
+        assert_eq!(o.kind, Kind::Merged, "{}", o.line);
+        assert_eq!(
+            o.merge_commit.as_deref(),
+            Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed")
+        );
+        let put = gh
+            .calls()
+            .into_iter()
+            .find(|c| c.contains("merge-async -f"))
+            .unwrap();
+        assert!(put.contains(&format!("sha={HEAD}")) && put.contains("merge_action=direct_merge"));
     }
 
     #[tokio::test]
