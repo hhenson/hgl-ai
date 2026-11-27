@@ -80,7 +80,8 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   Exit status 0 pass, 1 fail, 3 not run. Build ids are `YYYYMMDD-HHMMSS-xxxxxx` (UTC).
 - **BUILD-5 — Detached.** `--detach` returns a build id at once; `hgl-ai build status ID`
   and `hgl-ai build wait ID` report progress and the summary. A long build costs an agent no
-  tokens while it runs.
+  tokens while it runs. Inside an agent turn a local `--detach` is refused (the bridge
+  ends the turn's processes with it): `--platform P --detach` hands it to a builder.
 - **BUILD-6 — Elsewhere.** `--platform macos` (or `windows`) sends the build to a host of
   that platform through the bus (a `build` job); the builder service there runs it and
   returns the summary as a `receipt`. The agent's own host need not have that platform.

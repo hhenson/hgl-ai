@@ -360,6 +360,18 @@ fn detach(id: &str, run_dir: &Path, log_root: &Path) -> anyhow::Result<()> {
 }
 
 async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
+    // The bridge ends a turn with every process of its slice and every process that
+    // carries its marker: a build detached here would end with the turn.
+    if a.detach && a.id.is_none() && std::env::var_os("HGL_AI_TURN").is_some_and(|v| !v.is_empty())
+    {
+        let p = Platform::current().map_or("linux", Platform::as_str);
+        return Err(NotReady(format!(
+            "a build detached inside an agent turn ends with the turn; hand it to this \
+             host's builder, which outlives the turn: `hgl-ai build run --platform {p} \
+             --detach` (then `build wait ID`), or run it without --detach"
+        ))
+        .into());
+    }
     let cfg = ctx.load_config().ok();
     let src = source_dir(a.dir.clone())?;
     let repo = repo_name(a.repo.clone(), &src)?;

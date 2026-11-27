@@ -141,6 +141,7 @@ impl Hub {
             .args(args)
             .env_remove("HGL_AI_SEAT")
             .env_remove("HGL_AI_TASK_DIR")
+            .env_remove("HGL_AI_TURN")
             .env_remove("HGL_AI_CONFIG")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -456,4 +457,42 @@ fn builder_runs_a_remote_build_through_the_hub() {
     }
     let o = hub.run(&["builder", "list"]);
     assert_eq!(String::from_utf8_lossy(&o.stdout), "", "{}", text(&o));
+}
+
+/// Carbon's finding 7 on #12: a detached build inside an agent turn would end with the
+/// turn (its slice and marker are the turn's), so it is refused with the way that
+/// outlives the turn.
+#[test]
+fn detach_inside_a_turn_is_refused() {
+    let dir = Scratch::new("turn");
+    let src = dir.0.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let recipe = dir.0.join("r.toml");
+    std::fs::write(
+        &recipe,
+        "repo = \"demo\"\n[[step]]\nname = \"a\"\nrun = \"true\"\n",
+    )
+    .unwrap();
+    let logs = dir.0.join("logs");
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .args(["build", "run", "demo", "--recipe"])
+        .arg(&recipe)
+        .arg("--dir")
+        .arg(&src)
+        .arg("--log-dir")
+        .arg(&logs)
+        .arg("--detach")
+        .env("HGL_AI_CONFIG", dir.0.join("none.toml"))
+        .env("HGL_AI_TURN", "t-1")
+        .env_remove("HGL_AI_TASK_DIR")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(3), "{}", text(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("--platform"),
+        "{}",
+        text(&o)
+    );
+    assert!(!logs.exists(), "nothing started");
 }
