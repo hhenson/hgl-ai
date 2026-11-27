@@ -39,7 +39,12 @@ impl Ctx {
 
     pub fn load_config(&self) -> anyhow::Result<Config> {
         let p = self.config_path()?;
-        Config::load(&p).with_context(|| format!("no usable configuration at {}; run `hgl-ai client install`", p.display()))
+        Config::load(&p).with_context(|| {
+            format!(
+                "no usable configuration at {}; run `hgl-ai client install`",
+                p.display()
+            )
+        })
     }
 }
 
@@ -52,7 +57,8 @@ pub fn exit_code_for(e: &anyhow::Error) -> i32 {
     if e.downcast_ref::<NotReady>().is_some() {
         return EXIT_NOT_READY;
     }
-    if let Some(hgl_ai_bus::BusError::Unreachable { .. }) = e.downcast_ref::<hgl_ai_bus::BusError>() {
+    if let Some(hgl_ai_bus::BusError::Unreachable { .. }) = e.downcast_ref::<hgl_ai_bus::BusError>()
+    {
         return EXIT_UNREACHABLE;
     }
     EXIT_FAIL
