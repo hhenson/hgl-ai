@@ -1,0 +1,12 @@
+{
+  "repo": "alpha",
+  "pr": 7,
+  "head": "1f461fa77bba922fe81383df4c475feb58b7c233",
+  "main": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
+  "reviewer": "r1",
+  "family": "claude",
+  "model": "claude-opus-5-5",
+  "verdict": "clean",
+  "evidence": "Merged onto main. 12 programs: 8 accept, 4 reject; all as the rules say.",
+  "limitations": "Linux only."
+}

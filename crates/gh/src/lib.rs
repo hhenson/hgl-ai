@@ -10,6 +10,7 @@
 //! | [`coord`] | `gh coord run`: the batched pull request table `HGL_STATE/prs`, `hold`, alerts |
 //! | [`gate`] | `gh merge-if-clean`: the merge gate |
 //! | [`land`] | `gh land`: the gate in a loop, then `main`, `landed.log`, `landed` notes, pins |
+//! | [`progress`] | `HGL_STATE/landing.<repo>.<pr>`: what a landing has done, so a retry resumes |
 //! | [`pins`] | `gh pins sync`: the wrapper's submodule pins |
 //! | [`release`] | `gh release watch`: every workflow run on a commit |
 //! | [`tap`] | `gh tap release`, `gh tap formula`: the Homebrew tap |
@@ -22,6 +23,7 @@ pub mod gate;
 pub mod land;
 pub mod lock;
 pub mod pins;
+pub mod progress;
 pub mod release;
 pub mod state;
 pub mod store;
@@ -89,6 +91,8 @@ pub fn short(sha: &str) -> &str {
 /// The gate settings of one repository, compiled.
 #[derive(Debug, Clone)]
 pub struct GateRules {
+    /// A clean review receipt from another family is required (ROLE-9).
+    pub receipt: bool,
     pub global_paths: Vec<String>,
     pub verdicts: Vec<String>,
     pub relax_paths: Vec<Regex>,
@@ -131,6 +135,9 @@ pub struct Settings {
     /// Runtime named in the first line of note bodies the controller sends (PROTO-11).
     pub controller_runtime: String,
     pub data_dir: PathBuf,
+    /// First pause before a GitHub read that failed for a reason other than a rate limit or
+    /// a missing object is tried again (doubled each time, three tries).
+    pub api_retry: Duration,
 }
 
 fn regexes(what: &str, v: &[String]) -> Result<Vec<Regex>> {
@@ -182,6 +189,7 @@ impl Settings {
             tap: g.tap.clone(),
             controller_runtime,
             data_dir: cfg.data_dir()?,
+            api_retry: Duration::from_secs(2),
         })
     }
 
@@ -191,6 +199,7 @@ impl Settings {
         let mut global_paths = self.global_paths.clone();
         global_paths.extend(r.global_paths.iter().cloned());
         GateRules {
+            receipt: r.review_receipt,
             global_paths,
             verdicts: r.verdicts.clone(),
             // Checked in `from_config`.
@@ -224,7 +233,18 @@ pub(crate) mod testutil {
     pub fn settings() -> Settings {
         let mut cfg = Config::new("test");
         cfg.paths.data_dir = "/nonexistent/hgl-ai-test".into();
-        Settings::from_config(&cfg).unwrap()
+        let mut s = Settings::from_config(&cfg).unwrap();
+        s.api_retry = Duration::from_millis(5);
+        s
+    }
+
+    /// `s` with the review receipt (ROLE-9) turned off for `repos`, as `[github.gate.<repo>]
+    /// review_receipt = false` does.
+    pub fn without_receipts(mut s: Settings, repos: &[&str]) -> Settings {
+        for r in repos {
+            s.gates.entry(r.to_string()).or_default().review_receipt = false;
+        }
+        s
     }
 
     pub fn fixture(name: &str) -> String {
@@ -255,6 +275,7 @@ mod tests {
         assert!(g.relax_configured());
         let other = s.gate_rules("hgl_spec");
         assert!(other.verdicts.is_empty() && !other.relax_configured());
+        assert!(g.receipt && other.receipt, "required by default (ROLE-9)");
         assert_eq!(s.pin_sources(), ["hgl-compiler"]);
         assert_eq!(short("0123456789abcdef"), "01234567");
     }
