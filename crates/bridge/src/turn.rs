@@ -21,7 +21,10 @@ use crate::{Bridge, SeatRt, prompt};
 pub enum Target {
     /// `<work_root>/<seat>/_inbox`: notes that belong to no tree of the seat.
     Inbox,
-    Tree { task: TaskKey, review: bool },
+    Tree {
+        task: TaskKey,
+        review: bool,
+    },
 }
 
 impl Target {
@@ -37,8 +40,13 @@ impl fmt::Display for Target {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Target::Inbox => f.write_str("the inbox directory"),
-            Target::Tree { task, review: false } => write!(f, "{}#{}", task.repo, task.issue),
-            Target::Tree { task, review: true } => write!(f, "the review tree of {}#{}", task.repo, task.issue),
+            Target::Tree {
+                task,
+                review: false,
+            } => write!(f, "{}#{}", task.repo, task.issue),
+            Target::Tree { task, review: true } => {
+                write!(f, "the review tree of {}#{}", task.repo, task.issue)
+            }
         }
     }
 }
@@ -100,25 +108,49 @@ fn first_line(body: &str) -> String {
 
 impl<B: BusApi> Bridge<B> {
     pub(crate) fn plan(&self, seat: &SeatRt, n: &Note) -> Plan {
-        let inbox = Plan { target: Target::Inbox, create: None };
+        let inbox = Plan {
+            target: Target::Inbox,
+            create: None,
+        };
         let Some(task) = n.task() else { return inbox };
-        let tree = |review| Target::Tree { task: task.clone(), review };
+        let tree = |review| Target::Tree {
+            task: task.clone(),
+            review,
+        };
         match n.kind {
             Kind::Assign => Plan {
                 target: tree(false),
-                create: Some(Create::Implement { title: first_line(&n.body), base: n.base.clone() }),
+                create: Some(Create::Implement {
+                    title: first_line(&n.body),
+                    base: n.base.clone(),
+                }),
             },
             Kind::Review => match &n.head {
-                Some(h) => Plan { target: tree(true), create: Some(Create::Review { head: h.clone(), base: n.base.clone() }) },
+                Some(h) => Plan {
+                    target: tree(true),
+                    create: Some(Create::Review {
+                        head: h.clone(),
+                        base: n.base.clone(),
+                    }),
+                },
                 None => inbox,
             },
-            _ if self.trees.existing(seat.name(), &task, true).is_some() => Plan { target: tree(true), create: None },
-            _ if self.trees.existing(seat.name(), &task, false).is_some() => Plan { target: tree(false), create: None },
+            _ if self.trees.existing(seat.name(), &task, true).is_some() => Plan {
+                target: tree(true),
+                create: None,
+            },
+            _ if self.trees.existing(seat.name(), &task, false).is_some() => Plan {
+                target: tree(false),
+                create: None,
+            },
             // A sendback or approval for a tree this host no longer has (a moved seat):
             // recreate it; the pushed branch is resumed.
             Kind::Sendback | Kind::Approved if seat.cfg.role == Role::Implementor => Plan {
                 target: tree(false),
-                create: Some(Create::Implement { title: first_line(&n.body), base: n.base.clone() }),
+                create: Some(Create::Implement {
+                    title: first_line(&n.body),
+                    base: n.base.clone(),
+                }),
             },
             _ => inbox,
         }
@@ -127,7 +159,10 @@ impl<B: BusApi> Bridge<B> {
     pub(crate) async fn turn(self: Arc<Self>, job: Job) -> TurnOut {
         let binding_idx = job.binding_idx;
         let outcome = self.turn_inner(&job).await;
-        TurnOut { outcome, binding_idx }
+        TurnOut {
+            outcome,
+            binding_idx,
+        }
     }
 
     async fn turn_inner(&self, job: &Job) -> Outcome {
@@ -160,7 +195,10 @@ impl<B: BusApi> Bridge<B> {
                         Err(o) => return o,
                     }
                 }
-                if *review && matches!(job.create, Some(Create::Review { .. })) && dir.join(TASK_FILE).exists() {
+                if *review
+                    && matches!(job.create, Some(Create::Review { .. }))
+                    && dir.join(TASK_FILE).exists()
+                {
                     // Each review starts from a fresh tree and session.
                     let trees = self.trees.clone();
                     let (s, t) = (name.clone(), task.clone());
@@ -169,7 +207,11 @@ impl<B: BusApi> Bridge<B> {
                             let _ = self.bus.tree_del(&rm.key).await;
                         }
                         Ok(Ok(None)) => {}
-                        Ok(Err(e)) => return Outcome::PrepFailed(format!("removing the previous review tree: {e}")),
+                        Ok(Err(e)) => {
+                            return Outcome::PrepFailed(format!(
+                                "removing the previous review tree: {e}"
+                            ));
+                        }
                         Err(e) => return Outcome::PrepFailed(e.to_string()),
                     }
                 }
@@ -226,7 +268,10 @@ impl<B: BusApi> Bridge<B> {
                 (dir.join("src"), w)
             }
         };
-        let resume = file.as_ref().and_then(|f| f.sessions.get(r.runtime.as_str())).cloned();
+        let resume = file
+            .as_ref()
+            .and_then(|f| f.sessions.get(r.runtime.as_str()))
+            .cloned();
         let items: Vec<prompt::Item> = job.notes.iter().map(|(s, d, n)| (*s, *d, n)).collect();
         let text = prompt::build(
             &prompt::Context {
@@ -242,16 +287,20 @@ impl<B: BusApi> Bridge<B> {
             },
             &items,
         );
-        let program = self.opts.bins.get(&r.runtime).cloned().unwrap_or_else(|| PathBuf::from(r.runtime.as_str()));
+        let program = self
+            .opts
+            .bins
+            .get(&r.runtime)
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(r.runtime.as_str()));
         let input = TurnInput {
             prompt: &text,
-            model: &r.model,
-            effort: r.effort.as_deref(),
+            resolved: &r,
             resume: resume.as_deref(),
             cwd: &cwd,
             writable: &writable,
         };
-        let mut spec = adapter::command(r.runtime, &program, &input);
+        let mut spec = adapter::command(&program, &input);
         let env: [(&str, OsString); 5] = [
             ("TMPDIR", dir.join("tmp").into()),
             ("CARGO_TARGET_DIR", dir.join("build").into()),
@@ -260,13 +309,34 @@ impl<B: BusApi> Bridge<B> {
             ("HGL_AI_ROLE", seat.cfg.role.as_str().into()),
         ];
         spec.env.extend(env.into_iter().map(|(k, v)| (k.into(), v)));
-        let mem = seat.cfg.memcap_gb.unwrap_or(self.cfg.limits.memcap_gb);
-        let spec = self.deps.capper.wrap(mem, spec);
-        let (out_log, err_log) = open_logs(&dir.join("log"), r.runtime.as_str(), self.opts.keep_logs);
+        let mem_gb = seat.cfg.memcap_gb.unwrap_or(self.cfg.limits.memcap_gb);
+        let (out_log, err_log) =
+            open_logs(&dir.join("log"), r.runtime.as_str(), self.opts.keep_logs);
         tracing::info!(seat = %name, target = %job.target, runtime = %r.runtime, model = %r.model, resume = resume.is_some(), "turn starting");
         let mut parser = Parser::new(r.runtime);
-        let limits = Limits { timeout: self.opts.turn_timeout, kill_grace: self.opts.kill_grace, max_line: self.opts.max_line };
-        let run = proc::run(&spec, limits, job.stop.clone(), Some(&held), Some(&job.slot), |l| parser.line(l), out_log, err_log).await;
+        let limits = Limits {
+            mem_bytes: mem_gb.saturating_mul(1 << 30),
+            timeout: self.opts.turn_timeout,
+            kill_grace: self.opts.kill_grace,
+            max_line: self.opts.max_line,
+            method: self.opts.cap_method,
+        };
+        let marker = self.next_marker(&name);
+        let run = proc::run(
+            &spec,
+            limits,
+            job.stop.clone(),
+            Some(&held),
+            &marker,
+            Some(&job.slot),
+            |l| parser.line(l),
+            out_log,
+            err_log,
+        )
+        .await;
+        if run.long_lines > 0 {
+            tracing::warn!(seat = %name, lines = run.long_lines, "over-long output lines were skipped");
+        }
         let exited_ok = run.ended.success();
         let parsed = parser.finish(exited_ok, &run.stderr_tail);
         if let (Some(id), Target::Tree { .. }) = (&parsed.session_id, &job.target)
@@ -283,12 +353,23 @@ impl<B: BusApi> Bridge<B> {
             Ended::Stopped => Outcome::Stopped,
             Ended::ShutdownKilled => Outcome::Shutdown,
             Ended::TimedOut => Outcome::Failed(format!("time limit {:?}", self.opts.turn_timeout)),
+            Ended::MemoryCap => Outcome::Failed(format!("memory cap {mem_gb} GiB reached")),
             Ended::SpawnFailed(e) => Outcome::Failed(e),
-            Ended::Exited { .. } if parsed.success(exited_ok) => Outcome::Clean,
-            Ended::Exited { .. } if parsed.quota => Outcome::Quota(if err.is_empty() { "quota refusal".into() } else { err }),
-            Ended::Exited { code, signal } => {
-                let tail = run.stderr_tail.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("").to_string();
-                Outcome::Failed(format!("exit {code:?} signal {signal:?}: {err} {tail}").trim().to_string())
+            Ended::Exited(_) if parsed.success(exited_ok) => Outcome::Clean,
+            Ended::Exited(_) if parsed.quota => Outcome::Quota(if err.is_empty() {
+                "quota refusal".into()
+            } else {
+                err
+            }),
+            Ended::Exited(code) => {
+                let tail = run
+                    .stderr_tail
+                    .lines()
+                    .rev()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or("")
+                    .to_string();
+                Outcome::Failed(format!("exit {code}: {err} {tail}").trim().to_string())
             }
         }
     }
@@ -297,7 +378,7 @@ impl<B: BusApi> Bridge<B> {
 /// Take `<dir>/turn.lock`, or the `Busy` outcome when another process holds it.
 async fn take_lock(dir: &Path) -> Result<FileLock, Outcome> {
     let p = dir.join(lock::TURN_LOCK);
-    match FileLock::try_exclusive_patiently(&p).await {
+    match FileLock::turn_patiently(&p).await {
         Ok(Some(l)) => Ok(l),
         Ok(None) => Err(Outcome::Busy(holders(&p))),
         Err(e) => Err(Outcome::PrepFailed(format!("{}: {e}", p.display()))),
@@ -327,7 +408,11 @@ fn save_session(dir: &Path, runtime: &str, id: &str) -> hgl_ai_tree::Result<()> 
 }
 
 /// `<dir>/<UTC>-<runtime>.out|.err`, keeping the newest `keep` turns.
-fn open_logs(dir: &Path, runtime: &str, keep: usize) -> (Option<std::fs::File>, Option<std::fs::File>) {
+fn open_logs(
+    dir: &Path,
+    runtime: &str,
+    keep: usize,
+) -> (Option<std::fs::File>, Option<std::fs::File>) {
     if std::fs::create_dir_all(dir).is_err() {
         return (None, None);
     }
@@ -351,7 +436,10 @@ fn holders(p: &Path) -> String {
     {
         use std::os::unix::fs::MetadataExt;
         if let Ok(m) = std::fs::metadata(p) {
-            let pids = proc::members(TreeId { sid: 0, lock: Some((m.dev(), m.ino())) });
+            let pids = proc::members(&TreeId {
+                lock: Some((m.dev(), m.ino())),
+                ..TreeId::default()
+            });
             if !pids.is_empty() {
                 return format!("pids {pids:?}");
             }
@@ -368,10 +456,15 @@ pub async fn reap_lock_holders(path: &Path, grace: Duration) -> bool {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        let Ok(m) = std::fs::metadata(path) else { return true };
-        let t = TreeId { sid: 0, lock: Some((m.dev(), m.ino())) };
-        tracing::warn!(lock = %path.display(), holders = ?proc::members(t), "killing the holders of a turn lock");
-        proc::reap(t, grace, Duration::from_secs(10)).await
+        let Ok(m) = std::fs::metadata(path) else {
+            return true;
+        };
+        let t = TreeId {
+            lock: Some((m.dev(), m.ino())),
+            ..TreeId::default()
+        };
+        tracing::warn!(lock = %path.display(), holders = ?proc::members(&t), "killing the holders of a turn lock");
+        proc::reap(&t, grace, Duration::from_secs(10)).await
     }
     #[cfg(not(unix))]
     {

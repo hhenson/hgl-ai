@@ -26,7 +26,8 @@ Status: proposed. Open decisions are issues in this repository.
   controller) waits with `hgl-ai note wait SEAT`, which blocks until a note
   arrives, prints it and acknowledges it. A seat is served by a bridge or
   interactively, never both: `note wait` and `note peek` refuse a seat that a
-  live `HGL_HOSTS` record lists, unless given `--force`.
+  live `HGL_HOSTS` record lists, unless given `--force`. On one host, whoever
+  serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`.
 
 ```sh
 hgl-ai note send --to claude --issue 980 --kind ready --body-file ready.md

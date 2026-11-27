@@ -49,7 +49,9 @@ impl<B: BusApi> Bridge<B> {
         if changed {
             let host = &self.cfg.host;
             let body = match g {
-                Gate::Drain => format!("[bridge] {host}: mode is drain; not taking `assign` notes (naked for later)."),
+                Gate::Drain => format!(
+                    "[bridge] {host}: mode is drain; not taking `assign` notes (naked for later)."
+                ),
                 Gate::LowDisk => format!(
                     "[bridge] {host}: work_root has {} GB free, below min_free_gb {min}; not taking `assign` notes.",
                     free.unwrap_or(0)
@@ -62,28 +64,39 @@ impl<B: BusApi> Bridge<B> {
         g
     }
 
+    /// Write `HGL_HOSTS/<host>` with the seats served now (§9).
+    pub(crate) async fn beat(&self) {
+        let seats: Vec<SeatRecord> = {
+            let served = lock(&self.served);
+            served
+                .values()
+                .filter_map(|s| {
+                    let r = self.cfg.resolve(&s.current().1).ok()?;
+                    Some(SeatRecord {
+                        seat: s.name().clone(),
+                        role: s.cfg.role,
+                        runtime: r.runtime,
+                        family: r.family,
+                        model: r.model,
+                    })
+                })
+                .collect()
+        };
+        let rec = HostRecord {
+            host: self.cfg.host.clone(),
+            seats,
+            memcap_gb: self.cfg.limits.memcap_gb,
+            work_root_free_gb: self.free_gb().unwrap_or(0),
+            updated_at: hgl_ai_proto::utc_now_stamp(),
+        };
+        if let Err(e) = self.bus.host_put(&rec).await {
+            tracing::warn!("heartbeat: {e}");
+        }
+    }
+
     pub(crate) async fn heartbeat_loop(self: Arc<Self>, mut shutdown: watch::Receiver<bool>) {
         loop {
-            let seats: Vec<SeatRecord> = {
-                let served = lock(&self.served);
-                served
-                    .values()
-                    .filter_map(|s| {
-                        let r = self.cfg.resolve(&s.current().1).ok()?;
-                        Some(SeatRecord { seat: s.name().clone(), role: s.cfg.role, runtime: r.runtime, family: r.family, model: r.model })
-                    })
-                    .collect()
-            };
-            let rec = HostRecord {
-                host: self.cfg.host.clone(),
-                seats,
-                memcap_gb: self.cfg.limits.memcap_gb,
-                work_root_free_gb: self.free_gb().unwrap_or(0),
-                updated_at: hgl_ai_proto::utc_now_stamp(),
-            };
-            if let Err(e) = self.bus.host_put(&rec).await {
-                tracing::warn!("heartbeat: {e}");
-            }
+            self.beat().await;
             self.gate_check().await;
             tokio::select! {
                 _ = tokio::time::sleep(self.opts.heartbeat_every) => {}
@@ -106,8 +119,11 @@ impl<B: BusApi> Bridge<B> {
     pub(crate) async fn report(&self) {
         let hold = self.bus.state_get("hold").await.ok().flatten();
         let trees = self.trees.clone();
-        let closed: Arc<dyn IsClosed + Send + Sync> =
-            if hold.is_some() { Arc::new(stale::Unknown) } else { self.deps.closed.clone() };
+        let closed: Arc<dyn IsClosed + Send + Sync> = if hold.is_some() {
+            Arc::new(stale::Unknown)
+        } else {
+            self.deps.closed.clone()
+        };
         let after = self.cfg.stale_after();
         let job = tokio::task::spawn_blocking(move || {
             let list = trees.list()?;
@@ -141,7 +157,11 @@ impl<B: BusApi> Bridge<B> {
                 body,
                 "Stale (older than {} or closed{}):",
                 self.cfg.limits.stale_after,
-                if hold.is_some() { "; closed-ness not checked during the hold" } else { "" }
+                if hold.is_some() {
+                    "; closed-ness not checked during the hold"
+                } else {
+                    ""
+                }
             );
             for s in &stale {
                 let _ = writeln!(
@@ -171,16 +191,29 @@ pub(crate) fn cleanup_body(
     errors: &[String],
     root: &Path,
 ) -> String {
-    let mut s = format!("[bridge] Cleanup: {}#{} on {host}/{seat} after `{}`: ", task.repo, task.issue, note.kind);
+    let mut s = format!(
+        "[bridge] Cleanup: {}#{} on {host}/{seat} after `{}`: ",
+        task.repo, task.issue, note.kind
+    );
     if removed.is_empty() {
         s.push_str("no tree removed");
     } else {
         let names: Vec<String> = removed
             .iter()
-            .map(|r| r.dir.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default())
+            .map(|r| {
+                r.dir
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .unwrap_or_default()
+            })
             .collect();
         let freed: u64 = removed.iter().map(|r| r.freed_bytes).sum();
-        let _ = write!(s, "removed {}, freed {}", names.join(", "), human_bytes(freed));
+        let _ = write!(
+            s,
+            "removed {}, freed {}",
+            names.join(", "),
+            human_bytes(freed)
+        );
         let branches: Vec<&str> = removed.iter().filter_map(|r| r.branch.as_deref()).collect();
         if !branches.is_empty() {
             let _ = write!(s, ", deleted local branch {}", branches.join(", "));

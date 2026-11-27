@@ -15,7 +15,10 @@ pub struct Git {
 
 impl Default for Git {
     fn default() -> Self {
-        Git { program: PathBuf::from("git"), env: Vec::new() }
+        Git {
+            program: PathBuf::from("git"),
+            env: Vec::new(),
+        }
     }
 }
 
@@ -34,7 +37,10 @@ impl Git {
         Git {
             program: PathBuf::from("git"),
             env: vec![
-                ("GIT_CONFIG_GLOBAL".into(), global_config.as_os_str().to_owned()),
+                (
+                    "GIT_CONFIG_GLOBAL".into(),
+                    global_config.as_os_str().to_owned(),
+                ),
                 ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
             ],
         }
@@ -76,7 +82,11 @@ impl Git {
             Ok(out.stdout)
         } else {
             Err(TreeError::Git {
-                args: args.iter().map(|a| a.to_string_lossy()).collect::<Vec<_>>().join(" "),
+                args: args
+                    .iter()
+                    .map(|a| a.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
                 code: out.code,
                 stderr: out.stderr.trim().to_string(),
             })

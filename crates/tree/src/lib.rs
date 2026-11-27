@@ -30,11 +30,21 @@ pub enum TreeError {
     #[error("{0}")]
     Invalid(String),
     #[error("{path}: {source}")]
-    Io { path: PathBuf, source: std::io::Error },
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error("git {args} failed ({code:?}): {stderr}")]
-    Git { args: String, code: Option<i32>, stderr: String },
+    Git {
+        args: String,
+        code: Option<i32>,
+        stderr: String,
+    },
     #[error("{path}: {source}")]
-    Json { path: PathBuf, source: serde_json::Error },
+    Json {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
     #[error("a tree already exists at {0}")]
     Exists(PathBuf),
     #[error("commit {0} is not in the clone after fetching")]
@@ -45,7 +55,10 @@ pub enum TreeError {
 
 impl TreeError {
     pub fn io(path: &Path, source: std::io::Error) -> Self {
-        TreeError::Io { path: path.to_path_buf(), source }
+        TreeError::Io {
+            path: path.to_path_buf(),
+            source,
+        }
     }
 }
 
@@ -53,8 +66,14 @@ pub type Result<T> = std::result::Result<T, TreeError>;
 
 pub const TASK_FILE: &str = "task.json";
 /// Identity of the bridge's own merge commit in a review tree.
-const MERGE_IDENTITY: [&str; 6] =
-    ["-c", "user.name=hgl-ai bridge", "-c", "user.email=bridge@hgl-ai.invalid", "-c", "commit.gpgsign=false"];
+const MERGE_IDENTITY: [&str; 6] = [
+    "-c",
+    "user.name=hgl-ai bridge",
+    "-c",
+    "user.email=bridge@hgl-ai.invalid",
+    "-c",
+    "commit.gpgsign=false",
+];
 
 /// `task.json`: what the bridge knows about one task directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -88,7 +107,10 @@ pub struct TaskFile {
 
 impl TaskFile {
     pub fn task(&self) -> TaskKey {
-        TaskKey { repo: self.repo.clone(), issue: self.issue }
+        TaskKey {
+            repo: self.repo.clone(),
+            issue: self.issue,
+        }
     }
 }
 
@@ -163,11 +185,22 @@ pub struct Trees {
 
 impl Trees {
     pub fn new(cfg: &Config, git: Git) -> Result<Self> {
-        Ok(Self::with(Layout::new(cfg.work_root()?)?, &cfg.host, &cfg.github, git))
+        Ok(Self::with(
+            Layout::new(cfg.work_root()?)?,
+            &cfg.host,
+            &cfg.github,
+            git,
+        ))
     }
 
     pub fn with(layout: Layout, host: &str, github: &Github, git: Git) -> Self {
-        Trees { layout, host: host.to_string(), github: github.clone(), git, lock: Mutex::new(()) }
+        Trees {
+            layout,
+            host: host.to_string(),
+            github: github.clone(),
+            git,
+            lock: Mutex::new(()),
+        }
     }
 
     pub fn layout(&self) -> &Layout {
@@ -208,7 +241,12 @@ impl Trees {
             }
             let file = read_task(&dir)?;
             let record = self.record(&dir, &file, 0);
-            return Ok(Created { dir, file, record, reused: true });
+            return Ok(Created {
+                dir,
+                file,
+                record,
+                reused: true,
+            });
         }
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let clone = self.ensure_clone(&task.repo)?;
@@ -221,8 +259,12 @@ impl Trees {
             mkdir(&dir.join(sub))?;
         }
         let made = match what {
-            Create::Implement { title, base } => self.add_implementor(&clone, &dir, seat, task, title, base.as_deref()),
-            Create::Review { head, base } => self.add_review(&clone, &dir, seat, task, head, base.as_deref()),
+            Create::Implement { title, base } => {
+                self.add_implementor(&clone, &dir, seat, task, title, base.as_deref())
+            }
+            Create::Review { head, base } => {
+                self.add_review(&clone, &dir, seat, task, head, base.as_deref())
+            }
         };
         let file = match made {
             Ok(f) => f,
@@ -234,7 +276,12 @@ impl Trees {
         };
         write_task(&dir, &file)?;
         let record = self.record(&dir, &file, dir_size(&dir));
-        Ok(Created { dir, file, record, reused: false })
+        Ok(Created {
+            dir,
+            file,
+            record,
+            reused: false,
+        })
     }
 
     fn add_implementor(
@@ -253,25 +300,62 @@ impl Trees {
         let on_remote = if heads.contains(&wanted) {
             Some(wanted.clone())
         } else {
-            heads.iter().filter(|h| h.starts_with(&prefix)).min().cloned()
+            heads
+                .iter()
+                .filter(|h| h.starts_with(&prefix))
+                .min()
+                .cloned()
         };
         let branch = on_remote.clone().unwrap_or(wanted);
-        let local = self.git.check(clone, ["rev-parse", "--verify", "--quiet", &format!("refs/heads/{branch}")])?;
+        let local = self.git.check(
+            clone,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/heads/{branch}"),
+            ],
+        )?;
         let base_ref = self.resolve_base(clone, base)?;
         let src_os = src.as_os_str();
         if local {
-            self.git.run(clone, ["worktree".as_ref(), "add".as_ref(), src_os, branch.as_ref()])?;
+            self.git.run(
+                clone,
+                ["worktree".as_ref(), "add".as_ref(), src_os, branch.as_ref()],
+            )?;
         } else if on_remote.is_some() {
             // A sendback or a resumed task: continue the pushed branch.
             let tracking = format!("origin/{branch}");
-            self.git.run(clone, ["fetch", "--quiet", "origin", &format!("+refs/heads/{branch}:refs/remotes/{tracking}")])?;
-            let args: [&std::ffi::OsStr; 7] =
-                ["worktree".as_ref(), "add".as_ref(), "--track".as_ref(), "-b".as_ref(), branch.as_ref(), src_os, tracking.as_ref()];
+            self.git.run(
+                clone,
+                [
+                    "fetch",
+                    "--quiet",
+                    "origin",
+                    &format!("+refs/heads/{branch}:refs/remotes/{tracking}"),
+                ],
+            )?;
+            let args: [&std::ffi::OsStr; 7] = [
+                "worktree".as_ref(),
+                "add".as_ref(),
+                "--track".as_ref(),
+                "-b".as_ref(),
+                branch.as_ref(),
+                src_os,
+                tracking.as_ref(),
+            ];
             self.git.run(clone, args)?;
         } else {
             // `--no-track`, so a plain `git push` never targets the base branch.
-            let args: [&std::ffi::OsStr; 7] =
-                ["worktree".as_ref(), "add".as_ref(), "--no-track".as_ref(), "-b".as_ref(), branch.as_ref(), src_os, base_ref.as_ref()];
+            let args: [&std::ffi::OsStr; 7] = [
+                "worktree".as_ref(),
+                "add".as_ref(),
+                "--no-track".as_ref(),
+                "-b".as_ref(),
+                branch.as_ref(),
+                src_os,
+                base_ref.as_ref(),
+            ];
             self.git.run(clone, args)?;
         }
         let start = self.rev(&src, "HEAD")?;
@@ -304,10 +388,17 @@ impl Trees {
         hgl_ai_proto::check_head(head).map_err(|e| TreeError::Invalid(e.to_string()))?;
         let src = dir.join("src");
         if !self.has_commit(clone, head)? {
-            let pr_ref = format!("+refs/pull/{}/head:refs/remotes/origin/pr/{}", task.issue, task.issue);
-            let _ = self.git.output(clone, ["fetch", "--quiet", "origin", &pr_ref])?;
+            let pr_ref = format!(
+                "+refs/pull/{}/head:refs/remotes/origin/pr/{}",
+                task.issue, task.issue
+            );
+            let _ = self
+                .git
+                .output(clone, ["fetch", "--quiet", "origin", &pr_ref])?;
             if !self.has_commit(clone, head)? {
-                let _ = self.git.output(clone, ["fetch", "--quiet", "origin", head])?;
+                let _ = self
+                    .git
+                    .output(clone, ["fetch", "--quiet", "origin", head])?;
             }
             if !self.has_commit(clone, head)? {
                 return Err(TreeError::MissingCommit(head.to_string()));
@@ -315,8 +406,13 @@ impl Trees {
         }
         let base_ref = self.resolve_base(clone, base)?;
         let main = self.rev(clone, &base_ref)?;
-        let args: [&std::ffi::OsStr; 5] =
-            ["worktree".as_ref(), "add".as_ref(), "--detach".as_ref(), src.as_os_str(), main.as_ref()];
+        let args: [&std::ffi::OsStr; 5] = [
+            "worktree".as_ref(),
+            "add".as_ref(),
+            "--detach".as_ref(),
+            src.as_os_str(),
+            main.as_ref(),
+        ];
         self.git.run(clone, args)?;
         let msg = format!("Review merge of {} onto {}", &head[..12], &main[..12]);
         let mut args: Vec<&str> = MERGE_IDENTITY.to_vec();
@@ -324,14 +420,25 @@ impl Trees {
         let merged = self.git.output(&src, &args)?;
         let mut conflicts = Vec::new();
         if !merged.ok {
-            let unmerged = self.git.run(&src, ["diff", "--name-only", "--diff-filter=U"]).unwrap_or_default();
+            let unmerged = self
+                .git
+                .run(&src, ["diff", "--name-only", "--diff-filter=U"])
+                .unwrap_or_default();
             conflicts = unmerged.lines().map(str::to_string).collect();
             if conflicts.is_empty() {
-                let why = merged.stderr.lines().chain(merged.stdout.lines()).find(|l| !l.trim().is_empty());
-                conflicts.push(format!("(merge failed: {})", why.unwrap_or("no message").trim()));
+                let why = merged
+                    .stderr
+                    .lines()
+                    .chain(merged.stdout.lines())
+                    .find(|l| !l.trim().is_empty());
+                conflicts.push(format!(
+                    "(merge failed: {})",
+                    why.unwrap_or("no message").trim()
+                ));
             }
             let _ = self.git.output(&src, ["merge", "--abort"])?;
-            self.git.run(&src, ["checkout", "--quiet", "--force", "--detach", head])?;
+            self.git
+                .run(&src, ["checkout", "--quiet", "--force", "--detach", head])?;
         }
         let start = self.rev(&src, "HEAD")?;
         Ok(TaskFile {
@@ -361,13 +468,22 @@ impl Trees {
         let file = read_task(&dir).ok();
         let freed_bytes = dir_size(&dir);
         let src = dir.join("src");
-        let clone = self.layout.clone_dir(&task.repo).ok().filter(|c| c.is_dir());
+        let clone = self
+            .layout
+            .clone_dir(&task.repo)
+            .ok()
+            .filter(|c| c.is_dir());
         let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut salvage = None;
         if src.join(".git").exists() {
             salvage = self.salvage(&src, seat, task, file.as_ref())?;
             if let Some(clone) = &clone {
-                let args: [&std::ffi::OsStr; 4] = ["worktree".as_ref(), "remove".as_ref(), "--force".as_ref(), src.as_os_str()];
+                let args: [&std::ffi::OsStr; 4] = [
+                    "worktree".as_ref(),
+                    "remove".as_ref(),
+                    "--force".as_ref(),
+                    src.as_os_str(),
+                ];
                 let _ = self.git.output(clone, args)?;
             }
         }
@@ -380,12 +496,24 @@ impl Trees {
             }
         }
         let key = hgl_ai_proto::tree_key(&self.host, seat, task, review);
-        Ok(Some(Removed { key, dir, branch, freed_bytes, salvage }))
+        Ok(Some(Removed {
+            key,
+            dir,
+            branch,
+            freed_bytes,
+            salvage,
+        }))
     }
 
     /// Write uncommitted changes (untracked files included) and unpushed commits to
     /// `<work_root>/salvage/<seat>-<repo>-<issue>-<UTC>.patch`, if there are any.
-    fn salvage(&self, src: &Path, seat: &Seat, task: &TaskKey, file: Option<&TaskFile>) -> Result<Option<PathBuf>> {
+    fn salvage(
+        &self,
+        src: &Path,
+        seat: &Seat,
+        task: &TaskKey,
+        file: Option<&TaskFile>,
+    ) -> Result<Option<PathBuf>> {
         let status = self.git.output(src, ["status", "--porcelain"])?;
         if !status.ok {
             tracing::warn!(src = %src.display(), "git status failed; nothing salvaged: {}", status.stderr.trim());
@@ -400,7 +528,12 @@ impl Trees {
         }
         let mut rl = vec!["rev-list".to_string()];
         rl.extend(range.iter().cloned());
-        let unpushed: Vec<String> = self.git.run(src, &rl)?.lines().map(str::to_string).collect();
+        let unpushed: Vec<String> = self
+            .git
+            .run(src, &rl)?
+            .lines()
+            .map(str::to_string)
+            .collect();
         if !dirty && unpushed.is_empty() {
             return Ok(None);
         }
@@ -414,7 +547,11 @@ impl Trees {
             if dirty { "yes" } else { "no" }
         );
         if !unpushed.is_empty() {
-            let mut fp = vec!["format-patch".to_string(), "--stdout".into(), "--binary".into()];
+            let mut fp = vec![
+                "format-patch".to_string(),
+                "--stdout".into(),
+                "--binary".into(),
+            ];
             fp.extend(range);
             patch.push_str(&self.git.run(src, &fp)?);
         }
@@ -439,13 +576,17 @@ impl Trees {
     pub fn list(&self) -> Result<Vec<LocalTree>> {
         let mut out = Vec::new();
         for seat_ent in read_dir(self.layout.root())? {
-            let Ok(seat) = Seat::new(seat_ent.file_name().to_string_lossy().into_owned()) else { continue };
+            let Ok(seat) = Seat::new(seat_ent.file_name().to_string_lossy().into_owned()) else {
+                continue;
+            };
             if !seat_ent.path().is_dir() || self.layout.seat_dir(&seat).is_err() {
                 continue;
             }
             for ent in read_dir(&seat_ent.path())? {
                 let name = ent.file_name().to_string_lossy().into_owned();
-                let Some((task, review)) = layout::parse_task_dir_name(&name) else { continue };
+                let Some((task, review)) = layout::parse_task_dir_name(&name) else {
+                    continue;
+                };
                 let dir = ent.path();
                 if !dir.is_dir() {
                     continue;
@@ -495,7 +636,8 @@ impl Trees {
             self.git.run(&clone, ["init", "--quiet", "--bare"])?;
         }
         if self.git.check(&clone, ["remote", "get-url", "origin"])? {
-            self.git.run(&clone, ["remote", "set-url", "origin", &url])?;
+            self.git
+                .run(&clone, ["remote", "set-url", "origin", &url])?;
         } else {
             self.git.run(&clone, ["remote", "add", "origin", &url])?;
         }
@@ -519,21 +661,36 @@ impl Trees {
     fn resolve_base(&self, clone: &Path, base: Option<&str>) -> Result<String> {
         let base = base.unwrap_or("main");
         let remote = format!("origin/{base}");
-        if self.git.check(clone, ["rev-parse", "--verify", "--quiet", &format!("refs/remotes/{remote}")])? {
+        if self.git.check(
+            clone,
+            [
+                "rev-parse",
+                "--verify",
+                "--quiet",
+                &format!("refs/remotes/{remote}"),
+            ],
+        )? {
             return Ok(remote);
         }
         if self.has_commit(clone, base)? {
             return Ok(base.to_string());
         }
-        Err(TreeError::Invalid(format!("base {base:?} is neither a branch of origin nor a commit")))
+        Err(TreeError::Invalid(format!(
+            "base {base:?} is neither a branch of origin nor a commit"
+        )))
     }
 
     fn has_commit(&self, cwd: &Path, rev: &str) -> Result<bool> {
-        self.git.check(cwd, ["cat-file", "-e", &format!("{rev}^{{commit}}")])
+        self.git
+            .check(cwd, ["cat-file", "-e", &format!("{rev}^{{commit}}")])
     }
 
     fn rev(&self, cwd: &Path, rev: &str) -> Result<String> {
-        Ok(self.git.run(cwd, ["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?.trim().to_string())
+        Ok(self
+            .git
+            .run(cwd, ["rev-parse", "--verify", &format!("{rev}^{{commit}}")])?
+            .trim()
+            .to_string())
     }
 
     fn remove_dir(&self, dir: &Path) -> Result<()> {
@@ -557,23 +714,32 @@ pub fn read_task(dir: &Path) -> Result<TaskFile> {
 pub fn write_task(dir: &Path, f: &TaskFile) -> Result<()> {
     let p = dir.join(TASK_FILE);
     let tmp = dir.join(format!("{TASK_FILE}.tmp"));
-    let text = serde_json::to_string_pretty(f).map_err(|source| TreeError::Json { path: p.clone(), source })?;
+    let text = serde_json::to_string_pretty(f).map_err(|source| TreeError::Json {
+        path: p.clone(),
+        source,
+    })?;
     std::fs::write(&tmp, text + "\n").map_err(|e| TreeError::io(&tmp, e))?;
     std::fs::rename(&tmp, &p).map_err(|e| TreeError::io(&p, e))
 }
 
 /// Bytes under `p`, not following symlinks; unreadable entries count as 0.
 pub fn dir_size(p: &Path) -> u64 {
-    let Ok(m) = std::fs::symlink_metadata(p) else { return 0 };
+    let Ok(m) = std::fs::symlink_metadata(p) else {
+        return 0;
+    };
     if !m.is_dir() {
         return m.len();
     }
     let mut total = 0;
     let mut stack = vec![p.to_path_buf()];
     while let Some(d) = stack.pop() {
-        let Ok(rd) = std::fs::read_dir(&d) else { continue };
+        let Ok(rd) = std::fs::read_dir(&d) else {
+            continue;
+        };
         for e in rd.flatten() {
-            let Ok(m) = std::fs::symlink_metadata(e.path()) else { continue };
+            let Ok(m) = std::fs::symlink_metadata(e.path()) else {
+                continue;
+            };
             if m.is_dir() {
                 stack.push(e.path());
             } else {
@@ -597,8 +763,11 @@ fn read_dir(p: &Path) -> Result<Vec<std::fs::DirEntry>> {
 }
 
 fn mtime_stamp(p: &Path) -> String {
-    let t = std::fs::metadata(p).and_then(|m| m.modified()).map(chrono::DateTime::<chrono::Utc>::from);
-    t.map(hgl_ai_proto::utc_stamp).unwrap_or_else(|_| hgl_ai_proto::utc_now_stamp())
+    let t = std::fs::metadata(p)
+        .and_then(|m| m.modified())
+        .map(chrono::DateTime::<chrono::Utc>::from);
+    t.map(hgl_ai_proto::utc_stamp)
+        .unwrap_or_else(|_| hgl_ai_proto::utc_now_stamp())
 }
 
 /// Helpers for tests here and in the bridge: a local "remote" with a `main` branch.
@@ -608,7 +777,14 @@ pub mod testing {
 
     use crate::Git;
 
-    pub const IDENTITY: [&str; 6] = ["-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false"];
+    pub const IDENTITY: [&str; 6] = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@example.invalid",
+        "-c",
+        "commit.gpgsign=false",
+    ];
 
     /// A git runner isolated from the user's configuration, with its empty config in `dir`.
     pub fn git(dir: &Path) -> Git {
@@ -622,11 +798,23 @@ pub mod testing {
         let bare = dir.join(format!("{repo}.git"));
         let seed = dir.join(format!("{repo}-seed"));
         std::fs::create_dir_all(&bare).unwrap();
-        git.run(&bare, ["init", "--quiet", "--bare", "-b", "main"]).unwrap();
-        git.run(dir, ["clone".as_ref(), "--quiet".as_ref(), bare.as_os_str(), seed.as_os_str()]).unwrap();
-        git.run(&seed, ["checkout", "--quiet", "-b", "main"]).unwrap();
+        git.run(&bare, ["init", "--quiet", "--bare", "-b", "main"])
+            .unwrap();
+        git.run(
+            dir,
+            [
+                "clone".as_ref(),
+                "--quiet".as_ref(),
+                bare.as_os_str(),
+                seed.as_os_str(),
+            ],
+        )
+        .unwrap();
+        git.run(&seed, ["checkout", "--quiet", "-b", "main"])
+            .unwrap();
         commit(git, &seed, "README", "hello\n", "initial");
-        git.run(&seed, ["push", "--quiet", "origin", "main"]).unwrap();
+        git.run(&seed, ["push", "--quiet", "origin", "main"])
+            .unwrap();
         (bare, seed)
     }
 
@@ -637,7 +825,10 @@ pub mod testing {
         let mut args = IDENTITY.to_vec();
         args.extend(["commit", "--quiet", "-m", msg]);
         git.run(repo, args).unwrap();
-        git.run(repo, ["rev-parse", "HEAD"]).unwrap().trim().to_string()
+        git.run(repo, ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string()
     }
 }
 

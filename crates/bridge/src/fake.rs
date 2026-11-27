@@ -25,13 +25,17 @@ pub enum Ev {
     Progress,
 }
 
+/// (seq, delivery count, note)
+type Queued = (u64, u64, Note);
+
 #[derive(Default)]
 struct Inner {
-    queues: Mutex<HashMap<Seat, VecDeque<(u64, u64, Note)>>>,
+    queues: Mutex<HashMap<Seat, VecDeque<Queued>>>,
     notify: Notify,
     sent: Mutex<Vec<Note>>,
     state: Mutex<HashMap<String, String>>,
     hosts: Mutex<Vec<HostRecord>>,
+    deleted_hosts: Mutex<Vec<String>>,
     trees: Mutex<BTreeMap<String, TreeRecord>>,
     events: Mutex<Vec<(u64, Ev)>>,
     seq: AtomicU64,
@@ -54,16 +58,26 @@ impl FakeBus {
     }
 
     fn enqueue(&self, seat: Seat, seq: u64, delivered: u64, note: Note) {
-        g(&self.0.queues).entry(seat).or_default().push_back((seq, delivered, note));
+        g(&self.0.queues)
+            .entry(seat)
+            .or_default()
+            .push_back((seq, delivered, note));
         self.0.notify.notify_waiters();
     }
 
     pub fn events(&self, seq: u64) -> Vec<Ev> {
-        g(&self.0.events).iter().filter(|(s, _)| *s == seq).map(|(_, e)| e.clone()).filter(|e| *e != Ev::Progress).collect()
+        g(&self.0.events)
+            .iter()
+            .filter(|(s, _)| *s == seq)
+            .map(|(_, e)| e.clone())
+            .filter(|e| *e != Ev::Progress)
+            .collect()
     }
 
     pub fn progressed(&self, seq: u64) -> bool {
-        g(&self.0.events).iter().any(|(s, e)| *s == seq && *e == Ev::Progress)
+        g(&self.0.events)
+            .iter()
+            .any(|(s, e)| *s == seq && *e == Ev::Progress)
     }
 
     pub fn sent(&self) -> Vec<Note> {
@@ -71,7 +85,10 @@ impl FakeBus {
     }
 
     pub fn sent_containing(&self, text: &str) -> Vec<Note> {
-        self.sent().into_iter().filter(|n| n.body.contains(text)).collect()
+        self.sent()
+            .into_iter()
+            .filter(|n| n.body.contains(text))
+            .collect()
     }
 
     pub fn set_state(&self, k: &str, v: &str) {
@@ -84,6 +101,15 @@ impl FakeBus {
 
     pub fn last_host(&self) -> Option<HostRecord> {
         g(&self.0.hosts).last().cloned()
+    }
+
+    /// Another host's record, as its bridge would write it.
+    pub fn put_host(&self, rec: HostRecord) {
+        g(&self.0.hosts).push(rec);
+    }
+
+    pub fn deleted_hosts(&self) -> Vec<String> {
+        g(&self.0.deleted_hosts).clone()
     }
 }
 
@@ -106,7 +132,10 @@ impl BusApi for FakeBus {
     type Delivery = FakeDelivery;
 
     async fn inbox(&self, seat: &Seat) -> Result<FakeInbox> {
-        Ok(FakeInbox { bus: self.clone(), seat: seat.clone() })
+        Ok(FakeInbox {
+            bus: self.clone(),
+            seat: seat.clone(),
+        })
     }
     async fn send(&self, note: &Note) -> Result<()> {
         note.validate().map_err(BusError::Proto)?;
@@ -119,6 +148,21 @@ impl BusApi for FakeBus {
     async fn host_put(&self, rec: &HostRecord) -> Result<()> {
         g(&self.0.hosts).push(rec.clone());
         Ok(())
+    }
+    async fn host_del(&self, host: &str) -> Result<()> {
+        g(&self.0.deleted_hosts).push(host.to_string());
+        Ok(())
+    }
+    async fn bridge_host(&self, seat: &Seat) -> Result<Option<String>> {
+        let hosts = g(&self.0.hosts);
+        let mut latest: BTreeMap<&str, &HostRecord> = BTreeMap::new();
+        for h in hosts.iter() {
+            latest.insert(&h.host, h);
+        }
+        Ok(latest
+            .values()
+            .find(|h| h.seats.iter().any(|s| &s.seat == seat))
+            .map(|h| h.host.clone()))
     }
 }
 
@@ -142,7 +186,13 @@ impl InboxApi for FakeInbox {
                     let n = q.len().min(max);
                     return Ok(q
                         .drain(..n)
-                        .map(|(seq, delivered, note)| FakeDelivery { bus: self.bus.clone(), seat: self.seat.clone(), seq, delivered, note })
+                        .map(|(seq, delivered, note)| FakeDelivery {
+                            bus: self.bus.clone(),
+                            seat: self.seat.clone(),
+                            seq,
+                            delivered,
+                            note,
+                        })
                         .collect());
                 }
             }
@@ -185,7 +235,13 @@ impl DeliveryApi for FakeDelivery {
     async fn nak(&self, delay: Duration) -> Result<()> {
         self.record(Ev::Nak(delay));
         if self.delivered < MAX_DELIVER {
-            let (bus, seat, seq, n, note) = (self.bus.clone(), self.seat.clone(), self.seq, self.delivered + 1, self.note.clone());
+            let (bus, seat, seq, n, note) = (
+                self.bus.clone(),
+                self.seat.clone(),
+                self.seq,
+                self.delivered + 1,
+                self.note.clone(),
+            );
             tokio::spawn(async move {
                 tokio::time::sleep(delay).await;
                 bus.enqueue(seat, seq, n, note);

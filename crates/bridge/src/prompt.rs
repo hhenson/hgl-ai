@@ -70,16 +70,32 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
          (TMPDIR and CARGO_TARGET_DIR point there), never /tmp.\n",
     );
     if let Some(h) = c.hold {
-        let _ = writeln!(s, "State hold: {} (GitHub API allowance spent; defer every GitHub call that can wait).", h.trim());
+        let _ = writeln!(
+            s,
+            "State hold: {} (GitHub API allowance spent; defer every GitHub call that can wait).",
+            h.trim()
+        );
     }
     if let Some(m) = c.mode {
         let m = m.trim();
-        let what = if m == "drain" { " (finish in-flight work only; take nothing new)" } else { "" };
+        let what = if m == "drain" {
+            " (finish in-flight work only; take nothing new)"
+        } else {
+            ""
+        };
         let _ = writeln!(s, "State mode: {m}{what}.");
     }
     let budget = MAX_PROMPT.saturating_sub(s.len() + 200 * notes.len()) / notes.len().max(1);
     for (i, (seq, delivered, n)) in notes.iter().enumerate() {
-        let _ = write!(s, "\n--- Note {} of {}: {} from {} to {}", i + 1, notes.len(), n.kind, n.sender, n.recipient);
+        let _ = write!(
+            s,
+            "\n--- Note {} of {}: {} from {} to {}",
+            i + 1,
+            notes.len(),
+            n.kind,
+            n.sender,
+            n.recipient
+        );
         if let Some(r) = &n.repo {
             let _ = write!(s, ", {r}");
             if n.issue > 0 {
@@ -92,7 +108,11 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
         if let Some(b) = &n.base {
             let _ = write!(s, ", base {b}");
         }
-        let _ = writeln!(s, ", created {} (seq {seq}, delivery {delivered}) ---", n.created_at);
+        let _ = writeln!(
+            s,
+            ", created {} (seq {seq}, delivery {delivered}) ---",
+            n.created_at
+        );
         s.push_str(&truncate(n.body.trim_end(), budget));
         s.push('\n');
     }
@@ -107,7 +127,12 @@ fn truncate(body: &str, max: usize) -> String {
     while !body.is_char_boundary(end) {
         end -= 1;
     }
-    format!("{}\n[... truncated by the bridge: {} of {} bytes shown]", &body[..end], end, body.len())
+    format!(
+        "{}\n[... truncated by the bridge: {} of {} bytes shown]",
+        &body[..end],
+        end,
+        body.len()
+    )
 }
 
 #[cfg(test)]
@@ -132,7 +157,11 @@ mod tests {
             main: Some("b".repeat(40)),
             start: "c".repeat(40),
             created_at: "20261127T000000Z".into(),
-            conflicts: if review { vec!["src/x.rs".into()] } else { vec![] },
+            conflicts: if review {
+                vec!["src/x.rs".into()]
+            } else {
+                vec![]
+            },
             sessions: BTreeMap::new(),
         }
     }
@@ -155,7 +184,12 @@ mod tests {
     fn preamble_state_and_notes() {
         let s = seat("w1");
         let t = task(false);
-        let mut n = Note::new(seat("claude"), seat("w1"), Kind::Assign, "[claude] Assign: hgl-compiler#980 Fix it\n\nDetails.");
+        let mut n = Note::new(
+            seat("claude"),
+            seat("w1"),
+            Kind::Assign,
+            "[claude] Assign: hgl-compiler#980 Fix it\n\nDetails.",
+        );
         n.repo = Some("hgl-compiler".into());
         n.issue = 980;
         n.created_at = "20261127T041100Z".into();
@@ -189,7 +223,11 @@ mod tests {
         let t = task(true);
         let n = Note::new(seat("claude"), seat("r1"), Kind::Note, "x");
         let p = build(&ctx(Some(&t), &s), &[(1, 1, &n)]);
-        assert!(p.contains(&format!("review of hgl-compiler#980 at {}, merged onto origin/main ({})", "a".repeat(40), "b".repeat(40))));
+        assert!(p.contains(&format!(
+            "review of hgl-compiler#980 at {}, merged onto origin/main ({})",
+            "a".repeat(40),
+            "b".repeat(40)
+        )));
         assert!(p.contains("does NOT merge onto main (conflicts: src/x.rs)"));
     }
 

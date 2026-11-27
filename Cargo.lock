@@ -556,6 +556,7 @@ name = "hgl-ai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "hgl-ai-bridge",
  "hgl-ai-bus",

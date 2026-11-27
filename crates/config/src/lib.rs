@@ -126,7 +126,9 @@ pub fn default_clone_url() -> String {
 impl Github {
     /// The clone URL of `repo` (`clone_url` with `{owner}` and `{repo}` filled in).
     pub fn clone_url_for(&self, repo: &str) -> String {
-        self.clone_url.replace("{owner}", &self.owner).replace("{repo}", repo)
+        self.clone_url
+            .replace("{owner}", &self.owner)
+            .replace("{repo}", repo)
     }
 }
 
@@ -262,6 +264,37 @@ pub fn runtime_supports(r: Runtime, f: Family) -> bool {
         Runtime::Codex => f == Family::Gpt,
         Runtime::Agy => matches!(f, Family::Gemini | Family::Claude | Family::Gpt),
     }
+}
+
+/// Efforts a model slug may already end with (`gemini-4-carbon-high`).
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Antigravity names a model with its effort: `SLUG-EFFORT`, unless the slug has one.
+pub fn agy_model(model: &str, effort: Option<&str>) -> String {
+    match effort {
+        Some(e) if !EFFORTS.iter().any(|x| model.ends_with(&format!("-{x}"))) => {
+            format!("{model}-{e}")
+        }
+        _ => model.to_string(),
+    }
+}
+
+/// Model and effort flags of a runtime (docs/design.md §4), shared by headless turns
+/// and interactive sessions so the two never diverge.
+pub fn model_args(r: &Resolved) -> Vec<String> {
+    let e = r.effort.as_deref();
+    let mut a: Vec<String> = match r.runtime {
+        Runtime::Claude => vec!["--model".into(), r.model.clone()],
+        Runtime::Codex => vec!["-m".into(), r.model.clone()],
+        Runtime::Agy => vec!["--model".into(), agy_model(&r.model, e)],
+    };
+    if let Some(e) = e {
+        match r.runtime {
+            Runtime::Codex => a.extend(["-c".into(), format!("model_reasoning_effort={e}")]),
+            Runtime::Claude | Runtime::Agy => a.extend(["--effort".into(), e.to_string()]),
+        }
+    }
+    a
 }
 
 impl Config {
@@ -549,9 +582,18 @@ model = "claude-opus-5-5-high"
 
     #[test]
     fn clone_url_default_and_template() {
-        let g: Github = toml::from_str("owner = \"hhenson\"\nrepos = []\nbranch_prefix = \"codex/\"\nwrapper = \"w\"\n").unwrap();
-        assert_eq!(g.clone_url_for("hgl_spec"), "https://github.com/hhenson/hgl_spec.git");
-        let g = Github { clone_url: "/srv/git/{repo}.git".into(), ..Github::default() };
+        let g: Github = toml::from_str(
+            "owner = \"hhenson\"\nrepos = []\nbranch_prefix = \"codex/\"\nwrapper = \"w\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            g.clone_url_for("hgl_spec"),
+            "https://github.com/hhenson/hgl_spec.git"
+        );
+        let g = Github {
+            clone_url: "/srv/git/{repo}.git".into(),
+            ..Github::default()
+        };
         assert_eq!(g.clone_url_for("x"), "/srv/git/x.git");
     }
 

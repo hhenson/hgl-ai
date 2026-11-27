@@ -47,7 +47,9 @@ impl Stale {
 
 /// Parse the protocol's `YYYYMMDDTHHMMSSZ` stamp.
 pub fn parse_stamp(s: &str) -> Option<DateTime<Utc>> {
-    NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ").ok().map(|t| t.and_utc())
+    NaiveDateTime::parse_from_str(s, "%Y%m%dT%H%M%SZ")
+        .ok()
+        .map(|t| t.and_utc())
 }
 
 pub fn age(rec: &TreeRecord, now: DateTime<Utc>) -> Option<Duration> {
@@ -55,18 +57,30 @@ pub fn age(rec: &TreeRecord, now: DateTime<Utc>) -> Option<Duration> {
 }
 
 /// The stale subset of `records`; each issue or pull request is asked about once.
-pub fn stale(records: &[TreeRecord], now: DateTime<Utc>, after: Duration, closed: &dyn IsClosed) -> Vec<Stale> {
+pub fn stale(
+    records: &[TreeRecord],
+    now: DateTime<Utc>,
+    after: Duration,
+    closed: &dyn IsClosed,
+) -> Vec<Stale> {
     let mut asked: BTreeMap<(String, u64, bool), bool> = BTreeMap::new();
     let mut out = Vec::new();
     for r in records {
         let age = age(r, now);
         let old = age.is_some_and(|a| a > after);
         let key = (r.task.repo.clone(), r.task.issue, r.review);
-        let is_closed = *asked
-            .entry(key)
-            .or_insert_with(|| closed.is_closed(&r.task.repo, r.task.issue, r.review).unwrap_or(false));
+        let is_closed = *asked.entry(key).or_insert_with(|| {
+            closed
+                .is_closed(&r.task.repo, r.task.issue, r.review)
+                .unwrap_or(false)
+        });
         if old || is_closed {
-            out.push(Stale { record: r.clone(), age, old, closed: is_closed });
+            out.push(Stale {
+                record: r.clone(),
+                age,
+                old,
+                closed: is_closed,
+            });
         }
     }
     out
@@ -108,7 +122,10 @@ mod tests {
         TreeRecord {
             host: "h".into(),
             seat: Seat::new("w1").unwrap(),
-            task: TaskKey { repo: "r".into(), issue },
+            task: TaskKey {
+                repo: "r".into(),
+                issue,
+            },
             review,
             path: String::new(),
             branch: None,
@@ -120,16 +137,26 @@ mod tests {
     #[test]
     fn old_or_closed() {
         let now = parse_stamp("20261127T120000Z").unwrap();
-        let recs =
-            [rec(1, "20261120T120000Z", false), rec(2, "20261127T110000Z", false), rec(3, "20261127T110000Z", true), rec(3, "x", true)];
+        let recs = [
+            rec(1, "20261120T120000Z", false),
+            rec(2, "20261127T110000Z", false),
+            rec(3, "20261127T110000Z", true),
+            rec(3, "x", true),
+        ];
         let calls = Cell::new(0);
         let closed = |_: &str, n: u64, pr: bool| {
             calls.set(calls.get() + 1);
             Some(n == 3 && pr)
         };
         let s = stale(&recs, now, Duration::from_secs(3 * 86400), &closed);
-        let got: Vec<(u64, bool, bool)> = s.iter().map(|s| (s.record.task.issue, s.old, s.closed)).collect();
-        assert_eq!(got, vec![(1, true, false), (3, false, true), (3, false, true)]);
+        let got: Vec<(u64, bool, bool)> = s
+            .iter()
+            .map(|s| (s.record.task.issue, s.old, s.closed))
+            .collect();
+        assert_eq!(
+            got,
+            vec![(1, true, false), (3, false, true), (3, false, true)]
+        );
         assert_eq!(calls.get(), 3, "one question per issue or pull request");
         assert_eq!(s[0].reason(), "old");
         assert!(stale(&recs[1..2], now, Duration::from_secs(86400), &Unknown).is_empty());

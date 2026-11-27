@@ -15,7 +15,9 @@ pub fn slug(title: &str) -> String {
         if let Some((head, tail)) = s.split_once(':')
             && !head.is_empty()
             && head.split_whitespace().count() <= 2
-            && head.chars().all(|c| c.is_alphanumeric() || c == ' ' || c == '-')
+            && head
+                .chars()
+                .all(|c| c.is_alphanumeric() || c == ' ' || c == '-')
         {
             s = tail;
         }
@@ -62,25 +64,42 @@ mod tests {
 
     #[test]
     fn slugs() {
-        assert_eq!(slug("[claude] Assign: hgl-compiler#980 Fix the generic resolver crash"), "fix-the-generic-resolver-crash");
-        assert_eq!(slug("Add `foo::bar` support!!!\nsecond line"), "add-foo-bar-support");
+        assert_eq!(
+            slug("[claude] Assign: hgl-compiler#980 Fix the generic resolver crash"),
+            "fix-the-generic-resolver-crash"
+        );
+        assert_eq!(
+            slug("Add `foo::bar` support!!!\nsecond line"),
+            "add-foo-bar-support"
+        );
         assert_eq!(slug("[claude] Assign: hgl-compiler#980"), "task");
         assert_eq!(slug(""), "task");
-        assert_eq!(slug("Fix: keep colons without a runtime tag"), "fix-keep-colons-without-a-runtime-tag");
+        assert_eq!(
+            slug("Fix: keep colons without a runtime tag"),
+            "fix-keep-colons-without-a-runtime-tag"
+        );
         assert_eq!(slug("Ünïcode — dashes ok"), "n-code-dashes-ok");
-        let long = slug("a very long title that keeps going well past the forty character limit of a slug");
+        let long = slug(
+            "a very long title that keeps going well past the forty character limit of a slug",
+        );
         assert!(long.len() <= SLUG_MAX, "{long}");
         assert!(!long.ends_with('-'));
         assert_eq!(long, "a-very-long-title-that-keeps-going-well");
         let unbroken = slug(&"x".repeat(60));
         assert_eq!(unbroken.len(), SLUG_MAX);
         for s in [long, unbroken] {
-            assert!(s.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-'));
+            assert!(
+                s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+            );
         }
     }
 
     #[test]
     fn branches() {
-        assert_eq!(branch_name("codex/", 980, "[codex] Assign: Fix it"), "codex/980-fix-it");
+        assert_eq!(
+            branch_name("codex/", 980, "[codex] Assign: Fix it"),
+            "codex/980-fix-it"
+        );
     }
 }

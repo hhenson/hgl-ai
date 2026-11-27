@@ -4,20 +4,19 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+use hgl_ai_config::{Resolved, model_args};
 use hgl_ai_proto::Runtime;
 use serde_json::Value;
 
 use crate::proc::CmdSpec;
 
-/// Efforts a model slug may already end with (`gemini-4-carbon-high`).
-const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
-
 /// What one turn needs from its seat and task.
 #[derive(Debug, Clone)]
 pub struct TurnInput<'a> {
     pub prompt: &'a str,
-    pub model: &'a str,
-    pub effort: Option<&'a str>,
+    /// Runtime, model and effort; their flags come from [`model_args`], shared with
+    /// interactive sessions.
+    pub resolved: &'a Resolved,
     /// The session of this task's previous turn on the same runtime.
     pub resume: Option<&'a str>,
     /// The tree's `src/` (or the seat's inbox directory).
@@ -26,58 +25,71 @@ pub struct TurnInput<'a> {
     pub writable: &'a [PathBuf],
 }
 
-/// The agent command line for `runtime`; the caller adds environment and the cap.
-pub fn command(runtime: Runtime, program: &Path, t: &TurnInput) -> CmdSpec {
+/// The agent command line of a headless turn; the caller adds environment and the cap.
+pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
     let mut a: Vec<OsString> = Vec::new();
-    let mut push = |s: &str| a.push(s.into());
-    match runtime {
+    let s = |a: &mut Vec<OsString>, v: &[&str]| a.extend(v.iter().map(OsString::from));
+    let models = model_args(t.resolved);
+    let models: Vec<&str> = models.iter().map(String::as_str).collect();
+    let add_dirs = |a: &mut Vec<OsString>| {
+        for d in t.writable {
+            a.push("--add-dir".into());
+            a.push(d.into());
+        }
+    };
+    match t.resolved.runtime {
         Runtime::Claude => {
-            for s in ["-p", t.prompt, "--output-format", "stream-json", "--verbose", "--model", t.model] {
-                push(s);
-            }
-            if let Some(e) = t.effort {
-                push("--effort");
-                push(e);
-            }
+            s(
+                &mut a,
+                &[
+                    "-p",
+                    t.prompt,
+                    "--output-format",
+                    "stream-json",
+                    "--verbose",
+                ],
+            );
+            s(&mut a, &models);
             if let Some(id) = t.resume {
-                push("--resume");
-                push(id);
+                s(&mut a, &["--resume", id]);
             }
-            push("--permission-mode");
-            push("bypassPermissions");
-            for d in t.writable {
-                a.push("--add-dir".into());
-                a.push(d.into());
-            }
+            s(&mut a, &["--permission-mode", "bypassPermissions"]);
+            add_dirs(&mut a);
         }
         Runtime::Codex => {
-            push("exec");
+            s(&mut a, &["exec"]);
             if t.resume.is_some() {
-                push("resume");
+                s(&mut a, &["resume"]);
             }
-            for s in ["--json", "-m", t.model] {
-                push(s);
-            }
-            if let Some(e) = t.effort {
-                push("-c");
-                push(&format!("model_reasoning_effort={}", toml_str(e)));
-            }
+            s(&mut a, &["--json"]);
+            s(&mut a, &models);
             if t.resume.is_some() {
                 // `exec resume` takes no `--sandbox` or `-C`; the cwd is the process's.
-                push("-c");
-                push("sandbox_mode=\"workspace-write\"");
+                s(&mut a, &["-c", "sandbox_mode=\"workspace-write\""]);
             } else {
-                push("--sandbox");
-                push("workspace-write");
+                s(&mut a, &["--sandbox", "workspace-write"]);
             }
-            push("-c");
-            push("sandbox_workspace_write.network_access=true");
-            let roots: Vec<String> = t.writable.iter().map(|p| toml_str(&p.to_string_lossy())).collect();
-            push("-c");
-            push(&format!("sandbox_workspace_write.writable_roots=[{}]", roots.join(",")));
-            push("--skip-git-repo-check");
+            let roots: Vec<String> = t
+                .writable
+                .iter()
+                .map(|p| toml_str(&p.to_string_lossy()))
+                .collect();
+            let roots = format!(
+                "sandbox_workspace_write.writable_roots=[{}]",
+                roots.join(",")
+            );
+            s(
+                &mut a,
+                &[
+                    "-c",
+                    "sandbox_workspace_write.network_access=true",
+                    "-c",
+                    &roots,
+                    "--skip-git-repo-check",
+                ],
+            );
             match t.resume {
-                Some(id) => push(id),
+                Some(id) => s(&mut a, &[id]),
                 None => {
                     a.push("-C".into());
                     a.push(t.cwd.into());
@@ -86,33 +98,20 @@ pub fn command(runtime: Runtime, program: &Path, t: &TurnInput) -> CmdSpec {
             a.push(t.prompt.into());
         }
         Runtime::Agy => {
-            for s in ["-p", t.prompt, "--output-format", "stream-json", "--model", &agy_model(t.model, t.effort)] {
-                push(s);
-            }
-            if let Some(e) = t.effort {
-                push("--effort");
-                push(e);
-            }
+            s(&mut a, &["-p", t.prompt, "--output-format", "stream-json"]);
+            s(&mut a, &models);
             if let Some(id) = t.resume {
-                push("--conversation");
-                push(id);
+                s(&mut a, &["--conversation", id]);
             }
-            push("--dangerously-skip-permissions");
-            for d in t.writable {
-                a.push("--add-dir".into());
-                a.push(d.into());
-            }
+            s(&mut a, &["--dangerously-skip-permissions"]);
+            add_dirs(&mut a);
         }
     }
-    CmdSpec { program: program.to_path_buf(), args: a, env: Vec::new(), cwd: t.cwd.to_path_buf() }
-}
-
-/// `SLUG-EFFORT` unless the slug already names an effort.
-pub fn agy_model(model: &str, effort: Option<&str>) -> String {
-    let has = EFFORTS.iter().any(|e| model.ends_with(&format!("-{e}")));
-    match effort {
-        Some(e) if !has => format!("{model}-{e}"),
-        _ => model.to_string(),
+    CmdSpec {
+        program: program.to_path_buf(),
+        args: a,
+        env: Vec::new(),
+        cwd: t.cwd.to_path_buf(),
     }
 }
 
@@ -141,11 +140,17 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(runtime: Runtime) -> Self {
-        Parser { runtime, p: Parsed::default(), quota_hint: false }
+        Parser {
+            runtime,
+            p: Parsed::default(),
+            quota_hint: false,
+        }
     }
 
     pub fn line(&mut self, line: &str) {
-        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else { return };
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            return;
+        };
         match self.runtime {
             Runtime::Claude => self.claude(&v),
             Runtime::Codex => self.codex(&v),
@@ -168,7 +173,9 @@ impl Parser {
                 let is_error = v.get("is_error").and_then(Value::as_bool).unwrap_or(false);
                 self.p.result_ok = Some(!is_error);
                 if is_error {
-                    let msg = str_at(v, "result").or(str_at(v, "subtype")).unwrap_or("error result");
+                    let msg = str_at(v, "result")
+                        .or(str_at(v, "subtype"))
+                        .unwrap_or("error result");
                     self.error(msg);
                     if v.get("api_error_status").and_then(Value::as_u64) == Some(429) {
                         self.quota_hint = true;
@@ -193,7 +200,10 @@ impl Parser {
             }
             Some("turn.failed") => {
                 self.p.result_ok = Some(false);
-                let msg = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("turn failed");
+                let msg = v
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .unwrap_or("turn failed");
                 self.error(msg);
             }
             Some("error") => {
@@ -217,7 +227,10 @@ impl Parser {
                 let ok = str_at(r, "status") == Some("SUCCESS");
                 self.p.result_ok = Some(ok);
                 if !ok {
-                    let msg = ["error", "message", "status"].iter().find_map(|k| str_at(r, k)).unwrap_or("error result");
+                    let msg = ["error", "message", "status"]
+                        .iter()
+                        .find_map(|k| str_at(r, k))
+                        .unwrap_or("error result");
                     self.error(msg);
                     if is_quota(&r.to_string()) {
                         self.quota_hint = true;
@@ -225,7 +238,10 @@ impl Parser {
                 }
             }
             Some("error") => {
-                let msg = ["message", "error"].iter().find_map(|k| str_at(v, k)).unwrap_or("error");
+                let msg = ["message", "error"]
+                    .iter()
+                    .find_map(|k| str_at(v, k))
+                    .unwrap_or("error");
                 self.error(msg);
             }
             _ => {}
@@ -289,6 +305,7 @@ mod tests {
     //! (claude 2.1.332, codex-cli 0.155.1, agy 1.5.18), trimmed, ids and paths replaced.
     //! `*.synthetic.jsonl` are hand-written in the same shapes; no real refusal was triggered.
     use super::*;
+    use hgl_ai_proto::Family;
 
     const CLAUDE_OK: &str = include_str!("../fixtures/claude-ok.jsonl");
     const CODEX_OK: &str = include_str!("../fixtures/codex-ok.jsonl");
@@ -304,26 +321,47 @@ mod tests {
     }
 
     fn strs(c: &CmdSpec) -> Vec<String> {
-        c.args.iter().map(|a| a.to_string_lossy().into_owned()).collect()
+        c.args
+            .iter()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
     }
 
     #[test]
     fn real_successes() {
         let c = parse(Runtime::Claude, CLAUDE_OK, true, "");
-        assert_eq!(c.session_id.as_deref(), Some("00000000-0000-4000-8000-000000000001"));
+        assert_eq!(
+            c.session_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000001")
+        );
         assert!(c.success(true) && !c.quota);
-        let x = parse(Runtime::Codex, CODEX_OK, true, "Reading additional input from stdin...\n");
-        assert_eq!(x.session_id.as_deref(), Some("00000000-0000-4000-8000-000000000002"));
+        let x = parse(
+            Runtime::Codex,
+            CODEX_OK,
+            true,
+            "Reading additional input from stdin...\n",
+        );
+        assert_eq!(
+            x.session_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000002")
+        );
         assert!(x.success(true) && !x.quota);
         let a = parse(Runtime::Agy, AGY_OK, true, "");
-        assert_eq!(a.session_id.as_deref(), Some("00000000-0000-4000-8000-000000000003"));
+        assert_eq!(
+            a.session_id.as_deref(),
+            Some("00000000-0000-4000-8000-000000000003")
+        );
         assert!(a.success(true) && !a.quota);
         assert!(!a.success(false), "a non-zero exit is never a success");
     }
 
     #[test]
     fn quota_refusals() {
-        for (rt, text) in [(Runtime::Claude, CLAUDE_QUOTA), (Runtime::Codex, CODEX_QUOTA), (Runtime::Agy, AGY_QUOTA)] {
+        for (rt, text) in [
+            (Runtime::Claude, CLAUDE_QUOTA),
+            (Runtime::Codex, CODEX_QUOTA),
+            (Runtime::Agy, AGY_QUOTA),
+        ] {
             let p = parse(rt, text, false, "");
             assert!(p.quota, "{rt}");
             assert!(!p.success(false));
@@ -331,10 +369,21 @@ mod tests {
             assert!(p.error.is_some());
         }
         // A rate-limit warning on a turn that then succeeded is not a refusal.
-        let warned = format!("{}\n{CLAUDE_OK}", r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#);
+        let warned = format!(
+            "{}\n{CLAUDE_OK}",
+            r#"{"type":"rate_limit_event","rate_limit_info":{"status":"rejected"}}"#
+        );
         assert!(!parse(Runtime::Claude, &warned, true, "").quota);
         // Quota wording only on stderr, nothing structured.
-        assert!(parse(Runtime::Codex, "", false, "ERROR: You've hit your usage limit.").quota);
+        assert!(
+            parse(
+                Runtime::Codex,
+                "",
+                false,
+                "ERROR: You've hit your usage limit."
+            )
+            .quota
+        );
     }
 
     #[test]
@@ -342,49 +391,131 @@ mod tests {
         let crash = r#"{"type":"result","subtype":"error_during_execution","is_error":true,"session_id":"s"}"#;
         let p = parse(Runtime::Claude, crash, false, "panic: index out of range");
         assert!(!p.quota && !p.success(false));
-        let p = parse(Runtime::Codex, r#"{"type":"turn.failed","error":{"message":"stream disconnected"}}"#, false, "");
+        let p = parse(
+            Runtime::Codex,
+            r#"{"type":"turn.failed","error":{"message":"stream disconnected"}}"#,
+            false,
+            "",
+        );
         assert!(!p.quota);
         assert_eq!(p.error.as_deref(), Some("stream disconnected"));
         let p = parse(Runtime::Agy, "", true, "");
         assert!(!p.success(true), "no result line, no success");
     }
 
+    fn resolved(runtime: Runtime, family: Family, model: &str, effort: Option<&str>) -> Resolved {
+        Resolved {
+            runtime,
+            family,
+            model: model.into(),
+            effort: effort.map(String::from),
+        }
+    }
+
     #[test]
     fn claude_arguments() {
         let w = [PathBuf::from("/w/w1/r-1"), PathBuf::from("/w/clones/r")];
-        let t = TurnInput { prompt: "PROMPT", model: "claude-opus-5-5", effort: Some("high"), resume: Some("S1"), cwd: Path::new("/w/w1/r-1/src"), writable: &w };
-        let c = command(Runtime::Claude, Path::new("claude"), &t);
+        let r = resolved(
+            Runtime::Claude,
+            Family::Claude,
+            "claude-opus-5-5",
+            Some("high"),
+        );
+        let t = TurnInput {
+            prompt: "PROMPT",
+            resolved: &r,
+            resume: Some("S1"),
+            cwd: Path::new("/w/w1/r-1/src"),
+            writable: &w,
+        };
+        let c = command(Path::new("claude"), &t);
         assert_eq!(
             strs(&c),
             [
-                "-p", "PROMPT", "--output-format", "stream-json", "--verbose", "--model", "claude-opus-5-5", "--effort", "high",
-                "--resume", "S1", "--permission-mode", "bypassPermissions", "--add-dir", "/w/w1/r-1", "--add-dir", "/w/clones/r",
+                "-p",
+                "PROMPT",
+                "--output-format",
+                "stream-json",
+                "--verbose",
+                "--model",
+                "claude-opus-5-5",
+                "--effort",
+                "high",
+                "--resume",
+                "S1",
+                "--permission-mode",
+                "bypassPermissions",
+                "--add-dir",
+                "/w/w1/r-1",
+                "--add-dir",
+                "/w/clones/r",
             ]
         );
         assert_eq!(c.cwd, PathBuf::from("/w/w1/r-1/src"));
-        let fresh = TurnInput { resume: None, effort: None, ..t };
-        assert!(!strs(&command(Runtime::Claude, Path::new("claude"), &fresh)).contains(&"--resume".to_string()));
+        let plain = resolved(Runtime::Claude, Family::Claude, "claude-opus-5-5", None);
+        let fresh = TurnInput {
+            resume: None,
+            resolved: &plain,
+            ..t
+        };
+        assert!(!strs(&command(Path::new("claude"), &fresh)).contains(&"--resume".to_string()));
     }
 
     #[test]
     fn codex_arguments() {
         let w = [PathBuf::from("/w/w1/r-1")];
-        let t = TurnInput { prompt: "PROMPT", model: "gpt-6.1-sol", effort: Some("high"), resume: None, cwd: Path::new("/w/w1/r-1/src"), writable: &w };
+        let r = resolved(Runtime::Codex, Family::Gpt, "gpt-6.1-sol", Some("high"));
+        let t = TurnInput {
+            prompt: "PROMPT",
+            resolved: &r,
+            resume: None,
+            cwd: Path::new("/w/w1/r-1/src"),
+            writable: &w,
+        };
         assert_eq!(
-            strs(&command(Runtime::Codex, Path::new("codex"), &t)),
+            strs(&command(Path::new("codex"), &t)),
             [
-                "exec", "--json", "-m", "gpt-6.1-sol", "-c", "model_reasoning_effort=\"high\"", "--sandbox", "workspace-write", "-c",
-                "sandbox_workspace_write.network_access=true", "-c", "sandbox_workspace_write.writable_roots=[\"/w/w1/r-1\"]",
-                "--skip-git-repo-check", "-C", "/w/w1/r-1/src", "PROMPT",
+                "exec",
+                "--json",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "model_reasoning_effort=high",
+                "--sandbox",
+                "workspace-write",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "-c",
+                "sandbox_workspace_write.writable_roots=[\"/w/w1/r-1\"]",
+                "--skip-git-repo-check",
+                "-C",
+                "/w/w1/r-1/src",
+                "PROMPT",
             ]
         );
-        let r = TurnInput { resume: Some("T1"), effort: None, ..t };
+        let plain = resolved(Runtime::Codex, Family::Gpt, "gpt-6.1-sol", None);
+        let r = TurnInput {
+            resume: Some("T1"),
+            resolved: &plain,
+            ..t
+        };
         assert_eq!(
-            strs(&command(Runtime::Codex, Path::new("codex"), &r)),
+            strs(&command(Path::new("codex"), &r)),
             [
-                "exec", "resume", "--json", "-m", "gpt-6.1-sol", "-c", "sandbox_mode=\"workspace-write\"", "-c",
-                "sandbox_workspace_write.network_access=true", "-c", "sandbox_workspace_write.writable_roots=[\"/w/w1/r-1\"]",
-                "--skip-git-repo-check", "T1", "PROMPT",
+                "exec",
+                "resume",
+                "--json",
+                "-m",
+                "gpt-6.1-sol",
+                "-c",
+                "sandbox_mode=\"workspace-write\"",
+                "-c",
+                "sandbox_workspace_write.network_access=true",
+                "-c",
+                "sandbox_workspace_write.writable_roots=[\"/w/w1/r-1\"]",
+                "--skip-git-repo-check",
+                "T1",
+                "PROMPT",
             ]
         );
     }
@@ -392,15 +523,45 @@ mod tests {
     #[test]
     fn agy_arguments() {
         let w = [PathBuf::from("/w/w1/r-1")];
-        let t = TurnInput { prompt: "PROMPT", model: "gemini-4-carbon", effort: Some("high"), resume: Some("C1"), cwd: Path::new("/x"), writable: &w };
+        let r = resolved(
+            Runtime::Agy,
+            Family::Gemini,
+            "gemini-4-carbon",
+            Some("high"),
+        );
+        let t = TurnInput {
+            prompt: "PROMPT",
+            resolved: &r,
+            resume: Some("C1"),
+            cwd: Path::new("/x"),
+            writable: &w,
+        };
         assert_eq!(
-            strs(&command(Runtime::Agy, Path::new("agy"), &t)),
+            strs(&command(Path::new("agy"), &t)),
             [
-                "-p", "PROMPT", "--output-format", "stream-json", "--model", "gemini-4-carbon-high", "--effort", "high",
-                "--conversation", "C1", "--dangerously-skip-permissions", "--add-dir", "/w/w1/r-1",
+                "-p",
+                "PROMPT",
+                "--output-format",
+                "stream-json",
+                "--model",
+                "gemini-4-carbon-high",
+                "--effort",
+                "high",
+                "--conversation",
+                "C1",
+                "--dangerously-skip-permissions",
+                "--add-dir",
+                "/w/w1/r-1",
             ]
         );
-        assert_eq!(agy_model("claude-opus-5-5-high", Some("low")), "claude-opus-5-5-high");
-        assert_eq!(agy_model("gemini-3.8-flash", None), "gemini-3.8-flash");
+        let pinned = resolved(Runtime::Agy, Family::Claude, "claude-opus-5-5-high", None);
+        let t = TurnInput {
+            resolved: &pinned,
+            resume: None,
+            ..t
+        };
+        let a = strs(&command(Path::new("agy"), &t));
+        assert_eq!(a[4..6], ["--model", "claude-opus-5-5-high"]);
+        assert!(!a.contains(&"--effort".to_string()));
     }
 }

@@ -1,10 +1,12 @@
 //! Exclusive `flock(2)` locks on files.
 //!
-//! - Turn lock `<task_dir>/turn.lock`: held for a turn. The agent inherits the
-//!   descriptor, so the lock stays held while any process of the turn lives, even if
-//!   the bridge itself died; a second turn in that directory cannot start.
-//! - Seat lock `<data_dir>/seats/<seat>.lock`: held by whoever serves the seat, the
-//!   bridge or an interactive session (PROTO-6), never both.
+//! - Turn lock `<task_dir>/turn.lock` ([`FileLock::turn`]): held for a turn. The file
+//!   stays empty and its open file is the agent's stdin, so the lock stays held while
+//!   any process of the turn keeps it, even if the bridge itself died; a second turn in
+//!   that directory cannot start.
+//! - Seat lock `<data_dir>/seats/<seat>.lock` ([`FileLock::try_exclusive`]): held by
+//!   whoever serves the seat on this host, the bridge or an interactive session
+//!   (PROTO-6), never both. It records the holder's pid.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
@@ -25,26 +27,62 @@ impl FileLock {
         if let Some(dir) = path.parent() {
             std::fs::create_dir_all(dir)?;
         }
-        let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
         if !try_flock(&file)? {
             return Ok(None);
         }
         file.set_len(0)?;
         file.rewind()?;
         let _ = writeln!(file, "{}", std::process::id());
-        Ok(Some(FileLock { file, path: path.to_path_buf() }))
+        Ok(Some(FileLock {
+            file,
+            path: path.to_path_buf(),
+        }))
     }
 
-    /// [`FileLock::try_exclusive`], retried a few times over a quarter second: a fork
-    /// elsewhere in this process holds a copy of a just-closed descriptor until its exec.
-    pub async fn try_exclusive_patiently(path: &Path) -> std::io::Result<Option<FileLock>> {
+    /// A turn lock: the file is created empty and opened read-only, and stays empty.
+    pub fn turn(path: &Path) -> std::io::Result<Option<FileLock>> {
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        let w = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        let file = File::open(path)?;
+        if !try_flock(&file)? {
+            return Ok(None);
+        }
+        if file.metadata()?.len() > 0 {
+            w.set_len(0)?;
+        }
+        Ok(Some(FileLock {
+            file,
+            path: path.to_path_buf(),
+        }))
+    }
+
+    /// [`FileLock::turn`], retried a few times over a quarter second: a fork elsewhere
+    /// in this process holds a copy of a just-closed descriptor until its exec.
+    pub async fn turn_patiently(path: &Path) -> std::io::Result<Option<FileLock>> {
         for _ in 0..5 {
-            if let Some(l) = Self::try_exclusive(path)? {
+            if let Some(l) = Self::turn(path)? {
                 return Ok(Some(l));
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        Self::try_exclusive(path)
+        Self::turn(path)
+    }
+
+    /// A second descriptor of the same open file (and so of the lock), for a child.
+    pub fn share(&self) -> std::io::Result<File> {
+        self.file.try_clone()
     }
 
     pub fn path(&self) -> &Path {
@@ -81,7 +119,11 @@ fn try_flock(f: &File) -> std::io::Result<bool> {
         return Ok(true);
     }
     let e = std::io::Error::last_os_error();
-    if e.raw_os_error() == Some(libc::EWOULDBLOCK) { Ok(false) } else { Err(e) }
+    if e.raw_os_error() == Some(libc::EWOULDBLOCK) {
+        Ok(false)
+    } else {
+        Err(e)
+    }
 }
 
 #[cfg(not(unix))]
@@ -96,12 +138,31 @@ mod tests {
     #[tokio::test]
     async fn exclusive_until_dropped() {
         let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("x/turn.lock");
+        let p = d.path().join("x/seat.lock");
         let a = FileLock::try_exclusive(&p).unwrap().expect("free");
-        assert!(FileLock::try_exclusive(&p).unwrap().is_none(), "a second open file description conflicts");
+        assert!(
+            FileLock::try_exclusive(&p).unwrap().is_none(),
+            "a second open file description conflicts"
+        );
         assert_eq!(holder(&p), Some(std::process::id()));
-        assert!(a.id().is_some());
         drop(a);
-        assert!(FileLock::try_exclusive_patiently(&p).await.unwrap().is_some());
+        let t = d.path().join("y/turn.lock");
+        std::fs::create_dir_all(t.parent().unwrap()).unwrap();
+        std::fs::write(&t, "stale").unwrap();
+        let a = FileLock::turn(&t).unwrap().expect("free");
+        assert_eq!(
+            std::fs::metadata(&t).unwrap().len(),
+            0,
+            "a turn lock stays empty: it is the agent's stdin"
+        );
+        assert!(a.id().is_some());
+        let shared = a.share().unwrap();
+        drop(a);
+        assert!(
+            FileLock::turn(&t).unwrap().is_none(),
+            "the shared descriptor still holds it"
+        );
+        drop(shared);
+        assert!(FileLock::turn_patiently(&t).await.unwrap().is_some());
     }
 }

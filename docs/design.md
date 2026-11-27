@@ -35,7 +35,8 @@ hgl-ai client uninstall
 hgl-ai init                               provision stream and buckets (idempotent)
 hgl-ai doctor                             check config, hub, CLIs, skills, services, disk
 
-hgl-ai seat add NAME --role ROLE --runtime claude|codex|agy --model SLUG [--effort E]
+hgl-ai seat add NAME --role ROLE --runtime claude|codex|agy (--tier T [--family F] | --model SLUG)
+                [--effort E] [--fallback RUNTIME:FAMILY:TIER[:EFFORT] ...]
 hgl-ai seat list|remove NAME
 hgl-ai agent start SEAT                   interactive session in tmux `hgl-SEAT`
 hgl-ai agent attach SEAT
@@ -48,8 +49,8 @@ hgl-ai note peek SEAT                     print without ack
 hgl-ai state get|put|del KEY [VALUE|-]
 hgl-ai hosts
 
-hgl-ai tree list [--stale] [--json]
-hgl-ai tree remove SEAT REPO ISSUE        what the bridge does on `landed`, by hand
+hgl-ai tree list [--stale] [--local] [--json]   HGL_TREES, or this host's work_root
+hgl-ai tree remove SEAT REPO ISSUE [--review]  what the bridge does on `landed`, by hand
 
 hgl-ai cap SIZE [--time DUR] -- CMD ...   memory and time cap for a command tree
 
@@ -91,6 +92,7 @@ owner = "hhenson"
 repos = ["hgl-compiler", "hgl_spec", "hgl_core", "hgl-project", "homebrew-hgraph"]
 branch_prefix = "codex/"
 wrapper = "hgl-project"
+clone_url = "https://github.com/{owner}/{repo}.git"   # default
 
 [models.claude]
 frontier = "claude-opus-5-5"
@@ -150,6 +152,8 @@ A model's family comes from the `[models.<family>]` table that names it; an
     build/      CARGO_TARGET_DIR, CMake build trees
     tmp/        TMPDIR
     task.json   seat, repo, issue, head, branch, created, session ids
+    turn.lock   flock held for a turn; empty, it is the agent's stdin
+    log/        the last turns' stdout and stderr
   clones/<repo>/  one bare-ish clone per repository and host, shared by seats
   salvage/<seat>-<repo>-<issue>-<UTC>.patch
 ```

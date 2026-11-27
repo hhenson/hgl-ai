@@ -23,7 +23,10 @@ impl Layout {
     pub fn new(root: impl Into<PathBuf>) -> Result<Self> {
         let root = root.into();
         if !root.is_absolute() {
-            return Err(TreeError::Invalid(format!("work_root {} is not absolute", root.display())));
+            return Err(TreeError::Invalid(format!(
+                "work_root {} is not absolute",
+                root.display()
+            )));
         }
         std::fs::create_dir_all(&root).map_err(|e| TreeError::io(&root, e))?;
         let root = root.canonicalize().map_err(|e| TreeError::io(&root, e))?;
@@ -37,7 +40,9 @@ impl Layout {
     /// `<work_root>/<seat>`; seats named like a top-level directory are refused.
     pub fn seat_dir(&self, seat: &Seat) -> Result<PathBuf> {
         if [CLONES, SALVAGE].contains(&seat.as_str()) {
-            return Err(TreeError::Invalid(format!("seat name {seat} is reserved under work_root")));
+            return Err(TreeError::Invalid(format!(
+                "seat name {seat} is reserved under work_root"
+            )));
         }
         self.confine(&self.root.join(seat.as_str()))
     }
@@ -69,7 +74,11 @@ impl Layout {
 
     /// Lexically normalise `p` and require it to lie strictly inside `work_root`.
     pub fn confine(&self, p: &Path) -> Result<PathBuf> {
-        let joined = if p.is_absolute() { p.to_path_buf() } else { self.root.join(p) };
+        let joined = if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            self.root.join(p)
+        };
         let norm = normalize(&joined);
         if norm != self.root && norm.starts_with(&self.root) {
             Ok(norm)
@@ -83,7 +92,11 @@ impl Layout {
     pub fn confine_existing(&self, p: &Path) -> Result<PathBuf> {
         let p = self.confine(p)?;
         let real = p.canonicalize().map_err(|e| TreeError::io(&p, e))?;
-        if real != self.root && real.starts_with(&self.root) { Ok(real) } else { Err(TreeError::Escape(p)) }
+        if real != self.root && real.starts_with(&self.root) {
+            Ok(real)
+        } else {
+            Err(TreeError::Escape(p))
+        }
     }
 }
 
@@ -102,7 +115,13 @@ pub fn parse_task_dir_name(name: &str) -> Option<(TaskKey, bool)> {
     let (repo, issue) = rest.rsplit_once('-')?;
     let issue: u64 = issue.parse().ok().filter(|n| *n > 0)?;
     check_repo(repo).ok()?;
-    Some((TaskKey { repo: repo.to_string(), issue }, review))
+    Some((
+        TaskKey {
+            repo: repo.to_string(),
+            issue,
+        },
+        review,
+    ))
 }
 
 /// A GitHub repository name: `[A-Za-z0-9._-]`, at most 100, not `.` or `..`.
@@ -111,8 +130,14 @@ pub fn check_repo(name: &str) -> Result<()> {
         && name.len() <= 100
         && name != "."
         && name != ".."
-        && name.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
-    if ok { Ok(()) } else { Err(TreeError::Invalid(format!("repository name {name:?}"))) }
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if ok {
+        Ok(())
+    } else {
+        Err(TreeError::Invalid(format!("repository name {name:?}")))
+    }
 }
 
 fn normalize(p: &Path) -> PathBuf {
@@ -141,13 +166,28 @@ mod tests {
     fn paths_follow_the_layout() {
         let d = tempfile::tempdir().unwrap();
         let l = Layout::new(d.path()).unwrap();
-        let t = TaskKey { repo: "hgl-compiler".into(), issue: 980 };
+        let t = TaskKey {
+            repo: "hgl-compiler".into(),
+            issue: 980,
+        };
         let root = l.root().to_path_buf();
-        assert_eq!(l.task_dir(&seat("w1"), &t, false).unwrap(), root.join("w1/hgl-compiler-980"));
-        assert_eq!(l.task_dir(&seat("r1"), &t, true).unwrap(), root.join("r1/hgl-compiler-980-review"));
-        assert_eq!(l.clone_dir("hgl_spec").unwrap(), root.join("clones/hgl_spec"));
+        assert_eq!(
+            l.task_dir(&seat("w1"), &t, false).unwrap(),
+            root.join("w1/hgl-compiler-980")
+        );
+        assert_eq!(
+            l.task_dir(&seat("r1"), &t, true).unwrap(),
+            root.join("r1/hgl-compiler-980-review")
+        );
+        assert_eq!(
+            l.clone_dir("hgl_spec").unwrap(),
+            root.join("clones/hgl_spec")
+        );
         assert_eq!(l.inbox_dir(&seat("w1")).unwrap(), root.join("w1/_inbox"));
-        assert_eq!(parse_task_dir_name("hgl-compiler-980-review"), Some((t.clone(), true)));
+        assert_eq!(
+            parse_task_dir_name("hgl-compiler-980-review"),
+            Some((t.clone(), true))
+        );
         assert_eq!(parse_task_dir_name("hgl-compiler-980"), Some((t, false)));
         assert_eq!(parse_task_dir_name("_inbox"), None);
     }
@@ -157,13 +197,19 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let l = Layout::new(d.path().join("work")).unwrap();
         for bad in ["..", ".", "a/b", "../x", "x y", ""] {
-            let t = TaskKey { repo: bad.into(), issue: 1 };
+            let t = TaskKey {
+                repo: bad.into(),
+                issue: 1,
+            };
             assert!(l.task_dir(&seat("w1"), &t, false).is_err(), "{bad:?}");
             assert!(l.clone_dir(bad).is_err(), "{bad:?}");
         }
         assert!(l.confine(Path::new("../outside")).is_err());
         assert!(l.confine(&l.root().join("w1/../../outside")).is_err());
-        assert!(l.confine(l.root()).is_err(), "work_root itself is not a task path");
+        assert!(
+            l.confine(l.root()).is_err(),
+            "work_root itself is not a task path"
+        );
         assert!(l.confine(Path::new("/etc")).is_err());
         assert!(l.confine(Path::new("w1/x/../y")).is_ok());
         assert!(l.seat_dir(&seat("clones")).is_err());
@@ -176,6 +222,9 @@ mod tests {
         let link = l.root().join("w1/repo-1");
         std::os::unix::fs::symlink(&outside, &link).unwrap();
         assert!(l.confine(&link).is_ok());
-        assert!(matches!(l.confine_existing(&link), Err(TreeError::Escape(_))));
+        assert!(matches!(
+            l.confine_existing(&link),
+            Err(TreeError::Escape(_))
+        ));
     }
 }

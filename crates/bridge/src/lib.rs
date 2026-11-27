@@ -9,7 +9,6 @@
 
 pub mod adapter;
 pub mod bus;
-pub mod cap;
 pub mod disk;
 pub mod lock;
 pub mod proc;
@@ -19,7 +18,7 @@ mod turn;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,8 +30,8 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio::time::Instant;
 
 pub use bus::{BusApi, DeliveryApi, InboxApi};
-pub use cap::{Capper, NoCap, SelfCap};
 pub use disk::{DiskProbe, Statvfs};
+pub use hgl_ai_cap::Method as CapMethod;
 
 use crate::lock::FileLock;
 use crate::proc::{Stop, TreeSlot};
@@ -79,6 +78,8 @@ pub struct Options {
     /// Turn logs kept per task directory.
     pub keep_logs: usize,
     pub bins: BTreeMap<Runtime, PathBuf>,
+    /// How turns are capped; `None` detects it (`hgl_ai_cap::Method::detect`).
+    pub cap_method: Option<CapMethod>,
 }
 
 impl Options {
@@ -98,14 +99,17 @@ impl Options {
             kill_grace: Duration::from_secs(10),
             max_line: 16 << 20,
             keep_logs: 10,
-            bins: Runtime::ALL.iter().map(|r| (*r, PathBuf::from(r.as_str()))).collect(),
+            bins: Runtime::ALL
+                .iter()
+                .map(|r| (*r, PathBuf::from(r.as_str())))
+                .collect(),
+            cap_method: None,
         }
     }
 }
 
-/// What the bridge needs from outside: the cap, GitHub's closed-ness, free space.
+/// What the bridge needs from outside: GitHub's closed-ness and free space.
 pub struct Deps {
-    pub capper: Arc<dyn Capper>,
     pub closed: Arc<dyn IsClosed + Send + Sync>,
     pub disk: Arc<dyn DiskProbe>,
 }
@@ -127,6 +131,7 @@ pub struct Bridge<B: BusApi> {
     gate: Mutex<Gate>,
     /// Seats this bridge serves now (it holds their seat lock).
     served: Mutex<BTreeMap<Seat, Arc<SeatRt>>>,
+    turns: AtomicU64,
 }
 
 /// One seat at run time: its configuration and current binding.
@@ -140,13 +145,22 @@ struct SeatRt {
 
 impl SeatRt {
     fn new(cfg: SeatConfig) -> Self {
-        SeatRt { cfg, binding: Mutex::new(0), exhausted_told: AtomicBool::new(false), busy_told: Mutex::default() }
+        SeatRt {
+            cfg,
+            binding: Mutex::new(0),
+            exhausted_told: AtomicBool::new(false),
+            busy_told: Mutex::default(),
+        }
     }
     fn name(&self) -> &Seat {
         &self.cfg.name
     }
     fn binding_at(&self, i: usize) -> Binding {
-        if i == 0 { self.cfg.binding.clone() } else { self.cfg.fallback[i - 1].clone() }
+        if i == 0 {
+            self.cfg.binding.clone()
+        } else {
+            self.cfg.fallback[i - 1].clone()
+        }
     }
     fn current(&self) -> (usize, Binding) {
         let i = *lock(&self.binding);
@@ -177,6 +191,7 @@ impl<B: BusApi> Bridge<B> {
             opts,
             gate: Mutex::new(Gate::Open),
             served: Mutex::default(),
+            turns: AtomicU64::new(0),
         })
     }
 
@@ -184,27 +199,52 @@ impl<B: BusApi> Bridge<B> {
         &self.bus
     }
 
+    /// A value of `HGL_AI_TURN` no other turn of any bridge has.
+    fn next_marker(&self, seat: &Seat) -> String {
+        let n = self.turns.fetch_add(1, Ordering::Relaxed);
+        format!("{}-{seat}-{}-{n}", self.cfg.host, std::process::id())
+    }
+
     /// The seats to serve: the named ones, or every configured seat but controllers
     /// (a controller is interactive, PROTO-6, unless named).
     pub fn select(&self, only: &[Seat]) -> Result<Vec<SeatConfig>> {
         if only.is_empty() {
-            return Ok(self.cfg.seats.iter().filter(|s| s.role != Role::Controller).cloned().collect());
+            return Ok(self
+                .cfg
+                .seats
+                .iter()
+                .filter(|s| s.role != Role::Controller)
+                .cloned()
+                .collect());
         }
         only.iter()
-            .map(|n| self.cfg.seat(n.as_str()).cloned().ok_or_else(|| BridgeError::Invalid(format!("no seat {n} in the configuration"))))
+            .map(|n| {
+                self.cfg.seat(n.as_str()).cloned().ok_or_else(|| {
+                    BridgeError::Invalid(format!("no seat {n} in the configuration"))
+                })
+            })
             .collect()
     }
 
     /// Serve `only` (or the default seats) until `shutdown` turns true.
-    pub async fn run(self: Arc<Self>, only: &[Seat], shutdown: watch::Receiver<bool>) -> Result<()> {
+    pub async fn run(
+        self: Arc<Self>,
+        only: &[Seat],
+        shutdown: watch::Receiver<bool>,
+    ) -> Result<()> {
         let seats = self.select(only)?;
         if seats.is_empty() {
-            return Err(BridgeError::Invalid("no seats to serve; add one with `hgl-ai seat add`".into()));
+            return Err(BridgeError::Invalid(
+                "no seats to serve; add one with `hgl-ai seat add`".into(),
+            ));
         }
         tracing::info!(host = %self.cfg.host, seats = ?seats.iter().map(|s| s.name.to_string()).collect::<Vec<_>>(), "bridge starting");
         let mut set = tokio::task::JoinSet::new();
         for s in seats {
-            set.spawn(self.clone().seat_main(Arc::new(SeatRt::new(s)), shutdown.clone()));
+            set.spawn(
+                self.clone()
+                    .seat_main(Arc::new(SeatRt::new(s)), shutdown.clone()),
+            );
         }
         set.spawn(self.clone().heartbeat_loop(shutdown.clone()));
         set.spawn(self.clone().report_loop(shutdown.clone()));
@@ -212,6 +252,10 @@ impl<B: BusApi> Bridge<B> {
             if let Err(e) = r {
                 tracing::error!("bridge task failed: {e}");
             }
+        }
+        // No seat is served any more: let an interactive session take one at once.
+        if let Err(e) = self.bus.host_del(&self.cfg.host).await {
+            tracing::warn!("removing the host record: {e}");
         }
         tracing::info!("bridge stopped");
         Ok(())
@@ -229,10 +273,18 @@ impl<B: BusApi> Bridge<B> {
                 return;
             }
             match FileLock::try_exclusive(&path) {
-                Ok(Some(l)) => break l,
+                Ok(Some(l)) => match self.bus.bridge_host(seat.name()).await {
+                    Ok(Some(h)) if h != self.cfg.host => {
+                        if !told {
+                            told = true;
+                            tracing::warn!(seat = %seat.name(), host = %h, "the bridge of another host serves this seat; waiting");
+                        }
+                    }
+                    _ => break l,
+                },
                 Ok(None) if !told => {
                     told = true;
-                    tracing::warn!(seat = %seat.name(), holder = ?lock::holder(&path), "seat is served elsewhere (interactive session?); waiting for its lock");
+                    tracing::warn!(seat = %seat.name(), holder = ?lock::holder(&path), "seat is served elsewhere on this host (interactive session?); waiting for its lock");
                 }
                 Ok(None) => {}
                 Err(e) => tracing::error!(seat = %seat.name(), "seat lock {}: {e}", path.display()),
@@ -245,14 +297,21 @@ impl<B: BusApi> Bridge<B> {
         if told {
             tracing::info!(seat = %seat.name(), "seat lock taken; serving");
         }
+        // Advertise the seat before taking notes, so `note wait` refuses it (PROTO-6).
         lock(&self.served).insert(seat.name().clone(), seat.clone());
+        self.beat().await;
         self.clone().seat_loop(&seat, shutdown).await;
         lock(&self.served).remove(seat.name());
+        self.beat().await;
     }
 
     async fn seat_loop(self: Arc<Self>, seat: &Arc<SeatRt>, mut shutdown: watch::Receiver<bool>) {
         let (tx, mut rx) = mpsc::channel::<B::Delivery>(64);
-        let fetcher = tokio::spawn(self.clone().fetch_loop(seat.name().clone(), tx, shutdown.clone()));
+        let fetcher = tokio::spawn(self.clone().fetch_loop(
+            seat.name().clone(),
+            tx,
+            shutdown.clone(),
+        ));
         let mut pending: Vec<Arc<B::Delivery>> = Vec::new();
         let mut running: Option<Running<B::Delivery>> = None;
         let mut busy: HashMap<Target, Instant> = HashMap::new();
@@ -299,7 +358,12 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    async fn fetch_loop(self: Arc<Self>, seat: Seat, tx: mpsc::Sender<B::Delivery>, mut shutdown: watch::Receiver<bool>) {
+    async fn fetch_loop(
+        self: Arc<Self>,
+        seat: Seat,
+        tx: mpsc::Sender<B::Delivery>,
+        mut shutdown: watch::Receiver<bool>,
+    ) {
         let pause = Duration::from_secs(5);
         let mut inbox = loop {
             match self.bus.inbox(&seat).await {
@@ -376,7 +440,11 @@ impl<B: BusApi> Bridge<B> {
     ) {
         let note = d.note().clone();
         let Some(task) = note.task() else {
-            tracing::warn!(seq = d.seq(), "a `{}` note without a task; acked", note.kind);
+            tracing::warn!(
+                seq = d.seq(),
+                "a `{}` note without a task; acked",
+                note.kind
+            );
             let _ = d.ack().await;
             return;
         };
@@ -393,11 +461,17 @@ impl<B: BusApi> Bridge<B> {
         let mut removed = Vec::new();
         let mut errors = Vec::new();
         for review in [false, true] {
-            if let Some(dir) = self.trees.layout().task_dir(seat.name(), &task, review).ok().filter(|p| p.exists()) {
+            if let Some(dir) = self
+                .trees
+                .layout()
+                .task_dir(seat.name(), &task, review)
+                .ok()
+                .filter(|p| p.exists())
+            {
                 // A process that still holds the turn lock is a stray of an earlier turn.
                 let lp = dir.join(lock::TURN_LOCK);
                 if lp.exists()
-                    && matches!(FileLock::try_exclusive_patiently(&lp).await, Ok(None))
+                    && matches!(FileLock::turn_patiently(&lp).await, Ok(None))
                     && !turn::reap_lock_holders(&lp, self.opts.kill_grace).await
                 {
                     errors.push(format!("a process still held {}", lp.display()));
@@ -418,7 +492,16 @@ impl<B: BusApi> Bridge<B> {
             }
         }
         if !removed.is_empty() || stopped || !errors.is_empty() {
-            let body = service::cleanup_body(&self.cfg.host, seat.name(), &note, &task, &removed, stopped, &errors, self.trees.layout().root());
+            let body = service::cleanup_body(
+                &self.cfg.host,
+                seat.name(),
+                &note,
+                &task,
+                &removed,
+                stopped,
+                &errors,
+                self.trees.layout().root(),
+            );
             self.tell(seat.name(), Kind::Done, Some(&task), body).await;
         }
         let _ = d.ack().await;
@@ -434,8 +517,11 @@ impl<B: BusApi> Bridge<B> {
     ) -> Option<Running<B::Delivery>> {
         loop {
             let now = Instant::now();
-            let plans: Vec<turn::Plan> = pending.iter().map(|d| self.plan(seat, d.note())).collect();
-            let idx = plans.iter().position(|p| busy.get(&p.target).is_none_or(|u| *u <= now))?;
+            let plans: Vec<turn::Plan> =
+                pending.iter().map(|d| self.plan(seat, d.note())).collect();
+            let idx = plans
+                .iter()
+                .position(|p| busy.get(&p.target).is_none_or(|u| *u <= now))?;
             let target = plans[idx].target.clone();
             let mut group = Vec::new();
             let mut creates = Vec::new();
@@ -453,7 +539,9 @@ impl<B: BusApi> Bridge<B> {
             if new_task && group.iter().any(|d| d.note().kind == Kind::Assign) {
                 let gate = self.gate_check().await;
                 if gate != Gate::Open {
-                    let (assigns, others): (Vec<_>, Vec<_>) = group.into_iter().partition(|d| d.note().kind == Kind::Assign);
+                    let (assigns, others): (Vec<_>, Vec<_>) = group
+                        .into_iter()
+                        .partition(|d| d.note().kind == Kind::Assign);
                     for a in assigns {
                         tracing::info!(seat = %seat.name(), seq = a.seq(), ?gate, "assign refused for now");
                         let _ = a.nak(self.opts.gate_delay).await;
@@ -466,12 +554,31 @@ impl<B: BusApi> Bridge<B> {
             let hold = self.bus.state_get("hold").await.ok().flatten();
             let mode = self.bus.state_get("mode").await.ok().flatten();
             let (binding_idx, _) = seat.current();
-            let notes = group.iter().map(|d| (d.seq(), d.delivered(), d.note().clone())).collect();
+            let notes = group
+                .iter()
+                .map(|d| (d.seq(), d.delivered(), d.note().clone()))
+                .collect();
             let (stop_tx, stop_rx) = watch::channel(Stop::None);
             let slot = TreeSlot::default();
-            let job = turn::Job { seat: seat.clone(), target: target.clone(), create, notes, hold, mode, binding_idx, stop: stop_rx, slot: slot.clone() };
+            let job = turn::Job {
+                seat: seat.clone(),
+                target: target.clone(),
+                create,
+                notes,
+                hold,
+                mode,
+                binding_idx,
+                stop: stop_rx,
+                slot: slot.clone(),
+            };
             let handle = tokio::spawn(self.clone().turn(job));
-            return Some(Running { target, deliveries: Arc::new(Mutex::new(group)), stop: stop_tx, handle, slot });
+            return Some(Running {
+                target,
+                deliveries: Arc::new(Mutex::new(group)),
+                stop: stop_tx,
+                handle,
+                slot,
+            });
         }
     }
 
@@ -488,9 +595,9 @@ impl<B: BusApi> Bridge<B> {
             Ok(o) => o,
             Err(e) => {
                 // The turn task panicked or was cancelled: kill its tree, then nak.
-                let tree = *lock(&r.slot);
+                let tree = lock(&r.slot).clone();
                 if let Some(t) = tree {
-                    proc::reap(t, self.opts.kill_grace, Duration::from_secs(10)).await;
+                    proc::reap(&t, self.opts.kill_grace, Duration::from_secs(10)).await;
                 }
                 tracing::error!(seat = %seat.name(), "turn task failed: {e}");
                 return nak_all(&ds, self.opts.nak_delay).await;
@@ -520,8 +627,14 @@ impl<B: BusApi> Bridge<B> {
             }
             Outcome::PrepFailed(msg) => {
                 nak_all(&ds, self.opts.nak_delay).await;
-                let body = format!("[bridge] {}/{}: could not prepare {} for a turn: {msg}; notes naked.", self.cfg.host, seat.name(), r.target);
-                self.tell(seat.name(), Kind::Note, r.target.task(), body).await;
+                let body = format!(
+                    "[bridge] {}/{}: could not prepare {} for a turn: {msg}; notes naked.",
+                    self.cfg.host,
+                    seat.name(),
+                    r.target
+                );
+                self.tell(seat.name(), Kind::Note, r.target.task(), body)
+                    .await;
             }
             Outcome::Failed(_) | Outcome::Shutdown => nak_all(&ds, self.opts.nak_delay).await,
             Outcome::Busy(who) => {
@@ -535,7 +648,8 @@ impl<B: BusApi> Bridge<B> {
                         seat.name(),
                         r.target
                     );
-                    self.tell(seat.name(), Kind::Note, r.target.task(), body).await;
+                    self.tell(seat.name(), Kind::Note, r.target.task(), body)
+                        .await;
                 }
             }
         }
@@ -584,7 +698,11 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    async fn keep_alive(&self, pending: &[Arc<B::Delivery>], running: Option<&Running<B::Delivery>>) {
+    async fn keep_alive(
+        &self,
+        pending: &[Arc<B::Delivery>],
+        running: Option<&Running<B::Delivery>>,
+    ) {
         let mut all: Vec<Arc<B::Delivery>> = pending.to_vec();
         if let Some(r) = running {
             all.extend(lock(&r.deliveries).iter().cloned());
@@ -598,7 +716,9 @@ impl<B: BusApi> Bridge<B> {
 
     /// Send a note to the controller; failures are logged.
     async fn tell(&self, from: &Seat, kind: Kind, task: Option<&TaskKey>, body: String) {
-        let Ok(to) = Seat::new(CONTROLLER) else { return };
+        let Ok(to) = Seat::new(CONTROLLER) else {
+            return;
+        };
         let mut n = hgl_ai_proto::Note::new(from.clone(), to, kind, body);
         if let Some(t) = task {
             n.repo = Some(t.repo.clone());

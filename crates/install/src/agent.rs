@@ -4,13 +4,10 @@
 use std::path::PathBuf;
 
 use hgl_ai_config::{Config, Resolved};
-use hgl_ai_proto::Runtime;
 
 use crate::env::Env;
 use crate::sys::{Cmd, System};
 use crate::{Result, io_at, other, run_ok};
-
-const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
 
 pub fn session_name(seat: &str) -> String {
     format!("hgl-{seat}")
@@ -21,31 +18,10 @@ fn target(seat: &str) -> String {
     format!("={}", session_name(seat))
 }
 
-/// Antigravity names models with their effort (`gemini-4-carbon-high`).
-fn agy_model(model: &str, effort: Option<&str>) -> String {
-    match effort {
-        Some(e) if !EFFORTS.iter().any(|x| model.ends_with(&format!("-{x}"))) => {
-            format!("{model}-{e}")
-        }
-        _ => model.to_string(),
-    }
-}
-
-/// Model and effort flags of an interactive session (docs/design.md §4).
+/// Model and effort flags of an interactive session (docs/design.md §4); the bridge's
+/// headless turns use the same builder.
 pub fn runtime_args(r: &Resolved) -> Vec<String> {
-    let e = r.effort.as_deref();
-    let mut a: Vec<String> = match r.runtime {
-        Runtime::Claude => vec!["--model".into(), r.model.clone()],
-        Runtime::Codex => vec!["-m".into(), r.model.clone()],
-        Runtime::Agy => vec!["--model".into(), agy_model(&r.model, e)],
-    };
-    if let Some(e) = e {
-        match r.runtime {
-            Runtime::Codex => a.extend(["-c".into(), format!("model_reasoning_effort={e}")]),
-            Runtime::Claude | Runtime::Agy => a.extend(["--effort".into(), e.to_string()]),
-        }
-    }
-    a
+    hgl_ai_config::model_args(r)
 }
 
 /// A planned session.
@@ -165,7 +141,7 @@ mod tests {
     use super::*;
     use crate::sys::fake::Fake;
     use crate::{Os, Output};
-    use hgl_ai_proto::Family;
+    use hgl_ai_proto::{Family, Runtime};
 
     fn resolved(runtime: Runtime, model: &str, effort: Option<&str>) -> Resolved {
         Resolved {

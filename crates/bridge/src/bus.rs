@@ -16,11 +16,18 @@ pub trait BusApi: Registry + Send + Sync + 'static {
     fn send(&self, note: &Note) -> impl Future<Output = Result<()>> + Send;
     fn state_get(&self, key: &str) -> impl Future<Output = Result<Option<String>>> + Send;
     fn host_put(&self, rec: &HostRecord) -> impl Future<Output = Result<()>> + Send;
+    fn host_del(&self, host: &str) -> impl Future<Output = Result<()>> + Send;
+    /// The live host whose bridge serves `seat` (PROTO-6).
+    fn bridge_host(&self, seat: &Seat) -> impl Future<Output = Result<Option<String>>> + Send;
 }
 
 pub trait InboxApi: Send + 'static {
     type Delivery: DeliveryApi;
-    fn fetch(&mut self, max: usize, wait: Duration) -> impl Future<Output = Result<Vec<Self::Delivery>>> + Send;
+    fn fetch(
+        &mut self,
+        max: usize,
+        wait: Duration,
+    ) -> impl Future<Output = Result<Vec<Self::Delivery>>> + Send;
 }
 
 pub trait DeliveryApi: Send + Sync + 'static {
@@ -43,10 +50,18 @@ impl BusApi for hgl_ai_bus::Bus {
         hgl_ai_bus::Bus::send(self, note).await.map(|_| ())
     }
     async fn state_get(&self, key: &str) -> Result<Option<String>> {
-        Ok(hgl_ai_bus::Bus::state_get(self, key).await?.map(|e| e.value))
+        Ok(hgl_ai_bus::Bus::state_get(self, key)
+            .await?
+            .map(|e| e.value))
     }
     async fn host_put(&self, rec: &HostRecord) -> Result<()> {
         hgl_ai_bus::Bus::host_put(self, rec).await
+    }
+    async fn host_del(&self, host: &str) -> Result<()> {
+        hgl_ai_bus::Bus::host_del(self, host).await
+    }
+    async fn bridge_host(&self, seat: &Seat) -> Result<Option<String>> {
+        hgl_ai_bus::Bus::bridge_host(self, seat).await
     }
 }
 
