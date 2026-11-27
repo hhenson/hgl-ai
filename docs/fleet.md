@@ -14,7 +14,7 @@ given its part. A host's own file keeps only what it needs to reach the hub.
   while seats run: changing it drains the host's seats and brings them up under the
   new label, and pinned tasks re-pin (FLEET-9). Names and aliases live in the hub's
   state and the host's file, never in a repository.
-- **FLEET-2 — Registration.** `hgl-ai client join --hub URL --credential FILE --work-root DIR`
+- **FLEET-2 — Registration.** `hgl-ai client join --hub URL --work-root DIR`
   registers the host with:
   - its name, OS and architecture;
   - capacity: cores, memory, free disk under `work_root`;
@@ -25,7 +25,19 @@ given its part. A host's own file keeps only what it needs to reach the hub.
   The host is `pending` until the owner (console or `hgl-ai fleet host accept NAME`)
   accepts it. The client refreshes capacity and CLIs with its heartbeat.
 - **FLEET-3 — Local file.** After joining, `config.toml` holds the hub address, the
-  credential file, the host name and `work_root`. Everything else comes from the hub.
+  key file, the host name and alias, and `work_root`. Everything else comes from the hub.
+
+- **FLEET-10 — Identity.** On `join` the client makes its own key pair (a NATS NKey,
+  Ed25519) and keeps the seed in a mode-0600 file beside its configuration; the seed
+  never leaves the host. The registration carries the public key and a short
+  fingerprint of it, which `join` prints. Registration goes through a bootstrap
+  user that may only publish a registration request and read its own reply. When
+  the owner accepts the host, after checking that the fingerprint shown in the
+  console matches the one the host printed, the hub adds that public key as the
+  host's user with the host's permissions (FLEET-3, OWN-5), and the host connects
+  with its seed from then on. That key is the host's id: retiring the host removes
+  it, and a host that rejoins makes a new one. A rejected or expired request leaves
+  nothing behind.
 
 ## 2. Workers and roles
 
@@ -87,7 +99,7 @@ stops seats as they change. Only admin and console credentials write `plan.*`,
 ## 4. Commands
 
 ```
-hgl-ai client join --hub URL --credential FILE --work-root DIR [--alias LABEL]
+hgl-ai client join --hub URL --work-root DIR [--alias LABEL]   makes the key; prints its fingerprint
 hgl-ai fleet show                                  hosts, seats, roles, states
 hgl-ai fleet host accept|retire NAME
 hgl-ai fleet host alias NAME LABEL                 drains and renames the host's seats
