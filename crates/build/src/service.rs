@@ -363,11 +363,12 @@ async fn lane_loop(
     };
     // Heartbeat: gate, probe, record.
     let hb = {
-        let (bus, lane, settings, mut stop) = (
+        let (bus, lane, settings, mut stop, lost) = (
             bus.clone(),
             lane.clone(),
             settings.clone(),
             shutdown.clone(),
+            lost.clone(),
         );
         tokio::spawn(async move {
             let mut beat = 0u32;
@@ -397,6 +398,10 @@ async fn lane_loop(
                 }
                 was_reachable = reachable;
                 beat = beat.wrapping_add(1);
+                if lost.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                    // The record is the new holder's now.
+                    break;
+                }
                 let res = if gate == Gate::Retired && lane.busy() == 0 {
                     bus.builder_del(&lane.label).await
                 } else {
@@ -414,11 +419,16 @@ async fn lane_loop(
             }
         })
     };
-    let mut inbox = bus.inbox(&lane.inbox).await?;
+    // From here every way out goes through the cleanup below: the tasks above stop and
+    // the lease is given back.
+    let (mut inbox, mut fatal) = match bus.inbox(&lane.inbox).await {
+        Ok(i) => (Some(i), None),
+        Err(e) => (None, Some(ServiceError::from(e))),
+    };
     let running: Arc<Mutex<Vec<Cancel>>> = Arc::new(Mutex::new(Vec::new()));
     let mut jobs = tokio::task::JoinSet::new();
     let idle = Arc::new(Notify::new());
-    loop {
+    while let Some(inbox) = inbox.as_mut() {
         if *shutdown.borrow() {
             break;
         }
@@ -536,14 +546,21 @@ async fn lane_loop(
         let _ = s.await;
     }
     refresher.abort();
-    // Bounded: the hub may not answer (a partition ended this lane).
+    let _ = refresher.await;
+    // Bounded: the hub may not answer (a partition ended this lane). The record and the
+    // lease are this lane's only while it holds the lease: after a loss they are the new
+    // holder's.
     let bounded = Duration::from_secs(10);
-    match tokio::time::timeout(bounded, bus.builder_del(&lane.label)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => tracing::warn!(builder = %lane.label, "removing the builder record: {e}"),
-        Err(_) => tracing::warn!(builder = %lane.label, "removing the builder record: no answer"),
-    }
     if let Some(l) = lease.lock().await.take() {
+        match tokio::time::timeout(bounded, bus.builder_del(&lane.label)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(builder = %lane.label, "removing the builder record: {e}")
+            }
+            Err(_) => {
+                tracing::warn!(builder = %lane.label, "removing the builder record: no answer")
+            }
+        }
         let _ = tokio::time::timeout(bounded, l.release()).await;
     }
     forward.abort();
@@ -553,7 +570,10 @@ async fn lane_loop(
             lane.label
         )));
     }
-    Ok(())
+    match fatal.take() {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 async fn read_gate(bus: &Bus, label: &str) -> Gate {

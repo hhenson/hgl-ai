@@ -93,8 +93,14 @@ struct Rig {
     cut: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-type Before =
-    Box<dyn Fn(&Arc<Bus>) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>>;
+/// Runs on the hub (its bus, URL and token) before the service starts.
+type Before = Box<
+    dyn Fn(
+        &Arc<Bus>,
+        &str,
+        &str,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>,
+>;
 
 #[derive(Default)]
 struct Opts {
@@ -214,7 +220,7 @@ impl Rig {
             );
         }
         if let Some(f) = &o.before {
-            f(&bus).await;
+            f(&bus, &n.2, &n.3).await;
         }
         let lanes = service::lanes(&cfg, fake_ssh()).unwrap();
         let origin = bare.display().to_string();
@@ -522,13 +528,68 @@ async fn a_lost_lease_ends_the_service_with_an_error() {
         Ok(Ok(Err(e))) => assert!(e.to_string().contains("lease"), "{e}"),
         other => panic!("the service went on, or ended clean: {other:?}"),
     }
+    // The builder record is the new holder's to keep: the lane that lost the lease does
+    // not delete it on its way out (Carbon's check of #12's round-two fixes, note 3).
+    assert!(
+        r.bus
+            .builders()
+            .await
+            .unwrap()
+            .iter()
+            .any(|b| b.label == "lab1"),
+        "the record was deleted by a lane no longer holding the lease"
+    );
+}
+
+/// Note 3: a lane that fails to open its inbox gives its lease and tasks back.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lane_that_cannot_open_its_inbox_leaves_nothing_behind() {
+    let before: Before = Box::new(|_: &Arc<Bus>, url: &str, token: &str| {
+        let (url, token) = (url.to_string(), token.to_string());
+        Box::pin(async move {
+            // No notes stream: the inbox cannot be opened.
+            let c = async_nats::ConnectOptions::with_token(token)
+                .connect(url.as_str())
+                .await
+                .unwrap();
+            async_nats::jetstream::new(c)
+                .delete_stream(hgl_ai_proto::STREAM_NOTES)
+                .await
+                .unwrap();
+        })
+    });
+    let Some(mut r) = Rig::start_with(Opts {
+        before: Some(before),
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let svc = r.svc.take().unwrap();
+    match tokio::time::timeout(Duration::from_secs(15), svc).await {
+        Ok(Ok(Err(_))) => {}
+        other => panic!("expected the lane to fail: {other:?}"),
+    }
+    // Two refresh periods later: no lease kept alive, no record rewritten.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        r.bus.lock_get("builder.lab1").await.unwrap().is_none(),
+        "the lease was kept"
+    );
+    r.bus.builder_del("lab1").await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        r.bus.builders().await.unwrap().is_empty(),
+        "a heartbeat still writes the record"
+    );
 }
 
 /// Finding 2: one lane that cannot serve (its lease held elsewhere) ends the whole
 /// service, the other lane with it, instead of leaving it dead beside a running one.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lane_that_cannot_serve_ends_the_service() {
-    let before: Before = Box::new(|bus: &Arc<Bus>| {
+    let before: Before = Box::new(|bus: &Arc<Bus>, _: &str, _: &str| {
         let bus = bus.clone();
         Box::pin(async move {
             let l = bus
