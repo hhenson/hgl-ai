@@ -106,6 +106,17 @@ pub fn ensure_server(
     version: &str,
     base: &str,
 ) -> Result<(PathBuf, NatsSource)> {
+    ensure_server_with(sys, data_dir, version, base, true)
+}
+
+/// [`ensure_server`], with Homebrew only when `brew` (not for a server user).
+pub fn ensure_server_with(
+    sys: &dyn System,
+    data_dir: &Path,
+    version: &str,
+    base: &str,
+    brew: bool,
+) -> Result<(PathBuf, NatsSource)> {
     if let Some(p) = sys.which("nats-server") {
         return Ok((p, NatsSource::Path));
     }
@@ -126,7 +137,7 @@ pub fn ensure_server(
     if sys.exists(&ours) && pinned() {
         return Ok((ours, NatsSource::Release));
     }
-    if let Some(brew) = sys.which("brew") {
+    if let Some(brew) = sys.which("brew").filter(|_| brew) {
         let brew = brew.display().to_string();
         run_ok(sys, &Cmd::new(&brew).args(["install", "nats-server"]))?;
         if let Some(p) = sys.which("nats-server") {

@@ -110,6 +110,90 @@ impl Spec {
     }
 }
 
+/// A system unit (`/etc/systemd/system`) or launch daemon (`/Library/LaunchDaemons`):
+/// the server side run as its own OS user (docs/install.md).
+pub fn system_unit_path(os: Os, s: Service) -> PathBuf {
+    match os {
+        Os::Linux => PathBuf::from("/etc/systemd/system").join(s.unit()),
+        Os::MacOs => PathBuf::from("/Library/LaunchDaemons").join(format!("{}.plist", s.label())),
+    }
+}
+
+/// A system unit that runs `spec` as `user` (and `group`) with `HOME=home`.
+pub fn render_systemd_system(spec: &Spec, user: &str, group: &str, home: &Path) -> String {
+    let user_unit = render_systemd(spec);
+    let mut s = String::new();
+    for line in user_unit.lines() {
+        match line {
+            "[Service]" => {
+                s.push_str("[Service]\n");
+                s.push_str(&format!("User={user}\nGroup={group}\nUMask=0077\n"));
+                s.push_str(&format!("Environment=\"HOME={}\"\n", home.display()));
+            }
+            "[Unit]" => s.push_str("[Unit]\nAfter=network-online.target\n"),
+            "WantedBy=default.target" => s.push_str("WantedBy=multi-user.target\n"),
+            l => {
+                s.push_str(l);
+                s.push('\n');
+            }
+        }
+    }
+    // `Description=` follows `[Unit]` after the ordering line.
+    s
+}
+
+/// A launch daemon that runs `spec` as `user` with `HOME=home`.
+pub fn render_launchd_daemon(spec: &Spec, user: &str, home: &Path) -> String {
+    let mut sp = spec.clone();
+    sp.env
+        .insert(0, ("HOME".into(), home.display().to_string()));
+    let agent = render_launchd(&sp);
+    agent.replacen(
+        "  <key>ProgramArguments</key>",
+        &format!(
+            "  <key>UserName</key>\n  <string>{}</string>\n  <key>Umask</key>\n  <integer>63</integer>\n  <key>ProgramArguments</key>",
+            xml(user)
+        ),
+        1,
+    )
+}
+
+/// A system service's state, read without privilege.
+pub fn system_state(sys: &dyn System, s: Service) -> State {
+    match sys.env().os {
+        Os::Linux => {
+            let Ok(o) = sys.query(&Cmd::new("systemctl").args([
+                "show",
+                "-p",
+                "LoadState,ActiveState",
+                &s.unit(),
+            ])) else {
+                return State::NotInstalled;
+            };
+            let loaded = o.stdout.lines().any(|l| l.trim() == "LoadState=loaded");
+            let active = o.stdout.lines().any(|l| l.trim() == "ActiveState=active");
+            match (loaded, active) {
+                (false, _) => State::NotInstalled,
+                (true, true) => State::Running,
+                (true, false) => State::Stopped,
+            }
+        }
+        Os::MacOs => {
+            let target = format!("system/{}", s.label());
+            match sys.query(&Cmd::new("launchctl").args(["print", &target])) {
+                Ok(o) if o.ok() => {
+                    if o.stdout.lines().any(|l| l.trim() == "state = running") {
+                        State::Running
+                    } else {
+                        State::Stopped
+                    }
+                }
+                _ => State::NotInstalled,
+            }
+        }
+    }
+}
+
 pub fn log_path(data_dir: &Path, s: Service) -> PathBuf {
     data_dir.join("logs").join(format!("{}.log", s.short()))
 }

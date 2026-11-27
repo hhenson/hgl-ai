@@ -297,7 +297,12 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     }
     let cfg = ctx.load_config()?;
     let s = Settings::from_config(&cfg)?;
-    let gh = GhCli::default();
+    let gh = match &cfg.github.token_file {
+        Some(p) => GhCli::default()
+            .with_token_file(&hgl_ai_config::expand(p)?)
+            .map_err(lift)?,
+        None => GhCli::default(),
+    };
     // Every command below reads GitHub: say so clearly when `gh` cannot.
     hgl_ai_gh::exec::check_auth(&gh).await.map_err(lift)?;
     match *args.cmd {

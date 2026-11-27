@@ -66,6 +66,36 @@ pub struct Config {
     /// The owner's console (hub host only; docs/owner.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console: Option<Console>,
+    /// On a hub host whose server side runs as its own OS user (the client's
+    /// configuration): that user, for `server status` and `doctor`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_user: Option<ServerUser>,
+}
+
+/// The OS user the hub, coordinator and console run as (docs/install.md).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ServerUser {
+    pub name: String,
+    /// Its home: the server side's configuration, credentials and data.
+    pub home: String,
+}
+
+/// Where the hub's services are installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Units {
+    /// `systemd --user` units or launchd agents of the installing user.
+    #[default]
+    User,
+    /// System units (`User=`) or launch daemons (`UserName`) of a server user.
+    System,
+}
+
+impl Units {
+    fn is_user(&self) -> bool {
+        *self == Units::User
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -201,6 +231,10 @@ pub struct Github {
     /// Clone URL template; `{owner}` and `{repo}` are replaced.
     #[serde(default = "default_clone_url")]
     pub clone_url: String,
+    /// A GitHub token for `gh` (`GH_TOKEN`), mode 0600: the coordinator's own read-only
+    /// token when it runs as the server user. Without it, `gh`'s own sign-in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_file: Option<String>,
 }
 
 pub fn default_clone_url() -> String {
@@ -246,6 +280,7 @@ impl Default for Github {
             release: github::release(),
             tap: github::tap(),
             clone_url: default_clone_url(),
+            token_file: None,
         }
     }
 }
@@ -327,6 +362,9 @@ pub struct Server {
     /// How clients authenticate. A configuration from before hub users is `token`.
     #[serde(default = "HubAuth::legacy")]
     pub auth: HubAuth,
+    /// Where the hub's services are installed.
+    #[serde(default, skip_serializing_if = "Units::is_user")]
+    pub units: Units,
 }
 
 /// `users`: a hub user per client with its role's permissions (OWN-5); `token`: one
@@ -352,6 +390,7 @@ impl Default for Server {
             store_dir: "~/.local/share/hgl-ai/nats".into(),
             nats_version: "2.15.3".into(),
             auth: HubAuth::Users,
+            units: Units::User,
         }
     }
 }
@@ -427,6 +466,7 @@ impl Config {
             seats: Vec::new(),
             server: None,
             console: None,
+            server_user: None,
         }
     }
 

@@ -38,6 +38,15 @@ pub struct ServerOpts {
     pub console_users: Vec<String>,
     /// Run `loginctl enable-linger` (Linux).
     pub linger: bool,
+    /// Install, start and provision the services; `false` writes the configuration,
+    /// credentials and `nats.conf` only (the server-user step of a system install).
+    pub services: bool,
+    /// Install `nats-server` with Homebrew when it is not on `PATH`.
+    pub brew: bool,
+    /// Where the services are installed (recorded in `[server] units`).
+    pub units: hgl_ai_config::Units,
+    /// `[github] token_file` for the coordinator's own GitHub token.
+    pub github_token_file: Option<String>,
     /// Where the pinned `nats-server` release is downloaded from.
     pub release_base: String,
     /// How long to wait for the fresh hub to answer.
@@ -59,6 +68,10 @@ impl Default for ServerOpts {
             console_listen: None,
             console_users: Vec::new(),
             linger: false,
+            services: true,
+            brew: true,
+            units: hgl_ai_config::Units::User,
+            github_token_file: None,
             release_base: nats::RELEASE_BASE.into(),
             wait: Duration::from_secs(HUB_WAIT_SECS),
         }
@@ -134,6 +147,10 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
     if o.users {
         srv.auth = HubAuth::Users;
     }
+    srv.units = o.units;
+    if let Some(t) = &o.github_token_file {
+        cfg.github.token_file = Some(t.clone());
+    }
     cfg.hub.url = local_url(&srv.listen, srv.port);
     cfg.server = Some(srv.clone());
     if let Some(url) = &o.console_url {
@@ -167,7 +184,8 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
     let store = env.expand(&srv.store_dir);
     let token_path = env.expand(&cfg.hub.token_file);
 
-    let (nats_bin, src) = nats::ensure_server(sys, &data_dir, &srv.nats_version, &o.release_base)?;
+    let (nats_bin, src) =
+        nats::ensure_server_with(sys, &data_dir, &srv.nats_version, &o.release_base, o.brew)?;
     let how = match src {
         NatsSource::Path => "on PATH".to_string(),
         NatsSource::Brew => "Homebrew".to_string(),
@@ -253,6 +271,12 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
     save_config(sys, env, &cfg)?;
     let verb = if created { "created" } else { "updated" };
     sys.say(&format!("config: {} ({verb})", env.config_path.display()));
+    if !o.services {
+        // The server user's step of a system install: its services are system units.
+        let logs = data_dir.join("logs");
+        sys.mkdir(&logs).map_err(io_at(&logs))?;
+        return Ok(cfg);
+    }
 
     service::install(sys, &Spec::hub(&nats_bin, &conf, &data_dir))?;
     done(

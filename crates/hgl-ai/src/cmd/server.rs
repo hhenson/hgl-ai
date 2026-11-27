@@ -15,9 +15,16 @@ enum Sub {
     /// Install nats-server, its configuration and token, and the hub service; provision the hub.
     Install(InstallArgs),
     /// Start the hub services.
-    Start,
+    Start {
+        /// Print the root steps of a system install; run none.
+        #[arg(long)]
+        print_root_steps: bool,
+    },
     /// Stop the hub services.
-    Stop,
+    Stop {
+        #[arg(long)]
+        print_root_steps: bool,
+    },
     /// Show whether the hub services run and the port answers.
     Status,
     /// Hub users: one per client, with its role's permissions (docs/install.md).
@@ -27,9 +34,12 @@ enum Sub {
     },
     /// Remove the hub services and nats.conf; keep the JetStream store unless --purge.
     Uninstall {
-        /// Also remove the JetStream store and a downloaded nats-server.
+        /// Also remove the JetStream store and a downloaded nats-server (a system
+        /// install: the server user and its home).
         #[arg(long)]
         purge: bool,
+        #[arg(long)]
+        print_root_steps: bool,
         /// Print what would change; change nothing.
         #[arg(long)]
         dry_run: bool,
@@ -106,6 +116,79 @@ struct InstallArgs {
     /// Print what would change; change nothing.
     #[arg(long)]
     dry_run: bool,
+    /// Run the server side as yourself, with user services (development and tests).
+    /// Without it, the hub, coordinator and console run as their own OS user.
+    #[arg(long)]
+    same_user: bool,
+    /// The server side's OS user (default hgl-ai; _hgl-ai on macOS).
+    #[arg(long, value_name = "NAME")]
+    server_user: Option<String>,
+    /// That user's home (default /var/lib/hgl-ai; /Library/hgl-ai on macOS).
+    #[arg(long, value_name = "DIR")]
+    server_home: Option<std::path::PathBuf>,
+    /// Print the steps that need root as a script, and run none of them.
+    #[arg(long)]
+    print_root_steps: bool,
+    /// Write the configuration, credentials and nats.conf only (a system install's
+    /// server-user step).
+    #[arg(long, hide = true)]
+    no_services: bool,
+    #[arg(long, hide = true)]
+    no_brew: bool,
+    #[arg(long, hide = true, value_name = "user|system")]
+    units: Option<String>,
+    #[arg(long, hide = true, value_name = "FILE")]
+    github_token_file: Option<String>,
+}
+
+impl InstallArgs {
+    /// The flags the server user's step takes over.
+    fn forwarded(&self) -> Vec<String> {
+        let mut v = Vec::new();
+        let mut opt = |k: &str, x: &Option<String>| {
+            if let Some(x) = x {
+                v.push(k.to_string());
+                v.push(x.clone());
+            }
+        };
+        opt("--listen", &self.listen);
+        opt("--store", &self.store);
+        opt("--console-url", &self.console_url);
+        opt("--console-listen", &self.console_listen);
+        if let Some(p) = self.port {
+            v.push("--port".into());
+            v.push(p.to_string());
+        }
+        for u in &self.console_users {
+            v.push("--console-user".into());
+            v.push(u.clone());
+        }
+        for (on, flag) in [
+            (self.rotate_token, "--rotate-token"),
+            (self.no_coord, "--no-coord"),
+            (self.users, "--users"),
+            (self.no_console, "--no-console"),
+        ] {
+            if on {
+                v.push(flag.into());
+            }
+        }
+        v
+    }
+}
+
+/// The server user this client's configuration names (a system install), with the
+/// hub's address for a port check.
+fn server_user(sys: &dyn System) -> Option<(hgl_ai_config::ServerUser, Option<(String, u16)>)> {
+    let cfg = install::load_config(sys, sys.env()).ok()??;
+    let su = cfg.server_user?;
+    let addr = cfg
+        .hub
+        .url
+        .strip_prefix("nats://")
+        .and_then(|r| r.rsplit_once(':'))
+        .and_then(|(h, p)| Some((h.trim_matches(['[', ']']).to_string(), p.parse().ok()?)));
+    Some((su, addr))
 }
 
 /// The host, for the commands of this work package.
@@ -126,7 +209,39 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     let dry = DryRun::new(&real);
     let pick = |d: bool| -> &dyn System { if d { &dry } else { &real } };
     match args.cmd {
+        Sub::Install(a) if !a.same_user => {
+            let os = real.env().os;
+            let host = a
+                .host
+                .clone()
+                .unwrap_or_else(|| server::DEFAULT_HOST.to_string());
+            let o = install::system::SystemOpts {
+                user: a
+                    .server_user
+                    .clone()
+                    .unwrap_or_else(|| install::system::default_user(os).to_string()),
+                home: a
+                    .server_home
+                    .clone()
+                    .unwrap_or_else(|| install::system::default_home(os)),
+                print_only: a.print_root_steps || a.dry_run,
+                host,
+                inner_args: a.forwarded(),
+                listen: a.listen.clone().unwrap_or_else(|| "127.0.0.1".into()),
+                port: a.port.unwrap_or(4222),
+                coord: !a.no_coord,
+                console: !a.no_console,
+                wait: std::time::Duration::from_secs(install::HUB_WAIT_SECS),
+            };
+            if let Some(script) = install::system::install(&real, &o).map_err(lift)? {
+                println!("{script}");
+            }
+        }
         Sub::Install(a) => {
+            let units = match a.units.as_deref() {
+                Some("system") => hgl_ai_config::Units::System,
+                _ => hgl_ai_config::Units::User,
+            };
             let o = server::ServerOpts {
                 host: a.host,
                 listen: a.listen,
@@ -140,20 +255,38 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 console_listen: a.console_listen,
                 console_users: a.console_users,
                 linger: a.linger,
+                services: !a.no_services,
+                brew: !a.no_brew,
+                units,
+                github_token_file: a.github_token_file,
                 ..server::ServerOpts::default()
             };
             server::install(pick(a.dry_run), &BusHub, &o)
                 .await
                 .map_err(lift)?;
         }
-        Sub::Start => server::start(&real).map_err(lift)?,
-        Sub::Stop => server::stop(&real).map_err(lift)?,
+        Sub::Start { print_root_steps } if server_user(&real).is_some() => {
+            if let Some(s) =
+                install::system::control(&real, "start", print_root_steps).map_err(lift)?
+            {
+                println!("{s}");
+            }
+        }
+        Sub::Stop { print_root_steps } if server_user(&real).is_some() => {
+            if let Some(s) =
+                install::system::control(&real, "stop", print_root_steps).map_err(lift)?
+            {
+                println!("{s}");
+            }
+        }
+        Sub::Start { .. } => server::start(&real).map_err(lift)?,
+        Sub::Stop { .. } => server::stop(&real).map_err(lift)?,
         Sub::Status => {
-            return Ok(if server::status(&real).map_err(lift)? {
-                EXIT_OK
-            } else {
-                EXIT_FAIL
-            });
+            let up = match server_user(&real) {
+                Some((su, url)) => install::system::status(&real, &su, url),
+                None => server::status(&real).map_err(lift)?,
+            };
+            return Ok(if up { EXIT_OK } else { EXIT_FAIL });
         }
         Sub::User { cmd } => match cmd {
             UserCmd::Add {
@@ -187,7 +320,20 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 }
             }
         },
-        Sub::Uninstall { purge, dry_run } => {
+        Sub::Uninstall {
+            purge,
+            print_root_steps,
+            dry_run,
+        } if server_user(&real).is_some() => {
+            let (su, _) = server_user(&real).expect("checked");
+            if let Some(s) =
+                install::system::uninstall(&real, &su, purge, print_root_steps || dry_run)
+                    .map_err(lift)?
+            {
+                println!("{s}");
+            }
+        }
+        Sub::Uninstall { purge, dry_run, .. } => {
             server::uninstall(pick(dry_run), purge).map_err(lift)?
         }
     }
