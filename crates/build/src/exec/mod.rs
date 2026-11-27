@@ -88,6 +88,9 @@ pub struct Checkout {
     pub head: String,
     pub base: Option<String>,
     pub issue: u64,
+    /// A `build shell` checkout: under `shells/`, which a builder's startup cleanup of
+    /// `jobs/` leaves alone.
+    pub shell: bool,
 }
 
 /// Where a build runs: paths on the executor's host (`/`-separated).
@@ -242,7 +245,11 @@ pub fn job_dir(root: &str, id: &str) -> String {
 /// and `jobs/<id>/src` a detached worktree at `head`, or at `base` with `head` merged.
 pub(crate) fn checkout(h: &dyn HostOps, root: &str, c: &Checkout) -> Result<Workspace, Prep> {
     let clone = format!("{root}/clones/{}", c.repo);
-    let job = job_dir(root, &c.id);
+    let job = if c.shell {
+        format!("{root}/shells/{}", c.id)
+    } else {
+        job_dir(root, &c.id)
+    };
     let src = format!("{job}/src");
     // One checkout or removal at a time on the shared clone: git locks its config and
     // refs and fails a second writer at once.

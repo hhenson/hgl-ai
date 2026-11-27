@@ -106,6 +106,7 @@ impl World {
             head: self.head.clone(),
             base: None,
             issue: 0,
+            shell: false,
         }
     }
 
@@ -825,5 +826,46 @@ fn a_session_lost_with_its_master_is_a_drop_after_a_quick_reconnect() {
     t.join().unwrap();
     assert!(r.unreachable, "a drop, not a failure: {r:?}");
     ex.cleanup(&ws).unwrap();
+    conn.close();
+}
+
+/// Carbon's second review of #12, finding 7: two proxies' processes (a builder and a
+/// `build shell`) on one remote clone take turns, not only threads of one.
+#[test]
+fn remote_checkouts_take_turns_across_processes() {
+    let w = World::new();
+    let conn = w.conn();
+    conn.connect().unwrap();
+    // Two executors with no state in common but the ssh directory, as two processes are.
+    let a = Arc::new(Ssh::new(
+        Platform::Windows,
+        Dialect::Posix,
+        w.remote.to_str().unwrap(),
+        BTreeMap::new(),
+        conn.clone(),
+    ));
+    let b = Arc::new(Ssh::new(
+        Platform::Windows,
+        Dialect::Posix,
+        w.remote.to_str().unwrap(),
+        BTreeMap::new(),
+        conn.clone(),
+    ));
+    for round in 0..2 {
+        let handles: Vec<_> = (0..6)
+            .map(|i| {
+                let ex = if i % 2 == 0 { a.clone() } else { b.clone() };
+                let mut c = w.checkout(&format!("20261127-16000{round}-00000{i}"));
+                c.base = Some("main".into());
+                std::thread::spawn(move || {
+                    let ws = ex.prepare(&c).map_err(|e| format!("{e:?}"))?;
+                    ex.cleanup(&ws).map_err(|e| format!("{e:?}"))
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap().unwrap();
+        }
+    }
     conn.close();
 }

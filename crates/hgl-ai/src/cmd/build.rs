@@ -976,6 +976,7 @@ async fn shell(ctx: &Ctx, a: ShellArgs) -> anyhow::Result<i32> {
         head,
         base: a.base.clone(),
         issue: a.issue,
+        shell: true,
     };
     let cfg2 = cfg.clone();
     let platform = a.platform;

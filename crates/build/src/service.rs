@@ -659,6 +659,7 @@ async fn run_job(
         head: job.head.clone(),
         base: job.base.clone(),
         issue: job.issue,
+        shell: false,
     };
     let mut retried = false;
     loop {

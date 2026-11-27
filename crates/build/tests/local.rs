@@ -61,6 +61,7 @@ fn concurrent_checkouts_share_a_clone() {
                         head,
                         base: Some("main".into()),
                         issue: 0,
+                        shell: false,
                     };
                     let ws = ex.prepare(&c).map_err(|e| format!("{e:?}"))?;
                     assert!(Path::new(&ws.src).join("f.txt").is_file());

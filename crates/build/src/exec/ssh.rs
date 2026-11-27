@@ -703,30 +703,6 @@ pub struct Ssh {
     orphans: Mutex<Vec<u32>>,
     /// Bytes of artifacts one step may bring back.
     artifact_limit: u64,
-    /// Clones on the remote in use by a checkout or removal of this proxy.
-    clones: Arc<(
-        Mutex<std::collections::BTreeSet<String>>,
-        std::sync::Condvar,
-    )>,
-}
-
-/// Holds a remote clone for this proxy; frees it when dropped.
-struct RemoteClone {
-    clones: Arc<(
-        Mutex<std::collections::BTreeSet<String>>,
-        std::sync::Condvar,
-    )>,
-    clone: String,
-}
-
-impl Drop for RemoteClone {
-    fn drop(&mut self) {
-        let (set, cv) = &*self.clones;
-        set.lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.clone);
-        cv.notify_all();
-    }
 }
 
 impl Ssh {
@@ -746,7 +722,6 @@ impl Ssh {
             kick: Arc::new(tokio::sync::Notify::new()),
             orphans: Mutex::new(Vec::new()),
             artifact_limit: ARTIFACT_LIMIT,
-            clones: Arc::default(),
         }
     }
 
@@ -919,18 +894,20 @@ impl Ssh {
 }
 
 impl HostOps for Ssh {
-    /// In this proxy's process: it alone builds in the remote's work directory.
+    /// A `flock` on this host, beside the remote's control socket: the proxy's builder
+    /// and its `build shell`s, in their own processes, take turns on the remote clone.
     fn lock_clone(&self, clone: &str) -> Result<super::CloneGuard, HostError> {
-        let (set, cv) = &*self.clones;
-        let mut held = set.lock().unwrap_or_else(|e| e.into_inner());
-        while held.contains(clone) {
-            held = cv.wait(held).unwrap_or_else(|e| e.into_inner());
-        }
-        held.insert(clone.to_string());
-        Ok(Box::new(RemoteClone {
-            clones: self.clones.clone(),
-            clone: clone.to_string(),
-        }))
+        let repo = clone.rsplit(['/', '\\']).next().unwrap_or(clone);
+        let dir = self
+            .conn
+            .socket()
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let path = dir.join(format!("{}.clone.{repo}.lock", self.conn.label));
+        let l = crate::lock::FileLock::lock(&path)
+            .map_err(|e| HostError::Failed(format!("locking {}: {e}", path.display())))?;
+        Ok(Box::new(l))
     }
 
     fn git(&self, cwd: &str, args: &[&str]) -> Result<Out, HostError> {

@@ -585,3 +585,90 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
     let o = run(&["build", "log", &id, "../../r.toml"]);
     assert_ne!(o.status.code(), Some(0), "{}", text(&o));
 }
+
+/// Carbon's second review of #12, finding 7: a `build shell` checkout is not a job's,
+/// so a builder starting meanwhile (its cleanup of leftover jobs) leaves it alone.
+#[test]
+fn a_shell_checkout_survives_a_builder_starting() {
+    let dir = Scratch::new("shell");
+    let remotes = dir.0.join("remotes");
+    std::fs::create_dir_all(&remotes).unwrap();
+    git(
+        &remotes,
+        &["init", "--quiet", "--bare", "-b", "main", "demo.git"],
+    );
+    let seed = dir.0.join("seed");
+    git(
+        &dir.0,
+        &[
+            "clone",
+            "--quiet",
+            &remotes.join("demo.git").display().to_string(),
+            "seed",
+        ],
+    );
+    std::fs::write(seed.join("f.txt"), "x\n").unwrap();
+    git(&seed, &["checkout", "--quiet", "-b", "main"]);
+    git(&seed, &["add", "f.txt"]);
+    git(&seed, &["commit", "--quiet", "-m", "c"]);
+    git(&seed, &["push", "--quiet", "origin", "main"]);
+    let mut cfg = hgl_ai_config::Config::new("lab1");
+    cfg.paths.work_root = dir.0.join("work").display().to_string();
+    cfg.paths.data_dir = dir.0.join("data").display().to_string();
+    cfg.github.clone_url = format!("{}/{{repo}}.git", remotes.display());
+    let config = dir.0.join("config.toml");
+    cfg.save(&config).unwrap();
+    let (ready, go, result) = (dir.0.join("ready"), dir.0.join("go"), dir.0.join("result"));
+    let sh = dir.0.join("shell.sh");
+    std::fs::write(
+        &sh,
+        format!(
+            "#!/bin/sh\n: > '{}'\nwhile [ ! -e '{}' ]; do sleep 0.05; done\nif [ -f f.txt ]; then echo kept; else echo gone; fi > '{}'\n",
+            ready.display(),
+            go.display(),
+            result.display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&sh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let child = Proc(
+        Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+            .arg("--config")
+            .arg(&config)
+            .args(["build", "shell", "--platform", platform(), "demo", "--dir"])
+            .arg(&seed)
+            .env("SHELL", &sh)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("HGL_AI_TASK_DIR")
+            .env_remove("HGL_AI_TURN")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !ready.exists() {
+        assert!(Instant::now() < deadline, "the shell did not start");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    // A builder starts on this host: it removes leftover job directories.
+    use hgl_ai_build::exec::Executor;
+    hgl_ai_build::exec::local::Local::new(
+        dir.0.join("work/builder"),
+        Default::default(),
+        hgl_ai_tree::Git::default(),
+    )
+    .clean_all()
+    .unwrap();
+    std::fs::write(&go, "").unwrap();
+    let mut child = child;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while child.0.try_wait().unwrap().is_none() {
+        assert!(Instant::now() < deadline, "the shell did not end");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(std::fs::read_to_string(&result).unwrap(), "kept\n");
+}

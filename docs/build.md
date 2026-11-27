@@ -142,7 +142,9 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   directories and closes the connection.
 - **BUILD-14 — Debugging.** `hgl-ai build shell --platform P [REPO] [--head SHA]` opens an
   interactive shell in a fresh checkout on this host's builder of P (over ssh for a
-  remote), removed when the shell ends.
+  remote), removed when the shell ends. It checks out under `shells/`, which a builder's
+  startup cleanup of `jobs/` leaves alone, and takes turns with the builder on the
+  shared clone (a host lock, beside the remote's control socket for a proxy).
 
 ## 3. The merge queue
 
