@@ -1,0 +1,765 @@
+//! The seat loop against the fake bus, a local bare "remote", and fake agent CLIs
+//! (shell scripts that print fixture output).
+
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Duration;
+
+use hgl_ai_config::{Binding, Config, SeatConfig};
+use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, Tier};
+use hgl_ai_tree::testing::{commit, git, remote};
+use hgl_ai_tree::{Git, Layout, Trees};
+use tokio::sync::watch;
+
+use crate::fake::{Ev, FakeBus, FixedDisk};
+use crate::lock::FileLock;
+use crate::{Bridge, CapMethod, Deps, Options};
+
+const THREAD: &str = "00000000-0000-4000-8000-000000000002";
+
+fn fixture(name: &str) -> String {
+    format!("{}/fixtures/{name}", env!("CARGO_MANIFEST_DIR"))
+}
+
+fn seat(s: &str) -> Seat {
+    Seat::new(s).unwrap()
+}
+
+struct H {
+    _dir: tempfile::TempDir,
+    root: PathBuf,
+    git: Git,
+    seed: PathBuf,
+    bus: FakeBus,
+    bin: PathBuf,
+    calls: PathBuf,
+    cfg: Config,
+    opts: Options,
+    disk: Arc<FixedDisk>,
+}
+
+struct Call {
+    args: Vec<String>,
+    cwd: String,
+    env: HashMap<String, String>,
+}
+
+fn harness() -> H {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().canonicalize().unwrap();
+    let git = git(&root);
+    let (_bare, seed) = remote(&git, &root, "demo");
+    let mut cfg = Config::new("build-1");
+    cfg.paths.work_root = root.join("work").display().to_string();
+    cfg.paths.data_dir = root.join("data").display().to_string();
+    cfg.github.clone_url = format!("{}/{{repo}}.git", root.display());
+    let b = |runtime, family, tier, effort: Option<&str>| Binding {
+        runtime,
+        family,
+        tier: Some(tier),
+        model: None,
+        effort: effort.map(String::from),
+    };
+    cfg.seats = vec![
+        SeatConfig {
+            name: seat("w1"),
+            role: Role::Implementor,
+            binding: b(Runtime::Codex, None, Tier::Frontier, Some("high")),
+            fallback: vec![b(Runtime::Agy, Some(Family::Claude), Tier::Frontier, None)],
+            memcap_gb: None,
+        },
+        SeatConfig {
+            name: seat("r1"),
+            role: Role::Reviewer,
+            binding: b(Runtime::Claude, None, Tier::Frontier, Some("xhigh")),
+            fallback: vec![],
+            memcap_gb: None,
+        },
+    ];
+    cfg.validate().unwrap();
+    let bin = root.join("bin");
+    let calls = root.join("calls");
+    std::fs::create_dir_all(&bin).unwrap();
+    let mut opts = Options::from_config(&cfg);
+    opts.fetch_wait = Duration::from_millis(100);
+    opts.nak_delay = Duration::from_millis(50);
+    opts.gate_delay = Duration::from_secs(3600);
+    opts.busy_retry = Duration::from_millis(200);
+    opts.in_progress_every = Duration::from_millis(100);
+    opts.heartbeat_every = Duration::from_millis(100);
+    opts.report_every = Duration::from_secs(3600);
+    opts.seat_retry = Duration::from_millis(100);
+    opts.turn_timeout = Duration::from_secs(20);
+    opts.shutdown_grace = Duration::from_millis(300);
+    opts.kill_grace = Duration::from_millis(300);
+    opts.max_line = 1 << 20;
+    opts.cap_method = Some(CapMethod::Rlimit);
+    for rt in Runtime::ALL {
+        opts.bins.insert(*rt, bin.join(rt.as_str()));
+    }
+    let disk = Arc::new(FixedDisk(AtomicU64::new(1000 * crate::disk::GB)));
+    let h = H {
+        _dir: dir,
+        root,
+        git,
+        seed,
+        bus: FakeBus::default(),
+        bin,
+        calls,
+        cfg,
+        opts,
+        disk,
+    };
+    for rt in ["claude", "codex", "agy"] {
+        h.script(rt, "echo no fake set >&2; exit 9");
+    }
+    h
+}
+
+impl H {
+    /// A fake CLI: records its args, cwd and environment, then runs `body`.
+    fn script(&self, rt: &str, body: &str) {
+        let c = self.calls.join(rt);
+        std::fs::create_dir_all(&c).unwrap();
+        let text = format!(
+            "#!/bin/sh\nC='{c}'\nn=$(cat \"$C/n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$C/n\"\nd=\"$C/$n\"; mkdir -p \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/args\"\npwd > \"$d/cwd\"\nenv > \"$d/env\"\n{body}\n",
+            c = c.display()
+        );
+        let p = self.bin.join(rt);
+        std::fs::write(&p, text).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    fn calls(&self, rt: &str) -> Vec<Call> {
+        let c = self.calls.join(rt);
+        let n: usize = std::fs::read_to_string(c.join("n"))
+            .map(|s| s.trim().parse().unwrap())
+            .unwrap_or(0);
+        (1..=n)
+            .filter_map(|i| {
+                let d = c.join(i.to_string());
+                let args = std::fs::read_to_string(d.join("args"))
+                    .ok()?
+                    .lines()
+                    .map(String::from)
+                    .collect();
+                let cwd = std::fs::read_to_string(d.join("cwd"))
+                    .ok()?
+                    .trim()
+                    .to_string();
+                let env = std::fs::read_to_string(d.join("env"))
+                    .ok()?
+                    .lines()
+                    .filter_map(|l| {
+                        l.split_once('=')
+                            .map(|(k, v)| (k.to_string(), v.to_string()))
+                    })
+                    .collect();
+                Some(Call { args, cwd, env })
+            })
+            .collect()
+    }
+
+    fn work(&self) -> PathBuf {
+        self.root.join("work")
+    }
+
+    fn start(
+        &self,
+        only: &[&str],
+    ) -> (
+        watch::Sender<bool>,
+        tokio::task::JoinHandle<crate::Result<()>>,
+    ) {
+        let trees = Trees::with(
+            Layout::new(self.work()).unwrap(),
+            &self.cfg.host,
+            &self.cfg.github,
+            self.git.clone(),
+        );
+        let deps = Deps {
+            closed: Arc::new(|_: &str, _: u64, _: bool| None),
+            disk: self.disk.clone(),
+        };
+        let bridge = Bridge::new(
+            self.cfg.clone(),
+            self.bus.clone(),
+            trees,
+            deps,
+            self.opts.clone(),
+        );
+        let (tx, rx) = watch::channel(false);
+        let only: Vec<Seat> = only.iter().map(|s| seat(s)).collect();
+        let h = tokio::spawn(async move { bridge.run(&only, rx).await });
+        (tx, h)
+    }
+}
+
+async fn stop(tx: watch::Sender<bool>, h: tokio::task::JoinHandle<crate::Result<()>>) {
+    tx.send(true).unwrap();
+    tokio::time::timeout(Duration::from_secs(15), h)
+        .await
+        .expect("bridge stops")
+        .unwrap()
+        .unwrap();
+}
+
+async fn eventually(what: &str, f: impl Fn() -> bool) {
+    let end = std::time::Instant::now() + Duration::from_secs(20);
+    while !f() {
+        assert!(
+            std::time::Instant::now() < end,
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+fn note(kind: Kind, to: &str, issue: u64, body: &str) -> Note {
+    let mut n = Note::new(seat("claude"), seat(to), kind, body);
+    n.repo = Some("demo".into());
+    n.issue = issue;
+    if kind.needs_head() {
+        n.head = Some("a".repeat(40));
+    }
+    n
+}
+
+fn alive(pid: i32) -> bool {
+    // SAFETY: signal 0 checks existence only; a zombie does not count.
+    let exists = unsafe { libc::kill(pid, 0) == 0 };
+    exists
+        && std::fs::read_to_string(format!("/proc/{pid}/stat")).is_ok_and(|s| !s.contains(") Z "))
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn assign_then_sendback_resumes_then_landed_cleans_up() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+
+    let a = h.bus.push(
+        "w1",
+        note(
+            Kind::Assign,
+            "w1",
+            980,
+            "[claude] Assign: demo#980 Fix the thing\n\nDetails.",
+        ),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    let dir = h.work().join("w1/demo-980");
+    let calls = h.calls("codex");
+    assert_eq!(calls.len(), 1);
+    let c = &calls[0];
+    assert_eq!(c.cwd, dir.join("src").display().to_string());
+    for (k, v) in [
+        ("TMPDIR", dir.join("tmp").display().to_string()),
+        ("CARGO_TARGET_DIR", dir.join("build").display().to_string()),
+        ("HGL_AI_TASK_DIR", dir.display().to_string()),
+        ("HGL_AI_SEAT", "w1".into()),
+        ("HGL_AI_ROLE", "implementor".into()),
+    ] {
+        assert_eq!(c.env.get(k), Some(&v), "{k}");
+    }
+    assert_eq!(&c.args[..4], ["exec", "--json", "-m", "gpt-6.1-sol"]);
+    assert!(!c.args.contains(&"resume".to_string()));
+    assert!(
+        c.args
+            .iter()
+            .any(|a| a.contains("--- Note 1 of 1: assign from claude to w1, demo#980"))
+    );
+    assert!(h.bus.trees().contains_key("build-1.w1.demo-980"));
+    let tf = hgl_ai_tree::read_task(&dir).unwrap();
+    assert_eq!(tf.branch.as_deref(), Some("codex/980-fix-the-thing"));
+    assert_eq!(tf.sessions.get("codex").map(String::as_str), Some(THREAD));
+    assert!(
+        std::fs::read_dir(dir.join("log")).unwrap().count() >= 2,
+        "turn logs"
+    );
+
+    let s = h.bus.push(
+        "w1",
+        note(Kind::Sendback, "w1", 980, "[claude] Sendback: fix the test"),
+    );
+    eventually("sendback acked", || h.bus.events(s) == [Ev::Ack]).await;
+    let calls = h.calls("codex");
+    assert_eq!(calls.len(), 2);
+    assert_eq!(&calls[1].args[..2], ["exec", "resume"]);
+    assert!(
+        calls[1].args.contains(&THREAD.to_string()),
+        "resumed by the saved session id"
+    );
+
+    std::fs::write(dir.join("src/wip.txt"), "unsaved work\n").unwrap();
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 980, "[claude] Landed: demo#980"),
+    );
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    assert!(!dir.exists());
+    assert!(h.bus.trees().is_empty());
+    let done: Vec<Note> = h
+        .bus
+        .sent()
+        .into_iter()
+        .filter(|n| n.kind == Kind::Done)
+        .collect();
+    assert_eq!(done.len(), 1);
+    assert_eq!(
+        (
+            done[0].sender.as_str(),
+            done[0].recipient.as_str(),
+            done[0].issue
+        ),
+        ("w1", "claude", 980)
+    );
+    assert!(
+        done[0].body.contains("removed demo-980"),
+        "{}",
+        done[0].body
+    );
+    assert!(
+        done[0].body.contains("salvage: salvage/w1-demo-980-"),
+        "{}",
+        done[0].body
+    );
+    let salvaged: Vec<_> = std::fs::read_dir(h.work().join("salvage"))
+        .unwrap()
+        .flatten()
+        .collect();
+    assert_eq!(salvaged.len(), 1);
+    assert!(
+        std::fs::read_to_string(salvaged[0].path())
+            .unwrap()
+            .contains("+unsaved work")
+    );
+    assert_eq!(h.calls("codex").len(), 2, "no turn for `landed`");
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
+    let h = harness();
+    h.script(
+        "codex",
+        &format!("cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")),
+    );
+    h.script("agy", &format!("cat '{}'", fixture("agy-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 3, "[claude] Assign: demo#3 Three"),
+    );
+    eventually("nak then ack", || {
+        h.bus.events(a) == [Ev::Nak(Duration::from_millis(50)), Ev::Ack]
+    })
+    .await;
+    let moved = h
+        .bus
+        .sent_containing("moved from codex gpt/gpt-6.1-sol to agy claude/claude-opus-5-5");
+    assert_eq!(moved.len(), 1);
+    assert_eq!(
+        (moved[0].kind, moved[0].recipient.as_str()),
+        (Kind::Note, "claude")
+    );
+    let agy = h.calls("agy");
+    assert_eq!(agy.len(), 1);
+    let i = agy[0].args.iter().position(|a| a == "--model").unwrap();
+    assert_eq!(agy[0].args[i + 1], "claude-opus-5-5");
+    assert!(
+        !agy[0].args.contains(&"--conversation".to_string()),
+        "no agy session yet"
+    );
+    eventually("host record shows the new binding", || {
+        h.bus.last_host().is_some_and(|r| {
+            r.seats.iter().any(|s| {
+                s.seat.as_str() == "w1" && s.runtime == Runtime::Agy && s.family == Family::Claude
+            })
+        })
+    })
+    .await;
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_crash_naks_without_failover() {
+    let h = harness();
+    h.script("codex", "echo boom >&2; exit 2");
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 4, "[claude] Assign: demo#4 Four"),
+    );
+    eventually("nak", || {
+        h.bus.events(a).first() == Some(&Ev::Nak(Duration::from_millis(50)))
+    })
+    .await;
+    assert!(h.bus.sent_containing("Failover").is_empty());
+    assert!(h.calls("agy").is_empty());
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn drain_refuses_assign_and_tells_once_per_change() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    h.bus.set_state("mode", "drain");
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 1, "[claude] Assign: demo#1 One"),
+    );
+    let b = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 2, "[claude] Assign: demo#2 Two"),
+    );
+    let long = Ev::Nak(Duration::from_secs(3600));
+    eventually("both naked for long", || {
+        h.bus.events(a) == [long.clone()] && h.bus.events(b) == [long.clone()]
+    })
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(h.bus.sent_containing("mode is drain").len(), 1);
+    assert!(h.calls("codex").is_empty());
+    assert!(!h.work().join("w1/demo-1").exists());
+    h.bus.set_state("mode", "normal");
+    eventually("open again", || {
+        h.bus.sent_containing("taking `assign` notes again").len() == 1
+    })
+    .await;
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn low_disk_refuses_assign() {
+    let h = harness();
+    h.disk.0.store(crate::disk::GB, Ordering::SeqCst);
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 1, "[claude] Assign: demo#1 One"),
+    );
+    eventually("naked for long", || {
+        h.bus.events(a) == [Ev::Nak(Duration::from_secs(3600))]
+    })
+    .await;
+    let told = h.bus.sent_containing("below min_free_gb 200");
+    assert_eq!(told.len(), 1);
+    assert_eq!(told[0].sender.as_str(), "build-1");
+    assert!(h.calls("codex").is_empty());
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_oversized_line_then_a_hang_is_killed_and_turns_never_overlap() {
+    let mut h = harness();
+    h.opts.turn_timeout = Duration::from_millis(700);
+    let c = h.calls.display().to_string();
+    h.script(
+        "codex",
+        &format!(
+            "for p in $(cat '{c}/pids' 2>/dev/null); do kill -0 $p 2>/dev/null && echo $p >> '{c}/overlap'; done\n\
+             echo $$ >> '{c}/pids'\n\
+             head -c 3000000 /dev/zero | tr '\\0' x; echo\n\
+             cat '{f}'\n\
+             sleep 60 & echo $! >> '{c}/pids'\n\
+             sleep 60",
+            f = fixture("codex-ok.jsonl")
+        ),
+    );
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 6, "[claude] Assign: demo#6 Six"),
+    );
+    eventually("two attempts", || {
+        h.calls("codex").len() >= 2 && h.bus.events(a).len() >= 2
+    })
+    .await;
+    stop(tx, j).await;
+    assert!(
+        h.bus.events(a).iter().all(|e| matches!(e, Ev::Nak(_))),
+        "{:?}",
+        h.bus.events(a)
+    );
+    assert!(
+        !h.calls.join("overlap").exists(),
+        "a turn started while an earlier one lived"
+    );
+    let pids: Vec<i32> = std::fs::read_to_string(h.calls.join("pids"))
+        .unwrap()
+        .lines()
+        .map(|l| l.parse().unwrap())
+        .collect();
+    assert!(pids.len() >= 4);
+    for p in pids {
+        assert!(!alive(p), "{p} outlived its turn");
+    }
+    let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-6")).unwrap();
+    assert_eq!(
+        tf.sessions.get("codex").map(String::as_str),
+        Some(THREAD),
+        "the line after the long one was parsed"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_held_turn_lock_defers_the_turn() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 7, "[claude] Assign: demo#7 Seven"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    let held = FileLock::turn(&h.work().join("w1/demo-7/turn.lock"))
+        .unwrap()
+        .expect("free after the turn");
+    let q = h.bus.push(
+        "w1",
+        note(Kind::Question, "w1", 7, "[claude] Question: why?"),
+    );
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert_eq!(
+        h.calls("codex").len(),
+        1,
+        "no second turn while the lock is held"
+    );
+    assert!(
+        h.bus.events(q).is_empty(),
+        "the note waits; it is neither acked nor naked"
+    );
+    assert!(h.bus.progressed(q), "and kept alive");
+    assert_eq!(
+        h.bus
+            .sent_containing("still holds the turn lock of demo#7")
+            .len(),
+        1
+    );
+    drop(held);
+    eventually("question acked", || h.bus.events(q) == [Ev::Ack]).await;
+    assert_eq!(h.calls("codex").len(), 2);
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_held_elsewhere_is_not_served() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let held = FileLock::try_exclusive(&h.cfg.seat_lock_path(&seat("w1")).unwrap())
+        .unwrap()
+        .unwrap();
+    let (tx, j) = h.start(&["w1"]);
+    let n = h.bus.push(
+        "w1",
+        Note::new(seat("claude"), seat("w1"), Kind::Note, "hello"),
+    );
+    eventually("a heartbeat", || h.bus.last_host().is_some()).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    assert!(h.bus.events(n).is_empty());
+    assert!(h.calls("codex").is_empty());
+    assert!(
+        h.bus.last_host().unwrap().seats.is_empty(),
+        "an unserved seat is not advertised"
+    );
+    drop(held);
+    eventually("served", || h.bus.events(n) == [Ev::Ack]).await;
+    let c = &h.calls("codex")[0];
+    assert_eq!(c.cwd, h.work().join("w1/_inbox").display().to_string());
+    eventually("advertised", || {
+        h.bus.last_host().is_some_and(|r| r.seats.len() == 1)
+    })
+    .await;
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_runs_in_a_detached_merge_and_landed_removes_it() {
+    let h = harness();
+    h.git
+        .run(&h.seed, ["checkout", "--quiet", "-b", "feature"])
+        .unwrap();
+    let head = commit(&h.git, &h.seed, "f.txt", "f\n", "feature");
+    h.git
+        .run(&h.seed, ["push", "--quiet", "origin", "feature"])
+        .unwrap();
+    h.script("claude", &format!("cat '{}'", fixture("claude-ok.jsonl")));
+    let (tx, j) = h.start(&["r1"]);
+    let mut r = note(Kind::Review, "r1", 5, "[claude] Review: demo#5");
+    r.head = Some(head.clone());
+    let s = h.bus.push("r1", r);
+    eventually("review acked", || h.bus.events(s) == [Ev::Ack]).await;
+    let dir = h.work().join("r1/demo-5-review");
+    let c = &h.calls("claude")[0];
+    assert_eq!(c.cwd, dir.join("src").display().to_string());
+    assert_eq!(c.args[0], "-p");
+    assert!(
+        c.args
+            .iter()
+            .any(|a| a.contains(&format!("review of demo#5 at {head}"))),
+        "the prompt names the reviewed head"
+    );
+    for pair in [
+        ["--model", "claude-opus-5-5"],
+        ["--effort", "xhigh"],
+        ["--permission-mode", "bypassPermissions"],
+    ] {
+        let i = c.args.iter().position(|a| a == pair[0]).unwrap();
+        assert_eq!(c.args[i + 1], pair[1]);
+    }
+    assert!(!c.args.contains(&"--resume".to_string()));
+    assert!(h.bus.trees().contains_key("build-1.r1.demo-5-review"));
+
+    let l = h
+        .bus
+        .push("r1", note(Kind::Landed, "r1", 5, "[claude] Landed: demo#5"));
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    assert!(!dir.exists());
+    let done = h.bus.sent_containing("Cleanup: demo#5 on build-1/r1");
+    assert_eq!(done.len(), 1);
+    assert!(done[0].body.contains("salvage: none"), "{}", done[0].body);
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn landed_without_a_tree_is_acked_silently() {
+    let h = harness();
+    let (tx, j) = h.start(&["w1"]);
+    let l = h.bus.push(
+        "w1",
+        note(Kind::Landed, "w1", 99, "[claude] Landed: demo#99"),
+    );
+    eventually("acked", || h.bus.events(l) == [Ev::Ack]).await;
+    assert!(h.bus.sent().iter().all(|n| n.kind != Kind::Done));
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_stops_a_running_turn_after_the_grace_and_naks() {
+    let h = harness();
+    let pid = h.calls.join("pid");
+    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 8, "[claude] Assign: demo#8 Eight"),
+    );
+    eventually("turn running", || pid.exists()).await;
+    let t = std::time::Instant::now();
+    stop(tx, j).await;
+    assert!(t.elapsed() < Duration::from_secs(5));
+    assert_eq!(h.bus.events(a), [Ev::Nak(Duration::from_millis(50))]);
+    let p: i32 = std::fs::read_to_string(&pid)
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap();
+    assert!(!alive(p));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_report_and_heartbeat() {
+    let h = harness();
+    std::fs::create_dir_all(h.work().join("w1/demo-12/src")).unwrap();
+    let (tx, j) = h.start(&[]);
+    eventually("report", || {
+        !h.bus.sent_containing("work_root uses").is_empty()
+    })
+    .await;
+    let r = &h.bus.sent_containing("work_root uses")[0];
+    assert_eq!(
+        (r.sender.as_str(), r.recipient.as_str(), r.kind),
+        ("build-1", "claude", Kind::Note)
+    );
+    assert!(r.body.contains("1 trees"), "{}", r.body);
+    eventually("both seats advertised", || {
+        h.bus.last_host().is_some_and(|r| r.seats.len() == 2)
+    })
+    .await;
+    let host = h.bus.last_host().unwrap();
+    assert_eq!(host.host, "build-1");
+    assert_eq!(host.memcap_gb, 64);
+    assert_eq!(host.work_root_free_gb, 1000);
+    assert_eq!(host.seats[0].seat.as_str(), "r1");
+    assert_eq!(
+        (host.seats[1].seat.as_str(), host.seats[1].family),
+        ("w1", Family::Gpt)
+    );
+    stop(tx, j).await;
+}
+
+#[test]
+fn controllers_are_not_served_unless_named() {
+    let h = harness();
+    let mut cfg = h.cfg.clone();
+    cfg.seats.push(SeatConfig {
+        name: seat("claude"),
+        role: Role::Controller,
+        binding: Binding {
+            runtime: Runtime::Claude,
+            family: None,
+            tier: Some(Tier::Frontier),
+            model: None,
+            effort: None,
+        },
+        fallback: vec![],
+        memcap_gb: None,
+    });
+    let trees = Trees::with(
+        Layout::new(h.work()).unwrap(),
+        "build-1",
+        &cfg.github,
+        h.git.clone(),
+    );
+    let deps = Deps {
+        closed: Arc::new(|_: &str, _: u64, _: bool| None),
+        disk: h.disk.clone(),
+    };
+    let b = Bridge::new(cfg, h.bus.clone(), trees, deps, h.opts.clone());
+    let names = |v: Vec<SeatConfig>| {
+        v.into_iter()
+            .map(|s| s.name.to_string())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(b.select(&[]).unwrap()), ["w1", "r1"]);
+    assert_eq!(names(b.select(&[seat("claude")]).unwrap()), ["claude"]);
+    assert!(b.select(&[seat("nope")]).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_seat_another_hosts_bridge_serves_is_not_served() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    h.bus.put_host(hgl_ai_proto::HostRecord {
+        host: "build-2".into(),
+        seats: vec![hgl_ai_proto::SeatRecord {
+            seat: seat("w1"),
+            role: Role::Implementor,
+            runtime: Runtime::Codex,
+            family: Family::Gpt,
+            model: "gpt-6.1-sol".into(),
+        }],
+        memcap_gb: 64,
+        work_root_free_gb: 500,
+        updated_at: hgl_ai_proto::utc_now_stamp(),
+    });
+    let (tx, j) = h.start(&["w1"]);
+    let n = h.bus.push(
+        "w1",
+        Note::new(seat("claude"), seat("w1"), Kind::Note, "hello"),
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(h.bus.events(n).is_empty(), "build-2 serves w1");
+    assert!(h.calls("codex").is_empty());
+    stop(tx, j).await;
+    assert_eq!(
+        h.bus.deleted_hosts(),
+        ["build-1"],
+        "the host record goes at shutdown"
+    );
+}

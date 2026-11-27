@@ -556,6 +556,7 @@ name = "hgl-ai"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "chrono",
  "clap",
  "hgl-ai-bridge",
  "hgl-ai-bus",
@@ -575,6 +576,21 @@ dependencies = [
 [[package]]
 name = "hgl-ai-bridge"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hgl-ai-bus",
+ "hgl-ai-cap",
+ "hgl-ai-config",
+ "hgl-ai-proto",
+ "hgl-ai-tree",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "hgl-ai-bus"
@@ -668,6 +684,17 @@ dependencies = [
 [[package]]
 name = "hgl-ai-tree"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hgl-ai-bus",
+ "hgl-ai-config",
+ "hgl-ai-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tracing",
+]
 
 [[package]]
 name = "http"

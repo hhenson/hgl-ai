@@ -187,6 +187,22 @@ pub struct Github {
     pub release: ReleaseWatch,
     #[serde(default = "github::tap", skip_serializing_if = "github::is_tap")]
     pub tap: Tap,
+    /// Clone URL template; `{owner}` and `{repo}` are replaced.
+    #[serde(default = "default_clone_url")]
+    pub clone_url: String,
+}
+
+pub fn default_clone_url() -> String {
+    "https://github.com/{owner}/{repo}.git".into()
+}
+
+impl Github {
+    /// The clone URL of `repo` (`clone_url` with `{owner}` and `{repo}` filled in).
+    pub fn clone_url_for(&self, repo: &str) -> String {
+        self.clone_url
+            .replace("{owner}", &self.owner)
+            .replace("{repo}", repo)
+    }
 }
 
 impl Default for Github {
@@ -218,6 +234,7 @@ impl Default for Github {
             pin_branch: github::pin_branch(),
             release: github::release(),
             tap: github::tap(),
+            clone_url: default_clone_url(),
         }
     }
 }
@@ -334,6 +351,37 @@ pub fn runtime_supports(r: Runtime, f: Family) -> bool {
         Runtime::Codex => f == Family::Gpt,
         Runtime::Agy => matches!(f, Family::Gemini | Family::Claude | Family::Gpt),
     }
+}
+
+/// Efforts a model slug may already end with (`gemini-4-carbon-high`).
+pub const EFFORTS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// Antigravity names a model with its effort: `SLUG-EFFORT`, unless the slug has one.
+pub fn agy_model(model: &str, effort: Option<&str>) -> String {
+    match effort {
+        Some(e) if !EFFORTS.iter().any(|x| model.ends_with(&format!("-{x}"))) => {
+            format!("{model}-{e}")
+        }
+        _ => model.to_string(),
+    }
+}
+
+/// Model and effort flags of a runtime (docs/design.md §4), shared by headless turns
+/// and interactive sessions so the two never diverge.
+pub fn model_args(r: &Resolved) -> Vec<String> {
+    let e = r.effort.as_deref();
+    let mut a: Vec<String> = match r.runtime {
+        Runtime::Claude => vec!["--model".into(), r.model.clone()],
+        Runtime::Codex => vec!["-m".into(), r.model.clone()],
+        Runtime::Agy => vec!["--model".into(), agy_model(&r.model, e)],
+    };
+    if let Some(e) = e {
+        match r.runtime {
+            Runtime::Codex => a.extend(["-c".into(), format!("model_reasoning_effort={e}")]),
+            Runtime::Claude | Runtime::Agy => a.extend(["--effort".into(), e.to_string()]),
+        }
+    }
+    a
 }
 
 impl Config {
@@ -490,6 +538,11 @@ impl Config {
     pub fn token_file(&self) -> Result<PathBuf> {
         expand(&self.hub.token_file)
     }
+    /// `<data_dir>/seats/<seat>.lock`: exclusively `flock`ed by whoever serves the seat,
+    /// the bridge or an interactive session, never both.
+    pub fn seat_lock_path(&self, seat: &Seat) -> Result<PathBuf> {
+        Ok(self.data_dir()?.join("seats").join(format!("{seat}.lock")))
+    }
     pub fn stale_after(&self) -> Duration {
         parse_duration(&self.limits.stale_after).expect("validated")
     }
@@ -618,6 +671,23 @@ model = "claude-opus-5-5-high"
         let c: Config = toml::from_str(SAMPLE).unwrap();
         c.save(&p).unwrap();
         assert_eq!(Config::load(&p).unwrap(), c);
+    }
+
+    #[test]
+    fn clone_url_default_and_template() {
+        let g: Github = toml::from_str(
+            "owner = \"hhenson\"\nrepos = []\nbranch_prefix = \"codex/\"\nwrapper = \"w\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            g.clone_url_for("hgl_spec"),
+            "https://github.com/hhenson/hgl_spec.git"
+        );
+        let g = Github {
+            clone_url: "/srv/git/{repo}.git".into(),
+            ..Github::default()
+        };
+        assert_eq!(g.clone_url_for("x"), "/srv/git/x.git");
     }
 
     #[test]

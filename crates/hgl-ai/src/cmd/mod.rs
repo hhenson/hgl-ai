@@ -64,6 +64,3 @@ pub fn exit_code_for(e: &anyhow::Error) -> i32 {
     EXIT_FAIL
 }
 
-pub fn not_yet(what: &str) -> anyhow::Result<i32> {
-    anyhow::bail!("`{what}` is not implemented yet")
-}
