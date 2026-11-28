@@ -126,11 +126,15 @@ pub async fn status_post(bus: &Bus, sender: &Seat, body: &str) -> Result<u64> {
         body: body.to_string(),
     };
     let payload = serde_json::to_vec(&st).map_err(|e| invalid(e.to_string()))?;
-    let id = format!("status-{}-{}", st.sender, st.at);
+    let id = status_message_id();
     Ok(bus
         .publish_event(&event::status_subject(), &payload, &id)
         .await?
         .seq)
+}
+
+fn status_message_id() -> String {
+    format!("status-{}", hex::encode(model::random_bytes::<16>()))
 }
 
 /// Status reports stored since `since`, newest first, at most `max`.
@@ -497,6 +501,12 @@ pub async fn decisions_tail(bus: &Bus, n: usize) -> Result<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_posts_have_distinct_message_ids() {
+        let first = status_message_id();
+        assert_ne!(first, status_message_id());
+    }
 
     #[test]
     fn the_log_stays_bounded() {

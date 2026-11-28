@@ -129,6 +129,8 @@ pub struct Parsed {
     pub result_ok: Option<bool>,
     /// The turn was refused for quota or rate limits (only when it did not succeed).
     pub quota: bool,
+    /// Any output beyond the known refusal protocol may represent work.
+    pub activity: bool,
     pub error: Option<String>,
 }
 
@@ -151,8 +153,21 @@ impl Parser {
 
     pub fn line(&mut self, line: &str) {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            self.p.activity = true;
             return;
         };
+        let quiet = match self.runtime {
+            Runtime::Codex => matches!(
+                str_at(&v, "type"),
+                Some("thread.started" | "turn.started" | "error" | "turn.failed")
+            ),
+            Runtime::Claude => matches!(
+                str_at(&v, "type"),
+                Some("system" | "rate_limit_event" | "result")
+            ),
+            Runtime::Agy => matches!(str_at(&v, "event"), Some("init" | "error" | "result")),
+        };
+        self.p.activity |= !quiet;
         match self.runtime {
             Runtime::Claude => self.claude(&v),
             Runtime::Codex => self.codex(&v),

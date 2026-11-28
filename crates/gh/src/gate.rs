@@ -8,10 +8,12 @@
 //!   merges the present `main` into it and `main` moved since that parent only in files the
 //!   pull request does not touch and in none of the global paths, or (`--triaged`) reviewed
 //!   the head with findings the controller triaged;
-//! - (unless the repository turns it off) a clean review receipt (PROTO-19) for the head asked,
+//! - (unless the repository turns it off) a clean review receipt (PROTO-19),
 //!   from a model family none of the task's authors used (ROLE-11), sent to the controller
 //!   and read from the notes stream on the hub; the authors' families come from the
-//!   implementor trees the bridges registered (`HGL_TREES`);
+//!   implementor trees the bridges registered (`HGL_TREES`). For hgl-ai the receipt is for
+//!   the actual head, or carries through a conflict-free series of merges from main with
+//!   a clean bot review and passing checks at the actual head;
 //! - where the repository names local build verdicts, each passed for this head on this
 //!   `main`; then the branch is not brought up to date;
 //! - it is not behind `main`, or `main` moved only in files it does not touch and in none of
@@ -25,6 +27,8 @@
 //!
 //! The decision is [`decide`], a pure function over [`Facts`] that names the next fact it
 //! needs; [`evaluate`] fetches facts until it decides, and acts unless it is a dry run.
+
+mod carry;
 
 use std::collections::BTreeMap;
 
@@ -278,6 +282,8 @@ pub struct Facts {
     pub receipts: Option<std::result::Result<Vec<SeenReceipt>, String>>,
     /// The model families of the task's authors, or why they could not be read.
     pub authors: Option<std::result::Result<Vec<Family>, String>>,
+    /// The first reviewed ancestor a receipt can carry from, or why Git could not check.
+    pub receipt_carry: Option<std::result::Result<Option<String>, String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,7 +302,10 @@ pub enum Need {
     UpdateFiles,
     Receipts,
     Authors,
+    ReceiptCarry,
 }
+
+pub(crate) const RECEIPT_CARRY_REPO: &str = "hgl-ai";
 
 /// Switches the controller gives: `TRIAGED`, `HYGIENE_READ` and `NOUPDATE` of the shell gate,
 /// bound to the head asked for.
@@ -315,6 +324,59 @@ pub struct Opts {
     /// than the landing lock's lease from the merge; else [`crate::merge::POLL_LIMIT`]
     /// from the merge ([`crate::merge::until`]).
     pub merge_until: Option<tokio::time::Instant>,
+    /// The steps the landing does after a merge: what a `PARTIAL` right after it names.
+    pub after: AfterSteps,
+}
+
+/// Which of the optional steps after a merge a landing does (`landed.log` and `main` are
+/// always done).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AfterSteps {
+    /// The `landed` notes.
+    pub notes: bool,
+    /// Their GitHub comment.
+    pub comment: bool,
+    /// The wrapper's pins (`gh land` of a repository they follow).
+    pub pins: bool,
+}
+
+impl Default for AfterSteps {
+    fn default() -> Self {
+        AfterSteps {
+            notes: true,
+            comment: true,
+            pins: false,
+        }
+    }
+}
+
+/// The steps after the merge in `steps` that `p` does not show done, as a phrase ("main
+/// and the comment are"); with every step done, only the record is left to delete.
+pub(crate) fn left_of(p: Option<&Progress>, steps: AfterSteps, wrapper: &str) -> String {
+    let mut all = vec![
+        (progress::LANDED_LOG, state::KEY_LANDED.to_string()),
+        (progress::MAIN, state::KEY_MAIN.to_string()),
+    ];
+    if steps.notes {
+        all.push((progress::NOTES, "the landed notes".into()));
+    }
+    if steps.comment {
+        all.push((progress::COMMENT, "the comment".into()));
+    }
+    if steps.pins {
+        all.push((progress::PINS, format!("the {wrapper} pins")));
+    }
+    let left: Vec<String> = all
+        .into_iter()
+        .filter(|(step, _)| !p.is_some_and(|p| p.has(step)))
+        .map(|(_, name)| name)
+        .collect();
+    match left.as_slice() {
+        [] => "its record is".to_string(),
+        [one] if steps.pins && one.ends_with(" pins") => format!("{one} are"),
+        [one] => format!("{one} is"),
+        [init @ .., last] => format!("{} and {last} are", init.join(", ")),
+    }
 }
 
 /// The last word of a gate line.
@@ -389,6 +451,35 @@ impl Outcome {
             head: head.to_string(),
         }
     }
+    /// A step after the merge failed with `e`: `PARTIAL` (exit 3), naming the merge, what is
+    /// left (`left`, a phrase: "main and the landed notes are") and the error; the same
+    /// command finishes it. An unreachable hub stays the error (exit 10).
+    pub(crate) fn partial(
+        repo: &str,
+        number: u64,
+        head: &str,
+        merge: Option<&str>,
+        left: &str,
+        e: Error,
+    ) -> Result<Outcome> {
+        if matches!(e, Error::Bus(hgl_ai_bus::BusError::Unreachable { .. })) {
+            return Err(e);
+        }
+        let at = merge
+            .filter(|m| !m.is_empty())
+            .map(|m| format!(" at {}", short(m)))
+            .unwrap_or_default();
+        let mut o = Outcome::new(
+            Kind::Partial,
+            format!(
+                "{repo} #{number} is merged{at}, but {left} not done ({e}); run the same command again to finish PARTIAL"
+            ),
+            false,
+            head,
+        );
+        o.merge_commit = merge.filter(|m| !m.is_empty()).map(String::from);
+        Ok(o)
+    }
     pub fn to_json(&self) -> Value {
         serde_json::json!({
             "outcome": self.kind.word(),
@@ -426,11 +517,14 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         |kind: Kind, line: String, retry: bool| Step::Done(Outcome::new(kind, line, retry, head));
     let prefix = format!("{repo} #{} {}", pr.number, pr.branch);
     if pr.merged {
-        return done(
+        let mut o = Outcome::new(
             Kind::AlreadyMerged,
             format!("{repo} #{} already MERGED", pr.number),
             false,
+            head,
         );
+        o.merge_commit = pr.merge_commit.clone().filter(|m| !m.is_empty());
+        return Step::Done(o);
     }
     if pr.state != "open" {
         return done(
@@ -483,17 +577,21 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         "{prefix} {ms} head {} unresolved {unresolved} behind {behind} reviewed {reviewed}",
         short(head)
     );
-    if reviewed == "no" {
+    let bot_pending = |line: &str| {
         if bot.limited() {
-            return done(
+            return Some(done(
                 Kind::BotLimit,
                 format!("{line} review bot out of quota BOTLIMIT"),
                 false,
-            );
+            ));
         }
-        if bot.running_on(head) {
-            return done(Kind::Wait, format!("{line} review-running WAIT"), true);
-        }
+        bot.running_on(head)
+            .then(|| done(Kind::Wait, format!("{line} review-running WAIT"), true))
+    };
+    if reviewed == "no"
+        && let Some(step) = bot_pending(&line)
+    {
+        return step;
     }
     if pr.base != "main" || unresolved != 0 || reviewed == "no" {
         let mut why = Vec::new();
@@ -521,16 +619,62 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     if pr.draft {
         return done(Kind::Blocked, format!("{line} draft BLOCKED"), false);
     }
+    let mut carried = None;
     if rules.receipt && !opts.tool_made {
         let authors = need!(f.authors, Need::Authors);
         let receipts = need!(f.receipts, Need::Receipts);
-        match receipt_check(authors, receipts, asked) {
+        let receipt_head = if repo == RECEIPT_CARRY_REPO {
+            head
+        } else {
+            asked
+        };
+        match receipt_check(authors, receipts, receipt_head) {
             Ok(r) => line.push_str(&format!(
                 " receipt {}/{}",
                 r.receipt.reviewer, r.receipt.family
             )),
             Err((why, retry)) => {
-                return done(Kind::Blocked, format!("{line} {why} BLOCKED"), retry);
+                if repo != RECEIPT_CARRY_REPO {
+                    return done(Kind::Blocked, format!("{line} {why} BLOCKED"), retry);
+                }
+                let verdicts = carry_verdicts(f);
+                if verdicts.get(head) == Some(&Verdict::Findings) {
+                    return done(
+                        Kind::Blocked,
+                        format!("{line} ROLE-11: the receipts at the head have findings BLOCKED"),
+                        false,
+                    );
+                }
+                if !verdicts.values().any(|v| *v == Verdict::Clean)
+                    || need!(f.parents, Need::Parents).len() != 2
+                {
+                    return done(Kind::Blocked, format!("{line} {why} BLOCKED"), retry);
+                }
+                if reviewed != "head" {
+                    if let Some(step) = bot_pending(&line) {
+                        return step;
+                    }
+                    return done(
+                        Kind::Blocked,
+                        format!(
+                            "{line} ROLE-11: receipt carry needs a clean bot review at the head BLOCKED"
+                        ),
+                        true,
+                    );
+                }
+                match need!(f.receipt_carry, Need::ReceiptCarry) {
+                    Ok(Some(from)) => carried = Some(from),
+                    Ok(None) => return done(Kind::Blocked, format!("{line} {why} BLOCKED"), retry),
+                    Err(e) => {
+                        return done(
+                            Kind::Blocked,
+                            format!(
+                                "{line} ROLE-11: receipt carry could not be checked ({e}) BLOCKED"
+                            ),
+                            false,
+                        );
+                    }
+                }
             }
         }
     }
@@ -688,6 +832,11 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         checks.iter().filter(|c| c.passed()).count(),
         checks.len()
     ));
+    if let Some(from) = carried {
+        line.push_str(&format!(
+            " receipt carried from {from} (conflict-free merge)"
+        ));
+    }
     let files = need!(f.pr_files, Need::PrFiles);
     let diff = need!(f.diff, Need::Diff);
     let bad_files: Vec<&str> = files
@@ -748,13 +897,42 @@ fn moved_in(mine: &FileList, theirs: &FileList, global_paths: &[String]) -> Opti
     (!w.is_empty()).then(|| w.trim_end().to_string())
 }
 
-/// ROLE-11 over what was read: a clean receipt for the head `asked`, sent by the reviewer it
+fn independent_clean(r: &SeenReceipt, authors: &[Family]) -> bool {
+    r.receipt.reviewer.as_str() == r.sender
+        && r.receipt.verdict == Verdict::Clean
+        && !authors.contains(&r.receipt.family)
+}
+
+/// An independent clean receipt clears findings at the same commit.
+fn carry_verdicts(f: &Facts) -> BTreeMap<&str, Verdict> {
+    let mut verdicts = BTreeMap::new();
+    let (Some(Ok(authors)), Some(Ok(receipts))) = (&f.authors, &f.receipts) else {
+        return verdicts;
+    };
+    if authors.is_empty() {
+        return verdicts;
+    }
+    for r in receipts {
+        let head = r.receipt.head.as_str();
+        if r.receipt.reviewer.as_str() != r.sender || hgl_ai_proto::check_head(head).is_err() {
+            continue;
+        }
+        if independent_clean(r, authors) {
+            verdicts.insert(head, Verdict::Clean);
+        } else if r.receipt.verdict == Verdict::Findings {
+            verdicts.entry(head).or_insert(Verdict::Findings);
+        }
+    }
+    verdicts
+}
+
+/// ROLE-11 over what was read: a clean receipt for the given head, sent by the reviewer it
 /// names, from a family none of the authors used. Else why not, and whether waiting may
 /// bring one.
 fn receipt_check<'a>(
     authors: &std::result::Result<Vec<Family>, String>,
     receipts: &'a std::result::Result<Vec<SeenReceipt>, String>,
-    asked: &str,
+    head: &str,
 ) -> std::result::Result<&'a SeenReceipt, (String, bool)> {
     let authors = match authors {
         Ok(a) if a.is_empty() => {
@@ -777,14 +955,10 @@ fn receipt_check<'a>(
     };
     let at_head: Vec<&SeenReceipt> = receipts
         .iter()
-        .filter(|r| r.receipt.head == asked && r.receipt.reviewer.as_str() == r.sender)
+        .filter(|r| r.receipt.head == head && r.receipt.reviewer.as_str() == r.sender)
         .collect();
     let names = |fs: &[Family]| fs.iter().map(|f| f.as_str()).collect::<Vec<_>>().join(",");
-    if let Some(r) = at_head
-        .iter()
-        .rev()
-        .find(|r| r.receipt.verdict == Verdict::Clean && !authors.contains(&r.receipt.family))
-    {
+    if let Some(r) = at_head.iter().rev().find(|r| independent_clean(r, authors)) {
         return Ok(r);
     }
     let why = if at_head.iter().any(|r| r.receipt.verdict == Verdict::Clean) {
@@ -1030,6 +1204,15 @@ async fn fill<G: Gh>(
                 None => Err(NO_HUB.into()),
             });
         }
+        Need::ReceiptCarry => {
+            let main = f
+                .main
+                .as_deref()
+                .ok_or_else(|| resp("receipt carry", "no main"))?;
+            f.receipt_carry = Some(
+                carry::from_remote(&s.receipt_carry_url, &head, main, &carry_verdicts(f)).await,
+            );
+        }
     }
     Ok(())
 }
@@ -1120,12 +1303,23 @@ pub async fn evaluate<G: Gh>(
                     merge::POLL_EVERY,
                 )
                 .await?;
-                let after = read_back(gh, s, repo, number, res == Merge::Merged).await?;
+                let after = match read_back(gh, s, repo, number, res == Merge::Merged).await {
+                    Ok(pr) => pr,
+                    // GitHub reported it merged: the read after is a step after the merge.
+                    Err(e) if res == Merge::Merged => {
+                        let left = left_of(None, opts.after, &s.wrapper);
+                        return Outcome::partial(repo, number, &f.pr.head, None, &left, e);
+                    }
+                    Err(e) => return Err(e),
+                };
                 if after.merged {
                     let m = after.merge_commit.clone().unwrap_or_default();
                     if let Some(b) = bus {
                         let p = Progress::new(&f.pr.head, Some(m.clone()));
-                        progress::write(b, repo, number, &p).await?;
+                        if let Err(e) = progress::write(b, repo, number, &p).await {
+                            let left = left_of(None, opts.after, &s.wrapper);
+                            return Outcome::partial(repo, number, &f.pr.head, Some(&m), &left, e);
+                        }
                     }
                     let mut o = Outcome::new(
                         Kind::Merged,
@@ -1212,6 +1406,7 @@ mod tests {
             update_files: None,
             receipts: Some(Ok(vec![seen("r1", receipt())])),
             authors: Some(Ok(vec![Family::Gpt])),
+            receipt_carry: None,
         }
     }
 
@@ -1328,6 +1523,10 @@ mod tests {
             (o.kind, o.line.as_str()),
             (Kind::AlreadyMerged, "alpha #7 already MERGED")
         );
+        // hgl-ai#133: with the merge commit, so a `PARTIAL` after it names it.
+        f.pr.merge_commit = Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed".into());
+        let o = outcome(&f, &rules(), &Opts::default());
+        assert_eq!(o.merge_commit, f.pr.merge_commit);
         let mut f = allowed();
         f.pr.state = "closed".into();
         blocked(&f, "closed");
@@ -1519,6 +1718,116 @@ mod tests {
             ..Opts::default()
         };
         assert!(matches!(decide(&f, REPO, HEAD, &r, &tool), Step::Merge(_)));
+    }
+
+    #[test]
+    fn carried_receipt_needs_head_checks_and_a_clean_head_review() {
+        let mut f = allowed();
+        let head = "a".repeat(40);
+        f.pr.head.clone_from(&head);
+        f.parents = Some(vec![HEAD.into(), MAIN.into()]);
+        f.update_files = Some((
+            compare_files(&json("compare.json")),
+            compare_files(&json("compare-docs.json")),
+        ));
+        let mut rules = settings().gate_rules(RECEIPT_CARRY_REPO);
+        rules.required_checks = vec!["lint".into()];
+        let step =
+            |f: &Facts, asked, opts: &Opts| decide(f, RECEIPT_CARRY_REPO, asked, &rules, opts);
+        let normal = Opts::default();
+
+        // The existing parent-bot shortcut cannot authorize receipt carry.
+        assert!(matches!(
+            step(&f, HEAD, &normal),
+            Step::Done(o) if o.kind == Kind::Blocked && o.retry
+                && o.line.contains("receipt carry needs a clean bot review at the head")
+        ));
+        for (file, kind, retry) in [
+            ("comments-limit.json", Kind::BotLimit, false),
+            ("comments-running.json", Kind::Wait, true),
+        ] {
+            let body = fixture(file).replace("9a8b7c6d5e4f30211203f4e5d6c7b8a9a0b1c2d3", &head);
+            let mut comments: Vec<Value> = serde_json::from_str(&body).unwrap();
+            comments.extend(
+                json("comments-clean.json")
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
+            let comments: Vec<Comment> = comments.iter().map(Comment::from_rest).collect();
+            f.bot = Some(BotView::of("chatgpt-codex-connector", &comments, &[]));
+            assert!(matches!(
+                step(&f, HEAD, &normal),
+                Step::Done(o) if o.kind == kind && o.retry == retry && o.line.contains("reviewed parent")
+            ));
+        }
+        f.bot = Some(BotView::default());
+        f.bot_reviews = Some(vec![Review {
+            author: "b".into(),
+            commit: Some(head.clone()),
+            state: "COMMENTED".into(),
+            url: None,
+        }]);
+        let triaged = Opts {
+            triaged: true,
+            ..Opts::default()
+        };
+        assert!(matches!(
+            step(&f, &head, &triaged),
+            Step::Done(o) if o.kind == Kind::Blocked && o.line.contains("reviewed triaged")
+        ));
+
+        let body = fixture("comments-clean.json")
+            .replace(HEAD, &head)
+            .replace(&HEAD[..10], &head[..10]);
+        let comments: Vec<Value> = serde_json::from_str(&body).unwrap();
+        let comments: Vec<Comment> = comments.iter().map(Comment::from_rest).collect();
+        f.bot = Some(BotView::of("chatgpt-codex-connector", &comments, &[]));
+        assert_eq!(step(&f, &head, &normal), Step::Need(Need::ReceiptCarry));
+        f.receipt_carry = Some(Ok(None));
+        assert!(matches!(
+            step(&f, HEAD, &normal),
+            Step::Done(o) if o.kind == Kind::Blocked && o.line.contains("no clean review receipt")
+        ));
+
+        f.receipt_carry = Some(Ok(Some(HEAD.into())));
+        assert!(matches!(
+            step(&f, &head, &normal),
+            Step::Done(o) if o.kind == Kind::Wait && o.line.contains("required-checks-missing: lint")
+                && !o.line.contains("receipt carried from")
+        ));
+        f.checks = Some(vec![CheckRun {
+            id: 1,
+            name: "lint".into(),
+            status: "completed".into(),
+            conclusion: Some("success".into()),
+        }]);
+        for asked in [head.as_str(), HEAD] {
+            assert!(matches!(
+                step(&f, asked, &normal),
+                Step::Merge(l) if l.contains(&format!("receipt carried from {HEAD} (conflict-free merge)"))
+            ));
+        }
+        f.authors = Some(Ok(vec![Family::Gpt, Family::Claude]));
+        assert!(matches!(
+            step(&f, &head, &normal),
+            Step::Done(o) if o.kind == Kind::Blocked && o.line.contains("no clean review receipt")
+        ));
+        f.authors = Some(Ok(vec![Family::Gpt]));
+
+        f.parents = Some(vec![HEAD.into()]);
+        assert!(matches!(
+            step(&f, &head, &normal),
+            Step::Done(o) if o.kind == Kind::Blocked && o.line.contains("no clean review receipt")
+        ));
+        let mut direct = receipt();
+        direct.head.clone_from(&head);
+        f.receipts = Some(Ok(vec![seen("r1", direct)]));
+        assert!(matches!(
+            step(&f, &head, &normal),
+            Step::Merge(l) if l.contains("receipt r1/claude") && !l.contains("receipt carried from")
+        ));
     }
 
     #[test]

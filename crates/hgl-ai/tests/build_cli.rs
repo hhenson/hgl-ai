@@ -344,7 +344,15 @@ fn builder_runs_a_remote_build_through_the_hub() {
     assert_eq!(e["message"], "unknown type name ‘widget’");
     assert_eq!(s["warnings"]["-Wunused-variable"], 1);
     let id = s["id"].as_str().unwrap().to_string();
-    let log_dir = PathBuf::from(s["log_dir"].as_str().unwrap());
+    assert_eq!(s["log_dir"], "");
+    assert!(
+        s["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step.get("log").is_none())
+    );
+    let log_dir = hub.dir.0.join("work/builder/logs/lab1").join(&id);
     let log = std::fs::read(log_dir.join("compile.log")).unwrap();
     let (a, b) = (
         e["start"].as_u64().unwrap() as usize,
@@ -627,6 +635,19 @@ fn builder_runs_a_remote_build_through_the_hub() {
     let calls = hub.api_requests() - before;
     assert!(calls < 100, "{calls} hub requests in a 3s wait");
 
+    // A non-receipt on the reply subject must not hide a completed hub summary.
+    let mut fallback = s.clone();
+    fallback["id"] = stray.into();
+    fallback["status"] = "pass".into();
+    runtime
+        .block_on(bus.build_put(
+            &hgl_ai_proto::build::run_key(stray),
+            &serde_json::to_vec(&fallback).unwrap(),
+        ))
+        .unwrap();
+    let o = hub.run(&["build", "wait", stray, "--timeout", "3s"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
+
     // A local run with the hub's recipe.
     let logs = hub.dir.0.join("logs");
     let o = hub
@@ -736,6 +757,44 @@ fn detach_inside_a_turn_is_refused() {
         text(&o)
     );
     assert!(!logs.exists(), "nothing started");
+}
+
+#[test]
+fn local_build_from_subdirectory_discovers_dirty_checkout() {
+    let dir = Scratch::new("subdir");
+    let src = dir.0.join("src");
+    let sub = src.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&src, &["init", "--quiet"]);
+    std::fs::write(src.join("root-marker"), "initial\n").unwrap();
+    git(&src, &["add", "root-marker"]);
+    git(&src, &["commit", "--quiet", "-m", "initial"]);
+    let head = git(&src, &["rev-parse", "HEAD"]);
+    std::fs::write(src.join("root-marker"), "changed\n").unwrap();
+    let recipe = dir.0.join("r.toml");
+    std::fs::write(
+        &recipe,
+        "repo = \"demo\"\n[[step]]\nname = \"root\"\nrun = \"test -f root-marker\"\n",
+    )
+    .unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .args(["--json", "build", "run", "demo", "--recipe"])
+        .arg(&recipe)
+        .arg("--build-dir")
+        .arg(dir.0.join("build"))
+        .arg("--log-dir")
+        .arg(dir.0.join("logs"))
+        .current_dir(&sub)
+        .env("HGL_AI_CONFIG", dir.0.join("none.toml"))
+        .env_remove("HGL_AI_TASK_DIR")
+        .env_remove("HGL_AI_TURN")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["head"], head);
+    assert_eq!(s["dirty"], true);
 }
 
 /// Carbon's finding 10 on #12: a range in an XML report is read from that report, which
@@ -888,4 +947,72 @@ fn a_shell_checkout_survives_a_builder_starting() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(std::fs::read_to_string(&result).unwrap(), "kept\n");
+}
+
+#[test]
+fn missing_detached_status_reports_dead_process() {
+    let dir = Scratch::new("dead");
+    let id = "20261127-230000-abcdef";
+    let run = dir.0.join(id);
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("pid"), "0\n").unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .args(["build", "status", id, "--log-dir"])
+        .arg(&dir.0)
+        .env_remove("HGL_AI_TASK_DIR")
+        .env("HGL_AI_CONFIG", dir.0.join("missing"))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("stopped"),
+        "{}",
+        text(&o)
+    );
+}
+
+#[test]
+fn local_run_isolates_environment_without_a_task() {
+    let dir = Scratch::new("env");
+    let src = dir.0.join("src");
+    let build = dir.0.join("build");
+    let logs = dir.0.join("logs");
+    std::fs::create_dir_all(&src).unwrap();
+    let recipe = dir.0.join("recipe.toml");
+    std::fs::write(
+        &recipe,
+        r#"repo = "demo"
+[[step]]
+name = "env"
+run = '''printf '%s\n%s\n' "$TMPDIR" "$CARGO_TARGET_DIR"'''
+"#,
+    )
+    .unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .args(["--json", "build", "run", "demo", "--recipe"])
+        .arg(&recipe)
+        .arg("--dir")
+        .arg(&src)
+        .arg("--build-dir")
+        .arg(&build)
+        .arg("--log-dir")
+        .arg(&logs)
+        .env_remove("HGL_AI_TASK_DIR")
+        .env("HGL_AI_CONFIG", dir.0.join("missing"))
+        .env("TMPDIR", &dir.0)
+        .env("CARGO_TARGET_DIR", dir.0.join("caller-target"))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let summary: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let run = logs.join(summary["id"].as_str().unwrap());
+    let actual = std::fs::read_to_string(run.join("env.log")).unwrap();
+    assert_eq!(
+        actual,
+        format!(
+            "{}\n{}\n",
+            run.join("tmp").display(),
+            build.join("target").display()
+        )
+    );
 }
