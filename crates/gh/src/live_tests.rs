@@ -433,6 +433,8 @@ fn mergeable() -> FakeGh {
         .on("pulls/7", &fixture("pr-open.json"))
         .on("issues/7/comments", &fixture("comments-clean.json"))
         .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+        .on("check-runs", "{\"check_runs\":[]}")
+        .on("/status?per_page", "{\"statuses\":[]}")
         .on(
             "git/ref/heads/main",
             "{\"object\":{\"sha\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"}}",
@@ -739,6 +741,8 @@ fn landing_gh(after: impl FnOnce(FakeGh) -> FakeGh) -> FakeGh {
         )
         .on("issues/7/comments", &fixture("comments-clean.json"))
         .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+        .on("check-runs", "{\"check_runs\":[]}")
+        .on("/status?per_page", "{\"statuses\":[]}")
         .on(
             "graphql",
             "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}",

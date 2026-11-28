@@ -13,12 +13,14 @@
 //!   and read from the notes stream on the hub; the authors' families come from the
 //!   implementor trees the bridges registered (`HGL_TREES`);
 //! - where the repository names local build verdicts, each passed for this head on this
-//!   `main`; then GitHub's checks are not waited for (one that failed still blocks) and the
-//!   branch is not brought up to date;
+//!   `main`; then the branch is not brought up to date;
 //! - it is not behind `main`, or `main` moved only in files it does not touch and in none of
 //!   the global paths; otherwise it is brought up to date (and not merged: CI runs first);
-//! - GitHub reports it `CLEAN` (all checks green), or it changes only the relaxed paths and
-//!   the required checks passed while the optional ones have not failed;
+//! - (ROLE-20; the merge bypasses the rulesets, so `mergeable_state` is not relied on)
+//!   GitHub computed it `mergeable`, no check failed, every required check (`[github.gate.
+//!   <repo>] checks`) is present and passed, and every other check run and commit status
+//!   present is done and passed, except the `relax_optional` ones where it changes only
+//!   relaxed paths and every `relax_required` check passed;
 //! - no build output among its files and no local path among its added lines.
 //!
 //! The decision is [`decide`], a pure function over [`Facts`] that names the next fact it
@@ -118,6 +120,34 @@ impl CheckRun {
             Some("failure" | "cancelled" | "timed_out")
         )
     }
+}
+
+/// The commit statuses of `commits/SHA/status` (the latest per context), as checks named
+/// by their context: `pending` is not completed, `failure` and `error` failed.
+pub fn commit_statuses(v: &Value) -> Vec<CheckRun> {
+    v.get("statuses")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|s| {
+            let state = s.get("state").and_then(Value::as_str).unwrap_or("");
+            let (status, conclusion) = match state {
+                "success" => ("completed", Some("success")),
+                "failure" | "error" => ("completed", Some("failure")),
+                _ => ("pending", None),
+            };
+            CheckRun {
+                id: s.get("id").and_then(Value::as_u64).unwrap_or(0),
+                name: s
+                    .get("context")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                status: status.into(),
+                conclusion: conclusion.map(String::from),
+            }
+        })
+        .collect()
 }
 
 /// The latest run of each check from the pages of `commits/SHA/check-runs?filter=all`.
@@ -447,7 +477,7 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
             reviewed = "triaged";
         }
     }
-    let mut ms = pr.mergeable_state.clone();
+    let ms = pr.mergeable_state.clone();
     let mut line = format!(
         "{prefix} {ms} head {} unresolved {unresolved} behind {behind} reviewed {reviewed}",
         short(head)
@@ -503,8 +533,6 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
             }
         }
     }
-    // The local build passed and GitHub's checks are not all done (a relaxation may pass it).
-    let mut verdict_wait = false;
     if !rules.verdicts.is_empty() {
         let v = need!(f.verdicts, Need::Verdicts);
         let failed: Vec<&str> = v
@@ -531,43 +559,10 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
                 true,
             );
         }
-        let checks = need!(f.checks, Need::Checks);
-        let failed: Vec<&str> = checks
-            .iter()
-            .filter(|c| c.failed())
-            .map(|c| c.name.as_str())
-            .collect();
-        if !failed.is_empty() {
-            return done(
-                Kind::Blocked,
-                format!(
-                    "{line} local build passed but GitHub failed: {} BLOCKED",
-                    failed.join(",")
-                ),
-                false,
-            );
-        }
+        // The verdicts are in addition to GitHub's checks (ROLE-20), judged below; the
+        // build ran on the present `main`, so the branch is not brought up to date.
         line.push_str(&format!(" local-build-pass-on-main-{}", short(main)));
         behind = 0;
-        // The verdicts are in addition to GitHub's checks, not instead of them: every check
-        // has to be done and passed too (the merge bypasses the rulesets that would wait).
-        let open: Vec<&str> = checks
-            .iter()
-            .filter(|c| !c.passed())
-            .map(|c| c.name.as_str())
-            .collect();
-        if open.is_empty() && !checks.is_empty() {
-            ms = "CLEAN".into();
-        } else {
-            if checks.is_empty() {
-                line.push_str(" no-checks-yet");
-            } else {
-                line.push_str(&format!(" checks-not-done: {}", open.join(",")));
-            }
-            // Not merged as `CLEAN`, whatever GitHub says, unless a relaxation passes it.
-            verdict_wait = true;
-            ms = "CHECKS-NOT-DONE".into();
-        }
     }
     if behind != 0 {
         let mine = need!(f.mine, Need::CompareFiles);
@@ -586,55 +581,80 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     if behind != 0 {
         return Step::Update(line);
     }
-    // `merge_by_admin` (a ruleset only admins pass, which the merge bypasses) leaves a pull
-    // request `BLOCKED` when nothing else holds it: `mergeable` says it would merge.
-    let ruleset_only = ms == "BLOCKED" && pr.mergeable == Some(true);
-    if (ms == "UNSTABLE" || ruleset_only || verdict_wait) && rules.relax_configured() {
+    // ROLE-20. The merge bypasses the rulesets (`merge_by_admin` leaves every pull request
+    // `BLOCKED`), so GitHub's `mergeable_state` decides nothing here and the gate judges
+    // the checks itself.
+    let checks = need!(f.checks, Need::Checks);
+    let failed: Vec<&str> = checks
+        .iter()
+        .filter(|c| c.failed())
+        .map(|c| c.name.as_str())
+        .collect();
+    if !failed.is_empty() {
+        let what = if rules.verdicts.is_empty() {
+            "checks failed"
+        } else {
+            "local build passed but GitHub failed"
+        };
+        return done(
+            Kind::Blocked,
+            format!("{line} {what}: {} BLOCKED", failed.join(",")),
+            false,
+        );
+    }
+    if pr.mergeable != Some(true) {
+        let m = match pr.mergeable {
+            None => "not computed yet",
+            _ => "false",
+        };
+        return done(Kind::Wait, format!("{line} mergeable {m} WAIT"), true);
+    }
+    let passed = |n: &str| checks.iter().any(|c| c.name == n && c.passed());
+    let missing: Vec<&str> = rules
+        .required_checks
+        .iter()
+        .filter(|n| !checks.iter().any(|c| &c.name == *n))
+        .map(String::as_str)
+        .collect();
+    if !missing.is_empty() {
+        return done(
+            Kind::Wait,
+            format!("{line} required-checks-missing: {} WAIT", missing.join(",")),
+            true,
+        );
+    }
+    // Only relaxed paths changed (some did) and every `relax_required` check passed: the
+    // `relax_optional` checks are not waited for. Every other check still is.
+    let mut relaxed = false;
+    if rules.relax_configured() {
         let files = need!(f.pr_files, Need::PrFiles);
-        let checks = need!(f.checks, Need::Checks);
-        let inside = files
-            .iter()
-            .all(|f| rules.relax_paths.iter().any(|r| r.is_match(&f.name)));
-        let required_pass = rules.relax_required.iter().all(|n| {
-            checks
+        relaxed = !files.is_empty()
+            && files
                 .iter()
-                .any(|c| &c.name == n && c.conclusion.as_deref() == Some("success"))
-        });
-        let optional_ok = checks
-            .iter()
-            .filter(|c| rules.relax_optional.iter().any(|r| r.is_match(&c.name)))
-            .all(|c| matches!(c.conclusion.as_deref(), None | Some("") | Some("success")));
-        if inside && required_pass && optional_ok {
-            line.push_str(" relaxed-paths-only:not-waiting-for-optional-checks");
-            ms = "CLEAN".into();
-        }
+                .all(|f| rules.relax_paths.iter().any(|r| r.is_match(&f.name)))
+            && rules.relax_required.iter().all(|n| passed(n));
     }
-    if ms == "BLOCKED" && ruleset_only && !verdict_wait {
-        // The bypass no longer waits for checks: every one has to be done and passed.
-        let checks = need!(f.checks, Need::Checks);
-        if !checks.is_empty() && checks.iter().all(CheckRun::passed) {
-            line.push_str(" blocked-by-ruleset-only:checks-passed");
-            ms = "CLEAN".into();
-        } else if checks.is_empty() {
-            line.push_str(" no-checks-yet");
-        }
+    let optional = |n: &str| relaxed && rules.relax_optional.iter().any(|r| r.is_match(n));
+    let open: Vec<&str> = checks
+        .iter()
+        .filter(|c| !c.passed() && !optional(&c.name))
+        .map(|c| c.name.as_str())
+        .collect();
+    if !open.is_empty() {
+        return done(
+            Kind::Wait,
+            format!("{line} checks-not-done: {} WAIT", open.join(",")),
+            true,
+        );
     }
-    if ms != "CLEAN" {
-        let checks = need!(f.checks, Need::Checks);
-        let failed: Vec<&str> = checks
-            .iter()
-            .filter(|c| c.failed())
-            .map(|c| c.name.as_str())
-            .collect();
-        if !failed.is_empty() {
-            return done(
-                Kind::Blocked,
-                format!("{line} checks failed: {} BLOCKED", failed.join(",")),
-                false,
-            );
-        }
-        return done(Kind::Wait, format!("{line} WAIT"), true);
+    if relaxed {
+        line.push_str(" relaxed-paths-only:not-waiting-for-optional-checks");
     }
+    line.push_str(&format!(
+        " checks {}/{} passed",
+        checks.iter().filter(|c| c.passed()).count(),
+        checks.len()
+    ));
     let files = need!(f.pr_files, Need::PrFiles);
     let diff = need!(f.diff, Need::Diff);
     let bad_files: Vec<&str> = files
@@ -926,7 +946,11 @@ async fn fill<G: Gh>(
                 &format!("repos/{r}/commits/{head}/check-runs?per_page=100&filter=all"),
             )
             .await?;
-            f.checks = Some(latest_checks(&pages));
+            let mut checks = latest_checks(&pages);
+            let status =
+                exec::get(gh, &format!("repos/{r}/commits/{head}/status?per_page=100")).await?;
+            checks.extend(commit_statuses(&status));
+            f.checks = Some(checks);
         }
         Need::CompareFiles => {
             f.mine = Some(compare_files(
@@ -1151,7 +1175,7 @@ mod tests {
             bot_reviews: None,
             parents: Some(vec!["p".repeat(40)]),
             verdicts: None,
-            checks: None,
+            checks: Some(vec![]),
             mine: None,
             theirs: None,
             pr_files: Some(pr_files(json("pr-files.json").as_array().unwrap())),
@@ -1237,7 +1261,7 @@ mod tests {
             Step::Merge(line) => {
                 assert_eq!(
                     line,
-                    "alpha #7 codex/980-format-patterns CLEAN head 1f461fa7 unresolved 0 behind 0 reviewed head receipt r1/claude"
+                    "alpha #7 codex/980-format-patterns CLEAN head 1f461fa7 unresolved 0 behind 0 reviewed head receipt r1/claude checks 0/0 passed"
                 )
             }
             other => panic!("{other:?}"),
@@ -1559,6 +1583,7 @@ mod tests {
     fn checks_not_green() {
         let mut f = allowed();
         f.pr.mergeable_state = "UNSTABLE".into();
+        f.checks = None;
         assert_eq!(
             decide(&f, REPO, HEAD, &rules(), &Opts::default()),
             Step::Need(Need::Checks)
@@ -1580,9 +1605,16 @@ mod tests {
             "{}",
             o.line
         );
+        // Not computed yet (`UNKNOWN`, `mergeable` null): wait.
         f.pr.mergeable_state = "UNKNOWN".into();
+        f.pr.mergeable = None;
         f.checks = Some(vec![]);
-        assert_eq!(outcome(&f, &rules(), &Opts::default()).kind, Kind::Wait);
+        let o = outcome(&f, &rules(), &Opts::default());
+        assert!(
+            o.kind == Kind::Wait && o.line.contains("mergeable not computed yet"),
+            "{}",
+            o.line
+        );
     }
 
     #[test]
@@ -1666,6 +1698,7 @@ mod tests {
         let mut f = allowed();
         f.pr.mergeable_state = "BLOCKED".into();
         f.behind = Some(4);
+        f.checks = None;
         assert_eq!(
             decide(&f, REPO, HEAD, &r, &Opts::default()),
             Step::Need(Need::Verdicts)
@@ -1710,61 +1743,60 @@ mod tests {
             "{}",
             o.line
         );
+        let wait = |f: &Facts, word: &str| {
+            let o = outcome(f, &r, &Opts::default());
+            assert_eq!((o.kind, o.retry), (Kind::Wait, true), "{}", o.line);
+            assert!(o.line.contains(word), "{word}: {}", o.line);
+        };
         // All three pass and a GitHub check is still queued or running: wait for it (#60).
         for status in ["queued", "in_progress"] {
-            f.checks = Some(vec![
-                run("lint", "completed", Some("success")),
-                run("test (ubuntu-latest)", status, None),
-            ]);
-            let o = outcome(&f, &r, &Opts::default());
-            assert_eq!((o.kind, o.retry), (Kind::Wait, true), "{}", o.line);
-            assert!(
-                o.line.contains("checks-not-done: test (ubuntu-latest)"),
-                "{}",
-                o.line
-            );
+            let mut c = compiler_green();
+            c[1] = run("test (ubuntu-latest)", status, None);
+            f.checks = Some(c);
+            wait(&f, "checks-not-done: test (ubuntu-latest)");
         }
-        f.checks = Some(vec![]);
-        let o = outcome(&f, &r, &Opts::default());
-        assert!(
-            o.kind == Kind::Wait && o.line.contains("no-checks-yet"),
-            "{}",
-            o.line
+        // A fast check passed before the required ones exist: wait for them.
+        f.checks = Some(compiler_green()[..1].to_vec());
+        wait(
+            &f,
+            "required-checks-missing: test (ubuntu-latest),cpp (plain",
         );
         // GitHub's own `CLEAN` does not override the wait.
         let mut clean = f.clone();
         clean.pr.mergeable_state = "CLEAN".into();
-        clean.checks = Some(vec![run("lint", "queued", None)]);
-        assert_eq!(outcome(&clean, &r, &Opts::default()).kind, Kind::Wait);
-        // Only relaxed paths, the required checks passed: the optional one is not waited on.
-        let mut relaxed = f.clone();
-        relaxed.pr_files = Some(vec![PrFile {
-            name: "runtime/cpp/x.cpp".into(),
-            status: "modified".into(),
-        }]);
-        let mut checks: Vec<CheckRun> = ["lint", "test (ubuntu-latest)", "hgraph", "cpp"]
-            .iter()
-            .map(|n| run(n, "completed", Some("success")))
-            .collect();
-        checks.push(run("test (macos-latest)", "in_progress", None));
-        relaxed.checks = Some(checks);
-        assert!(
-            matches!(decide(&relaxed, REPO, HEAD, &r, &Opts::default()), Step::Merge(l) if l.contains("relaxed-paths-only")),
-            "{:?}",
-            decide(&relaxed, REPO, HEAD, &r, &Opts::default())
-        );
+        let mut c = compiler_green();
+        c[0] = run("lint", "queued", None);
+        clean.checks = Some(c);
+        wait(&clean, "checks-not-done: lint");
+        // Every check passed, but not `mergeable` (or not known yet): wait (r1, major 2).
+        for m in [None, Some(false)] {
+            let mut g = f.clone();
+            g.checks = Some(compiler_green());
+            g.pr.mergeable = m;
+            wait(&g, "mergeable");
+        }
         // Every check done and passed: merged without an update.
-        f.checks = Some(vec![
-            run("lint", "completed", Some("success")),
-            run("docs", "completed", Some("skipped")),
-        ]);
+        let mut c = compiler_green();
+        c.push(run("docs", "completed", Some("skipped")));
+        f.checks = Some(c);
         match decide(&f, REPO, HEAD, &r, &Opts::default()) {
             Step::Merge(l) => assert!(
-                l.ends_with(&format!("local-build-pass-on-main-{}", short(MAIN))),
+                l.contains(&format!("local-build-pass-on-main-{}", short(MAIN)))
+                    && l.ends_with("checks 7/7 passed"),
                 "{l}"
             ),
             s => panic!("{s:?}"),
         }
+    }
+
+    /// hgl-compiler's required checks, each passed.
+    fn compiler_green() -> Vec<CheckRun> {
+        settings()
+            .gate_rules("hgl-compiler")
+            .required_checks
+            .iter()
+            .map(|n| run(n, "completed", Some("success")))
+            .collect()
     }
 
     fn run(name: &str, status: &str, conclusion: Option<&str>) -> CheckRun {
@@ -1776,49 +1808,124 @@ mod tests {
         }
     }
 
+    /// ROLE-20 (r1 on #50, the blocker): the checks gate a merge, not `mergeable_state`.
     #[test]
-    fn blocked_by_the_ruleset_only() {
+    fn required_checks_and_commit_statuses() {
         let mut f = allowed();
+        // Every pull request is `BLOCKED` under `merge_by_admin`.
         f.pr.mergeable_state = "BLOCKED".into();
-        f.pr.mergeable = Some(true);
+        f.checks = None;
         let opts = Opts::default();
         assert_eq!(
             decide(&f, REPO, HEAD, &rules(), &opts),
             Step::Need(Need::Checks)
         );
-        let done = vec![
-            run("lint", "completed", Some("success")),
-            run("docs", "completed", Some("skipped")),
-        ];
-        f.checks = Some(done.clone());
-        assert!(
-            matches!(decide(&f, REPO, HEAD, &rules(), &opts), Step::Merge(l) if l.contains("blocked-by-ruleset-only:checks-passed")),
-            "{:?}",
-            decide(&f, REPO, HEAD, &rules(), &opts)
-        );
-        // A check queued or running: the bypass would not wait for it, so the gate does.
-        for status in ["queued", "in_progress"] {
-            let mut c = done.clone();
-            c.push(run("test (ubuntu-latest)", status, None));
-            f.checks = Some(c);
-            let o = outcome(&f, &rules(), &opts);
-            assert_eq!((o.kind, o.retry), (Kind::Wait, true), "{}", o.line);
-        }
-        // A failed check, or no checks yet.
-        let mut c = done.clone();
-        c.push(run("test (ubuntu-latest)", "completed", Some("failure")));
-        f.checks = Some(c);
-        assert_eq!(outcome(&f, &rules(), &opts).kind, Kind::Blocked);
+        // None required and none present (hgl_spec, hgl_core): merged on `mergeable`.
         f.checks = Some(vec![]);
-        let o = outcome(&f, &rules(), &opts);
-        assert_eq!(o.kind, Kind::Wait);
-        assert!(o.line.contains("no-checks-yet"), "{}", o.line);
-        // Not `mergeable` (or not known yet): blocked by something else, waited on.
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &rules(), &opts),
+            Step::Merge(_)
+        ));
+        let required = |names: &[&str]| GateRules {
+            required_checks: names.iter().map(|n| n.to_string()).collect(),
+            ..rules()
+        };
+        let r = required(&["lint", "test"]);
+        let wait = |f: &Facts, r: &GateRules, word: &str| {
+            let o = outcome(f, r, &opts);
+            assert_eq!((o.kind, o.retry), (Kind::Wait, true), "{}", o.line);
+            assert!(o.line.contains(word), "{word}: {}", o.line);
+        };
+        // A fast check passed before a required one exists: wait for it.
+        f.checks = Some(vec![run("lint", "completed", Some("success"))]);
+        wait(&f, &r, "required-checks-missing: test");
+        f.checks = Some(vec![
+            run("lint", "completed", Some("success")),
+            run("test", "in_progress", None),
+        ]);
+        wait(&f, &r, "checks-not-done: test");
+        let green = vec![
+            run("lint", "completed", Some("success")),
+            run("test", "completed", Some("success")),
+        ];
+        f.checks = Some(green.clone());
+        assert!(
+            matches!(decide(&f, REPO, HEAD, &r, &opts), Step::Merge(l) if l.ends_with("checks 2/2 passed"))
+        );
+        // A check present but not required still has to finish and pass.
+        let mut c = green.clone();
+        c.push(run("extra", "queued", None));
+        f.checks = Some(c);
+        wait(&f, &r, "checks-not-done: extra");
+        let mut c = green.clone();
+        c.push(run("extra", "completed", Some("failure")));
+        f.checks = Some(c);
+        assert_eq!(outcome(&f, &r, &opts).kind, Kind::Blocked);
+        // Not `mergeable`, or not known yet: wait, however green.
         for m in [None, Some(false)] {
-            f.pr.mergeable = m;
-            f.checks = Some(done.clone());
-            assert_eq!(outcome(&f, &rules(), &opts).kind, Kind::Wait);
+            let mut g = f.clone();
+            g.checks = Some(green.clone());
+            g.pr.mergeable = m;
+            wait(&g, &r, "mergeable");
         }
+        // A commit status (readthedocs) is a check like the others.
+        let r = required(&["docs/readthedocs.org:hgl-project"]);
+        let status = |state: &str| {
+            commit_statuses(&serde_json::json!({"state": state, "statuses": [
+                {"id": 9, "context": "docs/readthedocs.org:hgl-project", "state": state}
+            ]}))
+        };
+        f.checks = Some(vec![]);
+        wait(
+            &f,
+            &r,
+            "required-checks-missing: docs/readthedocs.org:hgl-project",
+        );
+        f.checks = Some(status("pending"));
+        wait(&f, &r, "checks-not-done: docs/readthedocs.org:hgl-project");
+        f.checks = Some(status("success"));
+        assert!(matches!(decide(&f, REPO, HEAD, &r, &opts), Step::Merge(_)));
+        for bad in ["failure", "error"] {
+            f.checks = Some(status(bad));
+            assert_eq!(outcome(&f, &r, &opts).kind, Kind::Blocked, "{bad}");
+        }
+    }
+
+    #[tokio::test]
+    async fn evaluate_reads_check_runs_and_commit_statuses() {
+        let s = without_receipts(settings(), &[REPO]);
+        let mut s = s;
+        s.gates.insert(
+            REPO.into(),
+            hgl_ai_config::github::RepoGate {
+                checks: vec!["docs/readthedocs.org:hgl-project".into()],
+                review_receipt: false,
+                ..Default::default()
+            },
+        );
+        let gh = FakeGh::default()
+            .on(
+                "/status?per_page",
+                r#"{"state":"pending","statuses":[{"id":1,"context":"docs/readthedocs.org:hgl-project","state":"pending"}]}"#,
+            )
+            .on("check-runs", r#"{"check_runs":[]}"#);
+        let gh = fake_with(gh, &["pr-open.json"]);
+        let gh = crate::exec::ReadOnly(gh);
+        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), false, None)
+            .await
+            .unwrap();
+        assert_eq!(o.kind, Kind::Wait, "{}", o.line);
+        assert!(
+            o.line
+                .contains("checks-not-done: docs/readthedocs.org:hgl-project"),
+            "{}",
+            o.line
+        );
+        assert!(
+            gh.0.calls()
+                .iter()
+                .any(|c| c.contains(&format!("commits/{HEAD}/status")))
+        );
     }
 
     #[test]
@@ -1830,52 +1937,63 @@ mod tests {
             verdicts: vec![],
             ..r
         };
-        f.pr.mergeable_state = "UNSTABLE".into();
-        f.pr_files = Some(vec![PrFile {
+        f.pr.mergeable_state = "BLOCKED".into();
+        let inside = vec![PrFile {
             name: "runtime/cpp/x.cpp".into(),
             status: "modified".into(),
-        }]);
-        let ok = |n: &str| CheckRun {
-            id: 1,
-            name: n.into(),
-            status: "completed".into(),
-            conclusion: Some("success".into()),
-        };
-        let pending = |n: &str| CheckRun {
-            id: 2,
-            name: n.into(),
-            status: "in_progress".into(),
-            conclusion: None,
-        };
-        let mut checks: Vec<CheckRun> = ["lint", "test (ubuntu-latest)", "hgraph", "cpp"]
-            .iter()
-            .map(|n| ok(n))
-            .collect();
-        checks.push(pending("test (macos-latest)"));
+        }];
+        f.pr_files = Some(inside.clone());
+        // Required and `relax_required` checks passed; the optional macOS and Windows runs
+        // still going.
+        let mut checks = compiler_green();
+        checks.extend(["hgraph", "cpp"].map(|n| run(n, "completed", Some("success"))));
+        checks.push(run("test (macos-latest)", "in_progress", None));
+        checks.push(run("test (windows-latest)", "queued", None));
         f.checks = Some(checks.clone());
         assert!(
-            matches!(decide(&f, REPO, HEAD, &r, &Opts::default()), Step::Merge(l) if l.contains("relaxed-paths-only"))
+            matches!(decide(&f, REPO, HEAD, &r, &Opts::default()), Step::Merge(l) if l.contains("relaxed-paths-only")),
+            "{:?}",
+            decide(&f, REPO, HEAD, &r, &Opts::default())
         );
-        // Under the ruleset alone (`BLOCKED`, mergeable) the relaxation holds as well.
-        let mut b = f.clone();
-        b.pr.mergeable_state = "BLOCKED".into();
-        b.pr.mergeable = Some(true);
-        assert!(
-            matches!(decide(&b, REPO, HEAD, &r, &Opts::default()), Step::Merge(l) if l.contains("relaxed-paths-only"))
+        let wait = |f: &Facts, word: &str| {
+            let o = outcome(f, &r, &Opts::default());
+            assert_eq!(o.kind, Kind::Wait, "{}", o.line);
+            assert!(o.line.contains(word), "{word}: {}", o.line);
+        };
+        // An optional check that failed blocks.
+        let mut c = checks.clone();
+        let n = c.len();
+        c[n - 2].status = "completed".into();
+        c[n - 2].conclusion = Some("failure".into());
+        f.checks = Some(c);
+        assert_eq!(outcome(&f, &r, &Opts::default()).kind, Kind::Blocked);
+        // A check neither required nor optional is waited for (r1, major 3).
+        let mut c = checks.clone();
+        c.push(run("extra", "in_progress", None));
+        f.checks = Some(c);
+        wait(&f, "checks-not-done: extra");
+        // A `relax_required` check missing: no relaxation, so the optional ones are waited for.
+        f.checks = Some(
+            checks
+                .iter()
+                .filter(|c| c.name != "hgraph")
+                .cloned()
+                .collect(),
         );
-        // An optional check that failed, a required one missing, or a file outside: wait.
-        let mut failed = checks.clone();
-        failed[4].conclusion = Some("failure".into());
-        f.checks = Some(failed);
-        assert!(outcome(&f, &r, &Opts::default()).kind == Kind::Blocked);
-        f.checks = Some(checks[1..].to_vec());
-        assert_eq!(outcome(&f, &r, &Opts::default()).kind, Kind::Wait);
-        f.checks = Some(checks);
+        wait(&f, "checks-not-done: test (macos-latest)");
+        // A file outside, or no files at all (r1, major 3): no relaxation.
+        f.checks = Some(checks.clone());
         f.pr_files = Some(vec![PrFile {
             name: "crates/hgl_types/src/lib.rs".into(),
             status: "modified".into(),
         }]);
-        assert_eq!(outcome(&f, &r, &Opts::default()).kind, Kind::Wait);
+        wait(&f, "checks-not-done: test (macos-latest)");
+        f.pr_files = Some(vec![]);
+        wait(&f, "checks-not-done: test (macos-latest)");
+        // Relaxed, but not `mergeable`: wait.
+        f.pr_files = Some(inside);
+        f.pr.mergeable = Some(false);
+        wait(&f, "mergeable false");
     }
 
     #[test]
@@ -1931,6 +2049,8 @@ mod tests {
             .on("issues/7/comments", &fixture("comments-clean.json"))
             .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
             .on("git/ref/heads/main", &format!("{{\"object\":{{\"sha\":\"{MAIN}\"}}}}"))
+            .on("check-runs", "{\"check_runs\":[]}")
+            .on("/status?per_page", "{\"statuses\":[]}")
             .on("graphql", "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[{\"isResolved\":true}]}}}}}")
     }
 

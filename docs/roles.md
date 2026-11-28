@@ -82,6 +82,13 @@ Open decisions are issues in this repository.
   coordinated. When no other family is available, nothing lands: same-family
   review is never a fallback, and failover never moves a task to a family that
   would leave it none (PROTO-17).
+- **ROLE-20 — Checks.** The merge bypasses the rulesets, so `gh land` and
+  `gh merge-if-clean` judge GitHub's checks (check runs and commit statuses) themselves.
+  A merge needs: GitHub computed the pull request `mergeable`; no check failed; every
+  check in `[github.gate.<repo>] checks` is present and passed; every other check present
+  is done and passed, apart from the `relax_optional` ones where the relaxation applies;
+  and, where the repository names them, the local build verdicts too. With no checks
+  listed and none present, a mergeable pull request merges.
 - **ROLE-12 — Pins follow merges.** A merge in `hgl_spec`, `hgl_core` or
   `hgl-compiler` is followed by the wrapper pin update and a new `main` state.
 - **ROLE-13 — No scope creep.** A defect found on the way that the change does
