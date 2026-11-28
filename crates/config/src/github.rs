@@ -18,6 +18,12 @@ pub struct RepoGate {
     /// Path prefixes added to `github.global_paths` for this repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub global_paths: Vec<String>,
+    /// Path prefixes that require tier 3. Omission uses the repository's built-in list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier3_paths: Option<Vec<String>>,
+    /// Exact paths cleared from hgl-ai's tier 3 rule for new files in sensitive crates.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tier3_new_exceptions: Vec<String>,
     /// Names of the local build verdicts a merge needs for the head on the present `main`
     /// under the current recipe, each a platform (`mac` for macOS): state keys
     /// `verdict.<repo>.<pr>.<name>.<pair>`, value `<head> <main> pass|fail ...`
@@ -54,6 +60,8 @@ impl Default for RepoGate {
         RepoGate {
             review_receipt: true,
             global_paths: Vec::new(),
+            tier3_paths: None,
+            tier3_new_exceptions: Vec::new(),
             verdicts: Vec::new(),
             checks: Vec::new(),
             relax_paths: Vec::new(),
@@ -148,6 +156,60 @@ fn strings(v: &[&str]) -> Vec<String> {
     v.iter().map(|s| s.to_string()).collect()
 }
 
+pub fn default_tier3_paths(repo: &str) -> Vec<String> {
+    if repo != "hgl-ai" {
+        return Vec::new();
+    }
+    strings(&[
+        "crates/gh/src/gate.rs",
+        "crates/gh/src/land.rs",
+        "crates/gh/src/merge.rs",
+        "crates/gh/src/lock.rs",
+        "crates/gh/src/verdict.rs",
+        "crates/gh/src/coord.rs",
+        "crates/gh/src/state.rs",
+        "crates/gh/src/store.rs",
+        "crates/gh/src/pins.rs",
+        "crates/gh/src/release.rs",
+        "crates/gh/src/tap.rs",
+        "crates/console/src/auth.rs",
+        "crates/console/src/jwt.rs",
+        "crates/console/src/api.rs",
+        "crates/owner/",
+        "crates/install/src/token.rs",
+        "crates/install/src/users.rs",
+        "crates/install/src/nats.rs",
+        "crates/install/src/hub.rs",
+        "crates/bus/src/cred.rs",
+        "crates/bridge/src/lock.rs",
+        "crates/bridge/src/holder.rs",
+        "crates/bridge/src/cleanup.rs",
+        "crates/proto/",
+        ".github/workflows/release.yml",
+        "packaging/",
+    ])
+}
+
+/// A path in a sensitive hgl-ai crate stays tier 3 until it is explicitly cleared.
+pub fn unlisted_sensitive_path(path: &str) -> bool {
+    const SENSITIVE_CRATES: &[&str] = &[
+        "crates/gh/",
+        "crates/console/",
+        "crates/owner/",
+        "crates/install/",
+        "crates/bus/",
+        "crates/bridge/",
+        "crates/proto/",
+        "crates/config/",
+    ];
+    SENSITIVE_CRATES
+        .iter()
+        .any(|prefix| path.starts_with(prefix))
+        && !include_str!("tier3-baseline.txt")
+            .lines()
+            .any(|known| known == path)
+}
+
 default_fns! {
     review_bot, is_review_bot: String = "chatgpt-codex-connector".into();
     controller, is_controller: String = "controller".into();
@@ -200,6 +262,7 @@ fn default_gates() -> BTreeMap<String, RepoGate> {
             "cpp (sanitize, sdk)",
         ]),
         relax_optional: strings(&[r"^test \((macos|windows)-latest\)$"]),
+        ..RepoGate::default()
     };
     let checks = |c: &[&str]| RepoGate {
         checks: strings(c),

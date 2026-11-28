@@ -71,6 +71,10 @@ Open decisions are issues in this repository.
 
 - **ROLE-9 — Exact head.** Every receipt and verdict binds one 40-character
   head. A new commit voids them.
+- **Review routing for hgl-ai.** The controller runs `hgl-ai gh tier REPO PR HEAD`,
+  sets one of `tier-1`, `tier-2` or `tier-3` at or above the computed tier, and
+  names the deciding paths in its routing comment. A Ready line can suggest a
+  tier. Anyone may add `risk-high`. Only the owner removes it.
 - **ROLE-10 — Current main.** A change lands only after its gates ran on the
   `main` it merges onto. When `main` moves, the next candidate is revalidated. A
   branch the gate brings up to date keeps its parent's review only where `main`

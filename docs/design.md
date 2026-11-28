@@ -83,6 +83,7 @@ hgl-ai tree remove SEAT REPO ISSUE [--review]  what the bridge does on `landed`,
 hgl-ai cap SIZE [--time DUR] [--no-address-limit] -- CMD ...   memory and time cap for a command tree
 
 hgl-ai gh coord run [--once] [--dry-run]  coordinator service loop
+hgl-ai gh tier REPO PR HEAD [--json]      minimum review tier and deciding paths
 hgl-ai gh approve|sendback REPO PR HEAD (--body T | --body-file F)
 hgl-ai gh merge-if-clean REPO PR HEAD     one gate attempt under the landing lock
 hgl-ai gh land REPO PR HEAD               the gate until it decides, then the steps after the merge
@@ -153,6 +154,8 @@ relax_required = ["lint", "test (ubuntu-latest)", "cpp (plain, runtime and core)
 
 [github.gate.hgl-ai]
 checks = ["lint", "lint (macos-latest)", "test (ubuntu-latest)", "test (macos-latest)"]
+# tier3_paths defaults to the built-in hgl-ai prefix list. Set it to replace that list.
+# tier3_new_exceptions = ["crates/gh/tests/example.rs"]  # clear an exact new path
 
 [github.gate.hgl-project]
 checks = ["docs/readthedocs.org:hgl-project"]   # a commit status
@@ -244,6 +247,22 @@ from = "console@example.com"
 # user = "console@example.com"
 # password_file = "~/.config/hgl-ai/console/smtp.password"
 ```
+
+`gh tier` checks the PR's current head and reads its diff by commit ID. It
+refuses a moved head or an incomplete file list. GitHub's comparison API
+returns at most 300 files. `tier3_paths` matches
+repository-relative prefixes on either side of a rename. hgl-ai also treats
+unlisted paths in sensitive crates as tier 3 until an exact path is cleared
+through `tier3_new_exceptions`. A `risk-high` label on the PR, its branch's
+task issue or a GitHub closing issue raises the minimum to tier 3.
+
+Docs and standalone test files qualify for tier 1. CI, recipes, `AGENTS.md`,
+`skill/`, `docs/roles.md` and `docs/protocol.md` require at least tier 2.
+A source fix can qualify for tier 1 with a `bug` label on its task issue,
+at most three changed files and 40 added plus deleted lines outside tests,
+and no changed Cargo manifest, lockfile, or higher-risk policy path. For a
+PR without a branch task issue, a single GitHub closing issue can supply
+the `bug` label. Other changes default to tier 2.
 
 `hub.token_file` holds the host's hub credential: its own hub user's NKey seed, or
 the shared token of an older hub. `HGL_AI_HUB_CREDENTIAL` overrides it for one
