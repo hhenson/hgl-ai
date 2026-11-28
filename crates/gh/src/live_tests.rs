@@ -1781,8 +1781,7 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
     assert!(notes[1].note.body.contains("review by r2"));
     assert!(no_gh.calls().is_empty());
 
-    // A restart sees the new task seat. GitHub accepts the comment but loses its response.
-    b.tree_put(&tree(&w2, first.seq + 10)).await.unwrap();
+    // GitHub accepts the comment but loses its response, leaving a pending sendback.
     let sequence = b.send(&receipt(HEAD, Verdict::Findings)).await.unwrap().seq;
     let gh = FakeGh::default()
         .on("comments?per_page", "[]")
@@ -1802,6 +1801,10 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
             .unwrap()
             .contains("The retry loses a checkpoint.")
     );
+    let checkpoint = b.state_get("coord.routing").await.unwrap().unwrap().value;
+    let mut moved = tree(&w2, first.seq + 10);
+    moved.task.issue = 7; // The new tree matches by branch, not by the original task number.
+    b.tree_put(&moved).await.unwrap();
 
     let recovered = FakeGh::default().on(
         "comments?per_page",
@@ -1811,6 +1814,8 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
     crate::routing::round(&recovered, &s, &b, &[])
         .await
         .unwrap();
+    // Replaying after a lost checkpoint write recovers the already delivered recipient.
+    b.state_put("coord.routing", &checkpoint).await.unwrap();
     crate::routing::round(&recovered, &s, &b, &read(HEAD))
         .await
         .unwrap();
@@ -1846,7 +1851,7 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
         .await
         .unwrap();
     let w3 = seat("w3");
-    b.tree_del(&tree(&w2, 0).key()).await.unwrap();
+    b.tree_del(&moved.key()).await.unwrap();
     b.tree_put(&tree(&w3, sequence + 10)).await.unwrap();
     let head = "b".repeat(40);
     let sequence = b.send(&ready(&w3, &head)).await.unwrap().seq;

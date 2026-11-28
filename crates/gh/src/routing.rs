@@ -245,7 +245,8 @@ enum Action {
     Sendback {
         pr: u64,
         issue: u64,
-        to: Seat,
+        #[serde(default)]
+        branch: String,
         fallback: Seat,
     },
     Candidate {
@@ -329,11 +330,11 @@ impl Facts<'_> {
                 match receipt.verdict {
                     Verdict::Clean => Action::Candidate { pr },
                     Verdict::Findings if !past.sent_back && !receipt.evidence.trim().is_empty() => {
-                        if let [to] = current.as_slice() {
+                        if current.len() == 1 {
                             Action::Sendback {
                                 pr,
                                 issue: pull.issue,
-                                to: to.clone(),
+                                branch: pull.pr.branch.clone(),
                                 fallback: self.settings.controller.clone(),
                             }
                         } else {
@@ -423,8 +424,8 @@ impl Facts<'_> {
     }
 }
 
-// Keep the selected delivery and digest line together before any side effect. The
-// source body remains in HGL_NOTES, so even a large receipt fits the checkpoint.
+// Keep the pending action and any fixed digest line together before any side effect.
+// The source body remains in HGL_NOTES, so even a large receipt fits the checkpoint.
 #[derive(Serialize, Deserialize)]
 struct Pending {
     seq: u64,
@@ -443,13 +444,12 @@ impl Pending {
         };
         let line = match &action {
             Action::Review { pr, to, .. } => Some(format!("{} → review by {to}", label(*pr))),
-            Action::Sendback { pr, to, .. } => Some(format!("{} → sendback to {to}", label(*pr))),
             Action::Candidate { pr } => Some(format!(
                 "{} → landing candidate (clean receipt by {})",
                 label(*pr),
                 item.note.sender
             )),
-            Action::Forward { .. } | Action::AlreadyRouted => None,
+            Action::Forward { .. } | Action::Sendback { .. } | Action::AlreadyRouted => None,
         };
         Self {
             seq: item.seq,
@@ -605,17 +605,21 @@ async fn run<G: Gh>(
         let id = format!("coord-routing-{seq}");
         let sent = bus.retained_note(pending.recipient(), seq + 1, &id).await?;
         let line = if let Some(sent) = sent {
-            pending.line.clone().filter(|_| {
-                matches!(
-                    (&pending.action, sent.note.kind),
-                    (Action::Review { .. }, Kind::Review)
-                        | (Action::Sendback { .. }, Kind::Sendback)
-                )
-            })
+            match (&pending.action, sent.note.kind) {
+                (Action::Review { .. }, Kind::Review) => pending.line.clone(),
+                (Action::Sendback { pr, .. }, Kind::Sendback) => {
+                    Some(sendback_line(&sent.note, *pr))
+                }
+                _ => None,
+            }
         } else {
             let (notes, _) = bus.read_page(inbox, seq, 1).await?;
             match notes.first().filter(|item| item.seq == seq) {
-                Some(item) => execute(gh, settings, bus, lease, item, pending).await?.0,
+                Some(item) => {
+                    execute(gh, settings, bus, lease, infos, item, pending)
+                        .await?
+                        .0
+                }
                 None => {
                     tracing::warn!(seq, "routing source is no longer retained");
                     None
@@ -634,34 +638,24 @@ async fn run<G: Gh>(
         Some(Facts::load(bus, settings, infos).await?)
     };
     for item in notes {
-        let mut action = facts.as_ref().map_or_else(
+        let action = facts.as_ref().map_or_else(
             || Action::Forward {
                 to: settings.controller.clone(),
             },
             |facts| facts.plan(&item.note),
         );
-        if let Action::Sendback { pr, to, .. } = &mut action {
-            let repo = item
-                .note
-                .repo
-                .as_deref()
-                .expect("sendback has a repository");
-            let facts = facts.as_ref().expect("sendback has routing facts");
-            let pull = facts
-                .pulls
-                .iter()
-                .find(|p| p.pr.row.repo == repo && p.number() == *pr)
-                .expect("sendback has a pull request");
-            if let [current] = pull.current_seats(&bus.trees().await?).as_slice() {
-                to.clone_from(current);
-            } else {
-                action = facts.forward();
-            }
-        }
         c.outbox = Some(Pending::new(&item, action));
         c.save(bus, lease, &mut revision).await?;
-        let (line, sent) =
-            execute(gh, settings, bus, lease, &item, c.outbox.as_ref().unwrap()).await?;
+        let (line, sent) = execute(
+            gh,
+            settings,
+            bus,
+            lease,
+            infos,
+            &item,
+            c.outbox.as_ref().unwrap(),
+        )
+        .await?;
         if let (Some(facts), Some(sent)) = (&mut facts, sent) {
             facts
                 .history
@@ -682,6 +676,7 @@ async fn execute<G: Gh>(
     s: &Settings,
     bus: &Bus,
     lease: &mut Lease,
+    infos: &[PrInfo],
     item: &StreamNote,
     pending: &Pending,
 ) -> Result<(Option<String>, Option<StreamNote>)> {
@@ -710,9 +705,25 @@ async fn execute<G: Gh>(
         Action::Sendback {
             pr,
             issue,
-            to,
+            branch,
             fallback,
         } => {
+            // Older outboxes know only the task issue. Use the PR batch to recover
+            // its branch when available so handoffs registered by branch count too.
+            let branch = if branch.is_empty() {
+                infos
+                    .iter()
+                    .find(|info| info.row.repo == repo && info.row.number == *pr)
+                    .map_or("", |info| info.branch.as_str())
+            } else {
+                branch
+            };
+            let current =
+                |trees: &[TreeRecord]| state::current_seats(trees, repo, branch, *issue, &[], &[]);
+            let owners = current(&bus.trees().await?);
+            let [to] = owners.as_slice() else {
+                return deliver(bus, lease, item.seq, None, forward(fallback, item)).await;
+            };
             let receipt = state::routed_receipt(n).expect("sendback comes from a review receipt");
             let findings = format!(
                 "Review findings from {} ({} {}).\n\n{}\n\nLimitations: {}",
@@ -730,10 +741,13 @@ async fn execute<G: Gh>(
                 *pr,
                 head,
             );
-            let sendback = routed_note(to, n, Kind::Sendback, *issue, body);
+            let mut sendback = routed_note(to, n, Kind::Sendback, *issue, body);
             if check_note(&sendback).is_ok()
                 && comment(gh, s, lease, item, *pr, &sendback.body).await?
+                && let [to] = current(&bus.trees().await?).as_slice()
             {
+                sendback.recipient.clone_from(to);
+                line = Some(sendback_line(&sendback, *pr));
                 sendback
             } else {
                 line = None;
@@ -742,9 +756,19 @@ async fn execute<G: Gh>(
         }
         Action::Candidate { .. } | Action::AlreadyRouted => return Ok((line, None)),
     };
+    deliver(bus, lease, item.seq, line, note).await
+}
+
+async fn deliver(
+    bus: &Bus,
+    lease: &mut Lease,
+    seq: u64,
+    line: Option<String>,
+    note: Note,
+) -> Result<(Option<String>, Option<StreamNote>)> {
     lease.refresh().await?;
     let sent = bus
-        .send_with_id(&note, &format!("coord-routing-{}", item.seq))
+        .send_with_id(&note, &format!("coord-routing-{seq}"))
         .await?;
     Ok((
         line,
@@ -753,6 +777,15 @@ async fn execute<G: Gh>(
             note,
         }),
     ))
+}
+
+fn sendback_line(note: &Note, pr: u64) -> String {
+    format!(
+        "{}#{pr} at {} → sendback to {}",
+        note.repo.as_deref().unwrap_or(""),
+        note.head.as_deref().unwrap_or(""),
+        note.recipient
+    )
 }
 
 fn forward(to: &Seat, item: &StreamNote) -> Note {
