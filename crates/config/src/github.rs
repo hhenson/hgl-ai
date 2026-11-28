@@ -18,10 +18,17 @@ pub struct RepoGate {
     /// Path prefixes added to `github.global_paths` for this repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub global_paths: Vec<String>,
-    /// Names of the local build verdicts a merge needs for the head on the present
-    /// `main` (state keys `verdict.<repo>.<pr>.<name>`, value `<head> <main> pass|fail ...`).
+    /// Names of the local build verdicts a merge needs for the head on the present `main`
+    /// under the current recipe, each a platform (`mac` for macOS): state keys
+    /// `verdict.<repo>.<pr>.<name>.<pair>`, value `<head> <main> pass|fail ...`
+    /// (docs/build.md BUILD-15).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verdicts: Vec<String>,
+    /// The checks a merge needs (docs/roles.md ROLE-20): check-run names or commit-status
+    /// contexts, each present at the head and passed. Every other check present must pass
+    /// as well; with none listed and none present, a mergeable pull request merges.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<String>,
     /// Regular expressions over changed paths. A pull request that changes only such paths
     /// does not wait for the `relax_optional` checks once every `relax_required` check passed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -48,6 +55,7 @@ impl Default for RepoGate {
             review_receipt: true,
             global_paths: Vec::new(),
             verdicts: Vec::new(),
+            checks: Vec::new(),
             relax_paths: Vec::new(),
             relax_required: Vec::new(),
             relax_optional: Vec::new(),
@@ -142,7 +150,7 @@ fn strings(v: &[&str]) -> Vec<String> {
 
 default_fns! {
     review_bot, is_review_bot: String = "chatgpt-codex-connector".into();
-    controller, is_controller: String = "claude".into();
+    controller, is_controller: String = "controller".into();
     coord_seat, is_coord_seat: String = "coord".into();
     coord_interval, is_coord_interval: String = "5m".into();
     hold_below, is_hold_below: u64 = 100;
@@ -165,6 +173,16 @@ fn default_gates() -> BTreeMap<String, RepoGate> {
         review_receipt: true,
         global_paths: strings(&["spec/hgl_spec", "spec/hgl_core"]),
         verdicts: strings(&["linux", "mac", "windows"]),
+        // The `relax_optional` tests are left out, or the relaxation could never apply;
+        // they are judged whenever they run.
+        checks: strings(&[
+            "lint",
+            "test (ubuntu-latest)",
+            "cpp (plain, runtime and core)",
+            "cpp (plain, sdk)",
+            "cpp (sanitize, runtime and core)",
+            "cpp (sanitize, sdk)",
+        ]),
         relax_paths: strings(&[
             r"^runtime/cpp/",
             r"^crates/hgl_cpp/",
@@ -176,7 +194,22 @@ fn default_gates() -> BTreeMap<String, RepoGate> {
         relax_required: strings(&["lint", "test (ubuntu-latest)", "hgraph", "cpp"]),
         relax_optional: strings(&[r"^test \((macos|windows)-latest\)$"]),
     };
-    BTreeMap::from([("hgl-compiler".to_string(), compiler)])
+    let checks = |c: &[&str]| RepoGate {
+        checks: strings(c),
+        ..RepoGate::default()
+    };
+    BTreeMap::from([
+        ("hgl-compiler".to_string(), compiler),
+        (
+            "hgl-ai".to_string(),
+            checks(&["lint", "test (ubuntu-latest)", "test (macos-latest)"]),
+        ),
+        (
+            "hgl-project".to_string(),
+            checks(&["docs/readthedocs.org:hgl-project"]),
+        ),
+        ("homebrew-hgraph".to_string(), checks(&["linux-formula"])),
+    ])
 }
 
 fn default_pins() -> Vec<Pin> {
@@ -227,6 +260,28 @@ pub fn validate_pins(pins: &[Pin]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn required_checks_of_the_fleet() {
+        let g: RepoGate = toml::from_str("checks = [\"lint\"]").unwrap();
+        assert_eq!(g.checks, ["lint"]);
+        assert!(RepoGate::default().checks.is_empty());
+        let all = gates();
+        let of = |r: &str| all.get(r).map(|g| g.checks.clone()).unwrap_or_default();
+        assert_eq!(
+            of("hgl-ai"),
+            ["lint", "test (ubuntu-latest)", "test (macos-latest)"]
+        );
+        assert_eq!(of("hgl-project"), ["docs/readthedocs.org:hgl-project"]);
+        assert_eq!(of("homebrew-hgraph"), ["linux-formula"]);
+        assert!(of("hgl_spec").is_empty() && of("hgl_core").is_empty());
+        let compiler = of("hgl-compiler");
+        assert!(compiler.contains(&"lint".to_string()) && compiler.len() == 6);
+        // The relaxation's optional checks are not required, or it could never apply.
+        for o in ["test (macos-latest)", "test (windows-latest)"] {
+            assert!(!compiler.iter().any(|c| c == o), "{o}");
+        }
+    }
 
     #[test]
     fn a_review_receipt_is_required_unless_turned_off() {

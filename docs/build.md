@@ -1,7 +1,8 @@
 # Builds
 
-Status: proposed. §1, §2 and §2a are implemented (`crates/build`); §3, the merge queue,
-is not: today the controller lands with `hgl-ai gh land` (`docs/protocol.md` §8). The
+Status: proposed. §1, §2, §2a and BUILD-15 are implemented (`crates/build`, `crates/gh`);
+§3, the merge queue, is not: today the controller lands with `hgl-ai gh land`
+(`docs/protocol.md` §8). The
 current rules are in `docs/protocol.md`, `docs/roles.md` and `docs/design.md`.
 
 Building and testing is deterministic work: a tool runs it, an agent only writes and
@@ -113,6 +114,58 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   repository, step and platform. The hub keeps the first 20 errors and failures of each
   run, rewritten as steps finish, and the newest 1000 runs; `hgl-ai build list [--repo R]
   [--failed]`.
+
+- **BUILD-15 — Gate builds.** Where `[github.gate.<repo>] verdicts` names local build
+  verdicts, `gh land` and `gh merge-if-clean` ask for each one that has no `pass` or
+  `fail` for the pull request's head on the current `main` under the current recipe: a
+  `build` job with `verdict = "<name>"`, `issue` the pull request and `base` the `main`
+  commit the gate read, to a ready builder of the platform the name stands for (`linux`,
+  `macos` or `mac`, `windows`). The gate waits while it builds, is blocked by a `fail` or
+  a `not-run`, and asks again when `main` moves or the recipe changes. Dry runs only
+  read.
+  - The builder refuses a verdict for another platform, a job without a pull request, a
+    `base` that is not a commit, one limited to some steps, or one pinned to a recipe
+    revision. It merges the head onto `base`, runs every step of the current recipe, and
+    records the commit it merged onto (`base_sha` in the summary).
+  - It writes `HGL_STATE/verdict.<repo>.<pr>.<name>.<pair>` (`docs/protocol.md` §8): the
+    key of exactly what it judges, the head, the `main` commit and the recipe revision.
+    It writes `running` once checked out, bounded by `until` (its steps' time limits and
+    15 minutes). Then it writes `pass`, `fail` (the failing step) or `not-run` (why), with
+    the build id, its label and `r<rev>`, before the final `run.<id>`.
+  - In a key, `pass` and `fail` are final. A later build of the same pair replaces only
+    `running` or `not-run` (compare-and-set on the key's revision). A build of anything
+    else, a bogus head or a skewed clock writes another key, so nothing displaces a
+    verdict the gate reads. Build ids order nothing; they only need to be unique.
+  - A recipe update needs new verdicts: the gate reads the current revision's key, so a
+    pass under an older recipe no longer counts.
+  - Once a command has asked for a build, it waits for that build while it may come
+    (queued with a builder that takes jobs, or running there). It ignores any older
+    `running` in the key, and asks again only when its build is lost: its builder gone
+    from `HGL_HOSTS` or retired, a queued job's builder not taking jobs, past `until`, or
+    an end without its verdict. A `running` it did not ask for is waited on unless it is
+    lost the same way. One command asks a pair at most 3 times, then reports it not run.
+  - Verdict keys go on facts, never on a note's word (notes are not authenticated,
+    hgl-ai#16). On a `landed` or `closed` note, a builder asks GitHub for the pull
+    request's state. It purges that pull request's keys only if GitHub reports it merged
+    or closed; an open one is never purged. About hourly it sweeps keys the hub wrote more
+    than 15 days ago (the hub's write time, never a requester's build id), and the keys of
+    pull requests GitHub reports merged or closed. GitHub is not asked while `hold`
+    holds. A builder where `gh` cannot read GitHub sweeps by age only.
+  - `hgl-ai build gate REPO PR [--wait] [--timeout DUR]` does the same by hand. It prints
+    each verdict for the head on the present `main` and asks for the missing or lost ones.
+    `--wait` asks again each 30 s round, up to `--timeout` (default 2h). Exit 0 all pass,
+    1 one failed or did not run, 3 still building or missing.
+  - Only a `builder` hub user writes verdicts; seat, coordinator and console users are
+    refused. `builder run` connects with `[builder] credential` and asks the hub whether
+    its user may write verdicts (a probe write), so a bare NKey seed works. A builder
+    whose user may not reports gate builds not run. `client install --token-file`
+    refuses a builder credential, as it does the console's: it would let every seat of
+    the host write verdicts.
+  - Limitation: the hub knows a user, not a process. While a builder's OS user is also
+    the agents' (they share a host account today), an agent can read the builder's
+    credential and write a verdict. Keep that file readable only by an OS user no agent
+    runs as. Separate OS accounts, and verdicts signed by the builder's key, are
+    hgl-ai#16. On a hub with one shared token, any client can write a verdict.
 
 ## 2a. Proxy builders
 

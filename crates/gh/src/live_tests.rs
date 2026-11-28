@@ -125,7 +125,7 @@ async fn a_round_writes_the_table_alerts_and_hold() {
     store::put_latest(&b, state::KEY_PRS, &fixture("coord-prev.prs"))
         .await
         .unwrap();
-    let controller = Seat::new("claude").unwrap();
+    let controller = Seat::new("controller").unwrap();
     let mut inbox = b.inbox(&controller).await.unwrap();
 
     let gh = FakeGh::default()
@@ -418,10 +418,13 @@ async fn a_held_landing_lock_is_refreshed() {
         .await;
 }
 
+/// `merge-async`'s answer for a merge done at once.
+const MERGED_ASYNC: &str = "{\"status\":\"merged\",\"details\":{\"message\":\"merged\"}}";
+
 /// A scripted GitHub under which the gate merges `alpha#7` at `HEAD`.
 fn mergeable() -> FakeGh {
     FakeGh::default()
-        .on("pulls/7/merge", "{\"merged\":true}")
+        .on("pulls/7/merge-async", MERGED_ASYNC)
         .on("pulls/7/files", &fixture("pr-files.json"))
         .on(
             "Accept: application/vnd.github.v3.diff",
@@ -430,6 +433,8 @@ fn mergeable() -> FakeGh {
         .on("pulls/7", &fixture("pr-open.json"))
         .on("issues/7/comments", &fixture("comments-clean.json"))
         .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+        .on("check-runs", "{\"check_runs\":[]}")
+        .on("/status?per_page", "{\"statuses\":[]}")
         .on(
             "git/ref/heads/main",
             "{\"object\":{\"sha\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"}}",
@@ -629,7 +634,7 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
 
     // The stream is back; a new run (a restarted service) sends them.
     b.provision().await.unwrap();
-    let controller = Seat::new("claude").unwrap();
+    let controller = Seat::new("controller").unwrap();
     let mut inbox = b.inbox(&controller).await.unwrap();
     coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new())
         .await
@@ -683,9 +688,10 @@ async fn authored_and_reviewed(b: &Bus) {
         class: None,
         class_seq: None,
         seq: None,
+        handoff_seq: None,
     };
     b.tree_put(&tree).await.unwrap();
-    let controller = Seat::new("claude").unwrap();
+    let controller = Seat::new("controller").unwrap();
     let note = |kind: Kind, from: &str, pr: u64, body: &str| {
         let mut n =
             hgl_ai_proto::Note::new(Seat::new(from).unwrap(), controller.clone(), kind, body);
@@ -728,7 +734,7 @@ async fn authored_and_reviewed(b: &Bus) {
 fn landing_gh(after: impl FnOnce(FakeGh) -> FakeGh) -> FakeGh {
     let main = "{\"object\":{\"sha\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"}}";
     let gh = FakeGh::default()
-        .on("pulls/7/merge", "{\"merged\":true}")
+        .on("pulls/7/merge-async", MERGED_ASYNC)
         .on("pulls/7/files", &fixture("pr-files.json"))
         .on(
             "Accept: application/vnd.github.v3.diff",
@@ -736,6 +742,8 @@ fn landing_gh(after: impl FnOnce(FakeGh) -> FakeGh) -> FakeGh {
         )
         .on("issues/7/comments", &fixture("comments-clean.json"))
         .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+        .on("check-runs", "{\"check_runs\":[]}")
+        .on("/status?per_page", "{\"statuses\":[]}")
         .on(
             "graphql",
             "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}",
@@ -770,6 +778,80 @@ fn posts(gh: &FakeGh, what: &str) -> usize {
         .count()
 }
 
+/// An accepted `merge-async` still pending at the deadline (#21): not refused, the landing
+/// record is kept and the lock released; a later run that finds the pull request merged
+/// finishes the landing.
+#[tokio::test]
+async fn a_merge_still_pending_keeps_its_record() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into()];
+    s.pins = vec![];
+    let o = land::LandOpts {
+        timeout: Duration::from_millis(50),
+        ..land::LandOpts::default()
+    };
+    let pending =
+        "{\"status\":\"pending\",\"details\":{\"uuid\":\"u-1\",\"merge_method\":\"merge\"}}";
+    let gh = mergeable()
+        .once("pulls/7/merge-async --input", pending)
+        .on("merge-async/u-1", pending);
+    // The rules above go first: `mergeable` answers the merge as done.
+    gh.rules.lock().unwrap().rotate_right(2);
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Wait,
+        "{}",
+        l.outcome.line
+    );
+    assert!(
+        l.outcome.line.contains("merge accepted, not done yet"),
+        "{}",
+        l.outcome.line
+    );
+    assert!(!l.outcome.line.contains("refused"), "{}", l.outcome.line);
+    let rec = crate::progress::read(&b, "alpha", 7)
+        .await
+        .unwrap()
+        .expect("the record is kept");
+    assert_eq!((rec.head.as_str(), rec.merge.as_deref()), (HEAD, None));
+    // The lock is free again.
+    LandLock::acquire(&b, "alpha", "other", Duration::ZERO)
+        .await
+        .unwrap()
+        .release()
+        .await;
+    // GitHub merged it meanwhile: the next run finishes the landing without merging again.
+    let gh = landing_gh(|g| g);
+    gh.rules
+        .lock()
+        .unwrap()
+        .retain(|r| r.0 != "pulls/7" || !r.2);
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Resumed,
+        "{}",
+        l.outcome.line
+    );
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 0);
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// Carbon's check 4 (hgl-ai#7): the read right after the merge fails (one HTTP 502). The
 /// retry finds the pull request merged and finishes its landing (`landed.log`, `main`, the
 /// notes, the comment) instead of reporting it merged with nothing recorded; a third run
@@ -788,7 +870,7 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("HTTP 502"), "{e}");
-    assert_eq!(posts(&gh, "pulls/7/merge"), 1, "merged");
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "merged");
     let rec = crate::progress::read(&b, "alpha", 7)
         .await
         .unwrap()
@@ -808,7 +890,7 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         l.outcome.line
     );
     assert!(l.outcome.kind.satisfied());
-    assert_eq!(posts(&gh, "pulls/7/merge"), 1, "not merged again");
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "not merged again");
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "{log}");
     assert!(
@@ -893,5 +975,429 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
     assert!(b.state_get(state::KEY_MAIN).await.unwrap().is_some());
     assert_eq!(landed_notes(&b).await.len(), 3);
     assert_eq!(posts(&gh, "issues/7/comments"), 1);
-    assert_eq!(posts(&gh, "pulls/7/merge"), 1);
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1);
+}
+
+fn git(dir: &std::path::Path, args: &[&str]) -> String {
+    let o = Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@example.invalid",
+            "-c",
+            "commit.gpgsign=false",
+        ])
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+/// A commit on branch `branch` of the seed from `from`, writing `file`, pushed.
+fn commit_on(seed: &std::path::Path, branch: &str, from: &str, file: &str, text: &str) -> String {
+    git(seed, &["checkout", "--quiet", "-B", branch, from]);
+    std::fs::write(seed.join(file), text).unwrap();
+    git(seed, &["add", file]);
+    git(
+        seed,
+        &["commit", "--quiet", "-m", &format!("{branch} {file}")],
+    );
+    git(seed, &["push", "--quiet", "--force", "origin", branch]);
+    git(seed, &["rev-parse", "HEAD"])
+}
+
+/// Ask until the verdict is judged (pass, fail) or the gate build did not run.
+async fn judged(
+    b: &Bus,
+    builds: &crate::builds::GateBuilds,
+    name: &str,
+    head: &str,
+    main: &str,
+) -> crate::builds::VerdictState {
+    use crate::builds::{VerdictState, verdict_state};
+    let deadline = Instant::now() + Duration::from_secs(90);
+    loop {
+        let st = verdict_state(Some(b), Some(builds), "demo", 7, name, head, main)
+            .await
+            .unwrap();
+        match st {
+            VerdictState::Building(_) => {}
+            VerdictState::Missing(ref why) => panic!("nothing asked: {why:?}"),
+            other => return other,
+        }
+        assert!(Instant::now() < deadline, "no verdict for {name}");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+}
+
+/// A hub, an origin with `main` at m1 and a pull request head off it, the recipe, and a
+/// local builder `lab1` (unless `builder` is false).
+struct GateRig {
+    h: Hub,
+    b: Bus,
+    _tmp: tempfile::TempDir,
+    seed: std::path::PathBuf,
+    m1: String,
+    head: String,
+    name: &'static str,
+    stop: Option<tokio::sync::watch::Sender<bool>>,
+    svc: Option<
+        tokio::task::JoinHandle<std::result::Result<(), hgl_ai_build::service::ServiceError>>,
+    >,
+}
+
+const GATE_RECIPE: &str = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"test -f g.txt -o -f bad.txt && test ! -f bad.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
+
+impl GateRig {
+    async fn start(builder: bool) -> Option<GateRig> {
+        use hgl_ai_build::service::{self, Settings};
+        use std::sync::Arc;
+        let h = hub()?;
+        let b = bus(&h).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let bare = root.join("origin.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "--quiet", "--bare", "-b", "main"]);
+        git(&root, &["clone", "--quiet", bare.to_str().unwrap(), "seed"]);
+        let seed = root.join("seed");
+        git(&seed, &["checkout", "--quiet", "-b", "main"]);
+        std::fs::write(seed.join("f.txt"), "one\n").unwrap();
+        git(&seed, &["add", "f.txt"]);
+        git(&seed, &["commit", "--quiet", "-m", "c0"]);
+        git(&seed, &["push", "--quiet", "origin", "main"]);
+        let m1 = git(&seed, &["rev-parse", "HEAD"]);
+        let head = commit_on(&seed, "feature", &m1, "g.txt", "g\n");
+        hgl_ai_build::store::recipe_put(&b, GATE_RECIPE, None)
+            .await
+            .unwrap();
+        let name = hgl_ai_proto::build::Platform::current().unwrap().as_str();
+        let (mut stop, mut svc) = (None, None);
+        if builder {
+            let mut cfg = hgl_ai_config::Config::new("lab1");
+            cfg.paths.work_root = root.join("work").display().to_string();
+            cfg.paths.data_dir = root.join("data").display().to_string();
+            let lanes = service::lanes(&cfg, std::path::PathBuf::from("ssh")).unwrap();
+            let origin = bare.display().to_string();
+            let settings = Settings {
+                clone_url: Arc::new(move |_| origin.clone()),
+                toolchains: vec!["git".into()],
+                heartbeat: Duration::from_millis(300),
+                verdicts: true,
+                pr_ended: None,
+            };
+            let svc_bus = Arc::new(Bus::connect_url(&h.url, None).await.unwrap());
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            svc = Some(tokio::spawn(service::serve(svc_bus, lanes, settings, rx)));
+            stop = Some(tx);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while b.builders().await.unwrap().is_empty() {
+                assert!(Instant::now() < deadline, "the builder did not register");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Some(GateRig {
+            h,
+            b,
+            _tmp: tmp,
+            seed,
+            m1,
+            head,
+            name,
+            stop,
+            svc,
+        })
+    }
+
+    async fn rev(&self) -> u64 {
+        hgl_ai_build::store::recipe_get(&self.b, "demo", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+    }
+
+    async fn key(&self, head: &str, main: &str) -> String {
+        hgl_ai_proto::build::verdict_key("demo", 7, self.name, head, main, self.rev().await)
+    }
+
+    async fn state(
+        &self,
+        builds: Option<&crate::builds::GateBuilds>,
+        head: &str,
+        main: &str,
+    ) -> crate::builds::VerdictState {
+        crate::builds::verdict_state(Some(&self.b), builds, "demo", 7, self.name, head, main)
+            .await
+            .unwrap()
+    }
+
+    async fn stop(mut self) {
+        if let Some(s) = self.stop.take() {
+            let _ = s.send(true);
+        }
+        if let Some(svc) = self.svc.take() {
+            tokio::time::timeout(Duration::from_secs(60), svc)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        drop(self.h);
+    }
+}
+
+fn controller_builds() -> crate::builds::GateBuilds {
+    crate::builds::GateBuilds::new(Seat::new("controller").unwrap(), "controller")
+}
+
+/// hgl-ai#6: the gate asks a builder for the local build verdict of the head merged onto
+/// the `main` it saw, and reads the key of exactly that pair; a `main` that has moved is
+/// another key, asked again; a build that fails or does not merge says so.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gate_builds_write_verdicts_and_a_moved_main_is_built_again() {
+    use crate::builds::VerdictState;
+    let Some(r) = GateRig::start(true).await else {
+        return;
+    };
+    let (b, head, m1, name) = (&r.b, r.head.clone(), r.m1.clone(), r.name);
+    // Nothing there and nothing asked (a dry run): missing.
+    assert_eq!(r.state(None, &head, &m1).await, VerdictState::Missing(None));
+    let builds = controller_builds();
+    let first = judged(b, &builds, name, &head, &m1).await;
+    let VerdictState::Pass(v) = &first else {
+        panic!("{first:?}")
+    };
+    assert!(v.starts_with(&format!("{head} {m1} pass ")), "{v}");
+    assert!(v.ends_with(&format!(" lab1 r{}", r.rev().await)), "{v}");
+    let k1 = r.key(&head, &m1).await;
+    assert_eq!(&b.state_get(&k1).await.unwrap().unwrap().value, v);
+    let id = hgl_ai_proto::build::VerdictValue::parse(v)
+        .unwrap()
+        .id
+        .unwrap();
+    let run = hgl_ai_build::store::run_get(b, &id).await.unwrap().unwrap();
+    assert_eq!(
+        run.base_sha.as_deref(),
+        Some(m1.as_str()),
+        "it built onto m1"
+    );
+    // Judged: not asked again.
+    assert_eq!(r.state(Some(&builds), &head, &m1).await, first);
+    // `build gate` by hand: the pull request's head on GitHub's `main`.
+    let mut st = crate::testutil::settings();
+    st.gates.entry("demo".into()).or_default().verdicts = vec![name.to_string()];
+    let pr = fixture("pr-open.json").replace("1f461fa77bba922fe81383df4c475feb58b7c233", &head);
+    let fake = FakeGh::default().on("pulls/7", &pr).on(
+        "git/ref/heads/main",
+        &format!("{{\"object\":{{\"sha\":\"{m1}\"}}}}"),
+    );
+    let (h0, m0, by_hand) = crate::builds::gate(&fake, &st, b, &builds, "demo", 7)
+        .await
+        .unwrap();
+    assert_eq!((h0.as_str(), m0.as_str()), (head.as_str(), m1.as_str()));
+    assert_eq!(by_hand, vec![(name.to_string(), first.clone())]);
+    st.gates.get_mut("demo").unwrap().verdicts.clear();
+    assert!(
+        crate::builds::gate(&fake, &st, b, &builds, "demo", 7)
+            .await
+            .is_err()
+    );
+    // `main` moves: m2's key is empty, so the gate waits and asks; m1's pass stays its own.
+    git(&r.seed, &["checkout", "--quiet", "main"]);
+    std::fs::write(r.seed.join("h.txt"), "h\n").unwrap();
+    git(&r.seed, &["add", "h.txt"]);
+    git(&r.seed, &["commit", "--quiet", "-m", "c1"]);
+    git(&r.seed, &["push", "--quiet", "origin", "main"]);
+    let m2 = git(&r.seed, &["rev-parse", "HEAD"]);
+    assert_eq!(r.state(None, &head, &m2).await, VerdictState::Missing(None));
+    match r.state(Some(&builds), &head, &m2).await {
+        VerdictState::Building(w) => assert!(w.starts_with("asked "), "{w}"),
+        other => panic!("not asked again: {other:?}"),
+    }
+    let second = judged(b, &builds, name, &head, &m2).await;
+    let VerdictState::Pass(v2) = &second else {
+        panic!("{second:?}")
+    };
+    assert!(v2.starts_with(&format!("{head} {m2} pass ")), "{v2}");
+    assert_eq!(&b.state_get(&k1).await.unwrap().unwrap().value, v);
+    // A head whose build fails: fail, naming the step.
+    let bad = commit_on(&r.seed, "feature", &m1, "bad.txt", "x\n");
+    match judged(b, &builds, name, &bad, &m2).await {
+        VerdictState::Fail(v) => {
+            assert!(v.starts_with(&format!("{bad} {m2} fail ")), "{v}");
+            assert!(v.ends_with("step check failed"), "{v}");
+        }
+        other => panic!("{other:?}"),
+    }
+    // A head that does not merge onto main: not run, and the gate is told why.
+    let clash = commit_on(&r.seed, "feature", &m1, "h.txt", "clash\n");
+    match judged(b, &builds, name, &clash, &m2).await {
+        VerdictState::NotRun(why) => assert!(why.contains("does not merge"), "{why}"),
+        other => panic!("{other:?}"),
+    }
+    r.stop().await;
+}
+
+/// The controller on #56: the gate needs the verdict of the current recipe. An update is
+/// another key, asked again; the old revision's pass no longer counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recipe_update_asks_again() {
+    use crate::builds::VerdictState;
+    let Some(r) = GateRig::start(true).await else {
+        return;
+    };
+    let builds = controller_builds();
+    let VerdictState::Pass(old) = judged(&r.b, &builds, r.name, &r.head, &r.m1).await else {
+        panic!("no first pass")
+    };
+    let r1 = r.rev().await;
+    hgl_ai_build::store::recipe_put(&r.b, &format!("{GATE_RECIPE}# stricter\n"), None)
+        .await
+        .unwrap();
+    let r2 = r.rev().await;
+    assert!(r2 > r1);
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Missing(None)
+    );
+    let VerdictState::Pass(new) = judged(&r.b, &builds, r.name, &r.head, &r.m1).await else {
+        panic!("no pass under the new recipe")
+    };
+    assert!(old.ends_with(&format!(" r{r1}")) && new.ends_with(&format!(" r{r2}")));
+    assert_ne!(old, new);
+    r.stop().await;
+}
+
+use hgl_ai_proto::build::BuildJob;
+
+/// r3 and r1 on #56: a `running` value whose builder is gone, or that ran past its bound,
+/// never holds the gate: it is asked again of a live builder, once. While that replacement
+/// is queued the old value is not judged again and nothing more is asked; a live one's
+/// `running` is waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_running_with_a_queued_replacement_is_asked_once() {
+    use crate::builds::VerdictState;
+    // No builder serves: the replacement stays queued with `parked`, a record only.
+    let Some(r) = GateRig::start(false).await else {
+        return;
+    };
+    let platform = hgl_ai_proto::build::Platform::current().unwrap();
+    let parked = hgl_ai_proto::build::BuilderRecord {
+        label: "parked".into(),
+        inbox: hgl_ai_proto::build::builder_inbox("parked").unwrap(),
+        platform,
+        arch: String::new(),
+        executor: "local".into(),
+        proxy: None,
+        reachable: true,
+        reason: None,
+        state: "active".into(),
+        slots: 1,
+        busy: 1,
+        free_gb: None,
+        toolchains: Default::default(),
+        updated_at: hgl_ai_proto::utc_now_stamp(),
+    };
+    r.b.builder_put(&parked).await.unwrap();
+    let key = r.key(&r.head, &r.m1).await;
+    for (label, until, why) in [
+        (
+            "ghost",
+            "29991231T000000Z",
+            "builder ghost of 20261127-120000-eeeeee is gone",
+        ),
+        (
+            "parked",
+            "20000101T000000Z",
+            "20261127-120000-eeeeee on parked ran past its bound",
+        ),
+    ] {
+        r.b.state_put(
+            &key,
+            &format!(
+                "{} {} running 20261127-120000-eeeeee {label} r1 until={until}",
+                r.head, r.m1
+            ),
+        )
+        .await
+        .unwrap();
+        let builds = controller_builds();
+        let VerdictState::Building(w) = r.state(Some(&builds), &r.head, &r.m1).await else {
+            panic!("a lost build held the gate")
+        };
+        assert!(w.starts_with(why) && w.contains("; asked "), "{w}");
+        let id = w
+            .rsplit("; asked ")
+            .next()
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string();
+        // Rounds later the old value is still there and the replacement still queued:
+        // waited for, never asked again.
+        for _ in 0..4 {
+            assert_eq!(
+                r.state(Some(&builds), &r.head, &r.m1).await,
+                VerdictState::Building(format!("asked {id} of parked"))
+            );
+        }
+        let queued = hgl_ai_build::store::run_get(&r.b, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.status, hgl_ai_proto::build::BuildStatus::Queued);
+    }
+    // A live builder's bounded `running`: waited for, nothing asked.
+    r.b.state_put(
+        &key,
+        &format!(
+            "{} {} running 20261127-120000-ffffff parked r1 until=29991231T000000Z",
+            r.head, r.m1
+        ),
+    )
+    .await
+    .unwrap();
+    let builds = controller_builds();
+    assert_eq!(
+        r.state(Some(&builds), &r.head, &r.m1).await,
+        VerdictState::Building("building 20261127-120000-ffffff on parked".into())
+    );
+    // r3's minor: that build, stopped and queued again, with `parked` now draining: lost,
+    // and asked of another builder (here none is live).
+    let job = BuildJob {
+        v: hgl_ai_proto::build::BUILD_VERSION,
+        id: "20261127-120000-ffffff".into(),
+        repo: "demo".into(),
+        head: r.head.clone(),
+        base: Some(r.m1.clone()),
+        issue: 7,
+        steps: None,
+        recipe_rev: None,
+        keep_going: false,
+        verdict: Some(r.name.into()),
+        reply_to: hgl_ai_proto::build::reply_seat("20261127-120000-ffffff").unwrap(),
+        notify: None,
+        requester: "controller".into(),
+    };
+    let mut draining = parked.clone();
+    draining.state = "draining".into();
+    r.b.builder_put(&draining).await.unwrap();
+    hgl_ai_build::store::run_put(&r.b, &hgl_ai_build::request::queued(&job, &draining))
+        .await
+        .unwrap();
+    match r.state(Some(&controller_builds()), &r.head, &r.m1).await {
+        VerdictState::Missing(Some(w)) => assert!(
+            w.starts_with(
+                "20261127-120000-ffffff is queued again with builder parked, which takes no jobs; no live"
+            ),
+            "{w}"
+        ),
+        other => panic!("a build queued with a draining builder held the gate: {other:?}"),
+    }
+    r.stop().await;
 }

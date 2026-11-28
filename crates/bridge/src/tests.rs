@@ -38,6 +38,11 @@ struct H {
     cfg: Config,
     opts: Options,
     disk: Arc<FixedDisk>,
+    /// Issue titles by number, as GitHub would answer; an issue not here is unknown.
+    titles: Arc<std::sync::Mutex<HashMap<u64, Result<String, String>>>>,
+    /// The issues whose title was asked for, in order.
+    asked: Arc<std::sync::Mutex<Vec<u64>>>,
+    title: Arc<dyn crate::IssueTitle + Send + Sync>,
 }
 
 struct Call {
@@ -53,6 +58,7 @@ fn harness() -> H {
     let git = git(&root);
     let (_bare, seed) = remote(&git, &root, "demo");
     let mut cfg = Config::new("build-1");
+    cfg.github.controller = "claude".into();
     cfg.paths.work_root = root.join("work").display().to_string();
     cfg.paths.data_dir = root.join("data").display().to_string();
     cfg.github.clone_url = format!("{}/{{repo}}.git", root.display());
@@ -102,6 +108,20 @@ fn harness() -> H {
         opts.bins.insert(*rt, bin.join(rt.as_str()));
     }
     let disk = Arc::new(FixedDisk(AtomicU64::new(1000 * crate::disk::GB)));
+    let titles: Arc<std::sync::Mutex<HashMap<u64, Result<String, String>>>> = Arc::default();
+    let asked: Arc<std::sync::Mutex<Vec<u64>>> = Arc::default();
+    let (t, a) = (titles.clone(), asked.clone());
+    let title = Arc::new(move |repo: &str, issue: u64| {
+        if repo != "demo" {
+            return Err(format!("gh: no repository {repo}"));
+        }
+        a.lock().unwrap().push(issue);
+        t.lock()
+            .unwrap()
+            .get(&issue)
+            .cloned()
+            .unwrap_or_else(|| Err("gh: Could not resolve to an issue".into()))
+    });
     let h = H {
         _dir: dir,
         root,
@@ -113,6 +133,9 @@ fn harness() -> H {
         cfg,
         opts,
         disk,
+        titles,
+        asked,
+        title,
     };
     for rt in ["claude", "codex", "agy"] {
         h.script(rt, "echo no fake set >&2; exit 9");
@@ -212,6 +235,7 @@ impl H {
         );
         let deps = Deps {
             closed: Arc::new(|_: &str, _: u64, _: bool| None),
+            title: self.title.clone(),
             disk: self.disk.clone(),
         };
         let bridge = Bridge::new(
@@ -286,6 +310,7 @@ async fn a_recreated_tree_keeps_the_class_from_its_record() {
             class,
             class_seq,
             seq: None,
+            handoff_seq: None,
         };
     // The task was moved from w2, where a sendback made it complex (seq 50), to w1 on
     // another host, where a later-made tree still says simple from its assign (seq 10).
@@ -412,6 +437,240 @@ async fn a_sendback_to_another_seat_moves_the_task_there_at_its_class() {
         "w2's tree is the newer"
     );
     assert_eq!(trees["build-1.w2.demo-41"].class, Some(TaskClass::Standard));
+    assert_eq!(trees["build-1.w2.demo-41"].handoff_seq, Some(s));
+    stop(tx, j).await;
+
+    // hgl-ai#44: a sendback moves the task back to w1, into its older tree, kept: that
+    // tree now holds the newest handoff, so verdicts without `--to` reach w1 again.
+    let (tx, j) = h.start(&["w1"]);
+    let back = h.bus.push(
+        "w1",
+        note(
+            Kind::Sendback,
+            "w1",
+            41,
+            "[claude] Sent back: demo#41 at 1f461fa7",
+        ),
+    );
+    eventually("sendback to w1 acked", || h.bus.events(back) == [Ev::Ack]).await;
+    let trees = h.bus.trees();
+    let w1 = &trees["build-1.w1.demo-41"];
+    assert_eq!(
+        (w1.seq, w1.handoff_seq),
+        (Some(a), Some(back)),
+        "the kept tree keeps its seq and takes the newer handoff"
+    );
+    assert!(w1.handoff_seq > trees["build-1.w2.demo-41"].handoff_seq);
+    stop(tx, j).await;
+}
+
+/// hgl-ai#51: the report lists the trees, then a handoff turn registers a fresher record
+/// before the report writes its listing. The report keeps the turn's `handoff_seq`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_listed_before_a_handoff_turn_keeps_the_turns_record() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+    let key = "build-1.w1.demo-41";
+    assert_eq!(h.bus.trees()[key].handoff_seq, Some(a));
+
+    // The startup report has listed the tree (handoff `a`) and waits to write it.
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its listing", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let back = h.bus.push(
+        "w1",
+        note(
+            Kind::Sendback,
+            "w1",
+            41,
+            "[claude] Sent back: demo#41 at 1f461fa7",
+        ),
+    );
+    eventually("sendback acked", || h.bus.events(back) == [Ev::Ack]).await;
+    assert_eq!(
+        h.bus.trees()[key].handoff_seq,
+        Some(back),
+        "the turn's record"
+    );
+
+    h.bus.release_tree_merges();
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    let rec = &h.bus.trees()[key];
+    assert_eq!(
+        (rec.seq, rec.handoff_seq),
+        (Some(a), Some(back)),
+        "the report did not take the handoff back"
+    );
+    stop(tx, j).await;
+}
+
+/// r3 on #57: the report lists a tree, then `closed` removes it and an `assign` makes the
+/// task's tree anew at that key. The report keeps the newer tree's record. (Its write of
+/// demo#40, listed first, is held: a held write of demo#41 holds that key's removal, #58.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_listed_before_a_tree_was_made_anew_keeps_the_new_record() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    for (i, t) in [(40, "Move it"), (41, "Rename it")] {
+        let a = h.bus.push(
+            "w1",
+            note(
+                Kind::Assign,
+                "w1",
+                i,
+                &format!("[claude] Assign: demo#{i} {t}"),
+            ),
+        );
+        eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    }
+    stop(tx, j).await;
+    let key = "build-1.w1.demo-41";
+
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its write of demo#40", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let c = h.bus.push(
+        "w1",
+        note(Kind::Closed, "w1", 41, "[claude] Closed: demo#41"),
+    );
+    eventually("closed acked", || h.bus.events(c) == [Ev::Ack]).await;
+    let again = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Again"),
+    );
+    eventually("assign acked", || h.bus.events(again) == [Ev::Ack]).await;
+    assert_eq!(h.bus.trees()[key].seq, Some(again), "the new tree's record");
+
+    h.bus.release_tree_merges();
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    let rec = &h.bus.trees()[key];
+    assert_eq!(
+        (rec.seq, rec.handoff_seq),
+        (Some(again), Some(again)),
+        "the report did not bring the removed tree back"
+    );
+    stop(tx, j).await;
+}
+
+/// hgl-ai#58: the report has listed the tree and is writing it when `closed` removes the
+/// tree. The removal's deregistering waits for that write, so no record is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_writing_a_tree_as_cleanup_removes_it_leaves_no_record() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+    let key = "build-1.w1.demo-41";
+    let dir = h.work().join("w1/demo-41");
+    assert!(h.bus.trees().contains_key(key) && dir.exists());
+
+    // The report is past its check that the tree is there, inside the write.
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its write", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let c = h.bus.push(
+        "w1",
+        note(Kind::Closed, "w1", 41, "[claude] Closed: demo#41"),
+    );
+    eventually("the tree removed", || !dir.exists()).await;
+
+    h.bus.release_tree_merges();
+    eventually("closed acked", || h.bus.events(c) == [Ev::Ack]).await;
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    assert!(
+        !h.bus.trees().contains_key(key),
+        "the report did not register the removed tree"
+    );
+    stop(tx, j).await;
+}
+
+/// hgl-ai#58: the report lists two trees; while it writes the first, `closed` removes the
+/// second. The report, checking before each write, does not register the second again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_does_not_register_a_tree_removed_after_its_listing() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    for (i, t) in [(41, "Rename it"), (42, "Move it")] {
+        let a = h.bus.push(
+            "w1",
+            note(
+                Kind::Assign,
+                "w1",
+                i,
+                &format!("[claude] Assign: demo#{i} {t}"),
+            ),
+        );
+        eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    }
+    stop(tx, j).await;
+    let (first, second) = ("build-1.w1.demo-41", "build-1.w1.demo-42");
+    let dir = h.work().join("w1/demo-42");
+    assert!(h.bus.trees().contains_key(second) && dir.exists());
+
+    // The report holds its write of the first tree (they are listed in key order).
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its first write", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let c = h.bus.push(
+        "w1",
+        note(Kind::Closed, "w1", 42, "[claude] Closed: demo#42"),
+    );
+    eventually("the second tree removed", || !dir.exists()).await;
+
+    h.bus.release_tree_merges();
+    eventually("closed acked", || h.bus.events(c) == [Ev::Ack]).await;
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    let trees = h.bus.trees();
+    assert!(
+        trees.contains_key(first),
+        "the first tree is still registered"
+    );
+    assert!(
+        !trees.contains_key(second),
+        "the report did not register the removed tree"
+    );
     stop(tx, j).await;
 }
 
@@ -561,6 +820,124 @@ async fn a_classed_task_fails_over_as_any_other() {
     assert_eq!(agy[0].args[i + 1], "claude-opus-5-5");
     let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-31")).unwrap();
     assert_eq!(f.class, Some(TaskClass::Simple));
+    stop(tx, j).await;
+}
+
+/// Every log line of the test binary, for tests that check what the bridge logs; set once.
+fn logs() -> &'static Arc<std::sync::Mutex<Vec<u8>>> {
+    static LOGS: std::sync::OnceLock<Arc<std::sync::Mutex<Vec<u8>>>> = std::sync::OnceLock::new();
+    LOGS.get_or_init(|| {
+        #[derive(Clone)]
+        struct W(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for W {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Arc::<std::sync::Mutex<Vec<u8>>>::default();
+        let w = W(buf.clone());
+        let _ = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(move || w.clone())
+            .try_init();
+        buf
+    })
+}
+
+fn logged(text: &str) -> Vec<String> {
+    String::from_utf8_lossy(&logs().lock().unwrap())
+        .lines()
+        .filter(|l| l.contains(text))
+        .map(String::from)
+        .collect()
+}
+
+/// hgl-ai#27: a new branch is named from the issue's GitHub title (trimmed, every word
+/// kept), not the note's first line; a pushed `codex/q<issue>-*` branch is resumed with no
+/// title asked for; with the title unknown (the reason logged), empty, or during a hold
+/// (nothing asked), the note's first line names it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_branch_is_named_from_the_issue_title_and_a_pushed_one_is_kept() {
+    logs();
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    {
+        let mut t = h.titles.lock().unwrap();
+        t.insert(40, Ok("  [P-F1] Parser: reject a trailing comma \n".into()));
+        t.insert(41, Ok("A renamed issue".into()));
+        t.insert(42, Err("HTTP 502: Bad Gateway (gh issue view 42)".into()));
+        t.insert(43, Ok(" \t ".into()));
+        t.insert(44, Ok("Not asked during a hold".into()));
+    }
+    // Issue 41's branch was pushed earlier, under the issue's old title.
+    h.git
+        .run(
+            &h.seed,
+            [
+                "checkout",
+                "--quiet",
+                "-B",
+                "codex/q41-old-title",
+                "origin/main",
+            ],
+        )
+        .unwrap();
+    let pushed = commit(&h.git, &h.seed, "q41.txt", "earlier\n", "q41 work");
+    h.git
+        .run(
+            &h.seed,
+            ["push", "--quiet", "origin", "codex/q41-old-title"],
+        )
+        .unwrap();
+    let (tx, j) = h.start(&["w1"]);
+    let branch = |issue: u64| {
+        hgl_ai_tree::read_task(&h.work().join(format!("w1/demo-{issue}")))
+            .unwrap()
+            .branch
+            .unwrap()
+    };
+    let from_note = "class-standard-docs-roles-md-3";
+    for (issue, want) in [
+        (
+            40,
+            "codex/q40-p-f1-parser-reject-a-trailing-comma".to_string(),
+        ),
+        (41, "codex/q41-old-title".into()),
+        (42, format!("codex/q42-{from_note}")),
+        (43, format!("codex/q43-{from_note}")),
+        (44, format!("codex/q44-{from_note}")),
+    ] {
+        if issue == 44 {
+            h.bus.set_state("hold", "rate limit");
+        }
+        let body = format!("Class: standard (docs/roles.md §3)\n\nFollow demo#{issue}.");
+        let a = h.bus.push("w1", note(Kind::Assign, "w1", issue, &body));
+        eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+        assert_eq!(branch(issue), want, "issue {issue}");
+    }
+    let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-41")).unwrap();
+    assert_eq!(f.start, pushed, "the pushed branch is resumed");
+    assert_eq!(
+        *h.asked.lock().unwrap(),
+        [40, 42, 43],
+        "asked only for new branches, never during a hold"
+    );
+    let why = logged("task=demo-42");
+    assert!(
+        why.iter()
+            .any(|l| l.contains("issue title unknown") && l.contains("HTTP 502: Bad Gateway")),
+        "the reason is logged: {why:?}"
+    );
+    assert!(
+        logged("task=demo-43")
+            .iter()
+            .any(|l| l.contains("the issue title is empty"))
+    );
     stop(tx, j).await;
 }
 
@@ -1420,6 +1797,7 @@ fn controllers_are_not_served_unless_named() {
     );
     let deps = Deps {
         closed: Arc::new(|_: &str, _: u64, _: bool| None),
+        title: h.title.clone(),
         disk: h.disk.clone(),
     };
     let b = Bridge::new(cfg, h.bus.clone(), trees, deps, h.opts.clone());
@@ -1445,6 +1823,7 @@ fn controllers_are_not_served_unless_named() {
     );
     let deps = Deps {
         closed: Arc::new(|_: &str, _: u64, _: bool| None),
+        title: h.title.clone(),
         disk: h.disk.clone(),
     };
     let b = Bridge::new(cfg, h.bus.clone(), trees, deps, h.opts.clone());
@@ -2080,7 +2459,13 @@ async fn a_build_note_at_an_agent_seat_is_refused() {
 /// The bot's P1 (hgl-ai PR 1): the hub stops answering (a partition), so no refresh says
 /// the lease is lost while it runs out. The seat stops, its turn and notes with it, once the
 /// lease has gone unrefreshed for half the bucket's `max_age`: before it can expire and
-/// another host take it. When the hub answers again the bridge serves the seat again.
+/// another host take it. Until the hub answers again the seat cannot be taken again; then
+/// the bridge serves it again.
+///
+/// hgl-ai#41: the bounds are measured from the last refresh the hub confirmed (the fake
+/// records it; no refresh succeeds once `refresh_down` returns), not from when the test cut
+/// the hub, and the seat's note waits for its notice, which the bridge sends after handing
+/// the notes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
     let h = harness();
@@ -2103,29 +2488,109 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
     eventually("the turn runs", || pid.exists()).await;
     let agent = pid_in(&pid);
     h.bus.refresh_down(true);
-    let cut = std::time::Instant::now();
+    let confirmed = h
+        .bus
+        .lease_confirmed_at("seat.w1")
+        .expect("the seat lease held");
     eventually("the turn stopped", || !alive(agent)).await;
-    let took = cut.elapsed();
-    // The last confirmed refresh was at most one refresh (max_age / 6) before the cut.
+    let took = confirmed.elapsed();
     assert!(
-        took < max_age - max_age / 6,
-        "stopped after {took:?}, when the lease could have expired"
+        took < max_age,
+        "stopped {took:?} after the last refresh, when the lease could have expired"
     );
     assert!(
-        took >= max_age / 2 - max_age / 6,
-        "not before the deadline: {took:?}"
+        took >= max_age / 2,
+        "not before the deadline: {took:?} after the last refresh"
     );
     eventually("its note handed back", || {
         h.bus.events(a).first() == Some(&Ev::Nak(Duration::from_millis(50)))
     })
     .await;
-    assert_eq!(h.bus.sent_containing("was not refreshed for").len(), 1);
+    eventually("the seat told", || {
+        !h.bus.sent_containing("was not refreshed for").is_empty()
+    })
+    .await;
+    // While the hub does not answer the seat cannot be taken again: nothing more runs.
+    eventually("a take refused", || h.bus.lease_takes_refused() > 0).await;
+    assert_eq!(h.calls("codex").len(), 1, "one turn while the hub is down");
     h.bus.refresh_down(false);
     eventually("served again, the note run", || {
         h.bus.events(a).last() == Some(&Ev::Ack)
     })
     .await;
+    assert_eq!(h.calls("codex").len(), 2);
+    assert_eq!(
+        h.bus.sent_containing("was not refreshed for").len(),
+        1,
+        "told once"
+    );
     stop(tx, j).await;
+}
+
+/// hgl-ai#65: the hub stalls silently, so every refresh hangs until it times out (`every`).
+/// The refreshes run at once, so with any number of seats each stops before its lease can
+/// expire: its last refresh was at most `every` before the stall, at `every == max_age / 6`.
+async fn hanging_refreshes_stop_every_seat_before_its_lease_can_expire(n: usize) {
+    let mut h = harness();
+    let max_age = Duration::from_secs(3);
+    let every = max_age / 6;
+    h.bus.set_lease_max_age(max_age);
+    h.opts.heartbeat_every = every;
+    let names: Vec<String> = (1..=n).map(|i| format!("w{i}")).collect();
+    let w = h.cfg.seats[0].clone();
+    h.cfg.seats = names
+        .iter()
+        .map(|name| {
+            let mut s = w.clone();
+            s.name = seat(name);
+            s
+        })
+        .collect();
+    h.cfg.validate().unwrap();
+    let only: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (tx, j) = h.start(&only);
+    eventually("every seat served", || {
+        h.bus.last_host().is_some_and(|r| r.seats.len() == n)
+            && names
+                .iter()
+                .all(|s| h.bus.lease_holder(&format!("seat.{s}")).is_some())
+    })
+    .await;
+    h.bus.refresh_hangs(true);
+    let cut = std::time::Instant::now();
+    eventually("every seat stopped", || {
+        let told = h.bus.sent_containing("was not refreshed for");
+        names
+            .iter()
+            .all(|s| told.iter().any(|t| t.sender.as_str() == s))
+    })
+    .await;
+    let took = cut.elapsed();
+    assert!(
+        took < max_age - every,
+        "{n} seats: the last stopped after {took:?}, when its lease could have expired"
+    );
+    assert!(
+        took >= max_age / 2 - every,
+        "{n} seats: not before the deadline: {took:?}"
+    );
+    h.bus.refresh_hangs(false);
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hanging_refresh_stops_one_seat_before_its_lease_can_expire() {
+    hanging_refreshes_stop_every_seat_before_its_lease_can_expire(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_refreshes_stop_three_seats_before_their_leases_can_expire() {
+    hanging_refreshes_stop_every_seat_before_its_lease_can_expire(3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_refreshes_stop_twenty_seats_before_their_leases_can_expire() {
+    hanging_refreshes_stop_every_seat_before_its_lease_can_expire(20).await;
 }
 
 /// The bot's P2: a removal on `landed` that fails (here the salvage patch cannot be written)

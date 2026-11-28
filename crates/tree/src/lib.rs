@@ -119,6 +119,10 @@ pub struct TaskFile {
     /// (an older note delivered again) changes nothing (PROTO-21).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_seq: Option<u64>,
+    /// The stream sequence of the newest `assign` or `sendback` a turn in this tree ran
+    /// (PROTO-21): verdicts go to the task's tree with the newest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handoff_seq: Option<u64>,
 }
 
 impl TaskFile {
@@ -133,10 +137,20 @@ impl TaskFile {
 /// What to create.
 #[derive(Debug, Clone)]
 pub enum Create {
-    /// An implementor tree on `<prefix><issue>-<slug(title)>`, from `base` (default `main`).
+    /// An implementor tree from `base` (default `main`). A pushed or local
+    /// `<prefix>q<issue>-*` branch is resumed whatever its slug; a new one is
+    /// `<prefix>q<issue>-<slug>` of the issue's title ([`Trees::create_for`]), else of
+    /// `title`, the note's first line ([`slug::note_slug`]).
     Implement { title: String, base: Option<String> },
     /// A reviewer tree: `head` merged onto `base` (default `main`), detached.
     Review { head: String, base: Option<String> },
+}
+
+/// What names a new implementor branch: the issue's title, asked for only then, else the
+/// note's first line.
+struct Naming<'a> {
+    note_line: &'a str,
+    issue_title: &'a dyn Fn() -> Option<String>,
 }
 
 /// A tree that exists after [`Trees::create`].
@@ -172,6 +186,11 @@ pub struct LocalTree {
 /// `HGL_TREES` access (PROTO-13); implemented for the hub connection.
 pub trait Registry: Send + Sync {
     fn tree_put(&self, rec: &TreeRecord) -> impl Future<Output = hgl_ai_bus::Result<()>> + Send;
+    /// Put `rec` merged with the record held, never losing a fresher one (hgl-ai#51).
+    fn tree_merge(
+        &self,
+        rec: &TreeRecord,
+    ) -> impl Future<Output = hgl_ai_bus::Result<TreeRecord>> + Send;
     fn tree_del(&self, key: &str) -> impl Future<Output = hgl_ai_bus::Result<()>> + Send;
     fn trees(&self) -> impl Future<Output = hgl_ai_bus::Result<Vec<TreeRecord>>> + Send;
 }
@@ -179,6 +198,9 @@ pub trait Registry: Send + Sync {
 impl Registry for hgl_ai_bus::Bus {
     async fn tree_put(&self, rec: &TreeRecord) -> hgl_ai_bus::Result<()> {
         hgl_ai_bus::Bus::tree_put(self, rec).await
+    }
+    async fn tree_merge(&self, rec: &TreeRecord) -> hgl_ai_bus::Result<TreeRecord> {
+        hgl_ai_bus::Bus::tree_merge(self, rec).await
     }
     async fn tree_del(&self, key: &str) -> hgl_ai_bus::Result<()> {
         hgl_ai_bus::Bus::tree_del(self, key).await
@@ -249,19 +271,22 @@ impl Trees {
     /// Create the task's tree (PROTO-12). An implementor tree that exists is kept;
     /// a review tree that exists is an error (the caller removes it first).
     pub fn create(&self, seat: &Seat, task: &TaskKey, what: &Create) -> Result<Created> {
-        self.make(seat, task, what, None)
+        self.make(seat, task, what, None, &|| None)
     }
 
     /// [`Trees::create`] for the note at stream sequence `seq`, recorded in a new tree's
-    /// `task.json` ([`TaskFile::seq`]); a kept tree keeps its own.
+    /// `task.json` ([`TaskFile::seq`]); a kept tree keeps its own. `title` is asked for
+    /// the issue's title only when a new branch is made (WORK §2 step 3); `None` names it
+    /// from the note's line.
     pub fn create_for(
         &self,
         seat: &Seat,
         task: &TaskKey,
         what: &Create,
         seq: u64,
+        title: &dyn Fn() -> Option<String>,
     ) -> Result<Created> {
-        self.make(seat, task, what, Some(seq))
+        self.make(seat, task, what, Some(seq), title)
     }
 
     fn make(
@@ -270,6 +295,7 @@ impl Trees {
         task: &TaskKey,
         what: &Create,
         seq: Option<u64>,
+        issue_title: &dyn Fn() -> Option<String>,
     ) -> Result<Created> {
         let review = matches!(what, Create::Review { .. });
         let dir = self.layout.task_dir(seat, task, review)?;
@@ -299,9 +325,17 @@ impl Trees {
             mkdir(&dir.join(sub))?;
         }
         let made = match what {
-            Create::Implement { title, base } => {
-                self.add_implementor(&clone, &dir, seat, task, title, base.as_deref())
-            }
+            Create::Implement { title, base } => self.add_implementor(
+                &clone,
+                &dir,
+                seat,
+                task,
+                Naming {
+                    note_line: title,
+                    issue_title,
+                },
+                base.as_deref(),
+            ),
             Create::Review { head, base } => {
                 self.add_review(&clone, &dir, seat, task, head, base.as_deref())
             }
@@ -331,29 +365,37 @@ impl Trees {
         dir: &Path,
         seat: &Seat,
         task: &TaskKey,
-        title: &str,
+        naming: Naming<'_>,
         base: Option<&str>,
     ) -> Result<TaskFile> {
+        let Naming {
+            note_line,
+            issue_title,
+        } = naming;
         let src = dir.join("src");
-        let wanted = slug::branch_name(&self.github.branch_prefix, task.issue, title);
-        let starts = slug::branch_starts(&self.github.branch_prefix, task.issue);
+        let prefix = &self.github.branch_prefix;
+        let from_note = slug::branch_name(prefix, task.issue, &slug::note_slug(note_line));
+        let starts = slug::branch_starts(prefix, task.issue);
         let ours = |h: &&String| starts.iter().any(|p| h.starts_with(p.as_str()));
         // The task's branch: on the remote (a sendback, a resumed or moved task), else one
-        // made on this host and not pushed yet, else a new one.
-        let heads = self.remote_heads(clone)?;
-        let on_remote = if heads.contains(&wanted) {
-            Some(wanted.clone())
-        } else {
-            heads.iter().filter(ours).min().cloned()
-        };
-        let locals = self.local_heads(clone)?;
-        let branch = on_remote.clone().unwrap_or_else(|| {
-            if locals.contains(&wanted) {
-                wanted.clone()
+        // made on this host and not pushed yet, else a new one. Of several, the note's name.
+        let pick = |names: &[String]| {
+            if names.contains(&from_note) {
+                Some(from_note.clone())
             } else {
-                locals.iter().filter(ours).min().cloned().unwrap_or(wanted)
+                names.iter().filter(ours).min().cloned()
             }
-        });
+        };
+        let on_remote = pick(&self.remote_heads(clone)?);
+        let locals = self.local_heads(clone)?;
+        // Only a new branch asks for the issue's title.
+        let branch = match on_remote.clone().or_else(|| pick(&locals)) {
+            Some(b) => b,
+            None => match issue_title() {
+                Some(t) => slug::branch_name(prefix, task.issue, &slug::slug(&t)),
+                None => from_note,
+            },
+        };
         let local = locals.contains(&branch);
         let base_ref = self.resolve_base(clone, base)?;
         let src_os = src.as_os_str();
@@ -421,6 +463,7 @@ impl Trees {
             families: Vec::new(),
             class: None,
             class_seq: None,
+            handoff_seq: None,
         })
     }
 
@@ -506,6 +549,7 @@ impl Trees {
             families: Vec::new(),
             class: None,
             class_seq: None,
+            handoff_seq: None,
         })
     }
 
@@ -679,6 +723,7 @@ impl Trees {
                         families: Vec::new(),
                         class: None,
                         class_seq: None,
+                        handoff_seq: None,
                         seq: None,
                     },
                 };
@@ -704,6 +749,7 @@ impl Trees {
             class: f.class,
             class_seq: f.class_seq,
             seq: f.seq,
+            handoff_seq: f.handoff_seq,
         }
     }
 

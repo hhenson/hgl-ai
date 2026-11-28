@@ -44,6 +44,9 @@ pub struct LandOpts {
     /// Extra lines for a pin commit and pull request (attribution).
     pub trailer: Option<String>,
     pub footer: Option<String>,
+    /// Ask builders for the local build verdicts the gate lacks (BUILD-15); `None`: only
+    /// read them.
+    pub builds: Option<std::sync::Arc<gate::GateBuilds>>,
 }
 
 impl Default for LandOpts {
@@ -61,6 +64,7 @@ impl Default for LandOpts {
             sync_pins: true,
             trailer: None,
             footer: None,
+            builds: None,
         }
     }
 }
@@ -213,6 +217,7 @@ async fn land_locked<G: Gh>(
         return Ok(done);
     }
     let deadline = Instant::now() + o.timeout;
+    let gate_opts = with_deadline(&o.gate, deadline);
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
     {
         let after = Vec::new();
@@ -246,9 +251,10 @@ async fn land_locked<G: Gh>(
             repo,
             number,
             head,
-            &o.gate,
+            &gate_opts,
             true,
             Some(lock),
+            o.builds.as_deref(),
         )
         .await
         {
@@ -303,6 +309,15 @@ async fn resume_recorded<G: Gh>(
     eprintln!("{}", outcome.line);
     let (after, what) = after_merge(gh, s, bus, repo, number, &outcome, o, lock, Some(p)).await?;
     Ok(Some((Landing { outcome, after }, what)))
+}
+
+/// The gate's options with the landing's `deadline`, which bounds the poll of an accepted
+/// merge (with the lock's lease, taken at the merge: [`crate::merge::until`]).
+fn with_deadline(gate: &gate::Opts, deadline: Instant) -> gate::Opts {
+    gate::Opts {
+        merge_until: Some(tokio::time::Instant::from_std(deadline)),
+        ..*gate
+    }
 }
 
 /// After the gate decided, under the lock: a merge's steps; a pull request found merged
@@ -409,6 +424,7 @@ pub(crate) async fn merge_locked<G: Gh>(
         match resume_recorded(gh, s, bus, repo, number, o, lock).await? {
             Some(done) => done,
             None => {
+                let gate_opts = with_deadline(&o.gate, Instant::now() + o.timeout);
                 let outcome = gate::evaluate(
                     gh,
                     s,
@@ -416,9 +432,10 @@ pub(crate) async fn merge_locked<G: Gh>(
                     repo,
                     number,
                     head,
-                    &o.gate,
+                    &gate_opts,
                     true,
                     Some(lock),
+                    o.builds.as_deref(),
                 )
                 .await?;
                 settle(gh, s, bus, repo, number, outcome, o, lock).await?
@@ -605,7 +622,8 @@ pub async fn plan<G: Gh>(
     head: &str,
     o: &LandOpts,
 ) -> Result<Landing> {
-    let outcome = gate::evaluate(gh, s, bus, repo, number, head, &o.gate, false, None).await?;
+    let outcome =
+        gate::evaluate(gh, s, bus, repo, number, head, &o.gate, false, None, None).await?;
     let mut after = Vec::new();
     if outcome.kind == Kind::AlreadyMerged
         && let Some(b) = bus
@@ -905,6 +923,8 @@ mod tests {
                 .on("pulls/7", &fixture("pr-open.json"))
                 .on("issues/7/comments", &fixture("comments-clean.json"))
                 .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+                .on("check-runs", "{\"check_runs\":[]}")
+                .on("/status?per_page", "{\"statuses\":[]}")
                 .on("git/ref/heads/main", &main)
                 .on("graphql", "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}"),
         );

@@ -56,8 +56,8 @@ An interactive seat, such as the controller (the default; `seat add --headless`
 lets the bridge serve a controller instead, docs/owner.md OWN-7):
 
 ```sh
-hgl-ai agent start claude
-hgl-ai agent attach claude
+hgl-ai agent start controller
+hgl-ai agent attach controller
 ```
 
 Every install command takes `--dry-run`.

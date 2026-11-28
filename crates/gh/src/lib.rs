@@ -10,6 +10,7 @@
 //! | [`coord`] | `gh coord run`: the batched pull request table `HGL_STATE/prs`, `hold`, alerts |
 //! | [`backlog`] | `gh coord run`, every 15 min: the claimable queue `HGL_STATE/backlog`, daily `HGL_METRICS` |
 //! | [`gate`] | `gh merge-if-clean`: the merge gate |
+//! | [`builds`] | the gate builds that write the local build verdicts (BUILD-15) |
 //! | [`land`] | `gh land`: the gate in a loop, then `main`, `landed.log`, `landed` notes, pins |
 //! | [`progress`] | `HGL_STATE/landing.<repo>.<pr>`: what a landing has done, so a retry resumes |
 //! | [`pins`] | `gh pins sync`: the wrapper's submodule pins |
@@ -19,11 +20,13 @@
 
 pub mod backlog;
 pub mod bot;
+pub mod builds;
 pub mod coord;
 pub mod exec;
 pub mod gate;
 pub mod land;
 pub mod lock;
+pub mod merge;
 pub mod pins;
 pub mod progress;
 pub mod release;
@@ -97,6 +100,8 @@ pub struct GateRules {
     pub receipt: bool,
     pub global_paths: Vec<String>,
     pub verdicts: Vec<String>,
+    /// Check names that must be present and passed (ROLE-20).
+    pub required_checks: Vec<String>,
     pub relax_paths: Vec<Regex>,
     pub relax_required: Vec<String>,
     pub relax_optional: Vec<Regex>,
@@ -204,6 +209,7 @@ impl Settings {
             receipt: r.review_receipt,
             global_paths,
             verdicts: r.verdicts.clone(),
+            required_checks: r.checks.clone(),
             // Checked in `from_config`.
             relax_paths: regexes("relax_paths", &r.relax_paths).unwrap_or_default(),
             relax_required: r.relax_required.clone(),
@@ -268,7 +274,7 @@ mod tests {
     #[test]
     fn settings_from_defaults() {
         let s = testutil::settings();
-        assert_eq!(s.controller.as_str(), "claude");
+        assert_eq!(s.controller.as_str(), "controller");
         assert_eq!(s.coord_interval, Duration::from_secs(300));
         let g = s.gate_rules("hgl-compiler");
         assert!(g.global_paths.iter().any(|p| p == "spec/hgl_spec"));

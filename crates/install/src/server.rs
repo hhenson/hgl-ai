@@ -47,6 +47,9 @@ pub struct ServerOpts {
     pub units: hgl_ai_config::Units,
     /// `[github] token_file` for the coordinator's own GitHub token.
     pub github_token_file: Option<String>,
+    /// The `nats-server` a system install chose for the hub unit; its server-user
+    /// step uses it (downloading the pinned release when it names `<data_dir>/bin`).
+    pub nats_server: Option<PathBuf>,
     /// Where the pinned `nats-server` release is downloaded from.
     pub release_base: String,
     /// How long to wait for the fresh hub to answer.
@@ -72,6 +75,7 @@ impl Default for ServerOpts {
             brew: true,
             units: hgl_ai_config::Units::User,
             github_token_file: None,
+            nats_server: None,
             release_base: nats::RELEASE_BASE.into(),
             wait: Duration::from_secs(HUB_WAIT_SECS),
         }
@@ -184,8 +188,12 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
     let store = env.expand(&srv.store_dir);
     let token_path = env.expand(&cfg.hub.token_file);
 
-    let (nats_bin, src) =
-        nats::ensure_server_with(sys, &data_dir, &srv.nats_version, &o.release_base, o.brew)?;
+    let (nats_bin, src) = match &o.nats_server {
+        Some(p) => nats::ensure_chosen(sys, &data_dir, &srv.nats_version, &o.release_base, p)?,
+        None => {
+            nats::ensure_server_with(sys, &data_dir, &srv.nats_version, &o.release_base, o.brew)?
+        }
+    };
     let how = match src {
         NatsSource::Path => "on PATH".to_string(),
         NatsSource::Brew => "Homebrew".to_string(),
@@ -272,9 +280,8 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
     let verb = if created { "created" } else { "updated" };
     sys.say(&format!("config: {} ({verb})", env.config_path.display()));
     if !o.services {
-        // The server user's step of a system install: its services are system units.
-        let logs = data_dir.join("logs");
-        sys.mkdir(&logs).map_err(io_at(&logs))?;
+        // The server user's step of a system install: its services are system units,
+        // logging to the journal or a directory root owns (hgl-ai#63), never here.
         return Ok(cfg);
     }
 
@@ -530,6 +537,11 @@ pub fn user_add(
             if role == Role::Seat {
                 sys.say(&format!(
                     "copy {shown} to host {name}, then there: hgl-ai client install --hub <hub url> --token-file <copied file> --host {name}"
+                ));
+            }
+            if role == Role::Builder {
+                sys.say(&format!(
+                    "copy {shown} to the builder's host, readable only by the OS user that runs `hgl-ai builder run`; there set [builder] credential = <copied file>"
                 ));
             }
             Some(cred)
@@ -1065,6 +1077,44 @@ mod tests {
         assert!(out.contains("nats-server-v2.15.3-linux-amd64.tar.gz"));
         assert!(out.contains("would verify"));
         assert!(!out.contains("coord"));
+    }
+
+    /// The server user's step of a system install uses the `nats-server` the install
+    /// chose, and makes no logs in its home: root would open them (hgl-ai#63).
+    #[tokio::test]
+    async fn server_user_step_uses_the_chosen_nats_server() {
+        let d = tempfile::tempdir().unwrap();
+        // On this step's PATH first, but the install chose another one.
+        let f = fake(d.path(), Os::Linux);
+        let o = ServerOpts {
+            services: false,
+            brew: false,
+            units: hgl_ai_config::Units::System,
+            nats_server: Some(PathBuf::from("/usr/local/bin/nats-server")),
+            ..ServerOpts::default()
+        };
+        install(&f, &FakeHub::up(), &o).await.unwrap();
+        let out = f.output();
+        assert!(
+            out.contains("nats-server: /usr/local/bin/nats-server (on PATH)"),
+            "{out}"
+        );
+        assert!(f.runs().is_empty(), "nothing downloaded: {:?}", f.runs());
+        assert!(!f.env.home.join(".local/share/hgl-ai/logs").exists());
+
+        // Chosen: the pinned release, which is not there yet: it is downloaded.
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux);
+        let o = ServerOpts {
+            nats_server: Some(nats::release_path(&f.env.home.join(".local/share/hgl-ai"))),
+            ..o
+        };
+        install(&DryRun::new(&f), &FakeHub::up(), &o).await.unwrap();
+        let out = f.output();
+        assert!(
+            out.contains("nats-server-v2.15.3-linux-amd64.tar.gz"),
+            "{out}"
+        );
     }
 
     #[tokio::test]

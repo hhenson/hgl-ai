@@ -35,7 +35,8 @@ this repository.
   serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`: the bridge,
   `note wait` and `note peek` alike.
   A bridge serves a seat only while it holds the lease `HGL_LOCKS/seat.<seat>`,
-  refreshed every 30 s (or a sixth of the bucket's `max_age`, if shorter). One the
+  refreshed every 30 s (or a sixth of the bucket's `max_age`, if shorter), every seat's
+  at once, each attempt bounded by that period. One the
   hub has not confirmed for half of `max_age` (no answer: a partition) stops the seat
   as a lost one does (its turn stopped, its notes naked), so it has stopped before
   the lease can expire and another host take it; `note wait` and `note peek` give it
@@ -51,8 +52,8 @@ this repository.
   no delivery.
 
 ```sh
-hgl-ai note send --to claude --issue 980 --kind ready --body-file ready.md
-hgl-ai note wait claude          # blocks; prints the next notes
+hgl-ai note send --to controller --issue 980 --kind ready --body-file ready.md
+hgl-ai note wait controller          # blocks; prints the next notes
 hgl-ai state get prs
 hgl-ai tree list --stale
 ```
@@ -110,7 +111,7 @@ before hub users takes one shared token until it moves.
   "v": 1,
   "created_at": "20261127T041100Z",
   "sender": "w4",
-  "recipient": "claude",
+  "recipient": "controller",
   "repo": "hgl-compiler",
   "issue": 980,
   "kind": "ready",
@@ -158,7 +159,13 @@ before hub users takes one shared token until it moves.
   inside it. Nothing of a task goes to `/tmp`, the caps' report files included.
 - **PROTO-13 — Every tree is registered** in `HGL_TREES` under
   `<host>.<seat>.<repo>-<issue>` with its path, branch, creation time and
-  last measured size.
+  last measured size. The daily report re-registers each tree by a revision
+  compare-and-set merged with the record held, so a fresher record never goes
+  back: `families` only grow, `handoff_seq` and `class_seq` never fall, and of
+  two trees made at that key the later made (by `seq`, then creation time) stays.
+  It writes a tree only while that tree's `task.json` still names it, checked
+  under a per-key lock that a removal holds across its deregistering, so a tree
+  removed after the listing is not registered again.
 - **PROTO-14 — Removal is the bridge's.** On `landed` or `closed` for an
   issue, the bridge stops any turn in that task, saves uncommitted changes as
   a patch under `<work_root>/salvage/` if there are any, removes the worktree
@@ -197,9 +204,11 @@ before hub users takes one shared token until it moves.
   elsewhere (another host or seat) takes the class of the task's record set last, unless
   the note that made it carries a class: that note moved the task (`gh sendback --class C
   --to SEAT`, ROLE-15) and its class is the task's there. Each `HGL_TREES` record carries the
-  stream sequence of the note that made its tree (`seq`): the task's newest implementor tree
-  is its current seat, and `gh approve` and `gh sendback` without `--to` go only there
-  (`landed` and `closed` still reach every seat that has a tree, PROTO-14).
+  stream sequence of the note that made its tree (`seq`) and of the newest `assign` or
+  `sendback` a turn in it ran (`handoff_seq`; a reused tree takes the later one, hgl-ai#44):
+  the seat of the task's implementor tree with the newest handoff (else `seq`) is its current
+  seat, and `gh approve` and `gh sendback` without `--to` go only there (`landed` and
+  `closed` still reach every seat that has a tree, PROTO-14).
 - **PROTO-17 — Failover.** A seat may list fallback bindings. A quota refusal
   is known from the CLI's structured output (an error event or result and its
   status), never from text on stderr. On one, the bridge holds the notes and
@@ -282,7 +291,7 @@ before hub users takes one shared token until it moves.
 | `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
-| `verdict.<repo>.<pr>.<name>` | local build hosts | `<head> <main> pass\|fail ...`: a local build verdict the gate reads where `[github.gate.<repo>] verdicts` names it. |
+| `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.

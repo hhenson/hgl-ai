@@ -71,10 +71,17 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ClientOpts) -> Result
     let token_src = absolute(env.expand(&o.token_file));
     let cred = token::read_credential(sys, &token_src)?
         .ok_or_else(|| other(format!("no credential at {}", token_src.display())))?;
-    if cred.role() == Some("console") {
-        return Err(other(
-            "that is the console's credential; a client takes a seat credential              (`hgl-ai server user add <label> --role seat`)",
-        ));
+    if let Some(r @ ("console" | "builder")) = cred.role() {
+        return Err(other(format!(
+            "that is a {r} credential; a client takes a seat credential \
+             (`hgl-ai server user add <label> --role seat`){}",
+            if r == "builder" {
+                ": every seat of the host would write the local build verdicts. A builder's \
+                 goes in [builder] credential"
+            } else {
+                ""
+            }
+        )));
     }
     token::copy(sys, &token_src, &token_dst)?;
     sys.say(&format!(
@@ -372,6 +379,27 @@ mod tests {
             .await
             .is_err()
         );
+        // The console's and a builder's credentials are no host's (hgl-ai#6).
+        for role in ["console", "builder"] {
+            let seed = nkeys::KeyPair::new_user().seed().unwrap();
+            std::fs::write(
+                f.env.home.join(format!("{role}.cred")),
+                hgl_ai_bus::Credential::render_nkey("x", role, &seed),
+            )
+            .unwrap();
+            let e = install(
+                &f,
+                &hub,
+                &ClientOpts {
+                    token_file: format!("~/{role}.cred"),
+                    ..opts()
+                },
+            )
+            .await
+            .unwrap_err()
+            .to_string();
+            assert!(e.contains(&format!("a {role} credential")), "{e}");
+        }
         assert!(!f.env.config_path.exists());
     }
 

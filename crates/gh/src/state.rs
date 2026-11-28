@@ -39,27 +39,6 @@ pub fn render_main(
     s
 }
 
-/// State key of one local build verdict: `verdict.<repo>.<pr>.<name>`.
-pub fn verdict_key(repo: &str, pr: u64, name: &str) -> String {
-    format!("verdict.{repo}.{pr}.{name}")
-}
-
-/// A verdict value `<head> <main> pass|fail [detail]` for this head on this main:
-/// `Some(true)` pass, `Some(false)` fail, `None` absent or for another pair.
-pub fn verdict_for(value: Option<&str>, head: &str, main: &str) -> Option<(bool, String)> {
-    let v = value?.trim();
-    let mut w = v.split_whitespace();
-    let (h, m, r) = (w.next()?, w.next()?, w.next()?);
-    if h != head || m != main {
-        return None;
-    }
-    match r {
-        "pass" => Some((true, v.to_string())),
-        "fail" => Some((false, v.to_string())),
-        _ => None,
-    }
-}
-
 static ISSUE_IN_BRANCH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^q?([0-9]+)(?:[-_/]|$)").unwrap());
 
@@ -113,8 +92,9 @@ pub fn author_seats(
 }
 
 /// The seats a verdict (`approved`, `sendback`) should reach: the task's current seat, the
-/// one whose implementor tree a later note made (`TreeRecord::seq`; a task moved to another
-/// seat, PROTO-21); else, with no tree recording its note, as [`author_seats`].
+/// one whose implementor tree ran the newest `assign` or `sendback` (`TreeRecord::handoff_seq`,
+/// else the note that made it, `seq`; a task moved to another seat and maybe back, PROTO-21);
+/// else, with no tree recording a note, as [`author_seats`].
 pub fn current_seats(
     trees: &[TreeRecord],
     repo: &str,
@@ -128,11 +108,12 @@ pub fn current_seats(
             && !t.review
             && (t.branch.as_deref() == Some(branch) || t.task.issue == issue)
     };
-    let newest = trees.iter().filter(mine).filter_map(|t| t.seq).max();
+    let handoff = |t: &TreeRecord| t.handoff_seq.max(t.seq);
+    let newest = trees.iter().filter(mine).filter_map(handoff).max();
     match newest {
         Some(n) => {
             let mut out: Vec<Seat> = Vec::new();
-            for t in trees.iter().filter(mine).filter(|t| t.seq == Some(n)) {
+            for t in trees.iter().filter(mine).filter(|t| handoff(t) == Some(n)) {
                 if !out.contains(&t.seat) {
                     out.push(t.seat.clone());
                 }
@@ -221,30 +202,6 @@ mod tests {
     }
 
     #[test]
-    fn verdicts() {
-        let (h, m) = ("h".repeat(40), "m".repeat(40));
-        assert_eq!(verdict_key("alpha", 7, "linux"), "verdict.alpha.7.linux");
-        assert!(
-            hgl_ai_proto::check_state_key(&verdict_key("hgl-compiler", 1037, "windows")).is_ok()
-        );
-        assert_eq!(
-            verdict_for(Some(&format!("{h} {m} pass")), &h, &m).map(|v| v.0),
-            Some(true)
-        );
-        assert_eq!(
-            verdict_for(Some(&format!("{h} {m} fail tests 3")), &h, &m).map(|v| v.0),
-            Some(false)
-        );
-        assert_eq!(
-            verdict_for(Some(&format!("{h} {} pass", "o".repeat(40))), &h, &m),
-            None,
-            "another main"
-        );
-        assert_eq!(verdict_for(Some("junk"), &h, &m), None);
-        assert_eq!(verdict_for(None, &h, &m), None);
-    }
-
-    #[test]
     fn branches() {
         assert_eq!(issue_from_branch("codex/980-fix-x", "codex/"), Some(980));
         assert_eq!(
@@ -275,6 +232,7 @@ mod tests {
             class: None,
             class_seq: None,
             seq: None,
+            handoff_seq: None,
         }
     }
 
@@ -369,7 +327,7 @@ mod tests {
     }
 
     /// r3's major on hgl-ai PR 25: once a task moved seats, a verdict reaches only its current
-    /// seat, the one whose implementor tree is newest; `landed` still reaches every seat.
+    /// seat, the one whose tree ran the newest handoff; `landed` still reaches every seat.
     #[test]
     fn a_verdict_goes_to_the_current_seat_only() {
         let known: Vec<String> = ["w1", "w2"].map(String::from).to_vec();
@@ -420,6 +378,35 @@ mod tests {
             seats(current_seats(&two, "alpha", "codex/q17-x", 17, &known, &[])),
             ["w2"]
         );
+    }
+
+    /// hgl-ai#44: a task moved from w1 to w2 and back reuses w1's older tree; the verdict
+    /// follows the newest handoff (w1's), not the newest tree (w2's).
+    #[test]
+    fn a_verdict_follows_the_newest_handoff_into_a_reused_tree() {
+        let known: Vec<String> = ["w1", "w2"].map(String::from).to_vec();
+        let at = |seat, seq, handoff_seq| TreeRecord {
+            seq,
+            handoff_seq,
+            ..tree(seat, "alpha", 17, "codex/q17-x", false)
+        };
+        let seats = |v: &[TreeRecord]| {
+            current_seats(v, "alpha", "codex/q17-x", 17, &known, &[])
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+        };
+        // assign w1 (10), sendback --to w2 (40), sendback --to w1 (60) into w1's tree.
+        let back = vec![at("w1", Some(10), Some(60)), at("w2", Some(40), Some(40))];
+        assert_eq!(seats(&back), ["w1"]);
+        // Before the move back, w2 is current.
+        let moved = vec![at("w1", Some(10), Some(10)), at("w2", Some(40), Some(40))];
+        assert_eq!(seats(&moved), ["w2"]);
+        // A record from a bridge before `handoff_seq` ranks by `seq`.
+        let mixed = vec![at("w1", Some(10), Some(60)), at("w2", Some(40), None)];
+        assert_eq!(seats(&mixed), ["w1"]);
+        let mixed = vec![at("w1", Some(10), Some(30)), at("w2", Some(40), None)];
+        assert_eq!(seats(&mixed), ["w2"]);
     }
 
     #[test]

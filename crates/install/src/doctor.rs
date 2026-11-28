@@ -594,10 +594,11 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 service::state(sys, s)
             };
             let hint = if system(s) {
-                match env.os {
+                let start = match env.os {
                     crate::Os::Linux => format!("`sudo systemctl start {}`", s.unit()),
                     crate::Os::MacOs => format!("`sudo launchctl kickstart system/{}`", s.label()),
-                }
+                };
+                format!("{start}; logs: {}", service::system_log_hint(env.os, s))
             } else {
                 format!("`{}`", service::start_hint(env, s))
             };
@@ -627,6 +628,16 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 ),
                 State::NotInstalled => Check::fail(name, "not installed", install),
             });
+            if system(s)
+                && st != State::NotInstalled
+                && let Some(why) = service::system_log_unsafe(sys, s)
+            {
+                out.push(Check::fail(
+                    format!("service {} log", s.short()),
+                    format!("{why}: root opens it in the server user's home (hgl-ai#63)"),
+                    crate::system::LOG_UPGRADE,
+                ));
+            }
         }
         if let Some(con) = &c.console {
             out.extend(console_checks(sys, con));
@@ -949,6 +960,7 @@ mod tests {
             name: "hgl-ai".into(),
             home: "/var/lib/hgl-ai".into(),
             console_url: None,
+            client_user: None,
         });
         crate::save_config(&f, &f.env, &cfg).unwrap();
         let stat = std::rc::Rc::new(std::cell::RefCell::new("hgl-ai 700".to_string()));
@@ -980,6 +992,34 @@ mod tests {
                 .filter(|c| c.level == Level::Fail)
                 .collect::<Vec<_>>()
         );
+
+        // A unit from before hgl-ai#63: root appends to a file in the server user's home.
+        let st = stat.clone();
+        f.on(move |c| {
+            let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
+            match (c.program.as_str(), a.as_slice()) {
+                (_, ["auth", "status", "--json"]) => Output::success(r#"{"loggedIn": true}"#),
+                ("id", _) => Output::success("1000\n"),
+                ("loginctl", _) => Output::success("yes\n"),
+                ("systemctl", ["show", "-p", "StandardOutput,StandardError", u])
+                    if *u == "hgl-ai-hub.service" =>
+                {
+                    Output::success("StandardOutput=append\nStandardError=append\n")
+                }
+                ("systemctl", ["show", ..]) => {
+                    Output::success("LoadState=loaded\nActiveState=active\n")
+                }
+                ("stat", _) => Output::success(format!("{}\n", st.borrow())),
+                ("df", _) => Output::success(DF),
+                _ => Output::success(""),
+            }
+        });
+        let cs = run(&f, &FakeHub::up()).await;
+        let log = get(&cs, "service hub log");
+        assert_eq!(log.level, Level::Fail);
+        assert!(log.detail.contains("StandardOutput=append"), "{log:?}");
+        assert!(log.fix.unwrap().contains("rerun `hgl-ai server install`"));
+        assert!(!cs.iter().any(|c| c.name == "service coord log"));
 
         // The console credential within the client user's reach, or a home open to others.
         f.readable

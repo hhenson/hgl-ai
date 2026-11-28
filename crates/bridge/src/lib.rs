@@ -130,9 +130,22 @@ impl Options {
     }
 }
 
-/// What the bridge needs from outside: GitHub's closed-ness and free space.
+/// Answers an issue's GitHub title, which names a new implementor branch (WORK §2 step 3);
+/// else why not (a failed or timed-out `gh`, its stderr), and the note's line names it.
+pub trait IssueTitle {
+    fn issue_title(&self, repo: &str, issue: u64) -> std::result::Result<String, String>;
+}
+
+impl<F: Fn(&str, u64) -> std::result::Result<String, String>> IssueTitle for F {
+    fn issue_title(&self, repo: &str, issue: u64) -> std::result::Result<String, String> {
+        self(repo, issue)
+    }
+}
+
+/// What the bridge needs from outside: GitHub's closed-ness and issue titles, and free space.
 pub struct Deps {
     pub closed: Arc<dyn IsClosed + Send + Sync>,
+    pub title: Arc<dyn IssueTitle + Send + Sync>,
     pub disk: Arc<dyn DiskProbe>,
 }
 
@@ -159,6 +172,11 @@ pub struct Bridge<B: BusApi> {
     host_id: String,
     /// How the seat leases are kept, from the hub's `max_age` ([`LeaseTiming`]).
     lease_timing: Mutex<LeaseTiming>,
+    /// A lock per tree key ([`Bridge::registry_lock`]), held by the report from its check
+    /// that a listed tree is still there through its write, and by a removal across its
+    /// deregistering, so the report never registers a tree removed after its listing
+    /// (hgl-ai#58).
+    registry: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// The seat leases' refresh, from `HGL_LOCKS`' `max_age` (PROTO-6): written every `every`
@@ -321,6 +339,7 @@ impl<B: BusApi> Bridge<B> {
             gate: Mutex::new(Gate::Open),
             served: Mutex::default(),
             leases: tokio::sync::Mutex::default(),
+            registry: Mutex::default(),
         })
     }
 
@@ -544,43 +563,47 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// Refresh every held seat lease (with the heartbeat). A lease no longer ours stops its
-    /// seat; so does one the hub has not confirmed for the deadline ([`LeaseTiming`]): in a
-    /// partition no answer says it is lost, and it expires on its own while the seat would
-    /// still run.
+    /// Refresh every held seat lease (with the heartbeat), all at once: a round takes at
+    /// most `every` at any seat count. A lease no longer ours stops its seat; so does one the
+    /// hub has not confirmed for the deadline ([`LeaseTiming`]): in a partition no answer says
+    /// it is lost, and it expires on its own while the seat would still run.
     pub(crate) async fn refresh_leases(&self) {
         let t = *lock(&self.lease_timing);
         let mut leases = self.leases.lock().await;
-        let mut lost = Vec::new();
-        for (seat, held) in leases.iter_mut() {
+        let rounds = leases.iter_mut().map(|(seat, held)| async move {
             let r = tokio::time::timeout(t.every, held.lease.refresh()).await;
             let failed = match r {
                 Ok(Ok(())) => {
                     held.ok_at = Instant::now();
-                    continue;
+                    return None;
                 }
                 Ok(Err(BusError::LeaseLost { .. })) => {
-                    lost.push((
+                    return Some((
                         seat.clone(),
                         "is no longer ours (it expired or another bridge took it)".to_string(),
                     ));
-                    continue;
                 }
                 Ok(Err(e)) => e.to_string(),
                 Err(_) => format!("no answer within {:?}", t.every),
             };
             let since = held.ok_at.elapsed();
             if since >= t.deadline {
-                lost.push((
+                Some((
                     seat.clone(),
                     format!(
                         "was not refreshed for {since:?} ({failed}), so it could expire and another host take the seat"
                     ),
-                ));
+                ))
             } else {
                 tracing::warn!(%seat, "refreshing the seat lease: {failed}; trying again (unrefreshed for {since:?} of {:?})", t.deadline);
+                None
             }
-        }
+        });
+        let lost: Vec<_> = futures::future::join_all(rounds)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
         for (seat, why) in lost {
             if let Some(held) = leases.remove(&seat) {
                 tracing::error!(%seat, "the seat lease {why}; stopping the seat");
@@ -889,6 +912,7 @@ impl<B: BusApi> Bridge<B> {
             let failed =
                 match tokio::task::spawn_blocking(move || trees.remove(&s, &t, review)).await {
                     Ok(Ok(Some(rm))) => {
+                        let _reg = self.registry_lock(&rm.key).await;
                         if let Err(e) = self.bus.tree_del(&rm.key).await {
                             tracing::warn!(key = %rm.key, "deregistering: {e}");
                         }
@@ -987,6 +1011,7 @@ impl<B: BusApi> Bridge<B> {
                     lock(&seat.cleanup).settle(&task, o.review);
                     let what = match &rm {
                         Some(rm) => {
+                            let _reg = self.registry_lock(&rm.key).await;
                             if let Err(e) = self.bus.tree_del(&rm.key).await {
                                 tracing::warn!(key = %rm.key, "deregistering: {e}");
                             }

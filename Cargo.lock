@@ -1303,6 +1303,7 @@ dependencies = [
  "hgl-ai-usage",
  "libc",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tracing",
@@ -1314,6 +1315,7 @@ name = "hgl-ai-bridge"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "futures",
  "hex",
  "hgl-ai-bus",
  "hgl-ai-cap",
@@ -1327,6 +1329,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -1433,6 +1436,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "hex",
+ "hgl-ai-build",
  "hgl-ai-bus",
  "hgl-ai-config",
  "hgl-ai-proto",
@@ -1454,6 +1458,7 @@ dependencies = [
  "chrono",
  "futures",
  "hex",
+ "hgl-ai-build",
  "hgl-ai-bus",
  "hgl-ai-config",
  "hgl-ai-owner",

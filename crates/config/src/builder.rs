@@ -34,6 +34,11 @@ pub struct Builder {
     /// Hosts this one drives over ssh as a proxy builder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote: Vec<Remote>,
+    /// The hub credential of this host's builder user (role `builder`), which alone may
+    /// write the local build verdicts (docs/build.md BUILD-15); default: the host's own.
+    /// Readable only by the OS user that runs `builder run`, never by the agents'.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential: Option<String>,
 }
 
 impl Default for Builder {
@@ -44,6 +49,7 @@ impl Default for Builder {
             sdk: BTreeMap::new(),
             toolchains: default_toolchains(),
             remote: Vec::new(),
+            credential: None,
         }
     }
 }
