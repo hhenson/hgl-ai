@@ -1104,10 +1104,8 @@ async fn alert_report_failures_drop_invalid_reports_and_retry_transient_failures
         Err(Error::Bus(hgl_ai_bus::BusError::Proto(_)))
     ));
     let kept = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap();
-    assert_eq!(
-        serde_json::from_str::<Vec<Note>>(&kept.value).unwrap(),
-        [valid.clone()]
-    );
+    let queued: Vec<Note> = serde_json::from_str(&kept.value).unwrap();
+    assert_eq!(queued.as_slice(), std::slice::from_ref(&valid));
 
     let result = coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new()).await;
     assert!(matches!(
