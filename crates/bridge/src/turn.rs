@@ -896,7 +896,12 @@ fn clean_head(cwd: &Path) -> Option<Vec<u8>> {
             .filter(|o| o.status.success())
             .map(|o| o.stdout)
     };
-    let status = git(&["status", "--porcelain=v1", "--untracked-files=all"])?;
+    let status = git(&[
+        "status",
+        "--porcelain=v1",
+        "--untracked-files=all",
+        "--ignored=matching",
+    ])?;
     if !status.is_empty() {
         return None;
     }
