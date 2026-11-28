@@ -75,7 +75,7 @@ async fn github_then_passkey_then_sign_out_and_in() {
                 && c.contains("HttpOnly; Secure; SameSite=Strict")),
         "{set:?}"
     );
-    let page = b.get("/telemetry").await;
+    let page = b.get("/").await;
     assert_eq!(page.status(), 200);
     let csp = page.headers()["content-security-policy"]
         .to_str()
@@ -99,7 +99,7 @@ async fn github_then_passkey_then_sign_out_and_in() {
     }
 
     // Sign-out needs the session's CSRF token and the console's origin.
-    let token = b.csrf("/telemetry").await;
+    let token = b.csrf("/").await;
     let r = b
         .post_form("/auth/signout", &[("csrf", "wrong")], Some(ORIGIN))
         .await;
@@ -216,8 +216,8 @@ async fn refusals() {
         )
         .await;
     assert_eq!(r.status(), 403);
-    assert_eq!(b.get("/telemetry.json").await.status(), 401);
-    assert_eq!(b.get("/telemetry/events").await.status(), 401);
+    assert_eq!(b.get("/api/session").await.status(), 401);
+    assert_eq!(b.get("/api/viewer").await.status(), 401);
 }
 
 #[tokio::test]
@@ -399,7 +399,7 @@ async fn every_provider_reaches_the_same_user_by_email() {
     let mut key2 = SoftPasskey::new(true);
     assert_eq!(register(&mut go, &mut key2).await.status(), 200);
     for b in [&mut gh, &mut go] {
-        let page = b.get("/telemetry").await.text().await.unwrap();
+        let page = b.get("/").await.text().await.unwrap();
         assert!(page.contains("This Dude (owner@example.com)"), "{page}");
     }
     // Apple's own address is not this user's Apple link (the relay is).

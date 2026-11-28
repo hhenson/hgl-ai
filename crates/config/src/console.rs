@@ -43,6 +43,10 @@ pub struct Console {
     /// Notification channels, tried in this order; the first that accepts is used.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub notify: Vec<Notify>,
+    /// The hub `viewer` user's credential, which the console hands to a signed-in page
+    /// for reading the telemetry over WebSocket (docs/owner.md §3).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub viewer_credential: Option<String>,
 }
 
 pub fn status_every() -> String {
@@ -72,6 +76,7 @@ impl Default for Console {
             apple: None,
             google: None,
             notify: Vec::new(),
+            viewer_credential: None,
         }
     }
 }
