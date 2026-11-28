@@ -10,6 +10,8 @@
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use hgl_ai_config::slack::{APP_TOKEN_FILE, BOT_TOKEN_FILE};
+
 use crate::env::Os;
 use crate::service::{self, Service, Spec};
 use crate::sys::{Cmd, System, shell_quote};
@@ -47,12 +49,14 @@ pub struct SystemOpts {
     pub coord: bool,
     /// Install the console service: only when the server side has `[console]`.
     pub console: bool,
+    /// Install the opt-in Slack Q&A system service.
+    pub slack: bool,
     /// `--console-url`, recorded so a later reinstall keeps the console.
     pub console_url: Option<String>,
     /// The OS user this host's client runs as, when not the installer: the client
     /// credential goes to it, never to the installer.
     pub client_user: Option<String>,
-    /// Keep the coordinator's GitHub token without asking for it.
+    /// Keep the existing GitHub and Slack tokens without asking for them.
     pub keep_token: bool,
     pub wait: Duration,
 }
@@ -67,6 +71,7 @@ pub struct Previous {
     pub user: Option<String>,
     pub home: Option<String>,
     pub console_url: Option<String>,
+    pub slack: bool,
     pub client_user: Option<String>,
 }
 
@@ -88,6 +93,7 @@ pub fn previous(sys: &dyn System) -> Previous {
                 p.parse::<u16>().ok(),
             )
         });
+    let slack = slack_enabled(sys, &su);
     Previous {
         host: Some(cfg.host),
         listen: addr.as_ref().map(|(h, _)| h.clone()),
@@ -95,8 +101,15 @@ pub fn previous(sys: &dyn System) -> Previous {
         user: Some(su.name),
         home: Some(su.home),
         console_url: su.console_url,
+        slack,
         client_user: su.client_user,
     }
+}
+
+/// Older client configs do not record Slack, so check the installed service too.
+pub(crate) fn slack_enabled(sys: &dyn System, user: &hgl_ai_config::ServerUser) -> bool {
+    user.slack
+        || service::system_account(sys, Service::Slack).is_some_and(|(name, _)| name == user.name)
 }
 
 /// Where the server user keeps things, by its home.
@@ -178,13 +191,33 @@ impl Root<'_> {
     /// answer keeps the old one and runs nothing. Printed, the script's own shell reads
     /// it ([`SECRET_PROMPT`]) and pipes it. Nothing under `sudo` reads the terminal:
     /// under sudo's own pseudo-terminal it never sees the keys (hgl-ai#90).
-    fn secret(&mut self, why: &str, prompt: &str, to: Cmd) -> Result<()> {
+    fn secret(&mut self, why: &str, prompt: &str, to: Cmd, keep_if: Option<Cmd>) -> Result<()> {
         let line = format!("sudo {to}");
+        if let Some(check) = &keep_if {
+            if self.print_only {
+                self.script.push(format!("if ! sudo {check}; then"));
+            } else if self
+                .sys
+                .query(
+                    &Cmd::new("sudo")
+                        .arg("-n")
+                        .arg(&check.program)
+                        .args(check.args.iter()),
+                )
+                .is_ok_and(|out| out.ok())
+            {
+                self.note(&format!("{why}: kept (--keep-token)"));
+                return Ok(());
+            }
+        }
         if self.print_only {
             self.script.push(format!(
                 "# {why}; Enter keeps the current one\n{}\n[ -z \"$t\" ] || printf '%s\\n' \"$t\" | {line}",
                 SECRET_PROMPT.replace("PROMPT", &shell_quote(prompt))
             ));
+            if keep_if.is_some() {
+                self.script.push("fi".into());
+            }
             return Ok(());
         }
         self.sys.say(&format!(
@@ -200,7 +233,7 @@ impl Root<'_> {
             .read_secret(prompt)
             .map_err(|e| other(format!("reading the answer from the terminal: {e}")))?
             .ok_or_else(|| {
-                other("no terminal to read the answer on (`--keep-token` keeps the current one)")
+                other("no terminal to read the token on (use a terminal to enter missing tokens or `--keep-token` to keep existing ones)")
             })?;
         let answer = answer.trim();
         if answer.is_empty() {
@@ -381,6 +414,15 @@ pub fn specs(sys: &dyn System, o: &SystemOpts) -> Vec<Spec> {
             layout.console_cred(),
         ));
     }
+    if o.slack {
+        out.push(svc(
+            Service::Slack,
+            &["slack", "run"],
+            layout
+                .creds()
+                .join(format!("{}.cred", crate::server::SLACK_USER)),
+        ));
+    }
     out
 }
 
@@ -399,6 +441,9 @@ fn wait_port(sys: &dyn System, host: &str, port: u16, wait: Duration) -> bool {
 
 /// Install the server side as `o.user`. Returns the script when printing only.
 pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
+    if o.slack && !o.console {
+        return Err(other("--slack requires the owner console"));
+    }
     let env = sys.env();
     let os = env.os;
     let layout = Layout {
@@ -638,7 +683,22 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
                 "sh",
                 &layout.github_token().display().to_string(),
             ]),
+            None,
         )?;
+    }
+    if o.slack {
+        let dir = layout.config();
+        let dir = dir.parent().expect("server configuration directory");
+        for (kind, file) in [("bot", BOT_TOKEN_FILE), ("app-level", APP_TOKEN_FILE)] {
+            let file = dir.join(file).display().to_string();
+            root.secret(
+                &format!("the Slack {kind} token, written as {user} (mode 0600)"),
+                &format!("Slack {kind} token (Enter keeps the current one): "),
+                Cmd::new("-u").args([user, "sh", "-c", SECRET_WRITER, "sh", &file]),
+                o.keep_token
+                    .then(|| Cmd::new("-u").args([user, "test", "-f", &file])),
+            )?;
+        }
     }
     for s in names.iter().copied().filter(|s| *s != Service::Hub) {
         start(&mut root, s)?;
@@ -696,6 +756,7 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
         name: user.to_string(),
         home: home.clone(),
         console_url: o.console_url.clone().filter(|_| o.console),
+        slack: o.slack,
         client_user: client_user.map(str::to_string),
     });
     cfg.hub.url = crate::server::local_url(&o.listen, o.port);
@@ -718,7 +779,12 @@ pub fn status(
     listen_port: Option<(String, u16)>,
 ) -> bool {
     let mut up = true;
-    for s in [Service::Hub, Service::Coord, Service::Console] {
+    for s in [
+        Service::Hub,
+        Service::Coord,
+        Service::Console,
+        Service::Slack,
+    ] {
         let st = service::system_state(sys, s);
         let text = match st {
             service::State::Running => "running",
@@ -761,7 +827,12 @@ pub fn control(sys: &dyn System, verb: &str, print_only: bool) -> Result<Option<
         print_only,
         script: Vec::new(),
     };
-    let mut svcs = vec![Service::Hub, Service::Coord, Service::Console];
+    let mut svcs = vec![
+        Service::Hub,
+        Service::Coord,
+        Service::Console,
+        Service::Slack,
+    ];
     if verb == "stop" {
         svcs.reverse();
     }
@@ -796,8 +867,16 @@ pub fn uninstall(
         print_only,
         script: Vec::new(),
     };
-    for s in [Service::Console, Service::Coord, Service::Hub] {
+    for s in [
+        Service::Slack,
+        Service::Console,
+        Service::Coord,
+        Service::Hub,
+    ] {
         let path = service::system_unit_path(os, s).display().to_string();
+        if s == Service::Slack && !sys.exists(Path::new(&path)) {
+            continue;
+        }
         match os {
             Os::Linux => {
                 root.step(
@@ -889,11 +968,36 @@ mod tests {
             port: 4222,
             coord: true,
             console: true,
+            slack: false,
             console_url: Some("https://console.example.com".into()),
             client_user: None,
             keep_token: false,
             wait: Duration::ZERO,
         }
+    }
+
+    #[test]
+    fn slack_root_steps_install_the_service_and_prompt_for_private_tokens() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux, true);
+        let mut o = opts(true);
+        o.slack = true;
+        o.keep_token = true;
+        let script = install(&f, &o).unwrap().unwrap();
+        assert!(f.runs().is_empty());
+        let start = script
+            .find("systemctl restart hgl-ai-slack.service")
+            .unwrap();
+        for want in [BOT_TOKEN_FILE, APP_TOKEN_FILE, "stty -echo", "umask 077"] {
+            assert!(script.find(want).unwrap() < start, "{want}");
+        }
+        assert_eq!(script.matches("if ! sudo -u hgl-ai test -f ").count(), 2);
+        let dir = f.env.home.join(".local/share/hgl-ai/system-units");
+        let unit = std::fs::read_to_string(dir.join("hgl-ai-slack.service")).unwrap();
+        assert!(unit.contains("User=hgl-ai\n"));
+        assert!(unit.contains("hub-users/slack.cred"));
+        assert!(unit.contains("ExecStart=/usr/local/bin/hgl-ai slack run"));
+        assert!(!unit.contains(BOT_TOKEN_FILE) && !unit.contains(APP_TOKEN_FILE));
     }
 
     #[test]
@@ -976,6 +1080,7 @@ mod tests {
             name: "hgl-ai".into(),
             home: "/var/lib/hgl-ai".into(),
             console_url: None,
+            slack: false,
             client_user: None,
         };
         assert!(status(&f, &su, None));
@@ -1073,6 +1178,21 @@ mod tests {
             Some("https://console.example.com")
         );
         assert_eq!(p.user.as_deref(), Some("hgl-ai"));
+    }
+
+    #[test]
+    fn a_reinstall_keeps_slack_and_skips_existing_slack_tokens() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux, true);
+        let mut o = opts(false);
+        o.slack = true;
+        o.keep_token = true;
+        install(&f, &o).unwrap();
+        assert!(previous(&f).slack);
+        assert!(f.output().contains("Slack bot token"));
+        assert!(f.output().contains("Slack app-level token"));
+        assert_eq!(f.output().matches("kept (--keep-token)").count(), 3);
+        assert_eq!(f.secrets.borrow().len(), 1, "no secret prompt ran");
     }
 
     /// `script` with the terminal replaced by files under `d`, `answer` its input, and

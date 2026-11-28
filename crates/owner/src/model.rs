@@ -117,6 +117,20 @@ pub struct Message {
 }
 
 impl Message {
+    pub fn source(&self) -> &'static str {
+        if self.sender != hgl_ai_proto::OWNER {
+            "hgl-ai"
+        } else if self
+            .user
+            .as_deref()
+            .is_some_and(|user| user.starts_with("slack:"))
+        {
+            "Slack"
+        } else {
+            "Console"
+        }
+    }
+
     /// `HPH, 27 Nov 14:05` for the owner's words; the seat and time for an agent's.
     pub fn signature(&self) -> String {
         match (&self.handle, &self.user) {

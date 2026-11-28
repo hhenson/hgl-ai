@@ -1,12 +1,10 @@
 # Owner channel and console
 
-Status: proposed — not implemented. Nothing here is built yet: today the controller is
-an interactive seat (`note wait`, PROTO-6), and the bus has one hub credential. The
-current rules are in `docs/protocol.md`, `docs/roles.md` and `docs/design.md`.
+Status: the console is implemented. Slack question and conversation parity is in #110.
 
 The controller runs headless, like every other seat. The owner talks to it through a
 web console served beside the hub: status reports, questions, conversations, and
-live telemetry. GitHub stays the record (PROTO-1).
+live telemetry. Slack also carries questions and conversations. GitHub stays the record (PROTO-1).
 
 ## 1. Interactions
 
@@ -35,20 +33,19 @@ live telemetry. GitHub stays the record (PROTO-1).
 
 ## 2. Owner words
 
-- **OWN-5 — Only the console speaks for the owner.** Notes and thread messages with
-  sender `owner` are published only by the console's hub credential. The hub gives
-  each client its own user and permissions: agent seats cannot publish as `owner`
-  or to the owner subjects. A message claiming the owner's words that did not come
-  through the console is agent traffic (PROTO-3).
-  - The owner subjects are `hgl.owner.>` (thread events) and `hgl.notes.owner.<seat>`
-    (notes to a seat); `HGL_THREADS` is the console's alone. Seat and coordinator users
-    are denied all three (docs/install.md, Hub users).
+- **OWN-5 — Owner words.** The console publishes owner notes and its own thread
+  events. Slack supports the same owner thread actions as the console, including
+  starting a conversation. It uses a separate hub credential and subject. The hub
+  denies seats and the coordinator write access to `hgl.owner.>`,
+  `hgl.notes.owner.>` and `HGL_THREADS` (docs/install.md, Hub users).
   - NATS stores a message under the subject it was published on, so a receiver checks
     the subject, never a header or the payload: the bridge accepts sender `owner` only on
     `hgl.notes.owner.<recipient>` and nothing else there; the console folds owner events
-    only from `hgl.owner.thread.<id>` and agent events only from `hgl.console.thread.<id>`.
-  - The server side (hub, coordinator, console) runs as its own OS user, so no agent,
-    which runs as the client user, can read the console's credential; `doctor` checks it.
+    from the owner thread subjects in §4 and agent events from `hgl.console.thread.<id>`.
+    The Slack subject carries `owner_message`, a question's `answer`, or a
+    conversation's `start` or `close`.
+  - The hub, coordinator, console and Slack adapter run as a dedicated OS user.
+    The client user cannot read their credentials.
 - **OWN-6 — Sign-in.** The console listens on a configured address (loopback or a
   tailnet address, never a public interface) over HTTPS, at a stable host name, which
   passkeys need. Users sign in with a passkey (WebAuthn). A user's first sign-in, and
@@ -92,6 +89,39 @@ live telemetry. GitHub stays the record (PROTO-1).
   decision on GitHub writes the handle and date, then the words:
   `This Dude, 2026-11-27: "..."`.
 
+### Slack Q&A (#42)
+
+HPH, 2026-11-28: "Slack is a first class communication channel, so if I close a conversation in the slack channel it is the same as if i close it in the web ui."
+HPH, 2026-11-28: "I should also be able to see an switch between the channels"
+
+The adapter posts each question and conversation in the private `#hgl-qa` channel,
+including threads already in `HGL_OWNER` on first activation. Console messages and
+agent follow-ups appear in the Slack thread. The root shows the thread ID and
+clips long posts at Slack's limits.
+
+Start a conversation in the console or mention the app in `#hgl-qa`, with the
+title on the first line and the message below it. For a Slack start the bot puts
+the controls in a reply to the owner's message. Every owner message appears
+once on each surface, showing its source. Native messages remain in their
+original Slack thread. The bot's posts link to the console. The console page
+links to the Slack thread.
+
+The owner replies by typing in the thread, answers a question with its Block Kit
+buttons and answer form, or closes a conversation with its Close button. The
+same `HGL_OWNER` events drive both surfaces. Answering, closing or withdrawing
+edits the Slack root with the new state and removes its buttons.
+
+Socket Mode accepts actions only from the configured owner account, workspace
+and private channel. It stores the event with the configured owner handle before
+acknowledging Slack. The subject keys each event by its Slack message or action
+timestamp. Native Slack replies stay in their original thread.
+
+`HGL_SLACK` keeps mappings, permalinks and delivery receipts across restarts.
+Posts and state edits carry the source event ID. After a lost response the
+adapter waits before checking Slack for its own matching message. Recovery
+uses Slack's visible message history. The initial replay is paced and retries
+honour Slack's rate limits.
+
 ## 3. Telemetry
 
 One page, live (server-sent events), from the hub and the coordinator, read every
@@ -128,12 +158,14 @@ repository per day.
 | KV | `HGL_THREADS` | one record per thread: id, kind, title, issue, priority, state, times, options, suggested, answer, messages |
 | KV | `HGL_METRICS` | daily samples per repository |
 | KV | `HGL_CONSOLE` | the console's sessions, pending `p2` batch and undelivered `p1`s; the console's user only |
+| KV | `HGL_SLACK` | Slack delivery receipts and thread mappings |
 
 | Subject | Publisher | Event |
 | --- | --- | --- |
 | `hgl.console.status` | controller | a status report |
 | `hgl.console.thread.<id>` | agents | `ask`, `message`, `withdraw` |
 | `hgl.owner.thread.<id>` | console | `answer`, `owner_message`, `start`, `close`, with the signed-in user |
+| `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` | Slack | `start`, `owner_message`, `answer`, `close`, with the allowlisted user and configured handle |
 | `hgl.notes.owner.<seat>` | console | the `answer` or `note` a folded owner event sends |
 
 - Thread ids are `q-` (question) or `c-` (conversation) and 8 hex digits.
@@ -186,8 +218,9 @@ hgl-ai decision add LINE           a controller judgement (OWN-8)
 hgl-ai decision tail [N]
 ```
 
-The owner answers only in the console. Pages: status reports (newest first), questions
-(open first, by priority; accept, option, reject or other, with a note), conversations
+The owner can answer in the console or in Slack, as agreed in §2. Console pages
+include status reports (newest first), questions (open first, by priority; accept,
+option, reject or other, with a note), conversations
 (start, reply, close; search by description, issue, state, date), telemetry. One
 embedded script and stylesheet, no CDN; works without the script except for passkeys
 and live updates.

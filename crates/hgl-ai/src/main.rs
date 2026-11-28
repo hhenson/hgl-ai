@@ -60,6 +60,8 @@ enum Command {
     Decision(cmd::owner::DecisionArgs),
     /// The owner's web console.
     Console(cmd::console::Args),
+    /// The Slack Socket Mode adapter for owner questions.
+    Slack(cmd::slack::Args),
     /// Subscription usage per login: collect, show, label.
     Usage(cmd::usage::Args),
     /// Build and test by recipe, here or on a builder of another platform.
@@ -102,6 +104,7 @@ async fn main() {
         Command::Status(a) => cmd::owner::status(&ctx, a).await,
         Command::Decision(a) => cmd::owner::decision(&ctx, a).await,
         Command::Console(a) => cmd::console::run(&ctx, a).await,
+        Command::Slack(a) => cmd::slack::run(&ctx, a).await,
         Command::Usage(a) => cmd::usage::run(&ctx, a).await,
         Command::Build(a) => cmd::build::run(&ctx, a).await,
         Command::Builder(a) => cmd::builder::run(&ctx, a).await,

@@ -4,8 +4,8 @@ use anyhow::Context as _;
 use hgl_ai_bus::{Bus, BusError, MAX_VALUE_BYTES};
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    HostRecord, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS,
-    KV_TREES, KV_USAGE, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
+    HostRecord, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE,
+    KV_THREADS, KV_TREES, KV_USAGE, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
 };
 
 use super::note::read_bounded;
@@ -141,6 +141,7 @@ pub async fn init(ctx: &Ctx) -> anyhow::Result<i32> {
         KV_THREADS,
         KV_METRICS,
         KV_CONSOLE,
+        KV_SLACK,
         KV_USAGE,
         KV_BUILD,
     ];

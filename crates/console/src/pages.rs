@@ -404,6 +404,12 @@ pub async fn thread(State(app): AppState, h: HeaderMap, Path(id): Path<String>) 
         esc(&t.seat),
         time(&t.created_at)
     );
+    if let Some(slack) = &app.cfg.slack
+        && let Ok(Some((link, _))) = bus.slack_get::<String>(&slack.link_key(&id)).await
+        && hgl_ai_config::slack::valid_permalink(&link)
+    {
+        let _ = write!(body, "<p><a href=\"{}\">Open in Slack</a></p>", esc(&link));
+    }
     if !t.context.is_empty() {
         let _ = write!(body, "<h2>Context</h2>{}", text_block(&t.context));
     }
@@ -441,8 +447,9 @@ pub async fn thread(State(app): AppState, h: HeaderMap, Path(id): Path<String>) 
             };
             let _ = write!(
                 body,
-                "<li><p class=\"meta\">{}</p>{}</li>",
+                "<li><p class=\"meta\">{} · {}</p>{}</li>",
                 esc(&who),
+                m.source(),
                 text_block(&m.body)
             );
         }

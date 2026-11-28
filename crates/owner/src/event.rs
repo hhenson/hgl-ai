@@ -1,6 +1,6 @@
 //! Events of the owner channel (docs/owner.md §4) and how the console folds them into
-//! thread records. Agents publish on `hgl.console.>`; only the console's hub user may
-//! publish on `hgl.owner.>`, so an event's subject says whose words it carries (OWN-5).
+//! thread records. Agents publish on `hgl.console.>`; the console and Slack have
+//! separate owner subjects, so an event's subject says whose words it carries (OWN-5).
 //! The fold refuses an owner event on an agent subject and the reverse.
 
 use hgl_ai_proto::{CONSOLE_PREFIX, Kind, Note, OWNER_PREFIX, Seat};
@@ -28,6 +28,19 @@ pub fn owner_subject(id: &str) -> String {
     format!("{OWNER_PREFIX}.thread.{id}")
 }
 
+/// An owner event from Slack, keyed by workspace, channel and reply or action ts.
+pub fn slack_subject(id: &str, team: &str, channel: &str, source_key: &str) -> String {
+    format!("{}.slack.{team}.{channel}.{source_key}", owner_subject(id))
+}
+
+pub fn slack_source(subject: &str) -> Option<(&str, &str, &str)> {
+    let (_, source) = subject.split_once(".slack.")?;
+    let (team, tail) = source.split_once('.')?;
+    let (channel, key) = tail.split_once('.')?;
+    (!team.is_empty() && !channel.is_empty() && !key.is_empty() && !key.contains('.'))
+        .then_some((team, channel, key))
+}
+
 /// Who published an event, by its subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -43,10 +56,15 @@ pub fn parse_subject(subject: &str) -> Option<(Origin, &str)> {
     {
         return Some((Origin::Agent, id));
     }
-    subject
+    let tail = subject
         .strip_prefix(OWNER_PREFIX)
-        .and_then(|r| r.strip_prefix(".thread."))
-        .map(|id| (Origin::Owner, id))
+        .and_then(|r| r.strip_prefix(".thread."))?;
+    let id = match tail.split_once(".slack.") {
+        Some((id, _)) if slack_source(subject).is_some() => id,
+        Some(_) => return None,
+        None => tail,
+    };
+    Some((Origin::Owner, id))
 }
 
 /// A status report (OWN-1) on `hgl.console.status`.
@@ -242,16 +260,8 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("").trim()
 }
 
-/// Fold `ev`, published on `subject` and stored at `seq`, into `rec` (absent before
-/// the thread's first event). `controller` is the seat conversations talk to. Returns the
-/// new record and its effects, or why the event is refused. Pure: no I/O.
-pub fn fold(
-    rec: Option<&Thread>,
-    subject: &str,
-    seq: u64,
-    ev: &Event,
-    controller: &Seat,
-) -> Result<(Thread, Effects), Refused> {
+/// Validate the event and its publisher before it is folded or mirrored.
+pub fn validate_event(subject: &str, ev: &Event) -> Result<(), Refused> {
     let (origin, sid) = parse_subject(subject).ok_or_else(|| refuse("not a thread subject"))?;
     if sid != ev.id {
         return Err(refuse(format!("event for {} on {subject}", ev.id)));
@@ -264,9 +274,17 @@ pub fn fold(
     // OWN-5: owner events only from the owner's subject, agent events never from it.
     if ev.body.origin() != origin {
         return Err(refuse(format!(
-            "a {:?} event on {subject}: owner events come only from the console",
+            "a {:?} event on the wrong subject {subject}",
             ev.body.origin()
         )));
+    }
+    if origin == Origin::Owner
+        && subject != owner_subject(sid)
+        && matches!(ev.body, Body::Start { .. })
+        && !slack_source(subject)
+            .is_some_and(|(_, _, key)| sid.starts_with("c-") && key.starts_with("start_"))
+    {
+        return Err(refuse("Slack conversations require a root mention"));
     }
     match origin {
         Origin::Owner if ev.sender != hgl_ai_proto::OWNER => {
@@ -286,6 +304,20 @@ pub fn fold(
         }
         hgl_ai_proto::check_handle(h).map_err(|e| refuse(e.to_string()))?;
     }
+    Ok(())
+}
+
+/// Fold `ev`, published on `subject` and stored at `seq`, into `rec` (absent before
+/// the thread's first event). `controller` is the seat conversations talk to. Returns the
+/// new record and its effects, or why the event is refused. Pure: no I/O.
+pub fn fold(
+    rec: Option<&Thread>,
+    subject: &str,
+    seq: u64,
+    ev: &Event,
+    controller: &Seat,
+) -> Result<(Thread, Effects), Refused> {
+    validate_event(subject, ev)?;
     let user = || ev.user.clone().unwrap_or_else(|| "unknown".into());
     let handle = || ev.handle.clone();
     // Who signs the owner's words: the handle, else the signed-in identity.
@@ -680,7 +712,7 @@ mod tests {
         );
         // A seat publishing the owner's answer on the agent subject it may use.
         let e = fold(Some(&t), &agent_subject(ID), 2, &ans, &ctl()).unwrap_err();
-        assert!(e.0.contains("only from the console"), "{e}");
+        assert!(e.0.contains("wrong subject"), "{e}");
         // An agent event on the owner's subject (only the console could put it there).
         let msg = Event {
             body: Body::Message { body: "hi".into() },
