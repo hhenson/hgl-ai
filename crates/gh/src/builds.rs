@@ -57,6 +57,20 @@ struct Asked {
     builder: String,
     /// Asks for this head, `main` and recipe so far.
     asks: u32,
+    /// A durable ask's delivery state: the job and its note's `created_at`, kept before the
+    /// send, so a requester that stopped before it knew the send went out sends the same
+    /// message again (the hub drops a copy) rather than wait for a job never published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job: Option<BuildJob>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    at: String,
+    /// The job note is published. An ask kept without it (an older value) counts as sent.
+    #[serde(default = "yes")]
+    sent: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The gate builds one `gh land`, `gh merge-if-clean` or `build gate` has asked for. While
@@ -254,25 +268,93 @@ impl GateBuilds {
             id,
             builder: b.label.clone(),
             asks: asks + 1,
+            job: key.is_some().then(|| job.clone()),
+            at: if key.is_some() {
+                utc_now_stamp()
+            } else {
+                String::new()
+            },
+            sent: key.is_none(),
         };
-        // Kept before it is sent: a restart after the send finds it and waits for it.
-        if let Some(k) = &key {
-            let text = serde_json::to_string(&a).expect("an ask encodes");
-            crate::store::put_latest(bus, k, &text).await?;
-        }
-        if let Err(e) = request::send(bus, self.sender.clone(), &b, &job).await {
-            if let Some(k) = &key
-                && let Err(d) = bus.state_del(k).await
-            {
-                tracing::warn!("{k}: removing an ask not sent: {d}");
-            }
-            return Err(store_err(e));
-        }
+        let Some(k) = key else {
+            request::send(bus, self.sender.clone(), &b, &job)
+                .await
+                .map_err(store_err)?;
+            self.remember(w, &a);
+            return Ok(Ok(a));
+        };
+        // Kept, unsent, before it is sent: a restart at any point after finds it and either
+        // waits for the job or sends the same message again ([`GateBuilds::replay`]).
+        self.keep(bus, &k, &a).await?;
+        self.remember(w, &a);
+        Ok(Ok(self.deliver(bus, &k, w, a, &b).await?))
+    }
+
+    fn remember(&self, w: &Want<'_>, a: &Asked) {
         self.asked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(w.slot(), a.clone());
-        Ok(Ok(a))
+    }
+
+    async fn keep(&self, bus: &Bus, key: &str, a: &Asked) -> Result<()> {
+        let text = serde_json::to_string(a).expect("an ask encodes");
+        crate::store::put_latest(bus, key, &text).await?;
+        Ok(())
+    }
+
+    /// Publish a durable ask's job with its kept `created_at`, then keep it sent. A failed
+    /// send leaves it unsent, for the next read to send again.
+    async fn deliver(
+        &self,
+        bus: &Bus,
+        key: &str,
+        w: &Want<'_>,
+        mut a: Asked,
+        b: &BuilderRecord,
+    ) -> Result<Asked> {
+        let Some(job) = a.job.clone() else {
+            return Ok(a);
+        };
+        request::send_at(bus, self.sender.clone(), b, &job, Some(&a.at))
+            .await
+            .map_err(store_err)?;
+        a.sent = true;
+        self.keep(bus, key, &a).await?;
+        self.remember(w, &a);
+        Ok(a)
+    }
+
+    /// A durable ask whose send is not known to have gone out: its builder has the job
+    /// (its summary is past `queued`), or the same message is sent again while that
+    /// builder takes jobs. Otherwise it stays unsent and is lost like any other.
+    async fn replay(
+        &self,
+        bus: &Bus,
+        builders: &[BuilderRecord],
+        w: &Want<'_>,
+        mut a: Asked,
+    ) -> Result<Asked> {
+        let Some(Ok(key)) = self.ask_key(w) else {
+            return Ok(a);
+        };
+        let run = hgl_ai_build::store::run_get(bus, &a.id)
+            .await
+            .map_err(store_err)?;
+        if run.is_some_and(|s| s.status != BuildStatus::Queued) {
+            a.sent = true;
+            self.keep(bus, &key, &a).await?;
+            self.remember(w, &a);
+            return Ok(a);
+        }
+        let Some(b) = builders
+            .iter()
+            .find(|b| b.label == a.builder && b.state == "active" && b.reachable)
+        else {
+            return Ok(a);
+        };
+        tracing::info!("{}: sending {} to {} again", key, a.id, a.builder);
+        self.deliver(bus, &key, w, a, b).await
     }
 }
 
@@ -381,7 +463,10 @@ pub async fn verdict_state(
     let builders = bus.builders().await?;
     let now = utc_now_stamp();
     builds.recall(bus, &w).await?;
-    let asked = builds.asked(&w);
+    let mut asked = builds.asked(&w);
+    if let Some(a) = asked.clone().filter(|a| !a.sent) {
+        asked = Some(builds.replay(bus, &builders, &w, a).await?);
+    }
     // Why the build to wait for is lost, and the builder that lost it; `None` with nothing
     // to wait for.
     let lost: Option<(String, Option<String>)> = if let Some(a) = &asked {
@@ -443,8 +528,9 @@ pub async fn verdict_state(
                     )));
                 }
             }
-            // Kept before the send and no summary: the send never happened (a summary is
-            // written before the job is sent).
+            // Kept before the send and not sent, with its builder not taking jobs, or no
+            // summary at all: lost.
+            _ if !a.sent => Some((format!("{} was not sent to {}", a.id, a.builder), None)),
             None if builds.durable.is_some() => {
                 Some((format!("{} was not sent to {}", a.id, a.builder), None))
             }

@@ -4,19 +4,21 @@
 //! round under the landing lock, which it does not wait for. The gate is the controller's
 //! (exact head, current `main`, an other-family clean receipt, checks, the bot and threads)
 //! with three more conditions: the local build verdicts for the head on the present `main`
-//! (BUILD-15), so a repository that names none is not landed on checks alone; Ready at that
-//! head, read again with the pull request right before the merge call
-//! ([`gate::Opts::ready_at_head`]); and no `hold`, read before each attempt and again right
-//! before the merge call. A build verdict it lacks is asked of a builder and read in a
-//! later round; the ask is kept on the hub (`coord.ask.<repo>.<pr>.<name>`), so a restart
-//! waits for that build rather than ask again.
+//! (BUILD-15), so a repository that names none is not landed on checks alone; the current
+//! head the Ready head, and still Ready, read again with the pull request, its base and
+//! `main` right before the merge call ([`gate::Opts::ready_at_head`]); and no `hold`, read
+//! before each attempt and again right before the merge call. A build verdict it lacks is
+//! asked of a builder and read in a later round; the ask, with its job, is kept on the hub
+//! (`coord.ask.<repo>.<pr>.<name>`), so a restart waits for that build, or sends the same
+//! job again when it is not known to have gone out.
 //!
 //! Its landing records say so (`by: coordinator`); it finishes and deletes only those. The
 //! controller's records, whatever they hold (the wrapper's pins left, say), are the
-//! controller's. First in each round, a record of its own whose merge is confirmed (the
-//! record holds the merge commit, or GitHub reports the pull request merged) is finished
-//! by the same attempt. One whose pull request is open is the candidates' to decide; one
-//! closed without a merge is retired (deleted, with its asks).
+//! controller's, and the controller's commands refuse its own ([`land`]). First in each
+//! round, a record of its own whose merge is confirmed (the record holds the merge commit,
+//! or GitHub reports the pull request merged at the intent's head) is finished by the same
+//! attempt. One whose pull request is open is the candidates' to decide; one closed without
+//! a merge of its head is retired (deleted, with its asks), unannounced.
 //!
 //! Every landing it does or finishes is reported in two more steps of its record, under
 //! the same lock and before the record is deleted: a `note` to the controller, then a
@@ -115,6 +117,7 @@ impl AutoLand {
             lock_wait: Duration::ZERO,
             sync_pins: false,
             keep_record: true,
+            adopt_merged: false,
             builds: Some(self.builds.clone()),
             ..LandOpts::default()
         }
@@ -305,7 +308,9 @@ impl AutoLand {
                         continue;
                     }
                 };
-                if !pr.merged {
+                // Merged at another head than the intent's: not this landing's merge.
+                let ours = pr.merged && pr.head.eq_ignore_ascii_case(&t.head);
+                if !ours {
                     if pr.state != "open" {
                         self.retire(s, bus, &t).await?;
                     }
@@ -341,7 +346,7 @@ impl AutoLand {
             progress::delete(bus, &t.repo, t.number).await?;
             self.builds.forget(bus, &t.repo, t.number).await?;
             tracing::info!(
-                "{} #{}: closed without a merge; its landing record is retired",
+                "{} #{}: closed without a merge of its head; its landing record is retired",
                 t.repo,
                 t.number
             );

@@ -50,6 +50,10 @@ pub struct LandOpts {
     /// `merge_locked`: keep the landing record once its steps are done, for a caller with
     /// steps of its own that deletes it after them (the coordinator's reports).
     pub keep_record: bool,
+    /// Finish the landing of a pull request found merged with no record of this landing
+    /// (merged by hand, or at a head other than the record's intent). Off for the
+    /// coordinator, which announces only what it merged.
+    pub adopt_merged: bool,
 }
 
 impl Default for LandOpts {
@@ -69,6 +73,7 @@ impl Default for LandOpts {
             footer: None,
             builds: None,
             keep_record: false,
+            adopt_merged: true,
         }
     }
 }
@@ -217,6 +222,10 @@ async fn land_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<(Landing, String)> {
+    if let Some(outcome) = owned_elsewhere(bus, repo, number, head, o).await? {
+        let after = Vec::new();
+        return Ok((Landing { outcome, after }, String::new()));
+    }
     if let Some(done) = resume_recorded(gh, s, bus, repo, number, o, lock).await? {
         return Ok(done);
     }
@@ -280,6 +289,30 @@ async fn land_locked<G: Gh>(
         tokio::time::sleep(o.interval).await;
     };
     settle(gh, s, bus, repo, number, outcome, o, lock).await
+}
+
+/// A landing record is finished and deleted only by whoever it is written for
+/// ([`Progress::by`]): the coordinator's by the coordinator, after its reports; the
+/// controller's by `gh land` or `gh merge-if-clean`. `Some` refuses another's.
+async fn owned_elsewhere(
+    bus: &Bus,
+    repo: &str,
+    number: u64,
+    head: &str,
+    o: &LandOpts,
+) -> Result<Option<Outcome>> {
+    let Some(p) = progress::read(bus, repo, number).await? else {
+        return Ok(None);
+    };
+    if p.by.as_deref() == o.gate.record_by {
+        return Ok(None);
+    }
+    let owner = p.by.as_deref().unwrap_or("controller");
+    let line = format!(
+        "{repo} #{number}: its landing record {} is the {owner}'s, which finishes it BLOCKED",
+        progress::key(repo, number)
+    );
+    Ok(Some(Outcome::new(Kind::Blocked, line, false, head)))
 }
 
 /// A landing whose record holds the merge commit: an earlier attempt merged and stopped
@@ -356,6 +389,16 @@ async fn settle<G: Gh>(
             // the merge, or it was merged without one): finish it now.
             let pr = gate::fetch_pr(gh, s, repo, number).await?;
             let merge = pr.merge_commit.clone().unwrap_or_default();
+            // An intent counts only for the head GitHub merged: another head merged is not
+            // this landing's merge.
+            let p = p.filter(|p| p.merge.is_some() || p.head.eq_ignore_ascii_case(&pr.head));
+            if p.is_none() && !o.adopt_merged {
+                let after = vec![format!(
+                    "{repo} #{number} was merged at {} without this landing; left",
+                    short(&pr.head)
+                )];
+                return Ok((Landing { outcome, after }, String::new()));
+            }
             let head = p
                 .as_ref()
                 .map(|p| p.head.clone())
@@ -424,6 +467,10 @@ pub(crate) async fn merge_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<Landing> {
+    if let Some(outcome) = owned_elsewhere(bus, repo, number, head, o).await? {
+        let after = Vec::new();
+        return Ok(Landing { outcome, after });
+    }
     let (Landing { outcome, mut after }, _) =
         match resume_recorded(gh, s, bus, repo, number, o, lock).await? {
             Some(done) => done,

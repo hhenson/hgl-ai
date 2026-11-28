@@ -475,6 +475,16 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         );
     }
     let main = need!(f.main, Need::Main).as_str();
+    if opts.ready_at_head && head != asked {
+        // Ready binds the head it names: a merge of it with `main` is another head, its
+        // Ready not given (the coordinator's landings).
+        let line = format!(
+            "{prefix} head {} is not the Ready head {}: head moved BLOCKED",
+            short(head),
+            short(asked)
+        );
+        return done(Kind::Blocked, line, false);
+    }
     if head != asked {
         let parents = need!(f.parents, Need::Parents);
         if !(parents.len() == 2 && parents[0] == asked && parents[1] == main) {
@@ -1046,7 +1056,13 @@ async fn fill<G: Gh>(
                 "application/vnd.github.v3.diff",
             )
             .await;
-            f.diff = Some(d.map_err(|e| e.to_string()));
+            // Refused credentials or the rate limit are the caller's, not this pull
+            // request's: they stop the gate rather than read as a diff that cannot be read.
+            f.diff = Some(match d {
+                Ok(d) => Ok(d),
+                Err(e @ (Error::Auth(_) | Error::RateLimited(_))) => return Err(e),
+                Err(e) => Err(e.to_string()),
+            });
         }
         Need::UpdateFiles => {
             let parent = f
@@ -1094,6 +1110,7 @@ async fn before_merge<G: Gh>(
     number: u64,
     asked: &str,
     head: &str,
+    main: Option<&str>,
     line: &str,
     opts: &Opts,
 ) -> Result<Option<Outcome>> {
@@ -1105,7 +1122,7 @@ async fn before_merge<G: Gh>(
             head,
         ))
     };
-    if opts.ready_at_head {
+    if opts.ready_at_head || opts.require_verdicts {
         let pr = fetch_pr(gh, s, repo, number).await?;
         if pr.merged || pr.state != "open" || pr.head != head {
             let why = format!(
@@ -1120,6 +1137,24 @@ async fn before_merge<G: Gh>(
             );
             return Ok(stop(Kind::Blocked, why, false));
         }
+        // What the gate judged on: the pull request into `main`, and `main` at the commit
+        // the verdicts were built on. A retarget or a `main` that moved since is judged
+        // again.
+        if pr.base != "main" {
+            let why = format!("at the merge: the base is {}, not main", pr.base);
+            return Ok(stop(Kind::Blocked, why, false));
+        }
+        let now = main_head(gh, s, repo).await?;
+        if main != Some(now.as_str()) {
+            let why = format!(
+                "at the merge: main is at {}, not {} as judged",
+                short(&now),
+                short(main.unwrap_or("none"))
+            );
+            return Ok(stop(Kind::Wait, why, true));
+        }
+    }
+    if opts.ready_at_head {
         let r = s.full(repo);
         let list = exec::get_list(
             gh,
@@ -1212,8 +1247,19 @@ pub async fn evaluate<G: Gh>(
                 });
             }
             Step::Merge(line) => {
-                if let Some(o) =
-                    before_merge(gh, s, bus, repo, number, asked, &f.pr.head, &line, opts).await?
+                if let Some(o) = before_merge(
+                    gh,
+                    s,
+                    bus,
+                    repo,
+                    number,
+                    asked,
+                    &f.pr.head,
+                    f.main.as_deref(),
+                    &line,
+                    opts,
+                )
+                .await?
                 {
                     return Ok(o);
                 }
@@ -1413,6 +1459,21 @@ mod tests {
                 .line
                 .contains("latest note: none")
         );
+        // The head moved to a merge of the Ready head with main: the parent's Ready is
+        // not this head's (r6). The controller's gate takes such a merge (ROLE-10).
+        f.comments = Some(vec![ready.clone()]);
+        let merge = "c".repeat(40);
+        f.pr.head = merge.clone();
+        f.parents = Some(vec![HEAD.to_string(), MAIN.to_string()]);
+        let o = outcome(&f, &rules(), &opts);
+        assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+        assert!(
+            o.line.contains("is not the Ready head 1f461fa7"),
+            "{}",
+            o.line
+        );
+        f.pr.head = HEAD.to_string();
+        f.parents = Some(vec!["p".repeat(40)]);
         // Off (the controller's commands): the note comments are not the gate's to judge.
         f.comments = Some(vec![]);
         assert!(matches!(

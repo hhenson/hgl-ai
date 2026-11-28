@@ -301,7 +301,7 @@ before hub users takes one shared token until it moves.
 | `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted. Read from the notes stream every 10 s; written when it changes. |
 | `decisions.log` | controller, console, coordinator service | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean`, coordinator service | JSON `{"head","merge","done","notes_at","by","report","partial","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. `by` is `coordinator` on the coordinator's landings, which alone finish them (`coord.note`, `coord.decision`, from the `report` kept in the record before it is sent; a `PARTIAL` once, `coord.partial`); it leaves every other record to the controller. |
-| `coord.ask.<repo>.<pr>.<name>` | coordinator service | JSON of the last gate build the coordinator asked for the verdict `name` (head, `main`, recipe revision, build id, builder, asks). Written before the job is sent; a restart waits for that build rather than ask again. Deleted when the landing is done or retired. |
+| `coord.ask.<repo>.<pr>.<name>` | coordinator service | JSON of the last gate build the coordinator asked for the verdict `name` (head, `main`, recipe revision, build id, builder, asks). Written before the job is sent, with the job, its note's `created_at` and `sent`, then again once the note is published. A restart waits for that build rather than ask again; an ask not known sent is sent again as the same message (the hub drops a copy) unless its builder already took the job. Deleted when the landing is done or retired. |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
 | `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
@@ -339,16 +339,20 @@ Where `[github.gate.<repo>] coordinator_lands` opts in, the coordinator service
 lands too, after each table round, reading `hold` again before each attempt. First
 it takes each `landing.<repo>.<pr>` of its own (`by: coordinator`) in such a
 repository whose merge is confirmed: recorded, or GitHub reports the pull request
-merged. Absence from the round's read is not taken as closed; an intent closed
-without a merge is retired. Then it takes each Ready candidate (docs/work.md
+merged at the intent's head. Absence from the round's read is not taken as
+closed; an intent closed without a merge of its head is retired, unannounced. Then it takes each Ready candidate (docs/work.md
 WORK-6), oldest first, unless its row shows a failed check, an unresolved thread,
-bot findings or the bot's limit. A pull request with a record not its own is left
-to the controller. Each gets one gate attempt under the landing lock, which it does not wait for. The gate also
-requires the local build verdicts for the head on the present `main` (a repository
-that names none is refused: checks alone never land), and Ready at the head asked
-for. Right before the merge call it reads the pull request, its comments and
-`hold` again: another head, a later `Sent back` or `Blocked`, or a hold stops it. A
-missing verdict is asked of a builder (`coord.ask.*`) and read in a later round. A
+bot findings or the bot's limit. A landing record is finished only by whoever it
+is written for (`by`): the coordinator leaves the controller's, and `gh land` and
+`gh merge-if-clean` refuse the coordinator's. Each candidate gets one gate attempt
+under the landing lock, which it does not wait for. The gate also requires the local
+build verdicts for the head on the present `main` (a repository that names none is
+refused: checks alone never land), and the current head to be the Ready head (a
+merge of it with `main` is not). Right before the merge call it reads the pull
+request, its comments, `main` and `hold` again: another head, a base other than
+`main`, `main` moved since the gate judged it, a later `Sent back` or `Blocked`, or
+a hold stops it. A missing verdict is asked of a builder (`coord.ask.*`) and read in
+a later round. A
 landing it does or finishes has two more steps in its record, done under the lock
 before the record is deleted: `coord.note`, a `note` to the controller (`[coord]
 Landed: <repo>#<pr> at <head> as <merge>`, carrying the `landed` notes'

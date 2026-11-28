@@ -76,9 +76,25 @@ pub async fn send(
     b: &BuilderRecord,
     job: &BuildJob,
 ) -> Result<(), StoreError> {
+    send_at(bus, sender, b, job, None).await
+}
+
+/// [`send`] with the note's `created_at` given: sent again with the same one, the note is
+/// the same message (PROTO-9) and the hub drops the copy, so a requester that does not
+/// know whether its send went out may send again.
+pub async fn send_at(
+    bus: &Bus,
+    sender: Seat,
+    b: &BuilderRecord,
+    job: &BuildJob,
+    created_at: Option<&str>,
+) -> Result<(), StoreError> {
     store::run_put(bus, &queued(job, b)).await?;
     let body = serde_json::to_string(job).map_err(|e| StoreError::Other(e.to_string()))?;
     let mut n = Note::new(sender, b.inbox.clone(), Kind::Build, body);
+    if let Some(at) = created_at {
+        n.created_at = at.to_string();
+    }
     n.repo = Some(job.repo.clone());
     n.head = Some(job.head.clone());
     n.base = job.base.clone();
