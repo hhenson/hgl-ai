@@ -288,7 +288,7 @@ async fn tree_remove_waits_for_the_registry_lock() {
         )
         .unwrap();
     let key = hgl_ai_proto::tree_key(&cfg.host, &seat, &task, false);
-    let held = hgl_ai_bridge::lock::FileLock::registry(&cfg.data_dir().unwrap(), &key)
+    let held = hgl_ai_bridge::lock::FileLock::registry(trees.layout().root(), &key)
         .await
         .unwrap();
     let mut command = hgl(&p, &["tree", "remove", "w1", "demo", "3"]);
