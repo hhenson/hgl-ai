@@ -82,6 +82,8 @@ before hub users takes one shared token until it moves.
   broadcast address. `owner` and `console` are senders, never seats: no seat takes
   `all`, `owner` or `console`, and no note goes to `owner` or `console`. A seat is a logical address; the runtime and model bound
   to it can change (§6) without peers noticing.
+  A seat receives broadcasts published from its durable inbox's creation onward,
+  measured by the hub. Unicast published earlier remains eligible while retained.
 - **PROTO-8 — Ack after the turn.** The bridge sends `in_progress` every 60 s
   while a turn runs or a note is held, and `ack` after a clean exit. JetStream
   never drops a note (`max_deliver` is unlimited); the bridge decides:
@@ -296,13 +298,24 @@ before hub users takes one shared token until it moves.
 | `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
 | `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
+| `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted. Read from the notes stream every 10 s; written when it changes. |
 | `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
+| `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.
+
+Intake scans open issues and PRs across `[github].repos` every 15 minutes under
+`hold`. The first scan looks back 15 minutes. Later scans resume from the saved
+time with a 15-minute overlap to catch updates during pagination. GitHub
+readiness labels, assignees, review requests, assignment notes and registered
+work suppress duplicate intake. A same-repository PR with a registered
+implementor branch is attributed to the fleet. Other PRs are flagged for
+controller routing. Empty rounds send no note. Pending notes are retried with
+the same message ID.
 
 `HGL_LOCKS` holds leases, `{"holder", "acquired_at", "token"}`, created only if
 absent, rewritten every minute while held, deleted by their holder; one not

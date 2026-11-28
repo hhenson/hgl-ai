@@ -799,3 +799,46 @@ fn a_seats_own_branch_is_not_the_tasks() {
     assert_eq!(c.file.branch.as_deref(), Some("codex/q57-new"));
     assert_eq!(c.file.local_branch, None);
 }
+
+#[test]
+fn salvage_preserves_non_utf8_patch_bytes() {
+    let e = env();
+    let c = e
+        .trees
+        .create(&seat("w1"), &task(981), &implement("bytes"))
+        .unwrap();
+    let src = c.dir.join("src");
+    std::fs::write(src.join("raw.txt"), b"committed \xff\n").unwrap();
+    e.git.run(&src, ["add", "raw.txt"]).unwrap();
+    e.git
+        .run(
+            &src,
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "raw bytes",
+            ],
+        )
+        .unwrap();
+    std::fs::write(src.join("raw.txt"), b"modified \xfe\n").unwrap();
+    let rm = e
+        .trees
+        .remove(&seat("w1"), &task(981), false)
+        .unwrap()
+        .unwrap();
+    let patch = std::fs::read(rm.salvage.unwrap()).unwrap();
+    assert!(
+        patch
+            .windows(b"+committed \xff\n".len())
+            .any(|w| w == b"+committed \xff\n")
+    );
+    assert!(
+        patch
+            .windows(b"+modified \xfe\n".len())
+            .any(|w| w == b"+modified \xfe\n")
+    );
+}

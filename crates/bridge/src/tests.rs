@@ -150,7 +150,7 @@ impl H {
         let c = self.calls.join(rt);
         std::fs::create_dir_all(&c).unwrap();
         let text = format!(
-            "#!/bin/sh\nC='{c}'\nn=$(cat \"$C/n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$C/n\"\nd=\"$C/$n\"; mkdir -p \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/args\"\npwd > \"$d/cwd\"\nenv > \"$d/env\"\ncat > \"$d/stdin\"\n{body}\n",
+            "#!/bin/sh\nC='{c}'\nn=$(cat \"$C/n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$C/n.tmp\"; mv \"$C/n.tmp\" \"$C/n\"\nd=\"$C/$n\"; mkdir -p \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/args\"\npwd > \"$d/cwd\"\nenv > \"$d/env\"\ncat > \"$d/stdin\"\ntouch \"$d/ready\"\n{body}\n",
             c = c.display()
         );
         let p = self.bin.join(rt);
@@ -167,6 +167,9 @@ impl H {
         (1..=n)
             .filter_map(|i| {
                 let d = c.join(i.to_string());
+                if !d.join("ready").exists() {
+                    return None;
+                }
                 let args = std::fs::read_to_string(d.join("args"))
                     .ok()?
                     .lines()
@@ -1643,7 +1646,7 @@ async fn landed_drops_the_queued_notes_of_its_task() {
     h.script(
         "codex",
         &format!(
-            "case \"$(pwd)\" in *demo-11*) while [ ! -e '{g}' ]; do sleep 0.05; done;; esac\ncat '{f}'",
+            "case \"$(pwd)\" in *demo-11*) i=0; while [ ! -e '{g}' ]; do i=$((i+1)); if [ \"$i\" -ge 400 ]; then echo 'timed out waiting for gate' >&2; exit 1; fi; sleep 0.05; done;; esac\ncat '{f}'",
             g = gate.display(),
             f = fixture("codex-ok.jsonl")
         ),
@@ -2533,7 +2536,8 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
 
 /// hgl-ai#65: the hub stalls silently, so every refresh hangs until it times out (`every`).
 /// The refreshes run at once, so with any number of seats each stops before its lease can
-/// expire: its last refresh was at most `every` before the stall, at `every == max_age / 6`.
+/// expire. Measure each seat from its last confirmed write to its actual stop, rather than
+/// from the stall to when the test happens to observe all the notices.
 async fn hanging_refreshes_stop_every_seat_before_its_lease_can_expire(n: usize) {
     let mut h = harness();
     let max_age = Duration::from_secs(3);
@@ -2560,8 +2564,7 @@ async fn hanging_refreshes_stop_every_seat_before_its_lease_can_expire(n: usize)
                 .all(|s| h.bus.lease_holder(&format!("seat.{s}")).is_some())
     })
     .await;
-    h.bus.refresh_hangs(true);
-    let cut = std::time::Instant::now();
+    let confirmed = h.bus.refresh_hangs(true);
     eventually("every seat stopped", || {
         let told = h.bus.sent_containing("was not refreshed for");
         names
@@ -2569,15 +2572,21 @@ async fn hanging_refreshes_stop_every_seat_before_its_lease_can_expire(n: usize)
             .all(|s| told.iter().any(|t| t.sender.as_str() == s))
     })
     .await;
-    let took = cut.elapsed();
-    assert!(
-        took < max_age - every,
-        "{n} seats: the last stopped after {took:?}, when its lease could have expired"
-    );
-    assert!(
-        took >= max_age / 2 - every,
-        "{n} seats: not before the deadline: {took:?}"
-    );
+    let stops = h.bus.lease_stops();
+    for name in &names {
+        let last = confirmed[&format!("seat.{name}")];
+        let (start, end) = stops[&seat(name)];
+        let start = start.duration_since(last);
+        let end = end.expect("seat stopped").duration_since(last);
+        assert!(
+            start >= max_age / 2,
+            "{name}: stopped too early after {start:?}"
+        );
+        assert!(
+            end < max_age,
+            "{name}: stopped after {end:?}, when its lease could have expired"
+        );
+    }
     h.bus.refresh_hangs(false);
     stop(tx, j).await;
 }
@@ -2674,3 +2683,63 @@ async fn low_disk_holds_new_trees_under_drain_too() {
 }
 
 mod reuse;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn author_registration_failure_blocks_and_retries_before_starting() {
+    let mut h = harness();
+    h.opts.prep_retry = Duration::from_millis(100);
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    h.bus.set_tree_put_down(true);
+    let (tx, j) = h.start(&["w1"]);
+    let seq = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 981, "[claude] Assign: demo#981"),
+    );
+    eventually("registration failure", || {
+        !h.bus
+            .sent_containing("could not prepare demo#981")
+            .is_empty()
+    })
+    .await;
+    assert!(h.calls("codex").is_empty());
+    assert!(h.bus.events(seq).is_empty());
+    h.bus.set_tree_put_down(false);
+    eventually("turn after registration", || h.bus.events(seq) == [Ev::Ack]).await;
+    assert_eq!(h.calls("codex").len(), 1);
+    assert!(
+        h.bus
+            .trees()
+            .values()
+            .any(|r| r.task.issue == 981 && r.families.contains(&Family::Gpt))
+    );
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_review_waits_for_disk_before_removing_old_tree() {
+    let h = harness();
+    h.script("claude", &format!("cat '{}'", fixture("claude-ok.jsonl")));
+    let (tx, j) = h.start(&["r1"]);
+    let head = h
+        .git
+        .run(&h.seed, ["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let mut review = note(Kind::Review, "r1", 982, "[claude] Review: demo#982");
+    review.head = Some(head);
+    let first = h.bus.push("r1", review.clone());
+    eventually("first review", || h.bus.events(first) == [Ev::Ack]).await;
+    let marker = h.work().join("r1/demo-982-review/src/kept-marker");
+    std::fs::write(&marker, "keep").unwrap();
+    h.disk.0.store(crate::disk::GB, Ordering::SeqCst);
+    let second = h.bus.push("r1", review);
+    eventually("replacement held", || h.bus.progressed(second)).await;
+    assert!(marker.exists());
+    assert_eq!(h.calls("claude").len(), 1);
+    h.disk.0.store(1000 * crate::disk::GB, Ordering::SeqCst);
+    eventually("replacement runs", || h.bus.events(second) == [Ev::Ack]).await;
+    assert_eq!(h.calls("claude").len(), 2);
+    assert!(!marker.exists());
+    stop(tx, j).await;
+}
