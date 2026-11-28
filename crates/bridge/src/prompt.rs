@@ -89,7 +89,7 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
              `hgl-ai thread list --open` and `hgl-ai state get main` (OWN-8).\n",
         ),
         Role::Implementor => s.push_str(
-            "Run local builds in the foreground. When resolving merge conflicts, \
+            "Run local builds in the foreground, never background them in the shell; wait for and report their summaries before ending the turn. When resolving merge conflicts, \
              keep the merge commit separate from other fixes.\n\
              Before `ready`, answer each item by ID in the Ready body with `n/a` or what you ran:\n\
              - PC-10 Restart: stop between durable writes; restart and check each step finishes once.\n\

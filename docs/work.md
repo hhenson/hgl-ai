@@ -36,7 +36,8 @@ Roles and gates are in `docs/roles.md`; notes and worktrees in `docs/protocol.md
 5. Run every check `AGENTS.md` names, under `hgl-ai cap`. A change reaching the C++
    target also runs that target's checks, plain and sanitized (under
    `hgl-ai cap --no-address-limit`), against the pinned hgraph SDK. The list of
-   unsupported cases does not grow.
+   unsupported cases does not grow. Run local builds in the foreground, never background
+   them in the shell; wait for and report their summaries before ending the turn.
 6. Open the pull request: what changed, the rule ids, the checks with counts, and
    `Closes #N` (in another repository `Part of hhenson/hgl-compiler#N`). Where Core and
    the compiler both change, Core's pull request comes first and the compiler pins it.

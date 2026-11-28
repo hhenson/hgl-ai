@@ -1,8 +1,9 @@
 //! `hgl-ai build`: recipes, runs here or on a builder of another platform, their status,
 //! summaries, logs, and a debugging shell (docs/build.md).
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
@@ -15,8 +16,8 @@ use hgl_ai_bus::Bus;
 use hgl_ai_config::Config;
 use hgl_ai_proto::Seat;
 use hgl_ai_proto::build::{
-    BUILD_VERSION, BuildJob, BuildStatus, Platform, Summary, check_build_id, new_build_id,
-    reply_seat,
+    BUILD_VERSION, BuildJob, BuildStatus, Platform, StepStatus, Summary, check_build_id,
+    new_build_id, reply_seat,
 };
 use hgl_ai_tree::Git;
 
@@ -326,19 +327,81 @@ fn print_summary(ctx: &Ctx, s: &Summary) {
     }
 }
 
-/// Stop `cancel` at SIGINT or SIGTERM.
-fn cancel_on_signal(cancel: Cancel) {
-    tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let Ok(mut term) = signal(SignalKind::terminate()) else {
-            return;
-        };
-        tokio::select! {
-            _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+#[derive(Default)]
+struct TurnSignal {
+    active: Option<String>,
+    interrupted: HashSet<String>,
+    failed_tests: HashSet<String>,
+    tests_failed: u64,
+}
+
+impl TurnSignal {
+    fn progress(&mut self, s: &Summary) {
+        if let Some(step) = s.steps.last() {
+            if step.status == StepStatus::Running {
+                self.active = Some(step.name.clone());
+            } else {
+                if s.tests.failed > self.tests_failed {
+                    self.failed_tests.insert(step.name.clone());
+                }
+                self.tests_failed = s.tests.failed;
+                self.active = None;
+            }
         }
-        cancel.cancel();
+    }
+
+    fn signal(&mut self) {
+        if let Some(step) = &self.active {
+            self.interrupted.insert(step.clone());
+        }
+    }
+}
+
+/// Cancel on either signal, and keep listening after SIGINT for the turn's SIGTERM.
+fn cancel_on_signal(cancel: Cancel) -> Arc<Mutex<TurnSignal>> {
+    let state = Arc::new(Mutex::new(TurnSignal::default()));
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut interrupt)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::interrupt()),
+    ) else {
+        return state;
+    };
+    let seen = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = interrupt.recv() => {},
+                _ = term.recv() => {},
+            }
+            seen.lock().unwrap_or_else(|e| e.into_inner()).signal();
+            cancel.cancel();
+        }
     });
+    state
+}
+
+fn mark_turn_interruption(s: &mut Summary, state: &TurnSignal) {
+    for step in &mut s.steps {
+        if !state.interrupted.contains(&step.name) {
+            continue;
+        }
+        let failed = step.errors > 0 || state.failed_tests.contains(&step.name);
+        if failed && step.status == StepStatus::Stopped {
+            step.status = StepStatus::Fail;
+        } else if !failed
+            && step.status == StepStatus::Fail
+            && matches!(step.exit, Some(130 | 143))
+            && step.limit.is_none()
+        {
+            step.status = StepStatus::Stopped;
+            step.reason = Some("turn ended".into());
+        }
+    }
+    s.status = summary::overall(&s.steps);
+    if s.status == BuildStatus::Stopped {
+        s.reason = Some("turn ended".into());
+    }
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -506,7 +569,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         log_dir: run_dir.clone(),
     };
     let cancel = Cancel::default();
-    cancel_on_signal(cancel.clone());
+    let signal_state = cancel_on_signal(cancel.clone());
     let bus = bus.map(Arc::new);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Summary>();
     let fwd = {
@@ -526,15 +589,24 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         })
     };
     let c2 = cancel.clone();
+    let progress_state = signal_state.clone();
     let driven = tokio::task::spawn_blocking(move || {
         driver::drive(&exec, &ws, &recipe, &meta, &opts, &c2, &mut |s| {
+            progress_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .progress(s);
             let _ = tx.send(s.clone());
         })
     })
     .await
     .context("the build stopped")?;
     let _ = fwd.await;
-    let s = driven.summary;
+    let mut s = driven.summary;
+    if std::env::var_os("HGL_AI_TURN").is_some_and(|v| !v.is_empty()) {
+        let state = signal_state.lock().unwrap_or_else(|e| e.into_inner());
+        mark_turn_interruption(&mut s, &state);
+    }
     store::write_final(&run_dir, &s)?;
     if let Some(b) = &bus {
         if let Err(e) = store::run_put(b, &s).await {
@@ -1162,6 +1234,91 @@ mod tests {
     use super::*;
 
     use hgl_ai_proto::build::BuilderRecord;
+
+    fn signal_summary() -> Summary {
+        serde_json::from_value(serde_json::json!({
+            "v": 1, "id": "test", "repo": "test", "host": "local",
+            "platform": "linux", "executor": "local", "status": "running",
+            "started_at": "", "log_dir": "", "steps": []
+        }))
+        .unwrap()
+    }
+
+    fn signal_step(
+        name: &str,
+        status: StepStatus,
+        exit: Option<i32>,
+    ) -> hgl_ai_proto::build::StepSummary {
+        let mut step = hgl_ai_proto::build::StepSummary::new(name, status);
+        step.exit = exit;
+        step
+    }
+
+    #[test]
+    fn interrupted_step_with_parsed_failures_stays_failed() {
+        for tests in [false, true] {
+            let mut s = signal_summary();
+            let mut state = TurnSignal::default();
+            s.steps.push(signal_step("a", StepStatus::Running, None));
+            state.progress(&s);
+            state.signal();
+            s.steps[0] = signal_step("a", StepStatus::Stopped, Some(143));
+            if tests {
+                s.tests.failed = 1;
+            } else {
+                s.steps[0].errors = 1;
+            }
+            state.progress(&s);
+            mark_turn_interruption(&mut s, &state);
+            assert_eq!(s.steps[0].status, StepStatus::Fail);
+            assert_eq!(s.status, BuildStatus::Fail);
+        }
+    }
+
+    #[test]
+    fn signal_marks_only_the_step_running_at_the_time() {
+        let mut s = signal_summary();
+        let mut state = TurnSignal::default();
+        s.steps
+            .push(signal_step("first", StepStatus::Fail, Some(143)));
+        state.progress(&s);
+        s.steps
+            .push(signal_step("second", StepStatus::Running, None));
+        state.progress(&s);
+        state.signal();
+        s.steps[1] = signal_step("second", StepStatus::Fail, Some(143));
+        state.progress(&s);
+        mark_turn_interruption(&mut s, &state);
+        assert_eq!(s.steps[0].status, StepStatus::Fail);
+        assert_eq!(s.steps[1].status, StepStatus::Stopped);
+        assert_eq!(s.status, BuildStatus::Fail);
+    }
+
+    #[test]
+    fn signal_after_passing_step_keeps_build_passed() {
+        let mut s = signal_summary();
+        let mut state = TurnSignal::default();
+        s.steps.push(signal_step("a", StepStatus::Running, None));
+        state.progress(&s);
+        s.steps[0] = signal_step("a", StepStatus::Pass, Some(0));
+        state.progress(&s);
+        state.signal();
+        mark_turn_interruption(&mut s, &state);
+        assert_eq!(s.status, BuildStatus::Pass);
+    }
+
+    #[test]
+    fn interrupted_exit_130_is_stopped() {
+        let mut s = signal_summary();
+        let mut state = TurnSignal::default();
+        s.steps.push(signal_step("a", StepStatus::Running, None));
+        state.progress(&s);
+        state.signal();
+        s.steps[0] = signal_step("a", StepStatus::Fail, Some(130));
+        state.progress(&s);
+        mark_turn_interruption(&mut s, &state);
+        assert_eq!(s.status, BuildStatus::Stopped);
+    }
 
     fn rec(label: &str, platform: Platform, reachable: bool, busy: u32) -> BuilderRecord {
         BuilderRecord {

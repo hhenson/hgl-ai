@@ -760,6 +760,103 @@ fn detach_inside_a_turn_is_refused() {
 }
 
 #[test]
+fn turn_term_stops_a_local_build_without_a_failure_verdict() {
+    turn_term_build(false, false);
+}
+
+#[test]
+fn turn_term_preserves_an_earlier_failure() {
+    turn_term_build(true, false);
+}
+
+#[test]
+fn turn_sigint_then_term_stops_a_local_build() {
+    turn_term_build(false, true);
+}
+
+fn turn_term_build(earlier_failure: bool, interrupt_first: bool) {
+    use std::os::unix::process::CommandExt;
+
+    let dir = Scratch::new("turn-term");
+    let src = dir.0.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    let recipe = dir.0.join("recipe.toml");
+    let first = if earlier_failure {
+        "[[step]]\nname = \"fail\"\nrun = \"exit 1\"\n"
+    } else {
+        ""
+    };
+    std::fs::write(
+        &recipe,
+        format!(
+            "repo = \"demo\"\n{first}[[step]]\nname = \"test\"\nrun = \"echo started; sleep 60\"\n"
+        ),
+    )
+    .unwrap();
+    let logs = dir.0.join("logs");
+    let mut command = Command::new(env!("CARGO_BIN_EXE_hgl-ai"));
+    command
+        .args(["--json", "build", "run", "demo", "--keep-going", "--recipe"])
+        .arg(&recipe)
+        .arg("--dir")
+        .arg(&src)
+        .arg("--log-dir")
+        .arg(&logs)
+        .arg("--build-dir")
+        .arg(dir.0.join("build"))
+        .env("HGL_AI_CONFIG", dir.0.join("none.toml"))
+        .env("HGL_AI_TURN", "test-turn")
+        .env_remove("HGL_AI_TASK_DIR")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0);
+    let mut child = command.spawn().unwrap();
+    let pid = child.id() as i32;
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            let output = child.wait_with_output().unwrap();
+            panic!("build exited before starting: {}", text(&output));
+        }
+        let started = std::fs::read_dir(&logs)
+            .ok()
+            .into_iter()
+            .flatten()
+            .flatten()
+            .any(|e| {
+                std::fs::read_to_string(e.path().join("test.log"))
+                    .is_ok_and(|s| s.contains("started"))
+            });
+        if started {
+            break;
+        }
+        assert!(Instant::now() < deadline, "build did not start");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Signal the whole group, as turn cleanup does.
+    if interrupt_first {
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(unsafe { libc::kill(-pid, libc::SIGTERM) }, 0);
+    let output = child.wait_with_output().unwrap();
+    let summary: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|_| panic!("{}", text(&output)));
+    if earlier_failure {
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+        assert_eq!(summary["status"], "fail");
+        assert_eq!(summary["steps"][0]["status"], "fail");
+        assert_eq!(summary["steps"][1]["status"], "stopped");
+    } else {
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+        assert_eq!(summary["status"], "stopped", "{}", text(&output));
+        assert_eq!(summary["reason"], "turn ended");
+        assert_eq!(summary["steps"][0]["status"], "stopped");
+    }
+}
+
+#[test]
 fn local_build_from_subdirectory_discovers_dirty_checkout() {
     let dir = Scratch::new("subdir");
     let src = dir.0.join("src");
