@@ -2400,3 +2400,23 @@ async fn precheck_rules_account_boundary_and_cas() {
     // A denial may be reported either by the local permission check or by no account import.
     let _ = &mut denied;
 }
+
+#[tokio::test]
+async fn precheck_rules_initial_creation() {
+    let Some(hub) = Hub::accounts() else {
+        panic!("nats-server is required for this boundary test")
+    };
+    hub.bus("hub-admin").await.provision().await.unwrap();
+    let seat = hub.bus("build-1").await;
+    let writer = hub.bus("precheck-rules").await;
+    assert!(seat.precheck_rules_get().await.unwrap().is_none());
+    let rev = writer
+        .precheck_rules_set("{\"rules\":[],\"reason\":\"initial\"}", 0)
+        .await
+        .unwrap();
+    assert_eq!(seat.precheck_rules_get().await.unwrap().unwrap().1, rev);
+    assert!(matches!(
+        writer.precheck_rules_set("{}", 0).await,
+        Err(BusError::Conflict { .. })
+    ));
+}
