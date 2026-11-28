@@ -15,7 +15,9 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
-use crate::bot::{BotState, BotView, Comment, NoteState, Review, note_state, ready_mark};
+use crate::bot::{
+    BotState, BotView, Comment, NoteState, Review, is_note_author, note_state, ready_mark,
+};
 use crate::{Error, Result, short};
 
 /// `CHECKS` of a row: the head commit's status check rollup.
@@ -224,6 +226,7 @@ pub fn parse_batch(
     v: &Value,
     repos: &[String],
     bot: &str,
+    note_authors: &[String],
     read: &str,
 ) -> Result<(Vec<PrInfo>, RateLimit, Vec<String>)> {
     let data = v.get("data").ok_or_else(|| resp("no data"))?;
@@ -237,7 +240,7 @@ pub fn parse_batch(
         };
         let mut infos: Vec<PrInfo> = nodes(r, &["pullRequests"])
             .iter()
-            .filter_map(|p| pr_info(repo, p, bot, read))
+            .filter_map(|p| pr_info(repo, p, bot, note_authors, read))
             .collect();
         infos.sort_by_key(|i| i.row.number);
         out.extend(infos);
@@ -262,7 +265,13 @@ pub fn parse_rate(data: &Value) -> Result<RateLimit> {
     })
 }
 
-fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
+fn pr_info(
+    repo: &str,
+    p: &Value,
+    bot: &str,
+    note_authors: &[String],
+    read: &str,
+) -> Option<PrInfo> {
     let number = p.get("number")?.as_u64()?;
     let head = p.get("headRefOid")?.as_str()?.to_string();
     let unresolved = nodes(p, &["reviewThreads"])
@@ -284,7 +293,13 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
         .map(Review::from_graphql)
         .collect();
     let view = BotView::of(bot, &comments, &reviews);
-    let mark = ready_mark(&comments, &head);
+    // Only the fleet's own comments change a note state (anyone can comment).
+    let notes: Vec<Comment> = comments
+        .iter()
+        .filter(|c| is_note_author(&c.author, note_authors))
+        .cloned()
+        .collect();
+    let mark = ready_mark(&notes, &head);
     let rollup = nodes(p, &["commits"])
         .first()
         .and_then(|c| c.get("commit"))
@@ -303,7 +318,7 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
             updated: read.to_string(),
             head: head.clone(),
         },
-        note: note_state(&comments),
+        note: note_state(&notes),
         ready_at: mark.at,
         ready_cleared: mark.cleared,
         url: p
@@ -534,7 +549,74 @@ mod tests {
     }
 
     fn batch() -> (Vec<PrInfo>, RateLimit, Vec<String>) {
-        parse_batch(&json("coord-batch.json"), &repos(), BOT, READ).unwrap()
+        parse_batch(&json("coord-batch.json"), &repos(), BOT, &fleet(), READ).unwrap()
+    }
+
+    /// The fixtures' fleet account.
+    fn fleet() -> Vec<String> {
+        vec!["octo".into()]
+    }
+
+    /// alpha#11 of the fixture with more late comments: `(author, body, created_at)`.
+    fn alpha11_with(extra: &[(&str, &str, &str)]) -> PrInfo {
+        let mut v = json("coord-batch.json");
+        let late = v
+            .pointer_mut("/data/r0/pullRequests/nodes")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["number"] == 11)
+            .unwrap()
+            .pointer_mut("/late/nodes")
+            .and_then(Value::as_array_mut)
+            .unwrap();
+        for (i, (author, body, at)) in extra.iter().enumerate() {
+            late.push(serde_json::json!({
+                "databaseId": 900_000 + i, "author": {"login": author}, "body": body,
+                "createdAt": at, "updatedAt": at,
+            }));
+        }
+        let (infos, ..) = parse_batch(&v, &repos(), BOT, &fleet(), READ).unwrap();
+        infos.into_iter().find(|i| i.row.number == 11).unwrap()
+    }
+
+    #[test]
+    fn only_the_fleets_comments_are_notes() {
+        const READY_AT: &str = "2026-01-05T09:00:00Z";
+        const T10: &str = "2026-01-05T10:00:00Z";
+        const T11: &str = "2026-01-05T11:00:00Z";
+        const BACK: &str = "[claude] Sent back: no";
+        const READY: &str = "[codex] Ready: alpha#11 at 11111111";
+        // The fixture's Ready is by the fleet account; read with another fleet, it is not.
+        let (infos, ..) = parse_batch(
+            &json("coord-batch.json"),
+            &repos(),
+            BOT,
+            &["x".into()],
+            READ,
+        )
+        .unwrap();
+        let alpha11 = infos.iter().find(|i| i.row.number == 11).unwrap();
+        assert_eq!((alpha11.note, &alpha11.ready_at), (None, &None));
+        // A stranger's later Sent back changes nothing; the fleet's clears Ready.
+        let foreign = alpha11_with(&[("stranger", BACK, T10)]);
+        assert_eq!(foreign.note, Some(NoteState::Ready));
+        assert_eq!(foreign.ready_at.as_deref(), Some(READY_AT));
+        assert_eq!(foreign.ready_cleared, None);
+        let own = alpha11_with(&[("octo", BACK, T10)]);
+        assert_eq!(own.note, Some(NoteState::Sendback));
+        assert_eq!(
+            (own.ready_at, own.ready_cleared.as_deref()),
+            (None, Some(T10))
+        );
+        // After the fleet's Sent back, a stranger's Ready at the head gives no place back;
+        // the fleet's does.
+        let foreign = alpha11_with(&[("octo", BACK, T10), ("stranger", READY, T11)]);
+        assert_eq!(foreign.note, Some(NoteState::Sendback));
+        assert_eq!(foreign.ready_at, None);
+        let own = alpha11_with(&[("octo", BACK, T10), ("octo", READY, T11)]);
+        assert_eq!(own.note, Some(NoteState::Ready));
+        assert_eq!(own.ready_at.as_deref(), Some(T11));
     }
 
     #[test]

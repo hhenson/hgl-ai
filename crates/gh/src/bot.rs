@@ -306,10 +306,22 @@ pub fn note_state(comments: &[Comment]) -> Option<NoteState> {
     found.last().map(|f| f.1)
 }
 
-/// The head a note's first line declares: the first `at <hex>`, 8 to 40 hex characters
-/// bounded by non-hex (`Ready: o/r#7 at 1f461fa7`, `Approved at 1f461fa7.`).
+/// The head a note's first line declares: the first `at <hex>`, 7 to 40 hex characters
+/// that make a whole word (`Ready: o/r#7 at 1f461fa7`, `Approved at 1f461fa7.`; not
+/// `at 1f461fa7g` or `at 1f461fa7_old`). A `Ready` must give at least 8.
 static DECLARED_HEAD: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"(?i)\bat\s+([0-9a-f]{8,40})(?:[^0-9a-f]|$)").unwrap());
+    LazyLock::new(|| Regex::new(r"(?i)\bat\s+([0-9a-f]{7,40})\b").unwrap());
+
+/// The fewest characters of a declared head that mark Ready at it.
+const READY_HEAD_MIN: usize = 8;
+
+/// Whether `login` is one of `authors` (in any letter case, a `[bot]` suffix aside): only
+/// their comments are read as note comments.
+pub fn is_note_author(login: &str, authors: &[String]) -> bool {
+    let bare = |l: &str| l.strip_suffix("[bot]").unwrap_or(l).to_string();
+    let login = bare(login);
+    !login.is_empty() && authors.iter().any(|a| bare(a).eq_ignore_ascii_case(&login))
+}
 
 fn declared_head(first: &str) -> Option<&str> {
     DECLARED_HEAD
@@ -325,9 +337,9 @@ fn names_head(token: &str, head: &str) -> bool {
 }
 
 /// Where the note comments leave Ready at `head` (WORK-6 Ready order), walked in creation
-/// order: a `Ready` comment declaring `head` marks it; `Sent back`, `Blocked`, `Landed`, a
-/// `Ready` at another head, or an `Approved` naming another head clears it; an `Approved`
-/// naming no head or `head` keeps it.
+/// order: a `Ready` comment declaring `head` (8 characters or more) marks it; `Sent back`,
+/// `Blocked`, `Landed`, any other `Ready`, or an `Approved` naming another head (7
+/// characters are enough) clears it; an `Approved` naming no head or `head` keeps it.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ReadyMark {
     /// `created_at` of the `Ready` comment at `head` that still stands.
@@ -355,7 +367,7 @@ pub fn ready_mark(comments: &[Comment], head: &str) -> ReadyMark {
     for (at, st, declared) in notes {
         let at_head = declared.is_some_and(|d| names_head(d, head));
         let keeps = match st {
-            NoteState::Ready if at_head => {
+            NoteState::Ready if at_head && declared.is_some_and(|d| d.len() >= READY_HEAD_MIN) => {
                 mark.at = Some(at.to_string());
                 continue;
             }
@@ -593,6 +605,11 @@ mod tests {
         assert_eq!(mark(&keep).at, at(&t(1)));
         let other = [first.clone(), c("[claude] Approved at 2222222222", &t(5))];
         assert_eq!(mark(&other).at, None);
+        // A 7-character sha is a head too: another one clears, this one keeps.
+        let short = [first.clone(), c("[claude] Approved at 2222222.", &t(5))];
+        assert_eq!(mark(&short).at, None);
+        let short = [first.clone(), c("[claude] Approved at 1f461fa", &t(5))];
+        assert_eq!(mark(&short).at, at(&t(1)));
         // A later Ready at another head clears it.
         let moved = [first.clone(), c("[codex] Ready: o/r#7 at 22222222", &t(5))];
         assert_eq!(mark(&moved).at, None);
@@ -607,6 +624,10 @@ mod tests {
             "[codex] Ready: o/r#7\nat 1f461fa7",
             "[codex] Ready: o/r#7 at 2222222222 after 1f461fa7",
             "[codex] Ready: o/r#7 at 1f461fa77bba922fe81383df4c475feb58b7c2330",
+            // The token must end at a word boundary.
+            "[codex] Ready: o/r#7 at 1f461fa7zz",
+            "[codex] Ready: o/r#7 at 1f461fa7g",
+            "[codex] Ready: o/r#7 at 1f461fa7_old",
         ] {
             let cs = [c(body, &t(1))];
             assert_eq!(mark(&cs).at, None, "{body}");
@@ -614,7 +635,8 @@ mod tests {
         for body in [
             "[codex] Ready: o/r#7 AT 1F461FA77BBA",
             "[codex] Ready: o/r#7 at 1f461fa7: checks pass",
-            "[codex] Ready: o/r#7 at 1f461fa7zz",
+            "[codex] Ready: o/r#7 at 1f461fa7 (claude, claude-opus-5-5).",
+            "[codex] Ready: o/r#7 at 1f461fa7-checks",
         ] {
             assert_eq!(mark(&[c(body, &t(1))]).at, at(&t(1)), "{body}");
         }
@@ -624,5 +646,18 @@ mod tests {
             ReadyMark::default()
         );
         assert_eq!(mark(&[]), ReadyMark::default());
+    }
+
+    #[test]
+    fn note_authors() {
+        let fleet = ["fleet-bot".to_string(), "Owner".to_string()];
+        assert!(is_note_author("fleet-bot", &fleet));
+        assert!(is_note_author("FLEET-BOT", &fleet));
+        assert!(is_note_author("fleet-bot[bot]", &fleet));
+        assert!(is_note_author("owner", &fleet));
+        assert!(!is_note_author("stranger", &fleet));
+        assert!(!is_note_author("fleet-bot-2", &fleet));
+        assert!(!is_note_author("", &fleet));
+        assert!(!is_note_author("fleet-bot", &[]));
     }
 }

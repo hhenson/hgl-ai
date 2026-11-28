@@ -142,6 +142,8 @@ branch_prefix = "codex/"
 wrapper = "hgl-project"
 clone_url = "https://github.com/{owner}/{repo}.git"   # default
 controller = "controller"              # default; the seat that gets the bridge's and coordinator's notes
+# note_authors = ["<fleet login>"]     # logins whose Ready/Approved/Sent back/Blocked/Landed comments
+                                       # count; `owner` always does, nobody else (default: owner only)
 
 [github.gate.hgl-compiler]             # per repository; every key optional
 review_receipt = true                  # default: a clean receipt from another family (ROLE-11)

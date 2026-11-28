@@ -129,6 +129,8 @@ pub struct Settings {
     pub branch_prefix: String,
     pub wrapper: String,
     pub review_bot: String,
+    /// Logins whose comments are read as note comments: `github.note_authors` and `owner`.
+    pub note_authors: Vec<String>,
     pub controller: Seat,
     pub coord_seat: Seat,
     pub coord_interval: Duration,
@@ -184,6 +186,12 @@ impl Settings {
             branch_prefix: g.branch_prefix.clone(),
             wrapper: g.wrapper.clone(),
             review_bot: g.review_bot.clone(),
+            note_authors: g
+                .note_authors
+                .iter()
+                .chain(std::iter::once(&g.owner))
+                .cloned()
+                .collect(),
             controller: Seat::new(g.controller.clone())?,
             coord_seat: Seat::new(g.coord_seat.clone())?,
             coord_interval: dur("github.coord_interval", &g.coord_interval)?,
@@ -255,6 +263,8 @@ pub(crate) mod testutil {
         cfg.paths.data_dir = "/nonexistent/hgl-ai-test".into();
         let mut s = Settings::from_config(&cfg).unwrap();
         s.api_retry = Duration::from_millis(5);
+        // The fleet account of the fixtures.
+        s.note_authors.push("octo".into());
         s
     }
 
