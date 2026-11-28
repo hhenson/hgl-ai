@@ -1803,8 +1803,8 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "{log}");
     assert!(
-        log.trim_end()
-            .ends_with(&format!("hgl-project #50 {pin_merge}")),
+        // The merged pull request's own title after the sha (hgl-ai#173).
+        log.contains(&format!("hgl-project #50 {pin_merge} ")),
         "{log}"
     );
     let main = b.state_get(state::KEY_MAIN).await.unwrap().unwrap().value;
@@ -1862,7 +1862,9 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert!(
         log.trim_end()
-            .ends_with(&format!("hgl-project #51 {pin_merge}")),
+            .lines()
+            .last()
+            .is_some_and(|l| l.contains(&format!("hgl-project #51 {pin_merge} "))),
         "{log}"
     );
     assert!(
@@ -2003,9 +2005,15 @@ impl crate::exec::Gh for Racing {
             && !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             let line = format!("20261128T000000Z hgl-project #{} {}", self.n, self.merge);
-            store::append_bounded(&self.bus, state::KEY_LANDED, &line, 100)
-                .await
-                .unwrap();
+            store::append_bounded(
+                &self.bus,
+                state::KEY_LANDED,
+                &line,
+                100,
+                state::LANDED_MAX_BYTES,
+            )
+            .await
+            .unwrap();
             crate::progress::delete(&self.bus, "hgl-project", self.n)
                 .await
                 .unwrap();
