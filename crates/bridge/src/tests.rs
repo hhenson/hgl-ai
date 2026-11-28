@@ -2351,7 +2351,13 @@ async fn a_build_note_at_an_agent_seat_is_refused() {
 /// The bot's P1 (hgl-ai PR 1): the hub stops answering (a partition), so no refresh says
 /// the lease is lost while it runs out. The seat stops, its turn and notes with it, once the
 /// lease has gone unrefreshed for half the bucket's `max_age`: before it can expire and
-/// another host take it. When the hub answers again the bridge serves the seat again.
+/// another host take it. Until the hub answers again the seat cannot be taken again; then
+/// the bridge serves it again.
+///
+/// hgl-ai#41: the bounds are measured from the last refresh the hub confirmed (the fake
+/// records it; no refresh succeeds once `refresh_down` returns), not from when the test cut
+/// the hub, and the seat's note waits for its notice, which the bridge sends after handing
+/// the notes back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
     let h = harness();
@@ -2374,28 +2380,42 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
     eventually("the turn runs", || pid.exists()).await;
     let agent = pid_in(&pid);
     h.bus.refresh_down(true);
-    let cut = std::time::Instant::now();
+    let confirmed = h
+        .bus
+        .lease_confirmed_at("seat.w1")
+        .expect("the seat lease held");
     eventually("the turn stopped", || !alive(agent)).await;
-    let took = cut.elapsed();
-    // The last confirmed refresh was at most one refresh (max_age / 6) before the cut.
+    let took = confirmed.elapsed();
     assert!(
-        took < max_age - max_age / 6,
-        "stopped after {took:?}, when the lease could have expired"
+        took < max_age,
+        "stopped {took:?} after the last refresh, when the lease could have expired"
     );
     assert!(
-        took >= max_age / 2 - max_age / 6,
-        "not before the deadline: {took:?}"
+        took >= max_age / 2,
+        "not before the deadline: {took:?} after the last refresh"
     );
     eventually("its note handed back", || {
         h.bus.events(a).first() == Some(&Ev::Nak(Duration::from_millis(50)))
     })
     .await;
-    assert_eq!(h.bus.sent_containing("was not refreshed for").len(), 1);
+    eventually("the seat told", || {
+        !h.bus.sent_containing("was not refreshed for").is_empty()
+    })
+    .await;
+    // While the hub does not answer the seat cannot be taken again: nothing more runs.
+    eventually("a take refused", || h.bus.lease_takes_refused() > 0).await;
+    assert_eq!(h.calls("codex").len(), 1, "one turn while the hub is down");
     h.bus.refresh_down(false);
     eventually("served again, the note run", || {
         h.bus.events(a).last() == Some(&Ev::Ack)
     })
     .await;
+    assert_eq!(h.calls("codex").len(), 2);
+    assert_eq!(
+        h.bus.sent_containing("was not refreshed for").len(),
+        1,
+        "told once"
+    );
     stop(tx, j).await;
 }
 

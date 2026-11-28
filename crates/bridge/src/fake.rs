@@ -46,6 +46,8 @@ struct Inner {
     seq: AtomicU64,
     /// name -> (holder, revision)
     leases: Mutex<HashMap<String, (String, u64)>>,
+    /// name -> when its holder's last write (take or refresh) was confirmed.
+    confirmed: Mutex<HashMap<String, std::time::Instant>>,
     revision: AtomicU64,
     /// `HGL_ENDED`: key -> seq
     ended: Mutex<HashMap<String, u64>>,
@@ -54,8 +56,10 @@ struct Inner {
     ended_writes_down: AtomicBool,
     /// The next inbox fetch panics.
     inbox_broken: AtomicBool,
-    /// Lease refreshes fail as if the hub did not answer.
+    /// Lease refreshes and takes fail as if the hub did not answer.
     refresh_down: AtomicBool,
+    /// Lease takes refused while `refresh_down`.
+    takes_refused: AtomicU64,
     /// Lease refreshes hang, as when the hub stalls silently.
     refresh_hangs: AtomicBool,
     /// `HGL_LOCKS` max_age in milliseconds; 0 is the protocol's.
@@ -88,6 +92,12 @@ impl FakeBus {
         g(&self.0.leases).get(name).map(|(h, _)| h.clone())
     }
 
+    /// When the last write of the lease `name` by its holder was confirmed: the lease expires
+    /// `max_age` after it unless refreshed.
+    pub fn lease_confirmed_at(&self, name: &str) -> Option<std::time::Instant> {
+        g(&self.0.confirmed).get(name).copied()
+    }
+
     /// The lease `name` goes (its holder released it, or it expired).
     pub fn drop_lease(&self, name: &str) {
         g(&self.0.leases).remove(name);
@@ -97,6 +107,33 @@ impl FakeBus {
     pub fn steal_lease(&self, name: &str, holder: &str) {
         let rev = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
         g(&self.0.leases).insert(name.into(), (holder.into(), rev));
+    }
+
+    /// Take the lease `name` when it is free, or held by `stale`; under one guard of the
+    /// leases, which `refresh_down` is set under: refused while the hub does not answer.
+    fn take_lease(&self, name: &str, holder: &str, stale: Option<&str>) -> Result<FakeLease> {
+        let mut leases = g(&self.0.leases);
+        if self.0.refresh_down.load(Ordering::SeqCst) {
+            self.0.takes_refused.fetch_add(1, Ordering::SeqCst);
+            return Err(no_responders());
+        }
+        if let Some((h, _)) = leases.get(name)
+            && Some(h.as_str()) != stale
+        {
+            return Err(BusError::Held {
+                name: name.into(),
+                holder: h.clone(),
+                since: "earlier".into(),
+            });
+        }
+        let rev = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
+        leases.insert(name.into(), (holder.into(), rev));
+        g(&self.0.confirmed).insert(name.into(), std::time::Instant::now());
+        Ok(FakeLease {
+            bus: self.clone(),
+            name: name.into(),
+            rev,
+        })
     }
 
     fn enqueue(&self, seat: Seat, seq: u64, delivered: u64, note: Note) {
@@ -187,13 +224,24 @@ impl FakeBus {
         self.0.ended_writes_down.store(writes, Ordering::SeqCst);
     }
 
-    /// Lease refreshes fail without an answer (`true`), as in a partition, or work.
+    /// Lease refreshes and takes fail without an answer (`true`), as in a partition, or
+    /// work. Set under the leases' lock, which a refresh or take checks it under: once this
+    /// returns none started before it can still succeed.
     pub fn refresh_down(&self, down: bool) {
+        let _leases = g(&self.0.leases);
         self.0.refresh_down.store(down, Ordering::SeqCst);
     }
 
-    /// Lease refreshes hang (`true`) until it is cleared, or work.
+    /// How many lease takes were refused while the hub did not answer.
+    pub fn lease_takes_refused(&self) -> u64 {
+        self.0.takes_refused.load(Ordering::SeqCst)
+    }
+
+    /// Lease refreshes hang (`true`) until it is cleared, or work. Set under the leases'
+    /// lock, which a refresh checks it under again after waiting: once this returns no
+    /// refresh that has not yet taken the lock answers.
     pub fn refresh_hangs(&self, hang: bool) {
+        let _leases = g(&self.0.leases);
         self.0.refresh_hangs.store(hang, Ordering::SeqCst);
     }
 
@@ -299,41 +347,10 @@ impl BusApi for FakeBus {
         Ok(latest.into_values().collect())
     }
     async fn lock_acquire(&self, name: &str, holder: &str) -> Result<FakeLease> {
-        let mut leases = g(&self.0.leases);
-        if let Some((h, _)) = leases.get(name) {
-            return Err(BusError::Held {
-                name: name.into(),
-                holder: h.clone(),
-                since: "earlier".into(),
-            });
-        }
-        let rev = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
-        leases.insert(name.into(), (holder.into(), rev));
-        Ok(FakeLease {
-            bus: self.clone(),
-            name: name.into(),
-            rev,
-        })
+        self.take_lease(name, holder, None)
     }
     async fn lock_take_over(&self, name: &str, holder: &str, stale: &str) -> Result<FakeLease> {
-        let held = g(&self.0.leases).get(name).map(|(h, _)| h.clone());
-        match held {
-            None => self.lock_acquire(name, holder).await,
-            Some(h) if h == stale => {
-                let rev = self.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
-                g(&self.0.leases).insert(name.into(), (holder.into(), rev));
-                Ok(FakeLease {
-                    bus: self.clone(),
-                    name: name.into(),
-                    rev,
-                })
-            }
-            Some(h) => Err(BusError::Held {
-                name: name.into(),
-                holder: h,
-                since: "earlier".into(),
-            }),
-        }
+        self.take_lease(name, holder, Some(stale))
     }
     async fn ended_get(&self, seat: &Seat, task: &TaskKey) -> Result<Option<u64>> {
         self.ended_up(&self.0.ended_reads_down)?;
@@ -348,30 +365,51 @@ impl BusApi for FakeBus {
     }
 }
 
+fn no_responders() -> BusError {
+    BusError::Nats("HGL_LOCKS: no responders".into())
+}
+
 pub struct FakeLease {
     bus: FakeBus,
     name: String,
     rev: u64,
 }
 
-impl LeaseApi for FakeLease {
-    async fn refresh(&mut self) -> Result<()> {
-        while self.bus.0.refresh_hangs.load(Ordering::SeqCst) {
-            tokio::time::sleep(Duration::from_millis(10)).await;
+impl FakeLease {
+    /// One refresh under the leases' guard; `None` when it hangs again.
+    fn refresh_once(&mut self) -> Option<Result<()>> {
+        let mut leases = g(&self.bus.0.leases);
+        if self.bus.0.refresh_hangs.load(Ordering::SeqCst) {
+            return None;
         }
         if self.bus.0.refresh_down.load(Ordering::SeqCst) {
-            return Err(BusError::Nats("HGL_LOCKS: no responders".into()));
+            return Some(Err(no_responders()));
         }
-        let mut leases = g(&self.bus.0.leases);
-        match leases.get_mut(&self.name) {
+        Some(match leases.get_mut(&self.name) {
             Some((_, rev)) if *rev == self.rev => {
                 *rev = self.bus.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
                 self.rev = *rev;
+                g(&self.bus.0.confirmed).insert(self.name.clone(), std::time::Instant::now());
                 Ok(())
             }
             _ => Err(BusError::LeaseLost {
                 name: self.name.clone(),
             }),
+        })
+    }
+}
+
+impl LeaseApi for FakeLease {
+    async fn refresh(&mut self) -> Result<()> {
+        loop {
+            // Wait without the leases' guard (it is not held across an await), then check
+            // again under it: a hang set in between holds this refresh too.
+            while self.bus.0.refresh_hangs.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if let Some(r) = self.refresh_once() {
+                return r;
+            }
         }
     }
     async fn release(self) -> Result<bool> {
