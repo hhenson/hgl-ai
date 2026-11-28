@@ -351,11 +351,7 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
                 &format!("service: {} started", service_name(sys, Service::Console)),
             );
             if let Some(ws) = nats::websocket_of(&cfg) {
-                sys.say(&format!(
-                    "console: its page reads the hub at <console url>/nats; run once (not run here):\n  \
-                     tailscale serve --bg --https=443 --set-path /nats http://127.0.0.1:{}",
-                    ws.port
-                ));
+                sys.say(&crate::system::console_page_step(ws.port));
             }
         } else {
             sys.say(
