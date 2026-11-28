@@ -169,12 +169,25 @@ impl<B: BusApi> Bridge<B> {
         // written under its registry lock: a removal since the listing has deregistered
         // it, or does after this write (hgl-ai#58).
         for t in list.iter().filter(|t| t.file.is_some()) {
-            let _reg = self.registry_lock(&t.record.key()).await;
+            let key = t.record.key();
+            let _reg = self.registry_lock(&key).await;
+            let _file_lock =
+                match crate::lock::FileLock::registry(self.trees.layout().root(), &key).await {
+                    Ok(held) => held,
+                    Err(e) => {
+                        tracing::warn!(%key, "locking registry: {e}");
+                        continue;
+                    }
+                };
             if !still_there(t) {
                 tracing::info!(key = %t.record.key(), "removed since the listing; not registered");
                 continue;
             }
-            if let Err(e) = self.bus.tree_merge(&t.record).await {
+            let Ok(f) = hgl_ai_tree::read_task(&t.dir) else {
+                continue;
+            };
+            let current = self.trees.record(&t.dir, &f, t.record.size_bytes);
+            if let Err(e) = self.bus.tree_merge(&current).await {
                 tracing::warn!(key = %t.record.key(), "registering: {e}");
             }
         }

@@ -13,8 +13,8 @@ use hgl_ai_bus::{Bus, BusError, Credential, InboxOptions, ProvisionOptions, pars
 use hgl_ai_install::nats::{Auth, render_conf};
 use hgl_ai_install::users::{Registry, Role as HubRole};
 use hgl_ai_proto::{
-    Family, HostRecord, Kind, Note, Role, Runtime, SLACK_FEED, SLACK_OWNER_FILTER, STREAM_OWNER,
-    Seat, SeatRecord, TaskKey, TreeRecord,
+    Family, HUB_API_PREFIX, HostRecord, KV_LOCKS, Kind, Note, Role, Runtime, SLACK_FEED,
+    SLACK_OWNER_FILTER, STREAM_OWNER, Seat, SeatRecord, TaskKey, TreeRecord,
 };
 
 struct Hub {
@@ -24,6 +24,7 @@ struct Hub {
     credentials: BTreeMap<HubRole, String>,
 }
 
+#[derive(Clone, Copy)]
 enum Layout {
     Token,
     Users,
@@ -141,12 +142,13 @@ impl Hub {
     }
 
     async fn as_role(&self, role: HubRole) -> Bus {
-        Bus::connect_with(
-            &self.url,
-            parse_credential(&self.credentials[&role]).unwrap(),
-        )
-        .await
-        .expect("connect")
+        self.connect_at(&self.url, role).await
+    }
+
+    async fn connect_at(&self, url: &str, role: HubRole) -> Bus {
+        Bus::connect_with(url, parse_credential(&self.credentials[&role]).unwrap())
+            .await
+            .expect("connect")
     }
 
     async fn ready(&self) -> Bus {
@@ -1732,6 +1734,307 @@ async fn owner_history_and_durable_feeds(layout: Layout) {
     );
 }
 
+/// A loopback proxy in front of the hub that holds back the hub's answer to the next
+/// publish on one subject, to stand for a slow PubAck.
+struct SlowAck {
+    url: String,
+    state: std::sync::Arc<std::sync::Mutex<SlowAckState>>,
+}
+
+#[derive(Default)]
+struct SlowAckState {
+    /// The subject whose next publish gets a late answer, and how late.
+    armed: Option<(String, Duration)>,
+    /// Reply subjects to hold back, with their delay.
+    held: Vec<(String, Duration)>,
+    /// Answers held back and then passed on.
+    late: usize,
+}
+
+impl SlowAck {
+    async fn start(hub: &str) -> SlowAck {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("nats://{}", listener.local_addr().unwrap());
+        let hub = hub.trim_start_matches("nats://").to_string();
+        let state = std::sync::Arc::<std::sync::Mutex<SlowAckState>>::default();
+        let st = state.clone();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let server = tokio::net::TcpStream::connect(&hub).await.unwrap();
+                tokio::spawn(Self::serve(client, server, st.clone()));
+            }
+        });
+        SlowAck { url, state }
+    }
+
+    /// Hold back the hub's answer to the next write to this lease.
+    fn delay_next_lease_write(&self, layout: Layout, name: &str, delay: Duration) {
+        let subject = format!("$KV.{KV_LOCKS}.{name}");
+        let subject = match layout {
+            Layout::Accounts => format!("{HUB_API_PREFIX}.{subject}"),
+            _ => subject,
+        };
+        self.state.lock().unwrap().armed = Some((subject, delay));
+    }
+
+    fn late(&self) -> usize {
+        self.state.lock().unwrap().late
+    }
+
+    async fn serve(
+        client: tokio::net::TcpStream,
+        server: tokio::net::TcpStream,
+        st: std::sync::Arc<std::sync::Mutex<SlowAckState>>,
+    ) {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let (cr, mut cw) = client.into_split();
+        let (sr, mut sw) = server.into_split();
+        let up = {
+            let st = st.clone();
+            async move {
+                let mut cr = BufReader::new(cr);
+                while let Some((frame, words)) = read_frame(&mut cr).await {
+                    if matches!(words[0].as_str(), "PUB" | "HPUB") && words.len() >= 4 {
+                        let mut s = st.lock().unwrap();
+                        if let Some((subject, delay)) = s.armed.take() {
+                            if words[1] == subject {
+                                s.held.push((words[2].clone(), delay));
+                            } else {
+                                s.armed = Some((subject, delay));
+                            }
+                        }
+                    }
+                    if sw.write_all(&frame).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let down = async move {
+            let mut sr = BufReader::new(sr);
+            while let Some((frame, words)) = read_frame(&mut sr).await {
+                let held = matches!(words[0].as_str(), "MSG" | "HMSG")
+                    .then(|| {
+                        let mut s = st.lock().unwrap();
+                        let i = s.held.iter().position(|(r, _)| *r == words[1])?;
+                        Some(s.held.remove(i).1)
+                    })
+                    .flatten();
+                match held {
+                    Some(delay) => {
+                        let (tx, st) = (tx.clone(), st.clone());
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = tx.send(frame);
+                            st.lock().unwrap().late += 1;
+                        });
+                    }
+                    None => {
+                        let _ = tx.send(frame);
+                    }
+                }
+            }
+        };
+        let write = async move {
+            while let Some(frame) = rx.recv().await {
+                if cw.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::join!(up, down, write);
+    }
+}
+
+/// One NATS protocol frame: its control line and, for a message, its payload.
+async fn read_frame(
+    r: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Option<(Vec<u8>, Vec<String>)> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut frame = Vec::new();
+    if r.read_until(b'\n', &mut frame).await.ok()? == 0 {
+        return None;
+    }
+    let words: Vec<String> = String::from_utf8_lossy(&frame)
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let op = words.first()?.to_ascii_uppercase();
+    if matches!(op.as_str(), "PUB" | "HPUB" | "MSG" | "HMSG") {
+        let len: usize = words.last()?.parse().ok()?;
+        let mut payload = vec![0; len + 2];
+        r.read_exact(&mut payload).await.ok()?;
+        frame.extend(payload);
+    }
+    let mut words = words;
+    words[0] = op;
+    Some((frame, words))
+}
+
+/// A refresh whose PubAck comes after the caller's timeout dropped it, though the hub
+/// committed the write, keeps the lease: the next refresh takes the committed revision
+/// rather than reporting it lost (hgl-ai#132).
+async fn a_refresh_whose_answer_came_late_keeps_the_lease(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
+    let direct = hub.ready().await;
+    let proxy = SlowAck::start(&hub.url).await;
+    let bus = hub.connect_at(&proxy.url, HubRole::Seat).await;
+    let name = "builder.slow-ack";
+    let mut lease = bus.lock_acquire(name, "builder-1 pid 1").await.unwrap();
+    let kv = hub.raw().await.get_key_value("HGL_LOCKS").await.unwrap();
+    let on_hub = async || kv.entry(name).await.unwrap().unwrap().revision;
+
+    // The caller gives up on the refresh; the hub commits it and answers late.
+    let before = lease.revision();
+    proxy.delay_next_lease_write(layout, name, Duration::from_millis(1500));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), lease.refresh())
+            .await
+            .is_err(),
+        "the refresh was answered in time"
+    );
+    within(10, "the late answer is passed on", async || {
+        proxy.late() == 1
+    })
+    .await;
+    assert_eq!(
+        on_hub().await,
+        before + 1,
+        "the dropped refresh was committed"
+    );
+    assert_eq!(lease.revision(), before);
+
+    // The next refresh keeps it, at the hub's revision.
+    lease
+        .refresh()
+        .await
+        .expect("a late answer is not a lost lease");
+    assert_eq!(lease.revision(), on_hub().await);
+    assert_eq!(lease.revision(), before + 2);
+    lease.refresh().await.unwrap();
+    assert_eq!(lease.revision(), before + 3);
+    assert!(matches!(
+        direct.lock_acquire(name, "builder-2 pid 2").await,
+        Err(BusError::Held { holder, .. }) if holder == "builder-1 pid 1"
+    ));
+
+    // A lease another holder wrote over is still lost.
+    let other = direct
+        .lock_take_over(name, "builder-2 pid 2", "builder-1 pid 1")
+        .await
+        .unwrap();
+    assert!(matches!(
+        lease.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+    assert!(!lease.release().await.unwrap());
+    assert!(other.release().await.unwrap());
+}
+
+/// A release whose lease was moved on by a refresh the caller dropped (the hub committed
+/// it; its answer came late) still deletes the lease, rather than leaving it to expire
+/// after `max_age` (hgl-ai#134).
+async fn a_release_after_a_refresh_whose_answer_came_late_deletes_the_lease(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
+    let direct = hub.ready().await;
+    let proxy = SlowAck::start(&hub.url).await;
+    let bus = hub.connect_at(&proxy.url, HubRole::Seat).await;
+    let name = "seat.slow-release";
+    let mut lease = bus.lock_acquire(name, "bridge-1 pid 1").await.unwrap();
+    let before = lease.revision();
+    proxy.delay_next_lease_write(layout, name, Duration::from_millis(1500));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), lease.refresh())
+            .await
+            .is_err(),
+        "the refresh was answered in time"
+    );
+    within(10, "the late answer is passed on", async || {
+        proxy.late() == 1
+    })
+    .await;
+    let kv = hub.raw().await.get_key_value("HGL_LOCKS").await.unwrap();
+    assert_eq!(
+        kv.entry(name).await.unwrap().unwrap().revision,
+        before + 1,
+        "the dropped refresh was committed"
+    );
+    assert_eq!(lease.revision(), before);
+
+    assert!(lease.release().await.unwrap(), "released, not leaked");
+    assert_eq!(direct.lock_get(name).await.unwrap(), None);
+    let next = direct.lock_acquire(name, "bridge-2 pid 2").await.unwrap();
+
+    // A lease another holder wrote over is not deleted by the old holder's release.
+    let taker = direct
+        .lock_take_over(name, "bridge-3 pid 3", "bridge-2 pid 2")
+        .await
+        .unwrap();
+    assert!(!next.release().await.unwrap());
+    assert_eq!(
+        direct.lock_get(name).await.unwrap().as_ref(),
+        Some(taker.record())
+    );
+    assert!(taker.release().await.unwrap());
+}
+
+/// Each acquisition has its own token, so a lease never mistakes another for its own: not
+/// one taken over by the same holder, nor one with the same holder and `acquired_at` (an
+/// expired lease re-acquired in the same second). Before the token the two ping-ponged,
+/// each refresh adopting the other's write (hgl-ai#134).
+async fn a_lease_with_the_same_holder_and_second_is_not_ours(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
+    let bus = hub.ready().await;
+    let name = "builder.same-second";
+    let mut old = bus.lock_acquire(name, "builder-1 pid 1").await.unwrap();
+    assert_eq!(old.record().token.len(), 32);
+
+    // The same holder takes it over (a restart that found its own lease).
+    let mut new = bus
+        .lock_take_over(name, "builder-1 pid 1", "builder-1 pid 1")
+        .await
+        .unwrap();
+    assert_eq!(new.record().holder, old.record().holder);
+    assert_ne!(new.record().token, old.record().token);
+    assert!(matches!(
+        old.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+    new.refresh().await.unwrap();
+    assert!(matches!(
+        old.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+
+    // The same holder and second, another token: what a re-acquire of an expired lease
+    // in the same second writes. Written directly, so the second is the same for sure.
+    let kv = hub.raw().await.get_key_value("HGL_LOCKS").await.unwrap();
+    let twin = hgl_ai_proto::LockRecord {
+        token: "0".repeat(32),
+        ..new.record().clone()
+    };
+    let at = kv
+        .put(name, serde_json::to_vec(&twin).unwrap().into())
+        .await
+        .unwrap();
+    assert!(matches!(
+        new.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+    assert!(!new.release().await.unwrap());
+    assert!(!old.release().await.unwrap());
+    let entry = kv.entry(name).await.unwrap().unwrap();
+    assert_eq!(entry.revision, at, "neither old lease wrote over it");
+    assert_eq!(bus.lock_get(name).await.unwrap(), Some(twin));
+}
+
 live_cases! { shared_token: Token, single_account: Users, role_accounts: Accounts; {
     provision_is_idempotent_and_corrects_settings,
     send_fetch_ack,
@@ -1757,6 +2060,9 @@ live_cases! { shared_token: Token, single_account: Users, role_accounts: Account
     a_released_lease_can_be_taken_again,
     ended_tasks_are_shared_and_a_later_end_stands,
     a_refreshed_lease_outlives_max_age_and_an_abandoned_one_expires,
+    a_refresh_whose_answer_came_late_keeps_the_lease,
+    a_release_after_a_refresh_whose_answer_came_late_deletes_the_lease,
+    a_lease_with_the_same_holder_and_second_is_not_ours,
     peeks_spend_no_delivery_and_naks_never_drop,
     pages_go_on_past_a_malformed_message,
     usage_keeps_the_newest_observation,

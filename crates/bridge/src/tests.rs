@@ -621,6 +621,128 @@ async fn a_report_writing_a_tree_as_cleanup_removes_it_leaves_no_record() {
     stop(tx, j).await;
 }
 
+/// A separate CLI removal waits for a report already inside its registry write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_removal_waits_for_report_before_deregistering() {
+    use hgl_ai_tree::Registry;
+
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+
+    let key = "build-1.w1.demo-41";
+    h.bus.hold_tree_merges();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("report holds its write", || h.bus.tree_merges_held() == 1).await;
+    let mut cli_cfg = h.cfg.clone();
+    cli_cfg.paths.data_dir = h.root.join("other-data").display().to_string();
+    assert_ne!(cli_cfg.data_dir().unwrap(), h.cfg.data_dir().unwrap());
+    let cli_trees = Trees::new(&cli_cfg, h.git.clone()).unwrap();
+    let root = cli_trees.layout().root().to_path_buf();
+    let mut cli = tokio::spawn(async move { FileLock::registry(&root, key).await.unwrap() });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut cli)
+            .await
+            .is_err()
+    );
+    h.bus.release_tree_merges();
+    let held = tokio::time::timeout(Duration::from_secs(5), cli)
+        .await
+        .unwrap()
+        .unwrap();
+    let task = TaskKey {
+        repo: "demo".into(),
+        issue: 41,
+    };
+    cli_trees
+        .remove(&seat("w1"), &task, false)
+        .unwrap()
+        .unwrap();
+    h.bus.tree_del(key).await.unwrap();
+    drop(held);
+    assert!(!h.bus.trees().contains_key(key));
+    stop(tx, j).await;
+}
+
+/// A CLI holding the second tree's file lock removes it after the report lists it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn report_checks_tree_after_taking_registry_file_lock() {
+    use hgl_ai_tree::Registry;
+
+    let h = harness();
+    let trees = Trees::new(&h.cfg, h.git.clone()).unwrap();
+    for issue in [41, 42] {
+        let task = TaskKey {
+            repo: "demo".into(),
+            issue,
+        };
+        trees
+            .create(
+                &seat("w1"),
+                &task,
+                &hgl_ai_tree::Create::Implement {
+                    title: format!("Task {issue}"),
+                    base: None,
+                },
+            )
+            .unwrap();
+    }
+    let key = "build-1.w1.demo-42";
+    let listed = trees.list().unwrap();
+    let second = listed.iter().find(|t| t.record.key() == key).unwrap();
+    h.bus.tree_merge(&second.record).await.unwrap();
+    assert!(h.bus.trees().contains_key(key));
+    let held = FileLock::registry(trees.layout().root(), key)
+        .await
+        .unwrap();
+    let deps = Deps {
+        closed: Arc::new(|_: &str, _: u64, _: bool| None),
+        title: h.title.clone(),
+        disk: h.disk.clone(),
+    };
+    let bridge = Arc::new(Bridge::new(
+        h.cfg.clone(),
+        h.bus.clone(),
+        trees,
+        deps,
+        h.opts.clone(),
+    ));
+    let reporting = {
+        let bridge = bridge.clone();
+        tokio::spawn(async move { bridge.report().await })
+    };
+    eventually("report waits on the second tree's file lock", || {
+        crate::lock(&bridge.registry)
+            .get(key)
+            .is_some_and(|m| m.try_lock().is_err())
+    })
+    .await;
+    let task = TaskKey {
+        repo: "demo".into(),
+        issue: 42,
+    };
+    let trees = Trees::new(&h.cfg, h.git.clone()).unwrap();
+    trees.remove(&seat("w1"), &task, false).unwrap().unwrap();
+    h.bus.tree_del(key).await.unwrap();
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), reporting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(h.bus.trees().contains_key("build-1.w1.demo-41"));
+    assert!(
+        !h.bus.trees().contains_key(key),
+        "report recreated the removed tree's record"
+    );
+}
+
 /// hgl-ai#58: the report lists two trees; while it writes the first, `closed` removes the
 /// second. The report, checking before each write, does not register the second again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1063,6 +1185,21 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
         &format!("cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")),
     );
     h.script("agy", &format!("cat '{}'", fixture("agy-ok.jsonl")));
+    // The refused family remains eligible to review the fallback's work.
+    h.bus.put_host(hgl_ai_proto::HostRecord {
+        host: "build-2".into(),
+        seats: vec![hgl_ai_proto::SeatRecord {
+            seat: seat("r9"),
+            role: Role::Reviewer,
+            runtime: Runtime::Codex,
+            family: Family::Gpt,
+            model: "gpt-6.2-astra".into(),
+        }],
+        memcap_gb: 64,
+        work_root_free_gb: 500,
+        updated_at: hgl_ai_proto::utc_now_stamp(),
+        accounts_capable: false,
+    });
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1070,6 +1207,12 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
     );
     // Held, not naked: the refusal spends no delivery (PROTO-8).
     eventually("acked once moved", || h.bus.events(a) == [Ev::Ack]).await;
+    let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-3")).unwrap();
+    assert_eq!(tf.families, [Family::Claude]);
+    assert_eq!(
+        h.bus.trees()["build-1.w1.demo-3"].families,
+        [Family::Claude]
+    );
     let moved = h
         .bus
         .sent_containing("moved from codex gpt/gpt-6.2-astra to agy claude/claude-opus-5-5");
@@ -1112,6 +1255,9 @@ async fn a_crash_naks_without_failover() {
     .await;
     assert!(h.bus.sent_containing("Failover").is_empty());
     assert!(h.calls("agy").is_empty());
+    let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-4")).unwrap();
+    assert_eq!(tf.families, [Family::Gpt]);
+    assert_eq!(h.bus.trees()["build-1.w1.demo-4"].families, [Family::Gpt]);
     stop(tx, j).await;
 }
 
@@ -1413,7 +1559,13 @@ async fn the_lease_of_a_crashed_bridge_of_this_host_is_taken_over() {
 async fn a_lost_seat_lease_stops_the_seat() {
     let h = harness();
     let pid = h.calls.join("pid");
-    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    h.script(
+        "codex",
+        &format!(
+            "echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60",
+            p = pid.display()
+        ),
+    );
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1701,7 +1853,13 @@ async fn landed_without_a_tree_is_acked_silently() {
 async fn shutdown_stops_a_running_turn_after_the_grace_and_naks() {
     let h = harness();
     let pid = h.calls.join("pid");
-    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    h.script(
+        "codex",
+        &format!(
+            "echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60",
+            p = pid.display()
+        ),
+    );
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1726,7 +1884,13 @@ async fn shutdown_stops_a_running_turn_after_the_grace_and_naks() {
 async fn a_failed_inbox_fetcher_stops_the_running_turn() {
     let h = harness();
     let pid = h.calls.join("pid");
-    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    h.script(
+        "codex",
+        &format!(
+            "echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60",
+            p = pid.display()
+        ),
+    );
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1984,7 +2148,7 @@ fn held_after_the_first(h: &H) -> (PathBuf, PathBuf) {
     h.script(
         "codex",
         &format!(
-            "if [ \"$n\" -ge 2 ]; then echo $$ > '{p}'; while [ ! -e '{g}' ]; do sleep 0.05; done; fi\ncat '{f}'",
+            "if [ \"$n\" -ge 2 ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; while [ ! -e '{g}' ]; do sleep 0.05; done; fi\ncat '{f}'",
             p = pid.display(),
             g = gate.display(),
             f = fixture("codex-ok.jsonl")
@@ -2075,7 +2239,7 @@ async fn a_late_end_hands_back_the_newer_notes_of_the_turn_it_stops() {
     h.script(
         "codex",
         &format!(
-            "if [ \"$n\" -eq 2 ]; then echo $$ > '{p}'; sleep 60; fi\ncat '{f}'",
+            "if [ \"$n\" -eq 2 ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60; fi\ncat '{f}'",
             p = pid.display(),
             f = fixture("codex-ok.jsonl")
         ),
@@ -2286,9 +2450,9 @@ async fn a_failed_over_seat_returns_to_its_primary_after_the_cool_down() {
     );
     // Both families worked on the task: its authors (ROLE-11).
     let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-7")).unwrap();
-    assert_eq!(tf.families, [Family::Gpt, Family::Claude]);
+    assert_eq!(tf.families, [Family::Claude, Family::Gpt]);
     let rec = h.bus.trees()["build-1.w1.demo-7"].clone();
-    assert_eq!(rec.families, [Family::Gpt, Family::Claude]);
+    assert_eq!(rec.families, [Family::Claude, Family::Gpt]);
     stop(tx, j).await;
 }
 
@@ -2481,10 +2645,11 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
     let max_age = Duration::from_secs(3);
     h.bus.set_lease_max_age(max_age);
     let pid = h.calls.join("pid");
+    // Publish the pid only after it is complete: redirection creates an empty file first.
     h.script(
         "codex",
         &format!(
-            "if [ \"$n\" -eq 1 ]; then echo $$ > '{p}'; sleep 60; fi\ncat '{f}'",
+            "if [ \"$n\" -eq 1 ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60; fi\ncat '{f}'",
             p = pid.display(),
             f = fixture("codex-ok.jsonl")
         ),
@@ -2743,5 +2908,190 @@ async fn replacement_review_waits_for_disk_before_removing_old_tree() {
     eventually("replacement runs", || h.bus.events(second) == [Ev::Ack]).await;
     assert_eq!(h.calls("claude").len(), 2);
     assert!(!marker.exists());
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refusal_after_tool_activity_keeps_the_author() {
+    let h = harness();
+    h.script("codex", &format!("echo '{{\"type\":\"item.started\",\"item\":{{\"type\":\"command_execution\"}}}}'; cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")));
+    h.script("agy", &format!("cat '{}'", fixture("agy-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let seq = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 982, "[claude] Assign: demo#982"),
+    );
+    eventually("fallback completed", || h.bus.events(seq) == [Ev::Ack]).await;
+    let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-982")).unwrap();
+    assert!(f.families.contains(&Family::Gpt));
+    assert!(f.families.contains(&Family::Claude));
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rollback_publication_failure_holds_notes_and_author() {
+    let mut h = harness();
+    h.opts.prep_retry = Duration::from_secs(60);
+    let flag = h.root.join("release");
+    h.script(
+        "codex",
+        &format!(
+            "while [ ! -e '{}' ]; do sleep 0.05; done; cat '{}'; exit 1",
+            flag.display(),
+            fixture("codex-quota.synthetic.jsonl")
+        ),
+    );
+    let (tx, j) = h.start(&["w1"]);
+    let seq = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 983, "[claude] Assign: demo#983"),
+    );
+    eventually("started", || !h.calls("codex").is_empty()).await;
+    h.bus.set_tree_put_down(true);
+    std::fs::write(flag, "").unwrap();
+    eventually("rollback failed", || {
+        !h.bus
+            .sent_containing("registering the family rollback")
+            .is_empty()
+    })
+    .await;
+    assert!(h.bus.events(seq).is_empty());
+    assert!(h.calls("agy").is_empty());
+    assert!(
+        hgl_ai_tree::read_task(&h.work().join("w1/demo-983"))
+            .unwrap()
+            .families
+            .contains(&Family::Gpt)
+    );
+    assert!(
+        h.bus.trees()["build-1.w1.demo-983"]
+            .families
+            .contains(&Family::Gpt)
+    );
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn same_family_fallback_after_refusal_still_checks_reviewers() {
+    let mut h = harness();
+    h.opts.quota_retry = Duration::from_secs(3600);
+    h.cfg.seats[0].fallback[0].family = Some(Family::Gpt);
+    h.script(
+        "codex",
+        &format!("cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")),
+    );
+    h.bus.put_host(hgl_ai_proto::HostRecord {
+        host: "build-2".into(),
+        seats: vec![hgl_ai_proto::SeatRecord {
+            seat: seat("r9"),
+            role: Role::Reviewer,
+            runtime: Runtime::Codex,
+            family: Family::Gpt,
+            model: "test".into(),
+        }],
+        memcap_gb: 64,
+        work_root_free_gb: 500,
+        updated_at: hgl_ai_proto::utc_now_stamp(),
+        accounts_capable: false,
+    });
+    let (tx, j) = h.start(&["w1"]);
+    let seq = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 984, "[claude] Assign: demo#984"),
+    );
+    eventually("fallback blocked", || {
+        !h.bus.sent_containing("has no fallback left").is_empty()
+    })
+    .await;
+    assert!(h.bus.events(seq).is_empty());
+    assert!(
+        hgl_ai_tree::read_task(&h.work().join("w1/demo-984"))
+            .unwrap()
+            .families
+            .is_empty()
+    );
+    assert!(h.bus.trees()["build-1.w1.demo-984"].families.is_empty());
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recorded_authors_are_checked_for_failover() {
+    let mut h = harness();
+    h.opts.quota_retry = Duration::from_secs(3600);
+    h.script(
+        "codex",
+        &format!(
+            "if [ \"$n\" = 1 ]; then cat '{}'; else cat '{}'; exit 1; fi",
+            fixture("codex-ok.jsonl"),
+            fixture("codex-quota.synthetic.jsonl")
+        ),
+    );
+    h.bus.put_host(hgl_ai_proto::HostRecord {
+        host: "build-2".into(),
+        seats: vec![
+            hgl_ai_proto::SeatRecord {
+                seat: seat("r8"),
+                role: Role::Reviewer,
+                runtime: Runtime::Codex,
+                family: Family::Gpt,
+                model: "test".into(),
+            },
+            hgl_ai_proto::SeatRecord {
+                seat: seat("r9"),
+                role: Role::Reviewer,
+                runtime: Runtime::Claude,
+                family: Family::Claude,
+                model: "test".into(),
+            },
+        ],
+        memcap_gb: 64,
+        work_root_free_gb: 500,
+        updated_at: hgl_ai_proto::utc_now_stamp(),
+        accounts_capable: false,
+    });
+    let (tx, j) = h.start(&["w1"]);
+    let seq = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 985, "[claude] Assign: demo#985"),
+    );
+    eventually("first turn", || h.bus.events(seq) == [Ev::Ack]).await;
+    let next = h.bus.push(
+        "w1",
+        note(Kind::Question, "w1", 985, "[claude] Question: continue"),
+    );
+    eventually("fallback blocked", || {
+        !h.bus.sent_containing("has no fallback left").is_empty()
+    })
+    .await;
+    assert!(h.bus.events(next).is_empty());
+    assert!(h.calls("agy").is_empty());
+    assert_eq!(
+        hgl_ai_tree::read_task(&h.work().join("w1/demo-985"))
+            .unwrap()
+            .families,
+        [Family::Gpt]
+    );
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn refusal_after_checkout_change_keeps_the_author() {
+    let h = harness();
+    h.script(
+        "codex",
+        &format!(
+            "echo changed > work.txt; cat '{}'; exit 1",
+            fixture("codex-quota.synthetic.jsonl")
+        ),
+    );
+    h.script("agy", &format!("cat '{}'", fixture("agy-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let seq = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 986, "[claude] Assign: demo#986"),
+    );
+    eventually("fallback completed", || h.bus.events(seq) == [Ev::Ack]).await;
+    let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-986")).unwrap();
+    assert!(f.families.contains(&Family::Gpt));
     stop(tx, j).await;
 }
