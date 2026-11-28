@@ -443,6 +443,17 @@ impl Conn {
         )
     }
 
+    /// A direct connection, without a control socket or runtime-directory lookup.
+    pub fn direct(
+        label: &str,
+        alias: &str,
+        program: PathBuf,
+        dir: &Path,
+        dialect: Dialect,
+    ) -> std::io::Result<Arc<Conn>> {
+        Self::make(label, alias, program, dir, dialect, false, None)
+    }
+
     fn lock(&self) -> std::sync::MutexGuard<'_, ConnState> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
@@ -1378,7 +1389,7 @@ mod tests {
         std::fs::create_dir(&runtime).unwrap();
         for name in ["one", "two"] {
             let dir = tmp.path().join(name);
-            let conn = Conn::new("r", "host", "ssh".into(), &dir, Dialect::Posix).unwrap();
+            let conn = Conn::direct("r", "host", "ssh".into(), &dir, Dialect::Posix).unwrap();
             let mut conn = Arc::into_inner(conn).unwrap_or_else(|| panic!("unexpected sharing"));
             conn.socket = runtime.join("fallback.sock");
             let ex = Ssh::new(
@@ -1438,14 +1449,21 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn long_control_socket_uses_private_runtime_and_is_stable() {
         let tmp = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let runtime = Path::new("/proc/self/cwd").join(short::relative(tmp.path()));
+        let runtime = tmp.path().canonicalize().unwrap();
         let dir = tmp.path().join("d".repeat(120));
         std::fs::create_dir(&dir).unwrap();
+        if fallback_socket(&runtime.join("hgl-ai"), &dir, "remote")
+            .as_os_str()
+            .len()
+            > socket_limit()
+        {
+            assert!(control_socket(&dir, "remote", Some(&runtime)).is_err());
+            return;
+        }
         let first = control_socket(&dir, "remote", Some(&runtime)).unwrap();
         assert!(first.as_os_str().len() <= socket_limit());
         assert_eq!(
@@ -1469,14 +1487,27 @@ mod tests {
         let state = tmp.path().join("remote");
         std::fs::create_dir_all(&state).unwrap();
         let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ssh");
-        let conn = Conn::new(
-            "r1",
-            state.to_str().unwrap(),
-            fake,
-            &socket_path.join("ssh"),
-            Dialect::Posix,
-        )
+        let conn = if short::fits(&socket_path, "r1") {
+            Conn::new(
+                "r1",
+                state.to_str().unwrap(),
+                fake,
+                &socket_path,
+                Dialect::Posix,
+            )
+        } else {
+            Conn::direct(
+                "r1",
+                state.to_str().unwrap(),
+                fake,
+                &socket_path,
+                Dialect::Posix,
+            )
+        }
         .unwrap();
+        if !short::fits(&socket_path, "r1") {
+            assert!(conn.opts().iter().any(|o| o == "ControlPath=none"));
+        }
         conn.connect().unwrap();
         let ex = Ssh::new(
             Platform::Linux,

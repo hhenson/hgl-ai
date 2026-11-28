@@ -214,7 +214,7 @@ impl Rig {
         let (socket_tmp, socket_path) = short::tempdir();
         let mut cfg = hgl_ai_config::Config::new("lab1");
         cfg.paths.work_root = root.join("work").display().to_string();
-        cfg.paths.data_dir = socket_path.join("data").display().to_string();
+        cfg.paths.data_dir = root.join("data").display().to_string();
         cfg.builder.toolchains = vec!["git".into()];
         if o.remote {
             let state = root.join("winbox");
@@ -231,7 +231,17 @@ impl Rig {
         if let Some(f) = &o.before {
             f(&bus, &n.2, &n.3).await;
         }
-        let lanes = service::lanes(&cfg, fake_ssh()).unwrap();
+        let lanes = service::lanes_with(&cfg, fake_ssh(), |label, alias, program, _, dialect| {
+            use hgl_ai_build::exec::ssh::Conn;
+            if short::fits(&socket_path, label) {
+                Conn::new(label, alias, program, &socket_path, dialect)
+            } else {
+                let conn = Conn::direct(label, alias, program, &socket_path, dialect)?;
+                assert!(conn.opts().iter().any(|o| o == "ControlPath=none"));
+                Ok(conn)
+            }
+        })
+        .unwrap();
         let origin = bare.display().to_string();
         let settings = Settings {
             clone_url: Arc::new(move |_| origin.clone()),
