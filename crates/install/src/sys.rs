@@ -12,7 +12,29 @@ use std::time::{Duration, Instant};
 
 use crate::env::Env;
 
-/// A command line with optional environment, directory and time limit.
+/// What a command reads on its standard input.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub enum Input {
+    /// Nothing: `/dev/null`.
+    #[default]
+    Null,
+    /// This process's own, the terminal: for a step that may prompt (sudo's password).
+    Terminal,
+    /// These bytes, then end of file. A secret: never shown, not even by `Debug`.
+    Secret(Vec<u8>),
+}
+
+impl fmt::Debug for Input {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Input::Null => f.write_str("Null"),
+            Input::Terminal => f.write_str("Terminal"),
+            Input::Secret(b) => write!(f, "Secret(<{} bytes>)", b.len()),
+        }
+    }
+}
+
+/// A command line with optional environment, directory, input and time limit.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Cmd {
     pub program: String,
@@ -20,6 +42,7 @@ pub struct Cmd {
     pub env: Vec<(String, String)>,
     pub cwd: Option<PathBuf>,
     pub timeout: Option<Duration>,
+    pub input: Input,
 }
 
 impl Cmd {
@@ -30,6 +53,7 @@ impl Cmd {
             env: Vec::new(),
             cwd: None,
             timeout: None,
+            input: Input::Null,
         }
     }
     pub fn arg(mut self, a: impl Into<String>) -> Self {
@@ -54,6 +78,16 @@ impl Cmd {
     }
     pub fn timeout(mut self, t: Duration) -> Self {
         self.timeout = Some(t);
+        self
+    }
+    /// Read this process's terminal (see [`Input::Terminal`]).
+    pub fn terminal(mut self) -> Self {
+        self.input = Input::Terminal;
+        self
+    }
+    /// Read `secret`, then end of file.
+    pub fn secret(mut self, secret: impl Into<Vec<u8>>) -> Self {
+        self.input = Input::Secret(secret.into());
         self
     }
     /// Program and arguments.
@@ -179,6 +213,11 @@ pub trait System {
     fn confirm(&self, _question: &str) -> bool {
         false
     }
+    /// Ask the person at the terminal for a secret, read without echo; `None` without
+    /// a terminal. An empty answer is `Some("")`.
+    fn read_secret(&self, _prompt: &str) -> io::Result<Option<String>> {
+        Ok(None)
+    }
     /// Whether this process may read `p` (a probe; nothing is read).
     fn can_read(&self, p: &Path) -> bool {
         std::fs::File::open(p).is_ok()
@@ -276,6 +315,9 @@ impl System for RealSystem {
         let _ = std::io::stdin().lock().read_line(&mut line);
         matches!(line.trim(), "y" | "Y" | "yes")
     }
+    fn read_secret(&self, prompt: &str) -> io::Result<Option<String>> {
+        tty::read_secret(prompt)
+    }
 }
 
 /// Reports changes instead of making them; reads and queries go to `inner`.
@@ -352,6 +394,10 @@ impl System for DryRun<'_> {
     fn confirm(&self, question: &str) -> bool {
         self.say(&format!("would ask: {question}"));
         true
+    }
+    fn read_secret(&self, prompt: &str) -> io::Result<Option<String>> {
+        self.say(&format!("would ask: {prompt}"));
+        Ok(None)
     }
     fn can_read(&self, p: &Path) -> bool {
         self.inner.can_read(p)
@@ -457,7 +503,11 @@ pub(crate) fn write_atomic(p: &Path, data: &[u8], mode: u32) -> io::Result<()> {
 fn exec(cmd: &Cmd) -> io::Result<Output> {
     let mut c = std::process::Command::new(&cmd.program);
     c.args(&cmd.args)
-        .stdin(Stdio::null())
+        .stdin(match cmd.input {
+            Input::Null => Stdio::null(),
+            Input::Terminal => Stdio::inherit(),
+            Input::Secret(_) => Stdio::piped(),
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in &cmd.env {
@@ -467,13 +517,21 @@ fn exec(cmd: &Cmd) -> io::Result<Output> {
         c.current_dir(d);
     }
     // A command with a time limit gets its own process group, so the limit
-    // stops everything it started.
+    // stops everything it started. Not one that reads the terminal: a background
+    // group cannot.
     #[cfg(unix)]
-    if cmd.timeout.is_some() {
+    if cmd.timeout.is_some() && cmd.input != Input::Terminal {
         use std::os::unix::process::CommandExt as _;
         c.process_group(0);
     }
     let mut child = c.spawn()?;
+    if let (Input::Secret(bytes), Some(mut stdin)) = (&cmd.input, child.stdin.take()) {
+        let bytes = bytes.clone();
+        // A command that exits without reading it all closes the pipe: not an error here.
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&bytes);
+        });
+    }
     let reader = |r: Option<Box<dyn io::Read + Send>>| {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -532,6 +590,101 @@ fn exec(cmd: &Cmd) -> io::Result<Output> {
     })
 }
 
+/// The terminal itself, `/dev/tty`: this process's, never one under `sudo`.
+#[cfg(unix)]
+mod tty {
+    use std::io::{self, BufRead as _, Write as _};
+    use std::mem::MaybeUninit;
+    use std::os::fd::AsRawFd as _;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// The terminal whose settings [`SAVED`] holds, while echo is off; else -1.
+    static TTY: AtomicI32 = AtomicI32::new(-1);
+    static mut SAVED: MaybeUninit<libc::termios> = MaybeUninit::uninit();
+    const SIGNALS: [libc::c_int; 4] = [libc::SIGINT, libc::SIGTERM, libc::SIGHUP, libc::SIGQUIT];
+
+    /// A signal at the prompt: echo back on, then die of it as before.
+    extern "C" fn restore_and_reraise(sig: libc::c_int) {
+        let fd = TTY.swap(-1, Ordering::SeqCst);
+        // SAFETY: async-signal-safe calls only; `SAVED` was written before `TTY` was set.
+        unsafe {
+            if fd >= 0 {
+                libc::tcsetattr(fd, libc::TCSANOW, (&raw const SAVED).cast());
+            }
+            libc::signal(sig, libc::SIG_DFL);
+            libc::raise(sig);
+        }
+    }
+
+    /// Prompt on the terminal and read one line without echo. `None` without a
+    /// terminal. Echo comes back on however the read ends, a signal included.
+    pub fn read_secret(prompt: &str) -> io::Result<Option<String>> {
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/tty")
+        else {
+            return Ok(None);
+        };
+        let fd = file.as_raw_fd();
+        let mut saved = MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: `fd` is open; tcgetattr fills `saved` on success.
+        if unsafe { libc::tcgetattr(fd, saved.as_mut_ptr()) } != 0 {
+            return Ok(None);
+        }
+        // SAFETY: initialised by tcgetattr above.
+        let saved = unsafe { saved.assume_init() };
+        let mut quiet = saved;
+        quiet.c_lflag &= !(libc::ECHO | libc::ECHOE | libc::ECHOK);
+        quiet.c_lflag |= libc::ECHONL;
+        let mut old: [MaybeUninit<libc::sigaction>; SIGNALS.len()] =
+            [const { MaybeUninit::uninit() }; SIGNALS.len()];
+        // SAFETY: one prompt at a time (the installer is single-threaded here); the
+        // handler reads `SAVED` only once `TTY` is set, after this write.
+        unsafe {
+            (&raw mut SAVED).write(MaybeUninit::new(saved));
+            TTY.store(fd, Ordering::SeqCst);
+            let mut act: libc::sigaction = std::mem::zeroed();
+            act.sa_sigaction = restore_and_reraise as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut act.sa_mask);
+            for (sig, o) in SIGNALS.iter().zip(old.iter_mut()) {
+                libc::sigaction(*sig, &act, o.as_mut_ptr());
+            }
+        }
+        let read = (|| {
+            // Echo off before the prompt shows: what is typed after it is never shown.
+            // SAFETY: `fd` is open and `quiet` a valid copy of its settings.
+            if unsafe { libc::tcsetattr(fd, libc::TCSAFLUSH, &quiet) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let mut w = &file;
+            w.write_all(prompt.as_bytes())?;
+            w.flush()?;
+            let mut line = String::new();
+            io::BufReader::new(&file).read_line(&mut line)?;
+            Ok(line)
+        })();
+        // SAFETY: restores what was saved; the old handlers were filled by sigaction.
+        unsafe {
+            if TTY.swap(-1, Ordering::SeqCst) >= 0 {
+                libc::tcsetattr(fd, libc::TCSANOW, &saved);
+            }
+            for (sig, o) in SIGNALS.iter().zip(old.iter()) {
+                libc::sigaction(*sig, o.as_ptr(), std::ptr::null_mut());
+            }
+        }
+        let line = read?;
+        Ok(Some(line.trim_end_matches(['\n', '\r']).to_string()))
+    }
+}
+
+#[cfg(not(unix))]
+mod tty {
+    pub fn read_secret(_prompt: &str) -> std::io::Result<Option<String>> {
+        Ok(None)
+    }
+}
+
 /// A test system: real files, but only under a temporary root; commands are
 /// recorded and answered by a closure.
 #[cfg(test)]
@@ -570,6 +723,8 @@ pub(crate) mod fake {
         pub confirms: std::cell::Cell<bool>,
         /// Paths outside the fake's root this process may read.
         pub readable: RefCell<std::collections::BTreeSet<PathBuf>>,
+        /// The answers to `read_secret`, in order; none left is no terminal.
+        pub secrets: RefCell<std::collections::VecDeque<String>>,
     }
 
     impl Fake {
@@ -587,6 +742,7 @@ pub(crate) mod fake {
                 ports_open: std::cell::Cell::new(true),
                 confirms: std::cell::Cell::new(true),
                 readable: RefCell::new(std::collections::BTreeSet::new()),
+                secrets: RefCell::new(std::collections::VecDeque::new()),
             }
         }
         pub fn tool(&self, name: &str) -> PathBuf {
@@ -688,6 +844,10 @@ pub(crate) mod fake {
             self.say(&format!("ask: {question}"));
             self.confirms.get()
         }
+        fn read_secret(&self, prompt: &str) -> io::Result<Option<String>> {
+            self.say(&format!("secret: {prompt}"));
+            Ok(self.secrets.borrow_mut().pop_front())
+        }
         fn can_read(&self, p: &Path) -> bool {
             if p.starts_with(&self.root) {
                 std::fs::File::open(p).is_ok()
@@ -774,6 +934,29 @@ mod tests {
             t.elapsed() < Duration::from_secs(5),
             "the group was killed, not waited for"
         );
+    }
+
+    /// A command reads nothing, this process's input, or a secret it is handed.
+    #[cfg(unix)]
+    #[test]
+    fn exec_input() {
+        let cat = Cmd::new("cat");
+        assert_eq!(exec(&cat).unwrap().stdout, "");
+        let o = exec(&cat.clone().secret("s3cret\n")).unwrap();
+        assert_eq!((o.code, o.stdout.as_str()), (Some(0), "s3cret\n"));
+        let c = cat.clone().secret("s3cret");
+        assert!(!format!("{c:?} {c}").contains("s3cret"), "{c:?}");
+        // A command that does not read it still ends.
+        let o = exec(&Cmd::new("true").secret(vec![b'x'; 1 << 20])).unwrap();
+        assert!(o.ok());
+        let o = exec(
+            &Cmd::new("sh")
+                .args(["-c", "[ -t 0 ] || echo no"])
+                .terminal(),
+        )
+        .unwrap();
+        let tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
+        assert_eq!(o.stdout, if tty { "" } else { "no\n" });
     }
 
     #[test]

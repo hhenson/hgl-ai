@@ -1465,6 +1465,7 @@ dependencies = [
  "hgl-ai-config",
  "hgl-ai-owner",
  "hgl-ai-proto",
+ "libc",
  "nkeys",
  "serde",
  "serde_json",

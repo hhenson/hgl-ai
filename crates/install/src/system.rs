@@ -52,6 +52,8 @@ pub struct SystemOpts {
     /// The OS user this host's client runs as, when not the installer: the client
     /// credential goes to it, never to the installer.
     pub client_user: Option<String>,
+    /// Keep the coordinator's GitHub token without asking for it.
+    pub keep_token: bool,
     pub wait: Duration,
 }
 
@@ -145,8 +147,11 @@ impl Root<'_> {
                 "stopped before `{line}`; nothing after it ran (`--print-root-steps` lists every step)"
             )));
         }
-        let mut sudo = Cmd::new("sudo").arg(cmd.program.clone());
-        sudo = sudo.args(cmd.args.iter().cloned());
+        // On the terminal: sudo may ask for a password (hgl-ai#90).
+        let sudo = Cmd::new("sudo")
+            .arg(cmd.program.clone())
+            .args(cmd.args.iter().cloned())
+            .terminal();
         crate::run_ok(self.sys, &sudo).map(drop)
     }
 
@@ -165,7 +170,48 @@ impl Root<'_> {
                 "stopped before `{line}`; nothing after it ran (`--print-root-steps` lists every step)"
             )));
         }
-        crate::run_ok(self.sys, &Cmd::new("sh").args(["-c", &line])).map(drop)
+        crate::run_ok(self.sys, &Cmd::new("sh").args(["-c", &line]).terminal()).map(drop)
+    }
+
+    /// Show `sudo to`, then once confirmed ask for a secret here, on this process's
+    /// terminal without echo, and run `sudo to` with it on its standard input; an empty
+    /// answer keeps the old one and runs nothing. Printed, the script's own shell reads
+    /// it ([`SECRET_PROMPT`]) and pipes it. Nothing under `sudo` reads the terminal:
+    /// under sudo's own pseudo-terminal it never sees the keys (hgl-ai#90).
+    fn secret(&mut self, why: &str, prompt: &str, to: Cmd) -> Result<()> {
+        let line = format!("sudo {to}");
+        if self.print_only {
+            self.script.push(format!(
+                "# {why}; Enter keeps the current one\n{}\n[ -z \"$t\" ] || printf '%s\\n' \"$t\" | {line}",
+                SECRET_PROMPT.replace("PROMPT", &shell_quote(prompt))
+            ));
+            return Ok(());
+        }
+        self.sys.say(&format!(
+            "sudo step: {why}\n  {line}  (the answer on its input)"
+        ));
+        if !self.sys.confirm("Run it?") {
+            return Err(other(format!(
+                "stopped before `{line}`; nothing after it ran (`--print-root-steps` lists every step)"
+            )));
+        }
+        let answer = self
+            .sys
+            .read_secret(prompt)
+            .map_err(|e| other(format!("reading the answer from the terminal: {e}")))?
+            .ok_or_else(|| {
+                other("no terminal to read the answer on (`--keep-token` keeps the current one)")
+            })?;
+        let answer = answer.trim();
+        if answer.is_empty() {
+            self.sys.say("kept the current one");
+            return Ok(());
+        }
+        let sudo = Cmd::new("sudo")
+            .arg(to.program.clone())
+            .args(to.args.iter().cloned())
+            .secret(format!("{answer}\n"));
+        crate::run_ok(self.sys, &sudo).map(drop)
     }
 
     fn note(&mut self, text: &str) {
@@ -245,19 +291,22 @@ const CRED_WRITER: &str = "umask 077; d=$1; mkdir -p \"$d\" && chmod 700 \"$d\" 
      if cat >\"$t\" && [ -s \"$t\" ]; then mv -f \"$t\" \"$d/hub.token\"; \
      else rm -f \"$t\"; exit 1; fi";
 
-/// A `sh -c` program that reads the coordinator's GitHub token from the terminal
-/// without echoing it and writes it to `file` (mode 0600); an empty answer keeps the
-/// file as it is.
-fn token_reader(file: &Path) -> String {
-    format!(
-        "f={}; umask 077; trap 'stty echo </dev/tty 2>/dev/null' EXIT; \
-         trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; \
-         printf 'GitHub token for the coordinator (Enter keeps the current one): ' >/dev/tty; \
-         stty -echo </dev/tty; IFS= read -r t </dev/tty; stty echo </dev/tty; echo >/dev/tty; \
-         [ -n \"$t\" ] || exit 0; printf '%s\\n' \"$t\" >\"$f\" && chmod 600 \"$f\"",
-        shell_quote(&file.display().to_string())
-    )
-}
+/// A `sh -c` program, run as the server user: its file `$1`, mode 0600, from stdin
+/// through a temporary file beside it; an empty read keeps the old file.
+const SECRET_WRITER: &str = "umask 077; f=$1; t=$(mktemp \"$f.XXXXXX\") || exit 1; \
+     if cat >\"$t\" && [ -s \"$t\" ]; then mv -f \"$t\" \"$f\"; \
+     else rm -f \"$t\"; exit 1; fi";
+
+/// The printed script's prompt, `PROMPT` replaced by its quoted text: the script's own
+/// shell, at the owner's terminal, reads the answer into `$t` without echo. Echo comes
+/// back on however the read ends; a signal stops the script.
+const SECRET_PROMPT: &str = "t=$(trap 'stty echo </dev/tty 2>/dev/null' EXIT; \
+     trap 'exit 130' INT; trap 'exit 143' TERM; trap 'exit 129' HUP; \
+     printf '%s' PROMPT >/dev/tty; stty -echo </dev/tty; IFS= read -r t </dev/tty; \
+     stty echo </dev/tty; echo >/dev/tty; printf '%s' \"$t\") || exit";
+
+/// The coordinator's token prompt.
+const TOKEN_PROMPT: &str = "GitHub token for the coordinator (Enter keeps the current one): ";
 
 /// The token the coordinator reads GitHub with.
 const TOKEN_SCOPE: &str = "a fine-grained, read-only token (Metadata, Contents, Issues, \
@@ -567,13 +616,23 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
         &format!("provision the streams and buckets as {user}'s admin hub user"),
         Cmd::new(init.program.clone()).args(init.args.iter().cloned()),
     )?;
-    if o.coord {
-        root.step(
+    if o.coord && o.keep_token {
+        root.note("the coordinator's GitHub token: kept (--keep-token)");
+    } else if o.coord {
+        root.secret(
             &format!(
                 "the coordinator's GitHub token, {TOKEN_SCOPE}: read without echo, \
                  written as {user} (mode 0600)"
             ),
-            Cmd::new("-u").args([user, "sh", "-c", &token_reader(&layout.github_token())]),
+            TOKEN_PROMPT,
+            Cmd::new("-u").args([
+                user,
+                "sh",
+                "-c",
+                SECRET_WRITER,
+                "sh",
+                &layout.github_token().display().to_string(),
+            ]),
         )?;
     }
     for s in names.iter().copied().filter(|s| *s != Service::Hub) {
@@ -809,6 +868,8 @@ mod tests {
                 _ => Output::success(""),
             }
         });
+        // Enter at the token prompt: keep the current one.
+        f.secrets.borrow_mut().push_back(String::new());
         f
     }
 
@@ -825,6 +886,7 @@ mod tests {
             console: true,
             console_url: Some("https://console.example.com".into()),
             client_user: None,
+            keep_token: false,
             wait: Duration::ZERO,
         }
     }
@@ -942,6 +1004,7 @@ mod tests {
         );
 
         let f = fake(d.path(), Os::Linux, true);
+        *f.secrets.borrow_mut() = ["ghp_secret".to_string()].into();
         install(&f, &opts(false)).unwrap();
         let runs = f.runs();
         assert!(
@@ -949,6 +1012,21 @@ mod tests {
                 .all(|r| r.starts_with("sudo ") || r.starts_with("sh -c sudo -u hgl-ai cat ")),
             "{runs:?}"
         );
+        // Each reads the terminal, for sudo's password; only the token step reads the
+        // token, which no command line and no output shows (hgl-ai#90).
+        let token = format!(
+            "sudo -u hgl-ai sh -c {SECRET_WRITER} sh /var/lib/hgl-ai/.config/hgl-ai/github.token"
+        );
+        for (_, c) in f.cmds.borrow().iter().filter(|(run, _)| *run) {
+            let want = if c.line() == token {
+                crate::sys::Input::Secret(b"ghp_secret\n".to_vec())
+            } else {
+                crate::sys::Input::Terminal
+            };
+            assert_eq!(c.input, want, "{}", c.line());
+            assert!(!format!("{c} {c:?}").contains("ghp_secret"), "{c:?}");
+        }
+        assert!(!f.output().contains("ghp_secret"), "{}", f.output());
         assert!(
             !runs.iter().any(|r| r.contains("useradd")),
             "the user exists"
@@ -958,8 +1036,7 @@ mod tests {
         let cfg = load_config(&f, &f.env).unwrap().unwrap();
         assert_eq!(cfg.server_user.unwrap().name, "hgl-ai");
         assert!(
-            runs.iter()
-                .any(|r| r.starts_with("sudo -u hgl-ai sh -c f=")),
+            runs.contains(&token),
             "the token step runs as the server user: {runs:?}"
         );
         assert!(f.output().contains("Next, on this host, as yourself:"));
@@ -993,10 +1070,32 @@ mod tests {
         assert_eq!(p.user.as_deref(), Some("hgl-ai"));
     }
 
+    /// `script` with the terminal replaced by files under `d`, `answer` its input, and
+    /// `stty` by nothing: a test never reads the real terminal.
+    fn off_tty(d: &Path, script: &str, answer: &str) -> String {
+        let (tin, tout) = (d.join("tty.in"), d.join("tty.out"));
+        std::fs::write(&tin, answer).unwrap();
+        let q = |p: &Path| shell_quote(&p.display().to_string());
+        format!(
+            "stty() {{ :; }}\n{}",
+            script
+                .replace("</dev/tty", &format!("<{}", q(&tin)))
+                .replace(">/dev/tty", &format!(">{}", q(&tout)))
+        )
+    }
+
     /// Run `script` in `sh` with `sudo` replaced by a function that records its words,
-    /// one step per paragraph: what root would run, as the shell parses it.
+    /// one step per paragraph: what root would run, as the shell parses it. Enter at
+    /// every prompt.
     fn sudo_words(d: &Path, script: &str) -> Vec<Vec<String>> {
+        sudo_words_answering(d, script, "\n")
+    }
+
+    /// [`sudo_words`], `answer` typed at the prompts.
+    fn sudo_words_answering(d: &Path, script: &str, answer: &str) -> Vec<Vec<String>> {
+        let script = &off_tty(d, script, answer);
         let rec = d.join("sudo.words");
+        let _ = std::fs::remove_file(&rec);
         // One write per step: the two ends of a pipeline record at once.
         let prog = format!(
             "sudo() {{ printf '%s\\n' \"$@\" '' >>{r}; }}\n{script}\n",
@@ -1160,6 +1259,7 @@ mod tests {
             o.client_user = Some("agents".into());
             o.home = srv.clone();
             let script = install(&f, &o).unwrap().unwrap();
+            let script = off_tty(d.path(), &script, "\n");
             let shim = format!(
                 "sudo() {{ if [ \"$1\" = -u ]; then u=$2; shift 2; \
                  case \"$u:$1\" in hgl-ai:cat|agents:sh) \"$@\"; return;; esac; fi; }}\n{script}\n"
@@ -1286,70 +1386,172 @@ mod tests {
         assert!(hub_unit(&f).contains(&format!("ExecStart={ours} -c ")));
     }
 
-    /// The coordinator's token: read without echo, written by the server user, 0600.
+    /// The coordinator's token: asked here without echo, piped to the server user, who
+    /// writes it 0600. Nothing under `sudo` reads the terminal (hgl-ai#90).
     #[test]
     fn the_token_step() {
         let d = tempfile::tempdir().unwrap();
+        let token = "sudo -u hgl-ai sh -c umask 077; f=$1;";
+        let ran = |f: &Fake| {
+            f.runs()
+                .into_iter()
+                .filter(|r| r.starts_with(token))
+                .count()
+        };
+        // An answer goes on the writer's input, never on a command line.
+        let f = fake(d.path(), Os::Linux, true);
+        *f.secrets.borrow_mut() = ["  ghp_secret \n".to_string()].into();
+        install(&f, &opts(false)).unwrap();
+        assert_eq!(ran(&f), 1, "{:?}", f.runs());
+        let out = f.output();
+        assert!(out.contains(&format!("secret: {TOKEN_PROMPT}")), "{out}");
+        assert!(out.contains("Actions, Commit statuses: read"), "{out}");
+        let runs = f.runs();
+        let at = |p: &str| runs.iter().position(|r| r.starts_with(p)).unwrap();
+        assert!(at(token) < at("sudo systemctl restart hgl-ai-coord.service"));
+        // Enter keeps the current one: nothing runs for it.
+        let f = fake(d.path(), Os::Linux, true);
+        install(&f, &opts(false)).unwrap();
+        assert_eq!(ran(&f), 0, "{:?}", f.runs());
+        assert!(
+            f.output().contains("kept the current one"),
+            "{}",
+            f.output()
+        );
+        assert!(
+            f.runs()
+                .contains(&"sudo systemctl restart hgl-ai-coord.service".to_string()),
+            "the steps after it run"
+        );
+        // `--keep-token`: not even asked.
+        let f = fake(d.path(), Os::Linux, true);
+        let mut o = opts(false);
+        o.keep_token = true;
+        install(&f, &o).unwrap();
+        assert_eq!(ran(&f), 0);
+        let out = f.output();
+        assert!(!out.contains("secret:"), "{out}");
+        assert!(out.contains("token: kept (--keep-token)"), "{out}");
+        // No terminal to ask on: stopped, naming the way round.
+        let f = fake(d.path(), Os::Linux, true);
+        f.secrets.borrow_mut().clear();
+        let e = install(&f, &opts(false)).unwrap_err().to_string();
+        assert!(e.contains("--keep-token"), "{e}");
+        assert!(
+            !f.runs()
+                .contains(&"sudo systemctl restart hgl-ai-coord.service".to_string()),
+            "{:?}",
+            f.runs()
+        );
+        // No coordinator, no token step.
+        let f = fake(d.path(), Os::Linux, true);
+        let mut o = opts(false);
+        o.coord = false;
+        install(&f, &o).unwrap();
+        assert!(!f.output().contains("secret:"), "{}", f.output());
+    }
+
+    /// Printed, the script's own shell reads the token at the terminal and pipes it to
+    /// the server user's writer; Enter keeps the file.
+    #[test]
+    fn the_printed_token_step() {
+        let d = tempfile::tempdir().unwrap();
         let f = fake(d.path(), Os::Linux, true);
         let script = install(&f, &opts(true)).unwrap().unwrap();
-        let steps = sudo_words(d.path(), &script);
-        let tok = steps
-            .iter()
-            .find(|s| s.len() == 5 && s[..4] == ["-u", "hgl-ai", "sh", "-c"])
-            .expect("the token step");
-        let prog = &tok[4];
-        for want in [
-            "f=/var/lib/hgl-ai/.config/hgl-ai/github.token;",
-            "umask 077",
-            "stty -echo </dev/tty",
-            "read -r t </dev/tty",
-            "chmod 600",
-        ] {
-            assert!(prog.contains(want), "missing {want:?} in {prog}");
-        }
-        let i = |needle: &str| script.find(needle).unwrap();
+        let writer = [
+            "-u",
+            "hgl-ai",
+            "sh",
+            "-c",
+            SECRET_WRITER,
+            "sh",
+            "/var/lib/hgl-ai/.config/hgl-ai/github.token",
+        ];
+        let steps = sudo_words_answering(d.path(), &script, "ghp_secret\n");
+        assert!(steps.iter().any(|s| s == &writer), "{steps:#?}");
         assert!(
-            i("github.token;") < i("restart hgl-ai-coord.service"),
-            "before the coordinator starts"
+            !steps.iter().flatten().any(|w| w.contains("ghp_secret")),
+            "the token is on no command line"
         );
+        assert!(
+            !steps.iter().flatten().any(|w| w.contains("/dev/tty")),
+            "nothing under sudo reads the terminal: {steps:#?}"
+        );
+        let steps = sudo_words(d.path(), &script);
+        assert!(!steps.iter().any(|s| s == &writer), "Enter: no writer");
+        let i = |needle: &str| script.find(needle).unwrap();
+        assert!(i("github.token\n") < i("restart hgl-ai-coord.service"));
         assert!(script.contains("Actions, Commit statuses: read"));
-        // The program itself, with a file for the terminal: an answer is written 0600,
-        // and an empty one keeps the file.
-        let file = d.path().join("github.token");
-        let (tin, tout) = (d.path().join("tty.in"), d.path().join("tty.out"));
+        assert!(script.contains("Enter keeps the current one"));
+        let mut o = opts(true);
+        o.keep_token = true;
+        let script = install(&f, &o).unwrap().unwrap();
+        assert!(!script.contains("github.token\n"), "{script}");
+        assert!(script.contains("# the coordinator's GitHub token: kept (--keep-token)"));
+
+        // The prompt and writer themselves, the writer run as this user.
+        let srv = d.path().join("srv");
+        let file = srv.join(".config/hgl-ai/github.token");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let mut o = opts(true);
+        o.home = srv.clone();
+        let script = install(&f, &o).unwrap().unwrap();
         let run = |answer: &str| {
-            let p = token_reader(&file)
-                .replace("</dev/tty", &format!("<{}", tin.display()))
-                .replace(">/dev/tty", &format!(">{}", tout.display()));
-            std::fs::write(&tin, answer).unwrap();
-            let o = std::process::Command::new("sh")
+            let shim = format!(
+                "sudo() {{ if [ \"$3\" = sh ]; then shift 2; \"$@\"; fi; }}\n{}\n",
+                off_tty(d.path(), &script, answer)
+            );
+            std::process::Command::new("sh")
                 .arg("-c")
-                .arg(&p)
+                .arg(&shim)
+                .env("HOME", d.path().join("caller"))
                 .output()
-                .unwrap();
-            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+                .unwrap()
         };
         run("ghp_secret\n");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "ghp_secret\n");
         assert_eq!(crate::sys::file_mode(&file).unwrap(), 0o600);
         run("\n");
         assert_eq!(std::fs::read_to_string(&file).unwrap(), "ghp_secret\n");
-
-        let mut o = opts(true);
-        o.coord = false;
-        let script = install(&f, &o).unwrap().unwrap();
-        assert!(
-            !script.contains("github.token;"),
-            "no coordinator, no token step"
-        );
+        let names: Vec<_> = std::fs::read_dir(file.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["github.token"], "no temporary left");
     }
 
-    /// A signal at the token prompt turns echo back on and fails the step.
+    /// The server user's writer: from its input through a temporary file, 0600; an
+    /// empty input fails and keeps the file.
     #[test]
-    fn the_token_prompt_restores_echo_on_a_signal() {
+    fn the_secret_writer() {
+        use std::io::Write as _;
+        let d = tempfile::tempdir().unwrap();
+        let file = d.path().join("github.token");
+        let write = |input: &[u8]| {
+            let mut c = std::process::Command::new("sh")
+                .args(["-c", SECRET_WRITER, "sh", &file.display().to_string()])
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            c.stdin.take().unwrap().write_all(input).unwrap();
+            c.wait().unwrap().success()
+        };
+        assert!(write(b"one\n"));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+        assert_eq!(crate::sys::file_mode(&file).unwrap(), 0o600);
+        assert!(!write(b""));
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "one\n");
+        assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
+    }
+
+    /// A signal at the printed prompt turns echo back on and stops the script.
+    #[test]
+    fn the_printed_prompt_restores_echo_on_a_signal() {
+        use std::os::unix::process::CommandExt as _;
         let d = tempfile::tempdir().unwrap();
         let fifo = d.path().join("tty.in");
         let log = d.path().join("stty.log");
+        let after = d.path().join("after");
         assert!(
             std::process::Command::new("mkfifo")
                 .arg(&fifo)
@@ -1357,51 +1559,58 @@ mod tests {
                 .unwrap()
                 .success()
         );
-        for (sig, code) in [("INT", 130), ("TERM", 143), ("HUP", 129)] {
+        let q = |p: &Path| shell_quote(&p.display().to_string());
+        for (name, sig) in [
+            ("INT", libc::SIGINT),
+            ("TERM", libc::SIGTERM),
+            ("HUP", libc::SIGHUP),
+        ] {
             let _ = std::fs::remove_file(&log);
             let prog = format!(
-                "stty() {{ echo \"stty $*\" >>{}; }}\n{}",
-                shell_quote(&log.display().to_string()),
-                token_reader(&d.path().join("github.token"))
-                    .replace(
-                        "</dev/tty",
-                        &format!("<{}", shell_quote(&fifo.display().to_string()))
-                    )
-                    .replace(">/dev/tty", ">/dev/null")
+                "stty() {{ echo \"stty $*\" >>{}; }}\n{}\ntouch {}\n",
+                q(&log),
+                SECRET_PROMPT
+                    .replace("PROMPT", "x")
+                    .replace("</dev/tty", &format!("<{}", q(&fifo)))
+                    .replace(">/dev/tty", ">/dev/null"),
+                q(&after)
             );
+            // Its own group, as at a terminal: the key's signal reaches every process
+            // of the script.
             let mut reader = std::process::Command::new("sh")
                 .arg("-c")
                 .arg(&prog)
+                .process_group(0)
                 .spawn()
                 .unwrap();
             // A writer that keeps the terminal stand-in open and silent.
             let mut writer = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(format!(
-                    "exec 3>{}; sleep 30",
-                    shell_quote(&fifo.display().to_string())
-                ))
+                .arg(format!("exec 3>{}; sleep 30", q(&fifo)))
                 .spawn()
                 .unwrap();
-            let start = Instant::now();
-            while !std::fs::read_to_string(&log).is_ok_and(|l| l.contains("stty -echo")) {
-                assert!(start.elapsed() < Duration::from_secs(10), "no prompt");
-                std::thread::sleep(Duration::from_millis(20));
-            }
+            let wait_log = |want: &dyn Fn(&str) -> bool, what: &str| {
+                let start = Instant::now();
+                while !std::fs::read_to_string(&log).is_ok_and(|l| want(&l)) {
+                    assert!(start.elapsed() < Duration::from_secs(10), "{name}: {what}");
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            };
+            wait_log(&|l| l.contains("stty -echo"), "no prompt");
             // `read` is waiting on the terminal now.
             std::thread::sleep(Duration::from_millis(200));
-            let kill = std::process::Command::new("kill")
-                .args([format!("-{sig}"), reader.id().to_string()])
-                .status()
-                .unwrap();
-            assert!(kill.success());
+            // SAFETY: a plain kill(2) of the reader's group.
+            assert_eq!(
+                unsafe { libc::kill(-(reader.id() as i32), sig) },
+                0,
+                "{name}"
+            );
             let st = reader.wait().unwrap();
             let _ = writer.kill();
             let _ = writer.wait();
-            assert_eq!(st.code(), Some(code), "{sig}");
-            let l = std::fs::read_to_string(&log).unwrap();
-            assert!(l.trim_end().ends_with("stty echo"), "{sig}: {l}");
-            assert!(!d.path().join("github.token").exists());
+            assert!(!st.success(), "{name}: {st:?}");
+            wait_log(&|l| l.trim_end().ends_with("stty echo"), "echo stays off");
+            assert!(!after.exists(), "{name}: the script went on");
         }
     }
 
