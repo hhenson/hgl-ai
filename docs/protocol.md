@@ -334,11 +334,18 @@ Each step after the merge (`landed.log`, `main`, the `landed` notes, the comment
 then, for `gh land`, the pins) is recorded in `landing.<repo>.<pr>` as it is done.
 The same command run again finds the pull request merged and does only the steps
 not done: no second `landed.log` line, the notes with their first `created_at`, no
-second comment. It reports success only when all are done; pins that did not land
-give `PARTIAL` (exit 3). A pull request found merged with neither a record nor a
-`landed.log` line has every step done then. `main` is written only whole: a failed
-read is tried three times, then the landing fails; a repository with no `main`
-(HTTP 404) is left out with a warning.
+second comment. It reports success only when all are done. A step after the merge
+that fails (pins that did not land, a GitHub error, a failed hub write, a lost landing
+lock) gives `PARTIAL` (exit 3): the merge commit, the steps not done, the error, and
+"run the same command again to finish"; the record is kept. Without `--json` the
+lines of the steps done follow it. An unreachable hub is still exit 10. Before it
+reads the pins, `gh pins sync` (and so `gh land`) finishes the landing of any pin pull
+request (its branch the pin branch) whose record shows it merged, or that GitHub shows
+merged; it is not left behind pins that read current. One another sync finished first
+is done, and the sync goes on to the pins. Its dry run reads the hub for them too. A pull
+request found merged with neither a record nor a `landed.log` line has every step
+done then. `main` is written only whole: a failed read is tried three times, then the
+landing fails; a repository with no `main` (HTTP 404) is left out with a warning.
 
 `HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream
 sequence of the note that ended the task for the seat. A later end replaces an
