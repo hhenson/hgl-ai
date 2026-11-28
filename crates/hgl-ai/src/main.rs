@@ -115,3 +115,39 @@ async fn main() {
     };
     std::process::exit(code);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Cli;
+    use clap::{Parser, error::ErrorKind};
+
+    #[test]
+    fn verdict_text_arguments() {
+        for command in ["approve", "sendback"] {
+            let base = ["hgl-ai", "gh", command, "repo", "42", "head", "--to", "w1"];
+            for text in [
+                vec!["--body", "message"],
+                vec!["--body-file", "message.txt"],
+            ] {
+                for no_comment in [false, true] {
+                    let mut args = base.to_vec();
+                    args.extend(&text);
+                    if no_comment {
+                        args.push("--no-comment");
+                    }
+                    assert!(Cli::try_parse_from(args).is_ok(), "{command}: {text:?}");
+                }
+            }
+            assert_eq!(
+                Cli::try_parse_from(base).err().unwrap().kind(),
+                ErrorKind::MissingRequiredArgument
+            );
+            let mut both = base.to_vec();
+            both.extend(["--body", "message", "--body-file", "message.txt"]);
+            assert_eq!(
+                Cli::try_parse_from(both).err().unwrap().kind(),
+                ErrorKind::ArgumentConflict
+            );
+        }
+    }
+}
