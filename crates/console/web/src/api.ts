@@ -8,6 +8,8 @@ export interface Session {
   open_questions: Record<string, number> | null;
   stale_after_secs: number;
   hosts_ttl_secs: number;
+  /** `[github] owner`: the page links issues and pull requests there. */
+  github_owner?: string;
 }
 
 async function get<T>(path: string): Promise<T> {

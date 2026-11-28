@@ -3,6 +3,7 @@
 // becomes, per table, one transaction of the rows that changed (by row id).
 
 import { diffRows, isEmpty, type Row, type Transaction } from "./diff";
+import { parseBacklog } from "./parse";
 import { type Bucket, type Context, derive, emptyRaw, notes, type Raw, type Source, TABLES, TABS } from "./tables";
 
 export type Connection = "connecting" | "connected" | "reconnecting" | "disconnected" | "failed";
@@ -114,6 +115,16 @@ export class Store {
 
   private schedule(): void {
     if (!this.timer) this.timer = setTimeout(() => this.flush(), this.delayMs);
+  }
+
+  /** Open issues per repository, from `backlog`. */
+  openByRepo(): Map<string, number> {
+    return parseBacklog(this.raw.HGL_STATE.get("backlog") ?? "").open;
+  }
+
+  /** `[github] owner`, once the console has said. */
+  githubOwner(): string | undefined {
+    return this.ctx.githubOwner;
   }
 
   /** A table's rows now. */
