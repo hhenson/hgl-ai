@@ -452,6 +452,22 @@ async fn lane_loop(
         Ok(i) => (Some(i), None),
         Err(e) => (None, Some(ServiceError::from(e))),
     };
+    let log_server = {
+        let (bus, lane, stop, stop_tx, lost) = (
+            bus.clone(),
+            lane.clone(),
+            shutdown.clone(),
+            stop_tx.clone(),
+            lost.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = crate::log::serve(bus, lane, stop).await {
+                *lost.lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(format!("log service failed: {e}"));
+                let _ = stop_tx.send(true);
+            }
+        })
+    };
     let running: Arc<Mutex<Vec<Cancel>>> = Arc::new(Mutex::new(Vec::new()));
     let mut jobs = tokio::task::JoinSet::new();
     let idle = Arc::new(Notify::new());
@@ -586,6 +602,8 @@ async fn lane_loop(
         c.cancel();
     }
     while jobs.join_next().await.is_some() {}
+    log_server.abort();
+    let _ = log_server.await;
     hb.abort();
     let _ = hb.await;
     let _ = conn_stop_tx.send(true);
