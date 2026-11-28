@@ -143,7 +143,7 @@ export function start(viewer: Viewer, store: Store): () => Promise<void> {
           maxReconnectAttempts: -1,
           reconnectDelayHandler: () => backoff.next(),
         }),
-      (err) => store.setConnection("failed", String(err)),
+      (err) => { if (!stop) store.setConnection("failed", String(err)); },
       () => stop,
       backoff,
     );
@@ -153,6 +153,7 @@ export function start(viewer: Viewer, store: Store): () => Promise<void> {
     store.setConnection("connected");
     void (async () => {
       for await (const s of c.status()) {
+        if (stop) break;
         if (s.type === "disconnect") store.setConnection("reconnecting");
         else if (s.type === "reconnecting") store.setConnection("reconnecting");
         else if (s.type === "reconnect") {
@@ -168,6 +169,7 @@ export function start(viewer: Viewer, store: Store): () => Promise<void> {
   })();
   return async () => {
     stop = true;
+    store.setConnection("disconnected");
     await nc?.close();
   };
 }
