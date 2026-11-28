@@ -3,7 +3,7 @@
 //! printed, when `nats-server` is not on `PATH`.
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use hgl_ai_proto::{
 
 struct Hub {
     child: Child,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     url: String,
     token: String,
 }
@@ -33,28 +33,48 @@ impl Hub {
             std::process::id(),
             dir.path().display().to_string().len()
         );
-        let child = Command::new(bin)
-            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--auth", &token])
+        let child = Self::spawn(&bin, dir.path(), &token);
+        let mut hub = Hub {
+            child,
+            dir,
+            url: String::new(),
+            token,
+        };
+        hub.wait_for_port();
+        Some(hub)
+    }
+
+    fn spawn(bin: &Path, dir: &Path, token: &str) -> Child {
+        Command::new(bin)
+            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--auth", token])
             .arg("-sd")
-            .arg(dir.path().join("store"))
+            .arg(dir.join("store"))
             .arg("-l")
-            .arg(dir.path().join("nats.log"))
+            .arg(dir.join("nats.log"))
             .arg("--ports_file_dir")
-            .arg(dir.path())
+            .arg(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("start nats-server");
-        let ports = dir.path().join(format!("nats-server_{}.ports", child.id()));
-        let mut hub = Hub {
-            child,
-            _dir: dir,
-            url: String::new(),
-            token,
-        };
+            .expect("start nats-server")
+    }
+
+    fn restart(&mut self) {
+        self.child.kill().expect("stop nats-server");
+        self.child.wait().expect("reap nats-server");
+        let bin = find_on_path("nats-server").expect("find nats-server for restart");
+        self.child = Self::spawn(&bin, self.dir.path(), &self.token);
+        self.wait_for_port();
+    }
+
+    fn wait_for_port(&mut self) {
+        let ports = self
+            .dir
+            .path()
+            .join(format!("nats-server_{}.ports", self.child.id()));
         let deadline = Instant::now() + Duration::from_secs(15);
-        hub.url = loop {
+        self.url = loop {
             let found = std::fs::read_to_string(&ports)
                 .ok()
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -68,7 +88,6 @@ impl Hub {
             );
             std::thread::sleep(Duration::from_millis(50));
         };
-        Some(hub)
     }
 
     async fn bus(&self) -> Bus {
@@ -419,6 +438,32 @@ async fn broadcasts_reach_only_inboxes_created_before_publish() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn unread_broadcast_survives_hub_restart() {
+    let Some(mut hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let recipient = seat("w2");
+    bus.send(&note("claude", "all", "before inbox creation"))
+        .await
+        .unwrap();
+    drop(bus.inbox(&recipient).await.unwrap());
+    let unread = bus
+        .send(&note("claude", "all", "unread before restart"))
+        .await
+        .unwrap();
+    drop(bus);
+
+    hub.restart();
+    let bus = hub.bus().await;
+    let mut inbox = bus.inbox(&recipient).await.unwrap();
+    let got = inbox.fetch(10, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        got.iter().map(|d| (d.seq, d.delivered)).collect::<Vec<_>>(),
+        [(unread.seq, 1)]
+    );
+    got[0].ack().await.unwrap();
 }
 
 #[tokio::test]

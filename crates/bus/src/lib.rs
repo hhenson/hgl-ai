@@ -595,7 +595,7 @@ impl Bus {
             .get_stream(STREAM_NOTES)
             .await
             .map_err(|e| missing(&format!("stream {STREAM_NOTES}"), e))?;
-        let consumer = stream
+        let mut consumer = stream
             .create_consumer(pull::Config {
                 durable_name: Some(seat.consumer()),
                 description: Some(format!("inbox of seat {seat}")),
@@ -612,6 +612,12 @@ impl Bus {
             })
             .await
             .map_err(|e| nats(&format!("opening the inbox of {seat}"), e))?;
+        // After a hub restart, CREATE can report the reload time as `created`.
+        // INFO refreshes the cached creation time used to skip old broadcasts.
+        consumer
+            .info()
+            .await
+            .map_err(|e| nats(&format!("reading the inbox of {seat}"), e))?;
         Ok(Inbox {
             seat: seat.clone(),
             consumer,
