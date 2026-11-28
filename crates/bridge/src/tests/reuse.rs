@@ -4,7 +4,7 @@ use super::*;
 
 /// A sendback moves the task to w2 at a higher class; w2 pushes; a sendback without a
 /// class moves it back into w1's kept tree. w1's tree takes w2's class, at its sequence,
-/// and w2's commits.
+/// and w2's commits, in its index and files.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_task_moved_back_takes_the_newest_class_and_the_pushed_commits() {
     let mut h = harness();
@@ -79,6 +79,15 @@ async fn a_task_moved_back_takes_the_newest_class_and_the_pushed_commits() {
         theirs,
         "w2's pushed commits"
     );
+    // r1's major 1 on PR 75: both seats share the branch's ref on this host; w1's index and
+    // files follow it, with nothing staged that would revert w2's work.
+    let src1 = dir1.join("src");
+    assert_eq!(
+        std::fs::read_to_string(src1.join("w2.txt")).unwrap(),
+        "w2\n"
+    );
+    assert_eq!(h.git.run(&src1, ["status", "--porcelain"]).unwrap(), "");
+    assert_eq!(f.checkout.as_deref(), Some(theirs.as_str()));
     assert!(
         h.calls("codex")[calls..]
             .iter()

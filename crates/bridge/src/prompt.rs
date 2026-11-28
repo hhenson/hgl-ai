@@ -202,6 +202,7 @@ mod tests {
             families: Vec::new(),
             class: None,
             class_seq: None,
+            checkout: None,
         }
     }
 

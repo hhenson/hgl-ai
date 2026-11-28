@@ -603,8 +603,13 @@ fn a_leading_dot_repository_is_refused_before_a_tree() {
     assert!(!e.root.join("work/w1").join(".github-5").exists());
 }
 
-/// hgl-ai#55: a kept tree takes the commits the seat the task moved to pushed in between;
-/// a branch never pushed, or one that has diverged, is left as it is.
+/// `git status --porcelain` of a tree's checkout.
+fn status(e: &Env, src: &Path) -> String {
+    e.git.run(src, ["status", "--porcelain"]).unwrap()
+}
+
+/// hgl-ai#55: a kept tree takes the commits the seat the task moved to pushed in between,
+/// from another clone; a branch never pushed, or one that has diverged, is left as it is.
 #[test]
 fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
     let e = env();
@@ -612,6 +617,12 @@ fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
         .trees
         .create(&seat("w1"), &task(55), &implement("Kept"))
         .unwrap();
+    let mut f = c.file.clone();
+    assert_eq!(
+        f.checkout.as_deref(),
+        Some(f.start.as_str()),
+        "made at start"
+    );
     let src = c.dir.join("src");
     let head = |p: &Path| {
         e.git
@@ -621,11 +632,11 @@ fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
             .to_string()
     };
     assert_eq!(
-        e.trees.refresh_branch(&c.dir, &c.file).unwrap(),
+        e.trees.refresh_branch(&c.dir, &mut f).unwrap(),
         None,
         "not pushed"
     );
-    let branch = c.file.branch.clone().unwrap();
+    let branch = f.branch.clone().unwrap();
     commit(&e.git, &src, "w1.txt", "w1\n", "w1's work");
     e.git
         .run(
@@ -633,7 +644,12 @@ fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
             ["push", "--quiet", "origin", &format!("HEAD:{branch}")],
         )
         .unwrap();
-    // The interim seat, elsewhere, pushes on the same branch.
+    // The turn's end records where it left the files.
+    write_task(&c.dir, &f).unwrap();
+    e.trees.note_checkout(&c.dir).unwrap();
+    let mut f = read_task(&c.dir).unwrap();
+    assert_eq!(f.checkout, Some(head(&src)));
+    // The interim seat, in another clone, pushes on the same branch.
     e.git.run(&e.seed, ["fetch", "--quiet", "origin"]).unwrap();
     e.git
         .run(
@@ -651,14 +667,21 @@ fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
     e.git
         .run(&e.seed, ["push", "--quiet", "origin", &branch])
         .unwrap();
+    // An uncommitted change of w1's own is kept.
+    std::fs::write(src.join("mine.txt"), "mine\n").unwrap();
     assert_eq!(
-        e.trees.refresh_branch(&c.dir, &c.file).unwrap(),
+        e.trees.refresh_branch(&c.dir, &mut f).unwrap(),
         Some(theirs.clone())
     );
-    assert_eq!(head(&src), theirs);
-    assert!(src.join("w2.txt").exists());
     assert_eq!(
-        e.trees.refresh_branch(&c.dir, &c.file).unwrap(),
+        (head(&src), f.checkout.clone()),
+        (theirs.clone(), Some(theirs.clone()))
+    );
+    assert_eq!(std::fs::read_to_string(src.join("w2.txt")).unwrap(), "w2\n");
+    assert_eq!(status(&e, &src), "?? mine.txt\n");
+    std::fs::remove_file(src.join("mine.txt")).unwrap();
+    assert_eq!(
+        e.trees.refresh_branch(&c.dir, &mut f).unwrap(),
         None,
         "up to date"
     );
@@ -669,9 +692,74 @@ fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
         .run(&e.seed, ["push", "--quiet", "origin", &branch])
         .unwrap();
     assert_eq!(
-        e.trees.refresh_branch(&c.dir, &c.file).unwrap(),
+        e.trees.refresh_branch(&c.dir, &mut f).unwrap(),
         None,
         "diverged"
     );
     assert_eq!(head(&src), ours);
+    assert_eq!(status(&e, &src), "");
+}
+
+/// r1's major 1 on PR 75: two seats of one host share the branch's ref, so the other
+/// seat's commit moves it under the kept tree. Its index and files catch up, with nothing
+/// staged that would revert that commit, and its own uncommitted changes are kept; a change
+/// the catch-up would overwrite stops it, and the tree is left as it was.
+#[test]
+fn a_kept_tree_catches_up_with_a_ref_another_tree_of_its_host_moved() {
+    let e = env();
+    let w1 = e
+        .trees
+        .create(&seat("w1"), &task(56), &implement("Shared"))
+        .unwrap();
+    let src1 = w1.dir.join("src");
+    commit(&e.git, &src1, "a.txt", "w1\n", "w1's work");
+    e.trees.note_checkout(&w1.dir).unwrap();
+    let w2 = e
+        .trees
+        .create(&seat("w2"), &task(56), &implement("Shared"))
+        .unwrap();
+    let src2 = w2.dir.join("src");
+    std::fs::write(src1.join("mine.txt"), "mine\n").unwrap();
+    std::fs::write(src1.join("a.txt"), "w1, uncommitted\n").unwrap();
+    let theirs = commit(&e.git, &src2, "b.txt", "w2\n", "w2's work");
+    assert_eq!(
+        e.git.run(&src1, ["rev-parse", "HEAD"]).unwrap().trim(),
+        theirs,
+        "the ref moved under w1"
+    );
+    assert!(
+        status(&e, &src1).contains("D  b.txt"),
+        "a staged revert, before"
+    );
+    let mut f = read_task(&w1.dir).unwrap();
+    assert_eq!(
+        e.trees.refresh_branch(&w1.dir, &mut f).unwrap(),
+        Some(theirs.clone())
+    );
+    assert_eq!(f.checkout.as_deref(), Some(theirs.as_str()));
+    assert_eq!(std::fs::read_to_string(src1.join("b.txt")).unwrap(), "w2\n");
+    assert_eq!(
+        status(&e, &src1),
+        " M a.txt\n?? mine.txt\n",
+        "only w1's own changes"
+    );
+    e.git.run(&src1, ["checkout", "--", "a.txt"]).unwrap();
+    std::fs::remove_file(src1.join("mine.txt")).unwrap();
+    assert_eq!(status(&e, &src1), "");
+    write_task(&w1.dir, &f).unwrap();
+
+    // w2 changes a file w1 has an uncommitted change in: no catch-up, nothing lost.
+    std::fs::write(src1.join("b.txt"), "w1's own\n").unwrap();
+    commit(&e.git, &src2, "b.txt", "w2 again\n", "w2 again");
+    let mut f = read_task(&w1.dir).unwrap();
+    assert!(e.trees.refresh_branch(&w1.dir, &mut f).is_err());
+    assert_eq!(
+        f.checkout.as_deref(),
+        Some(theirs.as_str()),
+        "left as it was"
+    );
+    assert_eq!(
+        std::fs::read_to_string(src1.join("b.txt")).unwrap(),
+        "w1's own\n"
+    );
 }

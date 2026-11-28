@@ -123,6 +123,11 @@ pub struct TaskFile {
     /// (PROTO-21): verdicts go to the task's tree with the newest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_seq: Option<u64>,
+    /// Implementor trees: the commit the tree's index and files were last brought to, at
+    /// its creation, the end of a turn, or a refresh (hgl-ai#55). Another tree of this host
+    /// sharing the branch can move the ref under them; [`Trees::refresh_branch`] catches up.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkout: Option<String>,
 }
 
 impl TaskFile {
@@ -455,6 +460,7 @@ impl Trees {
             branch: Some(branch),
             base: base_ref,
             main,
+            checkout: Some(start.clone()),
             start,
             created_at: hgl_ai_proto::utc_now_stamp(),
             conflicts: Vec::new(),
@@ -550,6 +556,7 @@ impl Trees {
             class: None,
             class_seq: None,
             handoff_seq: None,
+            checkout: None,
         })
     }
 
@@ -753,14 +760,36 @@ impl Trees {
         }
     }
 
-    /// Fetch the pushed head of a kept implementor tree's branch, and fast-forward the tree
-    /// to it when it is behind (hgl-ai#55): a seat the task moved to in between may have
-    /// pushed. Returns the new HEAD when it moved; a branch never pushed, or one that has
-    /// diverged, is left as it is.
-    pub fn refresh_branch(&self, dir: &Path, f: &TaskFile) -> Result<Option<String>> {
-        let Some(branch) = f.branch.as_deref().filter(|_| !f.review) else {
+    /// Bring a kept implementor tree to its branch's newest commit (hgl-ai#55), keeping its
+    /// uncommitted changes: a seat the task moved to in between may have committed on it.
+    /// First, a branch that another tree of this host moved under this one (the two share
+    /// the ref) since [`TaskFile::checkout`] (else `start`): a two-way `read-tree -m -u` from
+    /// that commit to HEAD, which takes the other tree's files and refuses to overwrite a
+    /// change of this one. Then the pushed branch, fetched: a fast-forward when the tree is
+    /// behind; a branch never pushed, or one that has diverged, is left. Records the commit
+    /// reached in `f.checkout` and returns it when the index or files moved; an error leaves
+    /// `checkout` as it was.
+    pub fn refresh_branch(&self, dir: &Path, f: &mut TaskFile) -> Result<Option<String>> {
+        let Some(branch) = f.branch.clone().filter(|_| !f.review) else {
             return Ok(None);
         };
+        let src = dir.join("src");
+        // A git killed in an earlier turn may have left its lock behind.
+        clear_stale_index_lock(&src);
+        let head = self.rev(&src, "HEAD")?;
+        let old = f.checkout.clone().unwrap_or_else(|| f.start.clone());
+        let mut moved = false;
+        if old != head {
+            let index = |t: &Self| {
+                t.git
+                    .run(&src, ["write-tree"])
+                    .map(|o| o.trim().to_string())
+            };
+            let before = index(self)?;
+            self.git
+                .run(&src, ["read-tree", "-m", "-u", old.as_str(), head.as_str()])?;
+            moved = index(self)? != before;
+        }
         let tracking = format!("refs/remotes/origin/{branch}");
         let fetched = {
             let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -775,21 +804,36 @@ impl Trees {
                 ],
             )?
         };
-        if !fetched.ok {
-            return Ok(None);
+        if fetched.ok {
+            let pushed = self.rev(&src, &tracking)?;
+            if pushed != head
+                && self
+                    .git
+                    .check(&src, ["merge-base", "--is-ancestor", &head, &pushed])?
+            {
+                self.git
+                    .run(&src, ["merge", "--ff-only", "--quiet", &pushed])?;
+                moved = true;
+            }
         }
-        let src = dir.join("src");
-        let (head, pushed) = (self.rev(&src, "HEAD")?, self.rev(&src, &tracking)?);
-        if head == pushed
-            || !self
-                .git
-                .check(&src, ["merge-base", "--is-ancestor", &head, &pushed])?
-        {
-            return Ok(None);
+        let now = self.rev(&src, "HEAD")?;
+        f.checkout = Some(now.clone());
+        Ok(moved.then_some(now))
+    }
+
+    /// Record in `task.json` the commit an implementor tree's index and files are at after a
+    /// turn ([`TaskFile::checkout`]).
+    pub fn note_checkout(&self, dir: &Path) -> Result<()> {
+        let mut f = read_task(dir)?;
+        if f.review || f.branch.is_none() {
+            return Ok(());
         }
-        self.git
-            .run(&src, ["merge", "--ff-only", "--quiet", &pushed])?;
-        Ok(Some(pushed))
+        let head = self.rev(&dir.join("src"), "HEAD")?;
+        if f.checkout.as_deref() != Some(head.as_str()) {
+            f.checkout = Some(head);
+            write_task(dir, &f)?;
+        }
+        Ok(())
     }
 
     /// `<work_root>/clones/<repo>`: a bare repository with `origin`, fetched now.

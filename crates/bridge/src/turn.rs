@@ -113,38 +113,49 @@ pub fn newest_class(recs: &[TreeRecord], task: &TaskKey) -> Classed {
         .map_or((None, None), |r| (r.class, r.class_seq))
 }
 
-/// Where a kept implementor tree's class starts from when a turn brings it the newer
-/// `handoff` (hgl-ai#55), and the note that moved the task here, if one did: the newer, by
-/// stream sequence, of its own class (`own`) and the task's in `recs`, so the class follows
-/// the newest handoff and its sequence never goes back. When another tree of the task took a
-/// handoff after this tree's last (`own_handoff`) and before `handoff`, the task was there
-/// in between and `handoff` moved it back: its class sets the class, as for a tree made anew.
+/// Where a kept implementor tree's class starts from when a turn brings it newer handoffs
+/// (`handoffs`, hgl-ai#55), and the note that moved the task here, if one did. The start is
+/// the newer, by stream sequence, of its own class (`own`) and the task's in `recs`, so the
+/// class follows the newest handoff and its sequence never goes back. When another tree of
+/// the task took a handoff after this tree's last (`own_handoff`) and before the newest of
+/// `handoffs`, the task was there in between: the first of `handoffs` after the latest such
+/// handoff moved it back, and its class sets the class, as for a tree made anew (the first
+/// by sequence, as [`choose_create`] picks, and as turns one note at a time would).
 pub fn reused_start(
     own: Classed,
     own_handoff: Option<u64>,
     own_key: &str,
     recs: &[TreeRecord],
     task: &TaskKey,
-    handoff: u64,
+    handoffs: &[u64],
 ) -> (Classed, Option<u64>) {
     let newest = newest_class(recs, task);
     let from = if newest.1 > own.1 { newest } else { own };
-    let moved = recs
+    let Some(&last) = handoffs.iter().max() else {
+        return (from, None);
+    };
+    let between = recs
         .iter()
         .filter(|r| &r.task == task && !r.review && r.key() != own_key)
         .filter_map(|r| r.handoff_seq.or(r.seq))
-        .any(|h| h < handoff && own_handoff.is_none_or(|o| h > o));
-    (from, moved.then_some(handoff))
+        .filter(|h| *h < last && own_handoff.is_none_or(|o| *h > o))
+        .max();
+    let made_by = between.and_then(|b| handoffs.iter().copied().filter(|h| *h > b).min());
+    (from, made_by)
 }
 
 /// The stream sequence of the newest `assign` or `sendback` among these notes: a handoff
 /// that moved the task to this seat (PROTO-21).
 pub fn newest_handoff(notes: &[(u64, u64, Note)]) -> Option<u64> {
+    handoffs(notes).max()
+}
+
+/// The stream sequences of the `assign` and `sendback` notes among these.
+fn handoffs(notes: &[(u64, u64, Note)]) -> impl Iterator<Item = u64> + '_ {
     notes
         .iter()
         .filter(|(_, _, n)| matches!(n.kind, Kind::Assign | Kind::Sendback))
         .map(|(seq, _, _)| *seq)
-        .max()
 }
 
 #[cfg(test)]
@@ -193,7 +204,8 @@ mod tests {
         let w1 = rec("w1", Some(Simple), Some(3), Some(3));
         let w2 = rec("w2", Some(Complex), Some(7), Some(7));
         let own = (w1.class, w1.class_seq);
-        let start = |recs: &[TreeRecord], h| reused_start(own, Some(3), &w1.key(), recs, &task, h);
+        let start =
+            |recs: &[TreeRecord], h| reused_start(own, Some(3), &w1.key(), recs, &task, &[h]);
         // Moved to w2 at 7, back at 9: w2's class, and the note at 9 moved it.
         let both = [w1.clone(), w2.clone()];
         assert_eq!(start(&both, 9), ((Some(Complex), Some(7)), Some(9)));
@@ -220,6 +232,29 @@ mod tests {
         // The own record newer than the other's: kept.
         let w2_old = rec("w2", Some(Complex), Some(2), Some(2));
         assert_eq!(start(&[w1.clone(), w2_old], 9), (own, None));
+        // r1's batches on PR 75: the first handoff after w2's moved it back, as one note at a
+        // time would, whatever came after it in the batch.
+        let batch = |hs: &[u64]| reused_start(own, Some(3), &w1.key(), &both, &task, hs);
+        let (from, made_by) = batch(&[11, 9]);
+        assert_eq!(made_by, Some(9));
+        assert_eq!(
+            task_class(from, &[sb(9, None), sb(11, Some(Simple))], made_by),
+            (Some(Complex), Some(7)),
+            "a lower sendback after the move does not move it down"
+        );
+        let (from, made_by) = batch(&[9, 11]);
+        assert_eq!(
+            task_class(from, &[sb(9, Some(Standard)), sb(11, None)], made_by),
+            (Some(Standard), Some(9)),
+            "the move's own class"
+        );
+        assert_eq!(batch(&[]), ((Some(Complex), Some(7)), None));
+        // r1's minor 3: a tree whose first turn never finished has no handoff yet; the note
+        // that made it, delivered again, still moved the task.
+        assert_eq!(
+            reused_start(own, None, &w1.key(), &both, &task, &[9]).1,
+            Some(9)
+        );
         // Its own record again in the listing is not another tree.
         assert_eq!(
             start(&[rec("w1", Some(Simple), Some(3), Some(8))], 9),
@@ -533,7 +568,7 @@ impl<B: BusApi> Bridge<B> {
                 // class is in that tree's record (PROTO-21). With the note that made it.
                 let mut start: Option<(Classed, Option<u64>)> = None;
                 let mut made = false;
-                let file = match &job.create {
+                let mut file = match &job.create {
                     Some((seq, c)) => {
                         let trees = self.trees.clone();
                         let (s, t, c, seq) = (name.clone(), task.clone(), c.clone(), *seq);
@@ -578,31 +613,48 @@ impl<B: BusApi> Bridge<B> {
                 // A kept implementor tree a newer handoff reaches (hgl-ai#55): the task may
                 // have been elsewhere since its last, so its class follows the newest
                 // record, and its branch the commits pushed there.
-                let handoff = (!made && !*review)
-                    .then(|| newest_handoff(&job.notes))
-                    .flatten()
-                    .filter(|n| file.handoff_seq.is_none_or(|h| *n > h));
-                if let Some(h) = handoff {
+                // A tree whose first turn never finished has no handoff yet: the note that
+                // made it is one of these.
+                let newer: Vec<u64> = if made || *review {
+                    Vec::new()
+                } else {
+                    handoffs(&job.notes)
+                        .filter(|n| file.handoff_seq.is_none_or(|h| *n > h))
+                        .collect()
+                };
+                if !newer.is_empty() {
                     let recs = self.tree_records(task).await;
                     let own = hgl_ai_proto::tree_key(self.trees.host(), &name, task, false);
                     start = Some(reused_start(
                         (file.class, file.class_seq),
-                        file.handoff_seq.or(file.seq),
+                        file.handoff_seq,
                         &own,
                         &recs,
                         task,
-                        h,
+                        &newer,
                     ));
-                    let (trees, d, f) = (self.trees.clone(), dir.clone(), file.clone());
-                    match tokio::task::spawn_blocking(move || trees.refresh_branch(&d, &f)).await {
-                        Ok(Ok(Some(head))) => {
-                            tracing::info!(seat = %name, %task, %head, "fast-forwarded to the pushed branch");
+                    let (trees, d, mut f) = (self.trees.clone(), dir.clone(), file.clone());
+                    match tokio::task::spawn_blocking(move || {
+                        let r = trees.refresh_branch(&d, &mut f);
+                        (f, r)
+                    })
+                    .await
+                    {
+                        Ok((f, r)) => {
+                            file = f;
+                            match r {
+                                Ok(Some(head)) => {
+                                    tracing::info!(seat = %name, %task, %head, "brought to the branch's newest commit");
+                                }
+                                Ok(None) => {}
+                                Err(e) => {
+                                    tracing::warn!(seat = %name, %task, "bringing the tree to its branch: {e}")
+                                }
+                            }
                         }
-                        Ok(Ok(None)) => {}
-                        Ok(Err(e)) => {
-                            tracing::warn!(seat = %name, %task, "fetching the branch: {e}")
+                        Err(e) => {
+                            tracing::warn!(seat = %name, %task, "bringing the tree to its branch: {e}")
                         }
-                        Err(e) => tracing::warn!(seat = %name, %task, "fetching the branch: {e}"),
                     }
                 }
                 (dir, held, Some(file), start)
@@ -758,6 +810,15 @@ impl<B: BusApi> Bridge<B> {
             && let Err(e) = save_session(&dir, r.runtime.as_str(), id)
         {
             tracing::warn!(dir = %dir.display(), "saving the session id: {e}");
+        }
+        // Where the turn left the files, so a later one sees a ref moved under them (hgl-ai#55).
+        if let Target::Tree { review: false, .. } = &job.target {
+            let (trees, d) = (self.trees.clone(), dir.clone());
+            match tokio::task::spawn_blocking(move || trees.note_checkout(&d)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => tracing::warn!(dir = %dir.display(), "recording the checkout: {e}"),
+                Err(e) => tracing::warn!(dir = %dir.display(), "recording the checkout: {e}"),
+            }
         }
         if !run.reaped {
             tracing::error!(seat = %name, "a process of the turn survived; the turn lock stays held by it");
