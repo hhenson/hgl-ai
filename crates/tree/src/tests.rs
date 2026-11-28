@@ -801,6 +801,90 @@ fn a_seats_own_branch_is_not_the_tasks() {
 }
 
 #[test]
+fn clone_lock_child() {
+    let Some(path) = std::env::var_os("HGL_TEST_CLONE_LOCK") else {
+        return;
+    };
+    let file = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+    let acquired = file.try_lock().is_ok();
+    assert_eq!(acquired, std::env::var_os("HGL_TEST_EXPECT_LOCK").is_some());
+}
+
+#[test]
+fn removal_without_clone_does_not_touch_enclosing_repository() {
+    let e = env();
+    e.git.run(&e.seed, ["branch", "keep-me"]).unwrap();
+    let root = e.seed.join("nested:work");
+    let trees = Trees::with(
+        Layout::new(&root).unwrap(),
+        "host",
+        &Github::default(),
+        e.git.clone(),
+    );
+    assert!(
+        trees
+            .remove(&seat("w1"), &task(12), false)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!root.join("clones").exists(), "no-op must not lock");
+    let dir = trees
+        .layout
+        .task_dir(&seat("w1"), &task(12), false)
+        .unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(TASK_FILE), r#"{"seat":"w1","repo":"demo","issue":12,"branch":"keep-me","base":"main","start":"x","created_at":"now"}"#).unwrap();
+    let clone = trees.layout.clone_dir("demo").unwrap();
+    std::fs::create_dir_all(&clone).unwrap();
+    assert!(e.git.check(&clone, ["rev-parse", "--git-dir"]).unwrap());
+    assert!(!trees.git.check(&clone, ["rev-parse", "--git-dir"]).unwrap());
+    let before = e
+        .git
+        .run(&e.seed, ["worktree", "list", "--porcelain"])
+        .unwrap();
+    trees
+        .remove(&seat("w1"), &task(12), false)
+        .unwrap()
+        .unwrap();
+    assert!(
+        e.git
+            .check(
+                &e.seed,
+                ["show-ref", "--verify", "--quiet", "refs/heads/keep-me"]
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        before,
+        e.git
+            .run(&e.seed, ["worktree", "list", "--porcelain"])
+            .unwrap()
+    );
+}
+
+#[test]
+fn clone_lock_serializes_processes_and_unlocks_inherited_descriptors() {
+    let e = env();
+    let guard = e.trees.lock_clone("demo").unwrap();
+    let inherited = guard.0.try_clone().unwrap();
+    let path = e.trees.layout.root().join("clones/.locks/demo.lock");
+    let child = |expect: bool| {
+        let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "tests::clone_lock_child"])
+            .env("HGL_TEST_CLONE_LOCK", &path);
+        if expect {
+            cmd.env("HGL_TEST_EXPECT_LOCK", "1");
+        } else {
+            cmd.env_remove("HGL_TEST_EXPECT_LOCK");
+        }
+        assert!(cmd.status().unwrap().success());
+    };
+    child(false);
+    drop(guard);
+    child(true);
+    drop(inherited);
+}
+#[test]
 fn salvage_preserves_non_utf8_patch_bytes() {
     let e = env();
     let c = e
@@ -841,4 +925,41 @@ fn salvage_preserves_non_utf8_patch_bytes() {
             .windows(b"+modified \xfe\n".len())
             .any(|w| w == b"+modified \xfe\n")
     );
+}
+
+fn assert_invalid_metadata_removed(metadata: &str, create_target: bool) {
+    let e = env();
+    let dir = e
+        .trees
+        .layout
+        .task_dir(&seat("w1"), &task(982), false)
+        .unwrap();
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    if create_target {
+        std::fs::create_dir_all(dir.join("metadata")).unwrap();
+    }
+    std::fs::write(src.join(".git"), metadata).unwrap();
+    let removed = e
+        .trees
+        .remove(&seat("w1"), &task(982), false)
+        .unwrap()
+        .unwrap();
+    assert!(removed.salvage.is_none());
+    assert!(!dir.exists());
+}
+
+#[test]
+fn removal_with_pruned_worktree_metadata() {
+    assert_invalid_metadata_removed("gitdir: ../missing\n", false);
+}
+
+#[test]
+fn removal_with_malformed_worktree_metadata() {
+    assert_invalid_metadata_removed("not a gitdir\n", false);
+}
+
+#[test]
+fn removal_with_worktree_metadata_missing_head() {
+    assert_invalid_metadata_removed("gitdir: ../metadata\n", true);
 }
