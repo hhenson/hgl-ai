@@ -134,13 +134,19 @@ pub async fn merge<G: Gh>(
                 e => Ok(Merge::Refused(e.to_string())),
             };
         }
+        // Accepted (a success) without an answer to read: GitHub may be merging it.
         _ => {
-            return Ok(Merge::Refused(format!(
-                "{path}: not JSON: {}",
+            return Ok(Merge::Pending(format!(
+                "{path}: accepted, the answer is not JSON: {}",
                 out.stdout.trim()
             )));
         }
     };
+    if out.ok && status(&v).is_empty() {
+        return Ok(Merge::Pending(format!(
+            "{path}: accepted with no status: {v}"
+        )));
+    }
     if let Some(done) = terminal(&v) {
         return Ok(done);
     }
@@ -341,6 +347,25 @@ mod tests {
             matches!(run(&gh, d).await.unwrap(), Merge::Pending(w) if w.contains("no details.uuid"))
         );
         assert_eq!(calls(&gh, "merge-async/"), 0);
+    }
+
+    /// r1 on #50, minor 4: a call GitHub accepted whose answer cannot be read is not a
+    /// refusal; the merge may be happening.
+    #[tokio::test]
+    async fn an_accepted_call_without_a_readable_answer_is_pending() {
+        for answer in [
+            "",
+            "<html>accepted</html>",
+            "{\"details\":{\"uuid\":\"u-1\"}}",
+        ] {
+            let gh = FakeGh::default().on(PUT, answer);
+            let m = run(&gh, MS).await.unwrap();
+            assert!(
+                matches!(&m, Merge::Pending(w) if w.contains("accepted")),
+                "{answer}: {m:?}"
+            );
+            assert_eq!(calls(&gh, POLL), 0);
+        }
     }
 
     #[tokio::test]

@@ -923,6 +923,8 @@ mod tests {
                 .on("pulls/7", &fixture("pr-open.json"))
                 .on("issues/7/comments", &fixture("comments-clean.json"))
                 .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+                .on("check-runs", "{\"check_runs\":[]}")
+                .on("/status?per_page", "{\"statuses\":[]}")
                 .on("git/ref/heads/main", &main)
                 .on("graphql", "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}"),
         );
