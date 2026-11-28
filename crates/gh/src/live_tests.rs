@@ -2389,6 +2389,536 @@ async fn tasks_without_a_task_write_nothing() {
     assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
 }
 
+#[tokio::test]
+async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller() {
+    use hgl_ai_config::ReviewPool;
+    use hgl_ai_proto::{
+        Family, HostRecord, Note, ReviewReceipt, Role, Runtime, SeatRecord, TaskKey, TreeRecord,
+        Verdict, utc_now_stamp,
+    };
+
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into()];
+    let seat = |name| Seat::new(name).unwrap();
+    let (r1, r2, r3, w1, w2) = (seat("r1"), seat("r2"), seat("r3"), seat("w1"), seat("w2"));
+    s.review_pools.insert(
+        "alpha".into(),
+        ReviewPool {
+            seats: vec![r1.clone(), r2.clone(), r3.clone()],
+            manual: false,
+        },
+    );
+    let h = HostRecord {
+        host: "test".into(),
+        seats: [
+            (&r1, Family::Claude),
+            (&r2, Family::Gemini),
+            (&r3, Family::Gpt),
+        ]
+        .into_iter()
+        .map(|(reviewer, family)| SeatRecord {
+            seat: reviewer.clone(),
+            role: Role::Reviewer,
+            runtime: Runtime::Agy,
+            family,
+            model: family.to_string(),
+        })
+        .collect(),
+        memcap_gb: 64,
+        work_root_free_gb: 200,
+        updated_at: utc_now_stamp(),
+    };
+    b.host_put(&h).await.unwrap();
+
+    let tree = |seat: &Seat, handoff| TreeRecord {
+        host: "test".into(),
+        seat: seat.clone(),
+        task: TaskKey {
+            repo: "alpha".into(),
+            issue: 980,
+        },
+        review: false,
+        path: "tree".into(),
+        branch: Some("codex/q980-fix".into()),
+        created_at: utc_now_stamp(),
+        size_bytes: 0,
+        families: vec![Family::Gpt],
+        class: None,
+        class_seq: None,
+        seq: Some(handoff),
+        handoff_seq: Some(handoff),
+    };
+    b.tree_put(&tree(&w1, 1)).await.unwrap();
+
+    let note = |kind, from: &Seat, to: &Seat, issue, head: &str, body: &str| {
+        let mut n = Note::new(from.clone(), to.clone(), kind, body);
+        n.repo = Some("alpha".into());
+        n.issue = issue;
+        n.head = Some(head.into());
+        n
+    };
+    let read = |head: &str| {
+        let response = serde_json::json!({
+            "data": {
+                "rateLimit": {"cost": 1, "remaining": 1000, "resetAt": "2100-01-01T00:00:00Z"},
+                "r0": {"pullRequests": {"nodes": [
+                    {"number": 7, "headRefOid": head, "headRefName": "codex/q980-fix", "baseRefName": "main"},
+                    {"number": 8, "headRefOid": HEAD, "headRefName": "codex/q981-other", "baseRefName": "main"},
+                    {"number": 9, "headRefOid": HEAD, "headRefName": "codex/q982-other", "baseRefName": "main"}
+                ]}}
+            }
+        });
+        crate::table::parse_batch(&response, &s.repos, &s.review_bot, &utc_now_stamp())
+            .unwrap()
+            .0
+    };
+    let ready = |from, head| {
+        note(
+            Kind::Ready,
+            from,
+            &s.coord_seat,
+            980,
+            head,
+            "Ready to review",
+        )
+    };
+    let receipt = |head: &str, verdict| {
+        let body = serde_json::to_string(&ReviewReceipt {
+            repo: "alpha".into(),
+            pr: 7,
+            head: head.into(),
+            main: "a".repeat(40),
+            reviewer: r2.clone(),
+            family: Family::Gemini,
+            model: "gemini-test".into(),
+            verdict,
+            evidence: "The retry loses a checkpoint.".into(),
+            limitations: "Linux".into(),
+        })
+        .unwrap();
+        note(Kind::Receipt, &r2, &s.coord_seat, 7, head, &body)
+    };
+    let no_gh = FakeGh::default();
+    b.send(&note(Kind::Review, &s.controller, &r1, 8, HEAD, "Queued"))
+        .await
+        .unwrap();
+    let first = b.send(&ready(&w1, HEAD)).await.unwrap();
+    crate::routing::round(&no_gh, &s, &b, &read(HEAD))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(
+            &[r1.clone(), r2.clone(), r3.clone(), s.controller.clone()],
+            first.seq,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 2);
+    assert_eq!(
+        notes[0].note.recipient, r2,
+        "same-family r3 is ineligible and r1 has queued work"
+    );
+    assert_eq!(notes[0].note.kind, Kind::Review);
+    assert_eq!(notes[0].note.issue, 7);
+    assert_eq!(notes[0].note.head.as_deref(), Some(HEAD));
+    assert!(notes[1].note.body.contains("review by r2"));
+    assert!(no_gh.calls().is_empty());
+
+    // GitHub accepts the comment but loses its response, leaving a pending sendback.
+    let sequence = b.send(&receipt(HEAD, Verdict::Findings)).await.unwrap().seq;
+    let gh = FakeGh::default()
+        .on("comments?per_page", "[]")
+        .on("pulls/7", &fixture("pr-open.json"))
+        .fail("-X POST", "connection reset after sending the request");
+    assert!(
+        crate::routing::round(&gh, &s, &b, &read(HEAD))
+            .await
+            .is_err()
+    );
+    let inputs = gh.inputs.lock().unwrap().clone();
+    assert_eq!(inputs.len(), 1);
+    let posted: serde_json::Value = serde_json::from_str(&inputs[0].1).unwrap();
+    assert!(
+        posted["body"]
+            .as_str()
+            .unwrap()
+            .contains("The retry loses a checkpoint.")
+    );
+    let checkpoint = b.state_get("coord.routing").await.unwrap().unwrap().value;
+    let mut moved = tree(&w2, first.seq + 10);
+    moved.task.issue = 981; // The new tree matches by branch, using its own task key.
+    b.tree_put(&moved).await.unwrap();
+
+    let recovered = FakeGh::default()
+        .on(
+            "comments?per_page",
+            &serde_json::json!([posted]).to_string(),
+        )
+        .on("pulls/7", &fixture("pr-open.json"));
+    // The accepted comment is recoverable when the PR is still open at the same head,
+    // even if the PR is missing from the batch.
+    crate::routing::round(&recovered, &s, &b, &[])
+        .await
+        .unwrap();
+    // Replaying after a lost checkpoint write recovers the already delivered recipient.
+    b.state_put("coord.routing", &checkpoint).await.unwrap();
+    crate::routing::round(&recovered, &s, &b, &read(HEAD))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(
+            &[w1.clone(), w2.clone(), s.controller.clone()],
+            sequence,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 2);
+    let sendback = &notes[0].note;
+    assert_eq!((sendback.kind, &sendback.recipient), (Kind::Sendback, &w2));
+    assert_eq!(sendback.task().as_ref(), Some(&moved.task));
+    assert_eq!(sendback.head.as_deref(), Some(HEAD));
+    assert_eq!(sendback.class, None);
+    assert!(
+        notes[1]
+            .note
+            .body
+            .contains(&format!("alpha#7 at {HEAD} → sendback to w2"))
+    );
+    assert_eq!(
+        recovered.calls().len(),
+        2,
+        "read the accepted comment and current PR once without posting again"
+    );
+
+    // The earlier reviewer gets the rerun even though r1 has less queued work now.
+    b.send(&note(Kind::Review, &s.controller, &r2, 8, HEAD, "Queued"))
+        .await
+        .unwrap();
+    b.send(&note(Kind::Review, &s.controller, &r2, 9, HEAD, "Queued"))
+        .await
+        .unwrap();
+    let w3 = seat("w3");
+    b.tree_del(&moved.key()).await.unwrap();
+    b.tree_put(&tree(&w3, sequence + 10)).await.unwrap();
+    let head = "b".repeat(40);
+    let sequence = b.send(&ready(&w3, &head)).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&head))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(&[r1, r2.clone()], sequence, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note.recipient, r2);
+    assert!(!notes[0].note.body.contains("Earlier reviewed head"));
+
+    let mut second = receipt(&head, Verdict::Findings);
+    let sequence = b.send(&second).await.unwrap().seq;
+    second.recipient = s.controller.clone();
+    crate::routing::round(&no_gh, &s, &b, &read(&head))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(&[s.controller.clone(), w2], sequence, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(
+        notes[0].note, second,
+        "the controller judges repeat findings"
+    );
+
+    let mut wrong_family = receipt(&head, Verdict::Clean);
+    let mut body = state::routed_receipt(&wrong_family).unwrap();
+    body.family = Family::Claude;
+    wrong_family.body = serde_json::to_string(&body).unwrap();
+    let sequence = b.send(&wrong_family).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&head))
+        .await
+        .unwrap();
+    wrong_family.recipient = s.controller.clone();
+    let notes = b
+        .read_notes(
+            std::slice::from_ref(&s.controller),
+            sequence,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note, wrong_family);
+
+    let sequence = b.send(&receipt(&head, Verdict::Clean)).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&head))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(
+            std::slice::from_ref(&s.controller),
+            sequence,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].note.body.contains("landing candidate"));
+    let receipts = crate::gate::receipts(&b, &s, "alpha", 7).await.unwrap();
+    assert_eq!(
+        receipts.len(),
+        3,
+        "the gate rejects the mismatched family and counts a forwarded receipt once"
+    );
+    assert!(
+        receipts
+            .iter()
+            .any(|r| r.receipt.head == head && r.receipt.verdict == Verdict::Clean)
+    );
+
+    // The accepted comment is still present, but the PR has moved or closed since
+    // the outbox entry was saved. Even a stale batch can say it is still current.
+    let closed_head = "e".repeat(40);
+    let closed = fixture("pr-open.json")
+        .replace(HEAD, &closed_head)
+        .replace("\"state\": \"open\"", "\"state\": \"closed\"");
+    for (reviewed, current_pr) in [
+        ("d".repeat(40), fixture("pr-open.json")),
+        (closed_head, closed),
+    ] {
+        let mut findings = receipt(&reviewed, Verdict::Findings);
+        let seq = b.send(&findings).await.unwrap().seq;
+        let cursor = serde_json::json!({
+            "after": seq - 1,
+            "digest": [],
+            "outbox": {
+                "seq": seq,
+                "action": {"Sendback": {"pr": 7, "issue": 980, "branch": "codex/q980-fix", "fallback": s.controller}},
+                "line": null
+            }
+        });
+        b.state_put("coord.routing", &cursor.to_string())
+            .await
+            .unwrap();
+        let comments = serde_json::json!([{
+            "body": format!("<!-- hgl-ai coordinator sendback {reviewed} {seq} -->\n"),
+        }]);
+        let gh = FakeGh::default()
+            .on("comments?per_page", &comments.to_string())
+            .on("pulls/7", &current_pr);
+        crate::routing::round(&gh, &s, &b, &read(&reviewed))
+            .await
+            .unwrap();
+        findings.recipient = s.controller.clone();
+        let notes = b
+            .read_notes(
+                &[s.controller.clone(), w1.clone(), w3.clone()],
+                seq,
+                10,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].note, findings,
+            "a stale sendback goes to the controller as the original receipt"
+        );
+        assert_eq!(gh.calls().len(), 2);
+    }
+
+    // An old outbox without a branch cannot rule out a branch-based handoff when
+    // GitHub omits the PR from its batch. Forward the original findings in that case.
+    let mut old = receipt(&"c".repeat(40), Verdict::Findings);
+    let seq = b.send(&old).await.unwrap().seq;
+    let cursor = serde_json::json!({
+        "after": seq - 1,
+        "digest": [],
+        "outbox": {
+            "seq": seq,
+            "action": {"Sendback": {"pr": 7, "issue": 980, "to": w1, "fallback": s.controller}},
+            "line": "alpha#7 → sendback to w1"
+        }
+    });
+    b.state_put("coord.routing", &cursor.to_string())
+        .await
+        .unwrap();
+    crate::routing::round(&no_gh, &s, &b, &[]).await.unwrap();
+    old.recipient = s.controller.clone();
+    let notes = b
+        .read_notes(&[s.controller.clone(), w1, w3], seq, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note, old);
+    assert!(no_gh.calls().is_empty());
+}
+
+#[tokio::test]
+async fn routing_recovers_retained_outputs_and_drains_a_disabled_pool() {
+    use hgl_ai_proto::Note;
+    use serde_json::{Value, json};
+
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let s = settings();
+    let mut config: Value =
+        serde_json::from_str(&js_api(&h.url, "$JS.API.STREAM.INFO.HGL_NOTES", "")).unwrap();
+    let config = &mut config["config"];
+    config["duplicate_window"] = json!(100_000_000);
+    let updated: Value = serde_json::from_str(&js_api(
+        &h.url,
+        "$JS.API.STREAM.UPDATE.HGL_NOTES",
+        &config.to_string(),
+    ))
+    .unwrap();
+    assert!(updated.get("error").is_none(), "{updated}");
+
+    let reviewer = Seat::new("removed").unwrap();
+    let author = Seat::new("w1").unwrap();
+    let mut ready = Note::new(author, s.coord_seat.clone(), Kind::Ready, "Ready");
+    ready.repo = Some("alpha".into());
+    ready.issue = 7;
+    ready.head = Some(HEAD.into());
+    let first = b.send(&ready).await.unwrap().seq;
+    let mut review = ready.clone();
+    review.sender = s.coord_seat.clone();
+    review.recipient = reviewer.clone();
+    review.kind = Kind::Review;
+    let routed = b
+        .send_with_id(&review, &format!("coord-routing-{first}"))
+        .await
+        .unwrap()
+        .seq;
+    let gh = FakeGh::default();
+    let checkpoint = "coord.routing";
+    b.state_put(
+        checkpoint,
+        &json!({
+            "after": first - 1,
+            "digest": [],
+            "outbox": {
+                "seq": first,
+                "action": { "Review": { "pr": 7, "to": reviewer, "earlier": null, "url": "" } },
+                "line": "alpha#7 → review by removed"
+            }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let queued = Note::new(
+        ready.sender.clone(),
+        s.coord_seat.clone(),
+        Kind::Question,
+        "Queued",
+    );
+    b.send(&queued).await.unwrap();
+    let probe = b
+        .send_with_id(&queued, "duplicate-window-probe")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let probe_again = b
+        .send_with_id(&queued, "duplicate-window-probe")
+        .await
+        .unwrap();
+    assert!(!probe_again.duplicate && probe.seq != probe_again.seq);
+
+    crate::routing::round(&gh, &s, &b, &[]).await.unwrap();
+    let reviews = b
+        .read_notes(&[reviewer], first, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].seq, routed);
+    let notes = b
+        .read_notes(
+            std::slice::from_ref(&s.controller),
+            first,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 4);
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|n| n.note.body.trim_end() == "Queued")
+            .count(),
+        3
+    );
+    assert!(notes[3].note.body.contains("review by removed"));
+
+    // Lose the cursor update after sending the digest.
+    b.state_put(
+        checkpoint,
+        &json!({
+            "after": probe_again.seq,
+            "digest": ["alpha#7 → review by removed"],
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    crate::routing::round(&gh, &s, &b, &[]).await.unwrap();
+
+    // Lose the cursor update after forwarding a new input.
+    let next = b.send(&queued).await.unwrap().seq;
+    let mut forwarded = queued;
+    forwarded.recipient = s.controller.clone();
+    b.send_with_id(&forwarded, &format!("coord-routing-{next}"))
+        .await
+        .unwrap();
+    b.state_put(
+        checkpoint,
+        &json!({
+            "after": probe_again.seq,
+            "digest": [],
+            "outbox": {
+                "seq": next,
+                "action": { "Forward": { "to": s.controller } },
+                "line": null
+            }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    crate::routing::round(&gh, &s, &b, &[]).await.unwrap();
+    let recovered = b
+        .read_notes(&[s.controller], first, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), 5);
+    assert_eq!(
+        recovered
+            .iter()
+            .filter(|n| n.note.body.contains("review by removed"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        recovered
+            .iter()
+            .filter(|n| n.note.body.trim_end() == "Queued")
+            .count(),
+        4
+    );
+    assert!(gh.calls().is_empty());
+}
+
 /// `gh` for [`a_pin_landing_finished_by_another_sync_is_done`]: at the first call matching
 /// `trigger`, another sync finishes the landing of the pin pull request `n` (its
 /// `landed.log` line, its record gone).

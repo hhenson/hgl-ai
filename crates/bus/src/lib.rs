@@ -566,15 +566,8 @@ impl Bus {
 
     /// Send a note keyed by its source event when the note contents alone are not unique.
     pub async fn send_with_id(&self, note: &Note, msg_id: &str) -> Result<SendReceipt> {
-        note.validate()?;
+        let payload = encode_note(note)?;
         let subject = note.subject();
-        let payload = serde_json::to_vec(note).map_err(|e| nats("encoding the note", e))?;
-        if payload.len() > MAX_NOTE_BYTES {
-            return Err(BusError::Nats(format!(
-                "the note is {} bytes encoded; the limit is {MAX_NOTE_BYTES}",
-                payload.len()
-            )));
-        }
         let publish = Publish::build().payload(payload.into()).message_id(msg_id);
         let ack = self
             .guarded(&subject, async {
@@ -667,7 +660,7 @@ impl Bus {
         wait: Duration,
     ) -> Result<Vec<StreamNote>> {
         let subjects = seats.iter().map(Seat::subject).collect();
-        Ok(self.read(subjects, from, max, wait, None).await?.0)
+        Ok(self.read(subjects, from, max, wait, None, None).await?.0)
     }
 
     /// One page of a whole-history read: at most `max` messages for `seats` from stream
@@ -680,7 +673,53 @@ impl Bus {
         max: usize,
     ) -> Result<(Vec<StreamNote>, Option<u64>)> {
         let subjects = seats.iter().map(Seat::subject).collect();
-        self.read(subjects, from, max, Duration::ZERO, None).await
+        self.read(subjects, from, max, Duration::ZERO, None, None)
+            .await
+    }
+
+    /// Read unicast history even for seats absent from the current configuration.
+    pub async fn read_note_history_page(
+        &self,
+        from: u64,
+        max: usize,
+    ) -> Result<(Vec<StreamNote>, Option<u64>)> {
+        self.read(
+            vec![format!("{SUBJECT_PREFIX}.*")],
+            from,
+            max,
+            Duration::ZERO,
+            None,
+            None,
+        )
+        .await
+    }
+
+    /// Recover a publish by its retained ID after the JetStream deduplication window.
+    /// A missing recipient searches all regular note subjects.
+    pub async fn retained_note(
+        &self,
+        recipient: Option<&Seat>,
+        mut from: u64,
+        msg_id: &str,
+    ) -> Result<Option<StreamNote>> {
+        let subject = recipient.map_or_else(|| format!("{SUBJECT_PREFIX}.*"), Seat::subject);
+        loop {
+            let (notes, last) = self
+                .read(
+                    vec![subject.clone()],
+                    from,
+                    READ_BATCH,
+                    Duration::ZERO,
+                    None,
+                    Some(msg_id),
+                )
+                .await?;
+            if let Some(note) = notes.into_iter().next() {
+                return Ok(Some(note));
+            }
+            let Some(last) = last else { return Ok(None) };
+            from = last + 1;
+        }
     }
 
     async fn read(
@@ -690,6 +729,7 @@ impl Bus {
         max: usize,
         wait: Duration,
         broadcast_start: Option<OffsetDateTime>,
+        msg_id: Option<&str>,
     ) -> Result<(Vec<StreamNote>, Option<u64>)> {
         let mut out = Vec::new();
         if max == 0 || subjects.is_empty() {
@@ -715,7 +755,16 @@ impl Bus {
             .map_err(|e| nats("opening a stream reader", e))?;
         let name = reader.cached_info().name.clone();
         let mut last = None;
-        let read = Self::read_with(&reader, max, wait, &mut out, &mut last, broadcast_start).await;
+        let read = Self::read_with(
+            &reader,
+            max,
+            wait,
+            &mut out,
+            &mut last,
+            broadcast_start,
+            msg_id,
+        )
+        .await;
         if let Err(e) = stream.delete_consumer(&name).await {
             tracing::debug!("deleting the stream reader {name}: {e}");
         }
@@ -731,6 +780,7 @@ impl Bus {
         out: &mut Vec<StreamNote>,
         last: &mut Option<u64>,
         broadcast_start: Option<OffsetDateTime>,
+        msg_id: Option<&str>,
     ) -> Result<()> {
         let deadline = Instant::now().checked_add(wait);
         let mut seen = 0;
@@ -750,7 +800,7 @@ impl Bus {
                 .messages()
                 .await
                 .map_err(|e| nats("reading the stream", e))?;
-            let (_, n) = take_read(batch, out, last, broadcast_start).await?;
+            let (_, n) = take_read(batch, out, last, broadcast_start, msg_id).await?;
             seen += n;
             if n > 0 {
                 break;
@@ -763,7 +813,7 @@ impl Bus {
                 .messages()
                 .await
                 .map_err(|e| nats("reading the stream", e))?;
-            let (received, n) = take_read(batch, out, last, broadcast_start).await?;
+            let (received, n) = take_read(batch, out, last, broadcast_start, msg_id).await?;
             if !received {
                 break;
             }
@@ -792,7 +842,7 @@ impl Bus {
             Err(e) => return Err(nats(&format!("reading the inbox of {seat}"), e)),
         };
         Ok(self
-            .read(subjects, from, max, wait, broadcast_start)
+            .read(subjects, from, max, wait, broadcast_start, None)
             .await?
             .0)
     }
@@ -1387,6 +1437,7 @@ async fn take_read(
     out: &mut Vec<StreamNote>,
     last: &mut Option<u64>,
     broadcast_start: Option<OffsetDateTime>,
+    msg_id: Option<&str>,
 ) -> Result<(bool, usize)> {
     let mut received = false;
     let mut n = 0;
@@ -1402,6 +1453,16 @@ async fn take_read(
         n += 1;
         let seq = info.stream_sequence;
         *last = Some(last.map_or(seq, |l| l.max(seq)));
+        if let Some(id) = msg_id
+            && msg
+                .headers
+                .as_ref()
+                .and_then(|h| h.get(async_nats::header::NATS_MESSAGE_ID))
+                .map(|v| v.as_str())
+                != Some(id)
+        {
+            continue;
+        }
         match parse_note(msg.subject.as_str(), &msg.payload) {
             Ok(note) => out.push(StreamNote { seq, note }),
             Err(why) => tracing::debug!(seq, "skipping a malformed note: {why}"),
@@ -1427,6 +1488,23 @@ fn broadcast_before(
 ) -> bool {
     info.published < start
         && msg.subject.as_str().rsplit_once('.') == Some((SUBJECT_PREFIX, BROADCAST))
+}
+
+/// Check that the finished envelope fits the note stream.
+pub fn check_note(note: &Note) -> Result<()> {
+    encode_note(note).map(|_| ())
+}
+
+fn encode_note(note: &Note) -> Result<Vec<u8>> {
+    note.validate()?;
+    let payload = serde_json::to_vec(note).map_err(|e| nats("encoding the note", e))?;
+    if payload.len() > MAX_NOTE_BYTES {
+        return Err(BusError::Nats(format!(
+            "the note is {} bytes encoded; the limit is {MAX_NOTE_BYTES}",
+            payload.len()
+        )));
+    }
+    Ok(payload)
 }
 
 /// Parse and check one inbox payload; the error says why it is rejected. The subject is

@@ -134,12 +134,12 @@ before hub users takes one shared token until it moves.
 | Kind | From → to | Meaning |
 | --- | --- | --- |
 | `assign` | controller or triage → seat | Take this issue. Carries `repo`, `issue`, optional `base` and `class` (`simple`, `standard` or `complex`; PROTO-21). The bridge creates the worktree first (§5). |
-| `ready` | implementor → controller | Pull request at `head` passes the author's checks. |
+| `ready` | implementor → controller or coordinator | Pull request at `head` passes the author's checks. |
 | `blocked` | any → controller | Cannot proceed; states the question or dependency. |
 | `question` / `answer` | any ↔ any | Clarification; no GitHub comment unless it settles something. |
-| `review` | controller → reviewer | Review `repo#issue` at `head`. The bridge creates a review worktree. |
-| `receipt` | reviewer or desk → controller | Gate result at `head` (§7). |
-| `sendback` | controller → implementor | Findings at `head`; fix with new commits. An optional `class` moves the task up (ROLE-15). |
+| `review` | controller or coordinator → reviewer | Review `repo#issue` at `head`. The bridge creates a review worktree. |
+| `receipt` | reviewer or desk → controller, reviewer → coordinator | Gate result at `head` (§7). |
+| `sendback` | controller or coordinator → implementor | Findings at `head`; fix with new commits. The controller may set `class` to move the task up (ROLE-15). |
 | `approved` | controller → implementor | Sign-off for `head` on a verified `main`. |
 | `landed` | controller → seat, `all` | Merged; carries the merge commit. The bridge removes the issue's worktrees (§5). |
 | `closed` | controller → seat | Closed unmerged or superseded; same removal as `landed`. |
@@ -147,6 +147,14 @@ before hub users takes one shared token until it moves.
 | `note` | any → any | Operational fact: an alert, a `hold`, a `drain`. |
 | `build` | any → `builder-<label>` | Build `repo` at `head` (optionally merged onto `base`); the body is the job JSON (`docs/build.md`). The builder answers with a `receipt`. |
 | `tick` | console → controller | A status report is due (`[console] status_every`). |
+
+For repositories with an automatic `[github.review_pools.<repo>]` on the sender and
+the coordinator, `note send --to controller` routes `ready` and structured review
+receipts through the coordinator. The coordinator validates against the current PR
+round and forwards exceptions with the original sender, kind, head and body. It sends
+the controller a digest of routine routes and clean landing candidates after each round.
+The controller handles findings following any earlier sendback so it can apply ROLE-15.
+The controller also handles `hgl_spec`, `hgl_core`, and repositories in `github.spec_repos`.
 
 - **PROTO-20 — Owner and screen notes.** A note with sender `owner` travels on
   `hgl.notes.owner.<recipient>`, which only the console's hub user may publish. The
@@ -273,7 +281,7 @@ before hub users takes one shared token until it moves.
 
   `verdict` is `clean` or `findings`. `family` is the model's vendor family
   (`claude`, `gpt`, `gemini`); the controller checks it against the author's.
-  The merge gate reads receipts from the controller's notes in `HGL_NOTES`
+  The merge gate reads receipts from the controller's and coordinator's notes in `HGL_NOTES`
   (14 days): `receipt` notes whose body holds this JSON (alone, or inside text or
   a fenced block) for the pull request, whose `reviewer` is the seat that sent
   the note. The authors' families are those the bridges record in the task's
@@ -303,6 +311,7 @@ before hub users takes one shared token until it moves.
 | --- | --- | --- |
 | `main` | controller | `updated <UTC>`, then `<repo> main <sha>` lines and the wrapper's pins. Rewritten after each merge. |
 | `prs` | coordinator service | `# read <UTC>`, `# cost <n> remaining <n> resetAt <ISO>`, then rows `REPO NUMBER HEAD draft\|open BOT UNRESOLVED CHECKS UPDATED`. At most every 5 min; stale after 15 min. |
+| `coord.routing` | coordinator service | Note cursor, pending review route and controller digest. The coordinator saves progress under `lock.coord.routing`. |
 | `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha>` per merge. |
 | `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |

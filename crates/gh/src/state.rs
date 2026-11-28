@@ -3,7 +3,9 @@
 
 use std::sync::LazyLock;
 
-use hgl_ai_proto::{Family, ReviewReceipt, Seat, TreeRecord};
+use hgl_ai_proto::{
+    Family, HostRecord, Kind, Note, ReviewReceipt, Role, Seat, TreeRecord, check_head,
+};
 use regex::Regex;
 
 use crate::short;
@@ -105,25 +107,58 @@ pub fn current_seats(
     known: &[String],
     signers: &[String],
 ) -> Vec<Seat> {
+    let current = current_trees(trees, repo, branch, issue);
+    if current.iter().all(|t| handoff(t).is_none()) {
+        return author_seats(trees, repo, branch, issue, known, signers);
+    }
+    let mut out = Vec::new();
+    for t in current {
+        if !out.contains(&t.seat) {
+            out.push(t.seat.clone());
+        }
+    }
+    out
+}
+
+/// The registered recipient and task of an automatic verdict. A tie across hosts
+/// is safe only when every winning record names the same seat and task key.
+pub(crate) fn current_implementor<'a>(
+    trees: &'a [TreeRecord],
+    repo: &str,
+    branch: &str,
+    issue: u64,
+) -> Option<&'a TreeRecord> {
+    let current = current_trees(trees, repo, branch, issue);
+    let first = *current.first()?;
+    (!first.seat.is_reserved()
+        && first.task.issue != 0
+        && current
+            .iter()
+            .all(|t| t.seat == first.seat && t.task == first.task))
+    .then_some(first)
+}
+
+fn handoff(tree: &TreeRecord) -> Option<u64> {
+    tree.handoff_seq.max(tree.seq)
+}
+
+fn current_trees<'a>(
+    trees: &'a [TreeRecord],
+    repo: &str,
+    branch: &str,
+    issue: u64,
+) -> Vec<&'a TreeRecord> {
     let mine = |t: &&TreeRecord| {
         t.task.repo == repo
             && !t.review
             && (t.branch.as_deref() == Some(branch) || t.task.issue == issue)
     };
-    let handoff = |t: &TreeRecord| t.handoff_seq.max(t.seq);
     let newest = trees.iter().filter(mine).filter_map(handoff).max();
-    match newest {
-        Some(n) => {
-            let mut out: Vec<Seat> = Vec::new();
-            for t in trees.iter().filter(mine).filter(|t| handoff(t) == Some(n)) {
-                if !out.contains(&t.seat) {
-                    out.push(t.seat.clone());
-                }
-            }
-            out
-        }
-        None => author_seats(trees, repo, branch, issue, known, signers),
-    }
+    trees
+        .iter()
+        .filter(mine)
+        .filter(|t| handoff(t) == newest)
+        .collect()
 }
 
 /// The task's author families (ROLE-11): the families recorded in the implementor trees of
@@ -149,6 +184,40 @@ pub fn parse_receipt(body: &str) -> Option<ReviewReceipt> {
     }
     let (a, z) = (body.find('{')?, body.rfind('}')?);
     (a < z).then(|| serde_json::from_str(&body[a..=z]).ok())?
+}
+
+/// A review receipt whose payload agrees with the routed note's envelope.
+pub fn routed_receipt(note: &Note) -> Option<ReviewReceipt> {
+    if note.kind != Kind::Receipt {
+        return None;
+    }
+    let receipt = parse_receipt(&note.body)?;
+    matches_receipt(note, &receipt).then_some(receipt)
+}
+
+pub(crate) fn matches_receipt(note: &Note, receipt: &ReviewReceipt) -> bool {
+    receipt.reviewer == note.sender
+        && Some(receipt.repo.as_str()) == note.repo.as_deref()
+        && receipt.pr == note.issue
+        && receipt.pr != 0
+        && Some(receipt.head.as_str()) == note.head.as_deref()
+        && check_head(&receipt.head).is_ok()
+        && check_head(&receipt.main).is_ok()
+        && !receipt.model.trim().is_empty()
+}
+
+/// A current seat record can confirm or contradict the claimed reviewer family.
+pub(crate) fn reviewer_family_matches(
+    hosts: &[HostRecord],
+    receipt: &ReviewReceipt,
+) -> Option<bool> {
+    let mut records = hosts
+        .iter()
+        .flat_map(|host| &host.seats)
+        .filter(|seat| seat.seat == receipt.reviewer)
+        .peekable();
+    records.peek()?;
+    Some(records.all(|seat| seat.role == Role::Reviewer && seat.family == receipt.family))
 }
 
 /// Body of a `landed` note (PROTO-11).
@@ -375,11 +444,17 @@ mod tests {
         // One seat on two hosts (a moved seat) is one seat.
         let mut other = at("w2", Some(40));
         other.host = "h2".into();
-        let two = vec![at("w1", Some(10)), at("w2", Some(40)), other];
+        let mut two = vec![at("w1", Some(10)), at("w2", Some(40)), other];
         assert_eq!(
             seats(current_seats(&two, "alpha", "codex/q17-x", 17, &known, &[])),
             ["w2"]
         );
+        assert_eq!(
+            current_implementor(&two, "alpha", "codex/q17-x", 17).map(|tree| tree.task.issue),
+            Some(17)
+        );
+        two[2].task.issue = 18;
+        assert!(current_implementor(&two, "alpha", "codex/q17-x", 17).is_none());
     }
 
     /// hgl-ai#44: a task moved from w1 to w2 and back reuses w1's older tree; the verdict
