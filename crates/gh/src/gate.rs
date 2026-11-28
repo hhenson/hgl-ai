@@ -1461,10 +1461,10 @@ pub async fn evaluate<G: Gh>(
                         {
                             eprintln!("{repo} #{number}: removing the landing record: {e}");
                         }
-                        return Err(error);
+                        return Err(*error);
                     }
                     // Accepted, or not known: the intent stays for a later attempt.
-                    Err(f) => return Err(f.error),
+                    Err(f) => return Err(*f.error),
                 };
                 let after = match read_back(gh, s, repo, number, res == Merge::Merged).await {
                     Ok(pr) => pr,

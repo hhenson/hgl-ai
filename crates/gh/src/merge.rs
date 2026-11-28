@@ -111,7 +111,7 @@ pub async fn merge<G: Gh>(
 ) -> Result<Merge> {
     merge_tracked(gh, full, number, head, deadline, every)
         .await
-        .map_err(|f| f.error)
+        .map_err(|f| *f.error)
 }
 
 /// Why [`merge_tracked`] stopped with an error, and whether GitHub may have taken the
@@ -119,7 +119,7 @@ pub async fn merge<G: Gh>(
 /// or a rate limit, so nothing can merge from it.
 #[derive(Debug)]
 pub struct Failed {
-    pub error: Error,
+    pub error: Box<Error>,
     pub maybe_accepted: bool,
 }
 
@@ -134,7 +134,7 @@ pub async fn merge_tracked<G: Gh>(
     every: Duration,
 ) -> std::result::Result<Merge, Failed> {
     let unknown = |error: Error| Failed {
-        error,
+        error: Box::new(error),
         maybe_accepted: true,
     };
     let path = format!("repos/{full}/pulls/{number}/merge-async");
@@ -162,7 +162,7 @@ pub async fn merge_tracked<G: Gh>(
         _ if !out.ok => {
             return match exec::failure(shown, &out) {
                 error @ (Error::Auth(_) | Error::RateLimited(_)) => Err(Failed {
-                    error,
+                    error: Box::new(error),
                     maybe_accepted: false,
                 }),
                 e => Ok(Merge::Refused(e.to_string())),
