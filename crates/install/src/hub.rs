@@ -7,8 +7,9 @@ use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_config::Config;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    HUB_API_PREFIX, HostRecord, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS,
-    KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
+    CANARY_PROBE, HUB_API_PREFIX, HostRecord, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS,
+    KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, STREAM_NOTES, STREAM_OWNER,
+    STREAM_USAGE,
 };
 
 use crate::users::{KV_VERDICTS, Role};
@@ -74,8 +75,21 @@ struct Plain {
     js: async_nats::jetstream::Context,
     /// The hub answered at [`HUB_API_PREFIX`]: this user is in a role account (hgl-ai#141).
     accounts: bool,
-    /// The role the credential names; `None` for a shared token or a bare seed.
-    role: Option<Role>,
+    who: Who,
+    /// The hub's permissions violations on this connection.
+    refused: tokio::sync::mpsc::UnboundedReceiver<String>,
+}
+
+/// Who a credential is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Who {
+    /// The shared token: every right.
+    Token,
+    /// An NKey user of a known role.
+    Role(Role),
+    /// An NKey whose role the credential does not say (a bare seed, an unknown name): any
+    /// role, the admin too.
+    Unknown,
 }
 
 /// Connect as `cfg`'s credential and find the JetStream API as the bus does: under
@@ -87,9 +101,12 @@ async fn connect(cfg: &Config) -> Result<Plain, String> {
     let cred = hgl_ai_bus::read_credential(&path).map_err(|e| e.to_string())?;
     // A hub user may subscribe to its own inbox prefix only (hgl-ai#111).
     let inbox = cred.as_ref().and_then(hgl_ai_bus::Credential::inbox_prefix);
-    let role = match &cred {
-        Some(hgl_ai_bus::Credential::Nkey { role: Some(r), .. }) => r.parse().ok(),
-        _ => None,
+    let who = match &cred {
+        Some(hgl_ai_bus::Credential::Nkey { role, .. }) => role
+            .as_deref()
+            .and_then(|r| r.parse().ok())
+            .map_or(Who::Unknown, Who::Role),
+        _ => Who::Token,
     };
     let (tx, mut refused) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut opts = match cred {
@@ -140,7 +157,8 @@ async fn connect(cfg: &Config) -> Result<Plain, String> {
         client,
         js,
         accounts,
-        role,
+        who,
+        refused,
     })
 }
 
@@ -167,24 +185,28 @@ const BUCKETS: [&str; 13] = [
     KV_CANARY,
 ];
 
-/// The streams and buckets `role` may look up, of [`STREAMS`] and [`BUCKETS`]: by the
-/// access table, the viewer's own buckets, or (the admin, a shared token, a credential
-/// without a role) all.
-fn health_scope(role: Option<Role>) -> (Vec<&'static str>, Vec<&'static str>) {
-    match role {
-        Some(r) if crate::users::ACCOUNT_ROLES.contains(&r) => {
-            let reads = crate::users::stream_reads(r);
-            (
-                STREAMS.into_iter().filter(|s| reads.contains(*s)).collect(),
-                BUCKETS
-                    .into_iter()
-                    .filter(|b| reads.contains(&format!("KV_{b}")))
-                    .collect(),
-            )
+/// The streams and buckets `who` may look up, of [`STREAMS`] and [`BUCKETS`]: by the access
+/// table for a role with an account, the viewer's own buckets, all for the admin and a
+/// shared token, and for a credential of unknown role those every role may.
+fn health_scope(who: Who) -> (Vec<&'static str>, Vec<&'static str>) {
+    let reads = match who {
+        Who::Token | Who::Role(Role::Admin) => return (STREAMS.to_vec(), BUCKETS.to_vec()),
+        Who::Role(Role::Viewer) => return (Vec::new(), crate::users::VIEWER_BUCKETS.to_vec()),
+        Who::Role(r) => crate::users::stream_reads(r),
+        Who::Unknown => {
+            let mut all = crate::users::ACCOUNT_ROLES.map(crate::users::stream_reads);
+            let mut common = std::mem::take(&mut all[0]);
+            common.retain(|s| all[1..].iter().all(|r| r.contains(s)));
+            common
         }
-        Some(Role::Viewer) => (Vec::new(), crate::users::VIEWER_BUCKETS.to_vec()),
-        _ => (STREAMS.to_vec(), BUCKETS.to_vec()),
-    }
+    };
+    (
+        STREAMS.into_iter().filter(|s| reads.contains(*s)).collect(),
+        BUCKETS
+            .into_iter()
+            .filter(|b| reads.contains(&format!("KV_{b}")))
+            .collect(),
+    )
 }
 
 /// What `hub boundary` found (hgl-ai#146).
@@ -213,7 +235,7 @@ impl Hub for BusHub {
     /// a lookup the hub refuses is not a missing bucket (r1 on hgl-ai#152).
     async fn health(&self, cfg: &Config) -> Result<Vec<String>, String> {
         let c = connect(cfg).await?;
-        let (streams, buckets) = health_scope(c.role);
+        let (streams, buckets) = health_scope(c.who);
         let mut missing = Vec::new();
         for s in streams {
             if c.js.get_stream(s).await.is_err() {
@@ -293,28 +315,40 @@ impl Hub for BusHub {
         lasting_consumers(&jetstream_of(cfg).await?).await
     }
 
-    /// Four writes at keys of their own under `doctor.<pid><nanos>`: on `$KV.HGL_CANARY.<k>`
-    /// and its name under the hub API prefix, directly and as the reply subject of a
-    /// lookup every role may make (`STREAM.INFO` of the canary), which one account lets
-    /// JetStream answer onto (hgl-ai#141). A second lookup, answered, shows the hub has
-    /// served the first; then each key is read back.
+    /// Four writes, each at a key of its own under `doctor.<pid><nanos>`, on
+    /// `$KV.HGL_CANARY.<k>` and on its name under the hub API prefix:
+    /// - directly: proved refused by the hub's permissions violation naming the subject;
+    /// - by the reply route: the canary's probe message ([`CANARY_PROBE`]) is pulled
+    ///   through an ephemeral consumer of its own and acknowledged with the key as the
+    ///   acknowledgement's reply subject, which one account lets JetStream answer onto
+    ///   (hgl-ai#141). The consumer's acknowledgement floor proves the hub served it.
+    ///   The answer is empty: what it stores carries no hub metadata (r6 on #192). (A
+    ///   pull's own delivery is never stored, and an API answer, such as `STREAM.INFO`,
+    ///   carries the stream's configuration and state.)
+    ///
+    /// A key read back present is a write. A write seen stands whatever else fails; with
+    /// none, any try without its proof is an error, never a pass (r6 on #192).
     async fn boundary(&self, cfg: &Config) -> Result<Option<Boundary>, String> {
-        let c = connect(cfg).await?;
-        if c.role == Some(Role::Admin) {
-            return Ok(None);
+        use async_nats::jetstream::consumer;
+        use futures::StreamExt as _;
+        let mut c = connect(cfg).await?;
+        match c.who {
+            Who::Role(Role::Admin) => return Ok(None),
+            // A bare admin seed would write as the admin may: a false breach. In a role
+            // account it is no admin, who lives in `HUB`.
+            Who::Unknown if !c.accounts => {
+                return Err(
+                    "the credential names no role (a bare seed), and in one account \
+                            it may be the admin's"
+                        .into(),
+                );
+            }
+            _ => {}
         }
         let n = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| d.as_nanos());
-        let base = format!("doctor.{}{n}", std::process::id());
-        let api = if c.accounts {
-            HUB_API_PREFIX
-        } else {
-            "$JS.API"
-        };
-        let lookup = format!("{api}.STREAM.INFO.KV_{KV_CANARY}");
-        let key =
-            |route: &str, under: bool| format!("{base}.{route}{}", if under { "-api" } else { "" });
+        let tag = format!("{}{n}", std::process::id());
         let subject = |k: &str, under: bool| {
             let s = format!("$KV.{KV_CANARY}.{k}");
             if under {
@@ -323,37 +357,139 @@ impl Hub for BusHub {
                 s
             }
         };
-        let mut tries = Vec::new();
-        for under in [false, true] {
-            let k = key("direct", under);
-            c.client
-                .publish(subject(&k, under), "hgl-ai doctor".into())
-                .await
-                .map_err(|e| e.to_string())?;
-            tries.push((k, "directly"));
-            let k = key("reply", under);
-            c.client
-                .publish_with_reply(lookup.clone(), subject(&k, under), "".into())
-                .await
-                .map_err(|e| e.to_string())?;
-            tries.push((k, "by the reply route"));
-        }
-        c.client.flush().await.map_err(|e| e.to_string())?;
         let canary =
             c.js.get_key_value(KV_CANARY)
                 .await
-                .map_err(|e| format!("no bucket {KV_CANARY} to read back: {e}"))?;
-        // JetStream answers API requests off the connection's order: give it a moment.
-        tokio::time::sleep(Duration::from_millis(500)).await;
-        let mut wrote = Vec::new();
-        for (k, route) in tries {
-            let got = canary
-                .entry(k.as_str())
+                .map_err(|e| format!("no bucket {KV_CANARY}: {e}"))?;
+        let stream =
+            c.js.get_stream(format!("KV_{KV_CANARY}"))
                 .await
-                .map_err(|e| format!("reading {KV_CANARY} back: {e}"))?;
-            if got.is_some() && !wrote.contains(&route) {
-                wrote.push(route);
+                .map_err(|e| format!("no bucket {KV_CANARY}: {e}"))?;
+        let err = |e: &dyn std::fmt::Display| e.to_string();
+
+        // Directly.
+        let mut direct = Vec::new();
+        for under in [false, true] {
+            let k = format!("doctor.{tag}.direct{}", if under { "-api" } else { "" });
+            let s = subject(&k, under);
+            c.client
+                .publish(s.clone(), "hgl-ai doctor".into())
+                .await
+                .map_err(|e| err(&e))?;
+            direct.push((k, s));
+        }
+        // By the reply route: one consumer per acknowledgement, each with the probe.
+        let mut acks = Vec::new();
+        for under in [false, true] {
+            let k = format!("doctor.{tag}.reply{}", if under { "-api" } else { "" });
+            let name = format!("doctor-{tag}-{}", if under { "api" } else { "plain" });
+            let pull = stream
+                .create_consumer(consumer::pull::Config {
+                    name: Some(name),
+                    filter_subject: format!("$KV.{KV_CANARY}.{CANARY_PROBE}"),
+                    deliver_policy: consumer::DeliverPolicy::LastPerSubject,
+                    ack_policy: consumer::AckPolicy::Explicit,
+                    inactive_threshold: Duration::from_secs(30),
+                    ..Default::default()
+                })
+                .await
+                .map_err(|e| format!("a consumer of {KV_CANARY}: {e}"))?;
+            let probe = pull
+                .fetch()
+                .max_messages(1)
+                .expires(Duration::from_secs(2))
+                .messages()
+                .await
+                .map_err(|e| format!("pulling {KV_CANARY}/{CANARY_PROBE}: {e}"))?
+                .next()
+                .await
+                .transpose()
+                .map_err(|e| format!("pulling {KV_CANARY}/{CANARY_PROBE}: {e}"))?
+                .ok_or_else(|| {
+                    format!("no {KV_CANARY}/{CANARY_PROBE} to pull (`hgl-ai init` writes it)")
+                })?;
+            let ack = probe
+                .message
+                .reply
+                .clone()
+                .ok_or_else(|| format!("{KV_CANARY}/{CANARY_PROBE} came without its ack"))?;
+            c.client
+                .publish_with_reply(ack, subject(&k, under), "".into())
+                .await
+                .map_err(|e| err(&e))?;
+            acks.push((k, pull));
+        }
+        c.client.flush().await.map_err(|e| err(&e))?;
+
+        let mut wrote: Vec<&'static str> = Vec::new();
+        let mut unproved: Vec<String> = Vec::new();
+        let stored = |k: String| {
+            let canary = canary.clone();
+            async move { canary.entry(k.as_str()).await.map(|e| e.is_some()) }
+        };
+        // Each direct publish: refused, or else stored.
+        let mut pending: Vec<String> = direct.iter().map(|(_, s)| format!("\"{s}\"")).collect();
+        let _ = tokio::time::timeout(Duration::from_secs(2), async {
+            while !pending.is_empty() {
+                let Some(m) = c.refused.recv().await else {
+                    break;
+                };
+                pending.retain(|q| !m.contains(q.as_str()));
             }
+        })
+        .await;
+        for (k, s) in direct {
+            if !pending.contains(&format!("\"{s}\"")) {
+                continue;
+            }
+            match stored(k).await {
+                Ok(true) => {
+                    if !wrote.contains(&"directly") {
+                        wrote.push("directly");
+                    }
+                }
+                Ok(false) => unproved.push(format!("no refusal of {s}")),
+                Err(e) => unproved.push(format!("reading {KV_CANARY}: {e}")),
+            }
+        }
+        // Each acknowledgement: served (the floor moved), then its key read back.
+        for (k, mut pull) in acks {
+            let mut served = false;
+            for _ in 0..30 {
+                if let Ok(i) = pull.info().await
+                    && i.ack_floor.consumer_sequence >= 1
+                {
+                    served = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            // An answer onto the canary lands through the hub's ingest: a moment later.
+            let mut found = Ok(false);
+            for _ in 0..10 {
+                found = stored(k.clone()).await;
+                if !matches!(found, Ok(false)) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            match (found, served) {
+                (Ok(true), _) => {
+                    if !wrote.contains(&"by the reply route") {
+                        wrote.push("by the reply route");
+                    }
+                }
+                (Ok(false), true) => {}
+                (Ok(false), false) => unproved.push(format!(
+                    "the hub did not take the acknowledgement on {KV_CANARY}"
+                )),
+                (Err(e), _) => unproved.push(format!("reading {KV_CANARY}: {e}")),
+            }
+        }
+        if wrote.is_empty()
+            && let Some(why) = unproved.into_iter().next()
+        {
+            return Err(why);
         }
         Ok(Some(Boundary {
             accounts: c.accounts,
@@ -454,6 +590,26 @@ pub(crate) mod fake {
             self.answer("hosts", cfg)
                 .map(|()| self.hosts.clone())
                 .map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// What `hub` looks up per credential (r1 on hgl-ai#152, r6 on #192).
+#[cfg(test)]
+mod scope {
+    use super::*;
+
+    #[test]
+    fn a_credential_of_unknown_role_checks_what_every_role_may() {
+        assert_eq!(
+            health_scope(Who::Unknown),
+            (vec![STREAM_OWNER], vec![KV_CANARY])
+        );
+        let (s, b) = health_scope(Who::Role(Role::Seat));
+        assert!(s.contains(&STREAM_NOTES) && b.contains(&KV_VERDICTS));
+        assert!(!b.contains(&KV_CONSOLE) && !b.contains(&KV_SLACK));
+        for who in [Who::Token, Who::Role(Role::Admin)] {
+            assert_eq!(health_scope(who), (STREAMS.to_vec(), BUCKETS.to_vec()));
         }
     }
 }
@@ -624,6 +780,12 @@ mod live {
             .await
             .unwrap();
         }
+        js.get_key_value(KV_CANARY)
+            .await
+            .unwrap()
+            .put(CANARY_PROBE, hgl_ai_proto::CANARY_PROBE_VALUE.into())
+            .await
+            .unwrap();
         assert!(BusHub.health(&cfg).await.unwrap().is_empty());
         // A shared token writes anything, the canary too, by either route.
         assert_eq!(

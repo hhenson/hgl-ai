@@ -59,10 +59,11 @@ use async_nats::jetstream::{self, AckKind, context::Publish, kv, stream};
 use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
-    BROADCAST, CONSOLE_PREFIX, EndedRecord, HUB_API_PREFIX, HostRecord, KV_CANARY, KV_CONSOLE,
-    KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE,
-    LockRecord, Note, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat,
-    TaskKey, TreeRecord, USAGE_PREFIX, ended_key, utc_now_stamp,
+    BROADCAST, CANARY_PROBE, CANARY_PROBE_VALUE, CONSOLE_PREFIX, EndedRecord, HUB_API_PREFIX,
+    HostRecord, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK,
+    KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord, Note, OWNER_PREFIX, STREAM_NOTES,
+    STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord, USAGE_PREFIX, ended_key,
+    utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -600,6 +601,14 @@ impl Bus {
                 .await
                 .map_err(|e| nats(&format!("provisioning bucket {bucket}"), e))?;
         }
+        // The canary's fixed probe message (`doctor`, `hub boundary`).
+        self.js
+            .get_key_value(KV_CANARY)
+            .await
+            .map_err(|e| missing(&format!("bucket {KV_CANARY}"), e))?
+            .put(CANARY_PROBE, CANARY_PROBE_VALUE.into())
+            .await
+            .map_err(|e| nats(&format!("writing {KV_CANARY}/{CANARY_PROBE}"), e))?;
         Ok(())
     }
 

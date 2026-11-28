@@ -2045,20 +2045,42 @@ fn role_writes_locks(role: Role) -> bool {
     writes_of(role).iter().any(|w| w == "$KV.HGL_LOCKS.>")
 }
 
+/// Write a fixture credential as a host keeps one: mode 0600 from creation.
+fn write_private(path: &std::path::Path, text: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+}
+
 impl Hub {
     /// A host's configuration with `who`'s credential as its `hub.token`.
     fn host_cfg(&self, who: &str) -> hgl_ai_config::Config {
+        self.host_cfg_as(who, false)
+    }
+
+    /// [`Hub::host_cfg`], the credential a bare seed when `bare`: no role named.
+    fn host_cfg_as(&self, who: &str, bare: bool) -> hgl_ai_config::Config {
         let Credential::Nkey { seed, user, role } = self.creds[who].clone() else {
             unreachable!()
         };
-        let dir = self.conf.with_file_name(format!("host-{who}"));
+        let dir = self.conf.with_file_name(format!("host-{who}-{bare}"));
         std::fs::create_dir_all(&dir).unwrap();
         let f = dir.join("hub.token");
-        std::fs::write(
-            &f,
-            Credential::render_nkey(&user.unwrap(), &role.unwrap(), &seed),
-        )
-        .unwrap();
+        if !f.exists() {
+            let text = if bare {
+                seed
+            } else {
+                Credential::render_nkey(&user.unwrap(), &role.unwrap(), &seed)
+            };
+            write_private(&f, &text);
+        }
         let mut cfg = hgl_ai_config::Config::new("t");
         cfg.hub.url = self.url.clone();
         cfg.hub.token_file = f.display().to_string();
@@ -2110,6 +2132,20 @@ async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
             assert_eq!(after, before + ROLE_USERS.len() as u64);
         }
         assert_eq!(BusHub.boundary(&hub.host_cfg("hub-admin")).await, Ok(None));
+        // A bare seed names no role: `hub` checks what every role may look up. In a role
+        // account it is no admin and is tried; in one account (or a bare admin seed, in
+        // `HUB`) it may be the admin's and is not (r6 on #192).
+        let bare = hub.host_cfg_as("build-1", true);
+        assert_eq!(BusHub.health(&bare).await.unwrap(), Vec::<String>::new());
+        match BusHub.boundary(&bare).await {
+            Ok(Some(b)) if accounts => assert!(b.wrote.is_empty(), "{b:?}"),
+            Err(e) if !accounts => assert!(e.contains("names no role"), "{e}"),
+            other => panic!("accounts {accounts}: {other:?}"),
+        }
+        let bare_admin = hub.host_cfg_as("hub-admin", true);
+        let r = BusHub.boundary(&bare_admin).await;
+        assert!(matches!(&r, Err(e) if e.contains("names no role")), "{r:?}");
+        assert_eq!(count().await, after, "no untried credential wrote");
 
         let rec = |host: &str, accounts_capable| hgl_ai_proto::HostRecord {
             host: host.into(),

@@ -61,6 +61,11 @@ pub const KV_SLACK: &str = "HGL_SLACK";
 /// A bucket no hub role may write and every role reads: `doctor` (`hub boundary`) tries a
 /// write there that its role must not have and checks that nothing arrived (hgl-ai#146).
 pub const KV_CANARY: &str = "HGL_CANARY";
+/// The one key of `HGL_CANARY` the admin writes (`provision`), with [`CANARY_PROBE_VALUE`]:
+/// what `hub boundary` pulls onto a canary key by the reply route. Fixed, so a delivery
+/// that lands stores no hub metadata.
+pub const CANARY_PROBE: &str = "probe";
+pub const CANARY_PROBE_VALUE: &str = "hgl-ai canary";
 /// Owner words (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
 /// One owner event per Slack workspace, channel and reply or action timestamp in a thread.

@@ -347,6 +347,10 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 // The role boundary canary (`doctor`, `hub boundary`).
                 format!("$JS.API.STREAM.INFO.{}", kv(KV_CANARY)),
                 format!("$JS.API.DIRECT.GET.{}.>", kv(KV_CANARY)),
+                format!("$JS.API.CONSUMER.CREATE.{}.>", kv(KV_CANARY)),
+                format!("$JS.API.CONSUMER.INFO.{}.*", kv(KV_CANARY)),
+                format!("$JS.API.CONSUMER.MSG.NEXT.{}.*", kv(KV_CANARY)),
+                format!("$JS.ACK.{}.>", kv(KV_CANARY)),
             ],
             publish_deny: Vec::new(),
         });
@@ -381,6 +385,10 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     for b in buckets {
         allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{}.*", kv(b)));
     }
+    // The role boundary canary's probe, pulled through a consumer (`hub boundary`).
+    allow.extend(consumers_on(&kv(KV_CANARY)));
+    allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{}.*", kv(KV_CANARY)));
+    allow.push(format!("$JS.ACK.{}.>", kv(KV_CANARY)));
     // `doctor` lists the consumers on the telemetry streams (durables the viewer made).
     allow.extend(VIEWER_BUCKETS.map(|b| format!("$JS.API.CONSUMER.LIST.{}", kv(b))));
     allow.extend(pull_from(STREAM_NOTES));
@@ -684,6 +692,8 @@ pub fn access_table() -> Vec<Row> {
         row(all(KV_SLACK), [No, No, No, No, RW]),
         // Every role reads the canary and none writes it (`doctor`, `hub boundary`).
         row(all(KV_CANARY), [R, R, R, R, R]),
+        // And acknowledges its probe through a consumer of its own.
+        row(Target::Stream(kv(KV_CANARY)), [R, R, R, R, R]),
     ]
 }
 
@@ -1001,10 +1011,18 @@ pub fn audit(text: &str, reg: &Registry) -> std::result::Result<Audit, String> {
                 ));
                 continue;
             }
-            let Some(to) = e.get("accounts") else {
+            // An export with no recipients, by omission or an empty list, is public.
+            let to: Vec<&str> = e
+                .get("accounts")
+                .map(Value::items)
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(Value::as_str)
+                .collect();
+            if to.is_empty() {
                 problems.push(format!("{HUB_ACCOUNT} exports {subject} to every account"));
                 continue;
-            };
+            }
             let allowed: Vec<&str> = want
                 .iter()
                 .find(|(svc, _)| svc.subject == subject)
@@ -1016,13 +1034,7 @@ pub fn audit(text: &str, reg: &Registry) -> std::result::Result<Audit, String> {
                 ));
                 continue;
             }
-            let wider: Vec<String> = to
-                .items()
-                .iter()
-                .filter_map(|a| a.as_str())
-                .filter(|a| !allowed.contains(a))
-                .map(String::from)
-                .collect();
+            let wider: Vec<&str> = to.into_iter().filter(|a| !allowed.contains(a)).collect();
             if !wider.is_empty() {
                 problems.push(format!(
                     "{HUB_ACCOUNT} exports {subject} to {}, beyond the access table",
@@ -1707,6 +1719,13 @@ mod tests {
                 text.replace(
                     &seat_line,
                     &seat_line.replace(", accounts: [SEAT, COORD, BUILDER]", ""),
+                ),
+                format!("HUB exports {seat_only} to every account"),
+            ),
+            (
+                text.replace(
+                    &seat_line,
+                    &seat_line.replace("accounts: [SEAT, COORD, BUILDER]", "accounts: []"),
                 ),
                 format!("HUB exports {seat_only} to every account"),
             ),
