@@ -247,9 +247,11 @@ impl Root<'_> {
         crate::run_ok(self.sys, &sudo).map(drop)
     }
 
+    /// Say `text`; printed, a comment, every line of it (the script runs as it reads).
     fn note(&mut self, text: &str) {
         if self.print_only {
-            self.script.push(format!("# {text}"));
+            let lines: Vec<String> = text.lines().map(|l| format!("# {l}")).collect();
+            self.script.push(lines.join("\n"));
         } else {
             self.sys.say(text);
         }
@@ -734,6 +736,11 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
             (owner.clone(), env.contract(&env.client_token_path()))
         }
     };
+    // The console's page reads the hub through `<console url>/nats`, which the TLS proxy
+    // serves: a step outside this host's services, so shown, never run.
+    if o.console {
+        root.note(&console_page_step(hgl_ai_config::DEFAULT_WEBSOCKET_PORT));
+    }
     let next = format!(
         "hgl-ai client install --hub {} --token-file {} --host {}",
         crate::server::local_url(&o.listen, o.port),
@@ -765,6 +772,15 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
     sys.say(&format!("Next, on this host, {who}:"));
     sys.say(&format!("  {next}"));
     Ok(None)
+}
+
+/// The proxy step the console's page needs (docs/install.md, The console): the hub's
+/// WebSocket listener on `port` at `<console url>/nats`.
+pub fn console_page_step(port: u16) -> String {
+    format!(
+        "console: its page reads the hub at <console url>/nats; run once (not run here):\n  \
+         tailscale serve --bg --https=443 --set-path /nats http://127.0.0.1:{port}"
+    )
 }
 
 /// What to do about a unit from before hgl-ai#63, whose log root opens in the server
@@ -1023,9 +1039,19 @@ mod tests {
             "sudo -u hgl-ai cat /var/lib/hgl-ai/.config/hgl-ai/hub.token | sh -c ",
             "sudo -u hgl-ai sh -c ",
             "# next, as yourself: hgl-ai client install --hub nats://192.0.2.10:4222 --token-file ~/.config/hgl-ai/hub.token --host hub",
+            // The console page's proxy step: shown, commented, never run.
+            "# console: its page reads the hub at <console url>/nats; run once (not run here):\n\
+             #   tailscale serve --bg --https=443 --set-path /nats http://127.0.0.1:4223",
         ] {
             assert!(script.contains(want), "missing {want:?} in\n{script}");
         }
+        assert!(
+            script
+                .lines()
+                .filter(|l| l.contains("tailscale"))
+                .all(|l| l.starts_with('#')),
+            "{script}"
+        );
         // The units run as the server user, with its home.
         let unit = std::fs::read_to_string(
             f.env
@@ -1150,6 +1176,14 @@ mod tests {
             "the token step runs as the server user: {runs:?}"
         );
         assert!(f.output().contains("Next, on this host, as yourself:"));
+        // Run, the console page's proxy step is shown too.
+        assert!(
+            f.output().contains(
+                "tailscale serve --bg --https=443 --set-path /nats http://127.0.0.1:4223"
+            ),
+            "{}",
+            f.output()
+        );
     }
 
     #[test]
@@ -1161,6 +1195,7 @@ mod tests {
         o.console_url = None;
         let script = install(&f, &o).unwrap().unwrap();
         assert!(!script.contains("hgl-ai-console.service"), "{script}");
+        assert!(!script.contains("tailscale"), "{script}");
     }
 
     #[test]
@@ -1220,11 +1255,12 @@ mod tests {
     fn sudo_words_answering(d: &Path, script: &str, answer: &str) -> Vec<Vec<String>> {
         let script = &off_tty(d, script, answer);
         let rec = d.join("sudo.words");
-        let _ = std::fs::remove_file(&rec);
-        // One write per step: the two ends of a pipeline record at once.
+        let _ = std::fs::remove_dir_all(&rec);
+        std::fs::create_dir(&rec).unwrap();
+        // The two ends of a pipeline can record simultaneously.
         let prog = format!(
-            "sudo() {{ printf '%s\\n' \"$@\" '' >>{r}; }}\n{script}\n",
-            r = shell_quote(&rec.display().to_string())
+            "sudo() {{ f=$(mktemp {r}/step.XXXXXX); printf '%s\\n' \"$@\" >\"$f\"; }}\n{script}\n",
+            r = shell_quote(&rec.display().to_string()),
         );
         let parse = std::process::Command::new("sh")
             .args(["-n", "-c", script])
@@ -1244,11 +1280,15 @@ mod tests {
             .env("HOME", d.join("caller"))
             .output()
             .unwrap();
-        std::fs::read_to_string(&rec)
+        std::fs::read_dir(&rec)
             .unwrap()
-            .split("\n\n")
-            .filter(|p| !p.is_empty())
-            .map(|p| p.lines().map(str::to_string).collect())
+            .map(|entry| {
+                std::fs::read_to_string(entry.unwrap().path())
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
             .collect()
     }
 
@@ -1669,10 +1709,47 @@ mod tests {
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
     }
 
+    #[test]
+    fn the_printed_prompt_signal_test_handles_inherited_ignored_hup() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "system::tests::the_printed_prompt_restores_echo_on_a_signal",
+        ]);
+        // SAFETY: signal is async-signal-safe and only affects the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
     /// A signal at the printed prompt turns echo back on and stops the script.
     #[test]
     fn the_printed_prompt_restores_echo_on_a_signal() {
         use std::os::unix::process::CommandExt as _;
+        // Always reap both process groups, including when an assertion fails.
+        struct ProcessGroup(std::process::Child);
+        impl Drop for ProcessGroup {
+            fn drop(&mut self) {
+                // SAFETY: the child was started as the leader of its own group.
+                unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+                let _ = self.0.wait();
+            }
+        }
         let d = tempfile::tempdir().unwrap();
         let fifo = d.path().join("tty.in");
         let log = d.path().join("stty.log");
@@ -1702,18 +1779,34 @@ mod tests {
             );
             // Its own group, as at a terminal: the key's signal reaches every process
             // of the script.
-            let mut reader = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&prog)
-                .process_group(0)
-                .spawn()
-                .unwrap();
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&prog).process_group(0);
+            // SAFETY: only async-signal-safe operations run between fork and exec.
+            unsafe {
+                command.pre_exec(|| {
+                    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                        if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    let mut mask = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    if libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut reader = ProcessGroup(command.spawn().unwrap());
             // A writer that keeps the terminal stand-in open and silent.
-            let mut writer = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("exec 3>{}; sleep 30", q(&fifo)))
-                .spawn()
-                .unwrap();
+            let _writer = ProcessGroup(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("exec 3>{}; sleep 30", q(&fifo)))
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
             let wait_log = |want: &dyn Fn(&str) -> bool, what: &str| {
                 let start = Instant::now();
                 while !std::fs::read_to_string(&log).is_ok_and(|l| want(&l)) {
@@ -1726,13 +1819,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             // SAFETY: a plain kill(2) of the reader's group.
             assert_eq!(
-                unsafe { libc::kill(-(reader.id() as i32), sig) },
+                unsafe { libc::kill(-(reader.0.id() as i32), sig) },
                 0,
                 "{name}"
             );
-            let st = reader.wait().unwrap();
-            let _ = writer.kill();
-            let _ = writer.wait();
+            let start = Instant::now();
+            let st = loop {
+                if let Some(st) = reader.0.try_wait().unwrap() {
+                    break st;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "{name}: did not exit"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
             assert!(!st.success(), "{name}: {st:?}");
             wait_log(&|l| l.trim_end().ends_with("stty echo"), "echo stays off");
             assert!(!after.exists(), "{name}: the script went on");

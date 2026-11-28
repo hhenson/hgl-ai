@@ -61,10 +61,14 @@ impl Credential {
 
     /// The inbox prefix this client uses (hgl-ai#111): a hub user's own,
     /// [`hgl_ai_proto::user_inbox`] of the public key of its seed, which a bare seed (no
-    /// `role` line) has too. `None` for the shared token, whose hub has no permissions.
+    /// `role` line) has too; the `viewer`'s is [`hgl_ai_proto::VIEWER_INBOX`], as the
+    /// console's page uses. `None` for the shared token, whose hub has no permissions.
     pub fn inbox_prefix(&self) -> Option<String> {
         match self {
             Credential::Token(_) => None,
+            Credential::Nkey { role, .. } if role.as_deref() == Some("viewer") => {
+                Some(hgl_ai_proto::VIEWER_INBOX.to_string())
+            }
             Credential::Nkey { seed, .. } => nkeys::KeyPair::from_seed(seed)
                 .ok()
                 .map(|k| hgl_ai_proto::user_inbox(&k.public_key())),
@@ -170,6 +174,11 @@ mod tests {
         for c in [full, bare] {
             assert_eq!(c.unwrap().inbox_prefix().as_deref(), Some(want.as_str()));
         }
+        let viewer = parse_credential(&Credential::render_nkey("viewer", "viewer", &seed));
+        assert_eq!(
+            viewer.unwrap().unwrap().inbox_prefix().as_deref(),
+            Some(hgl_ai_proto::VIEWER_INBOX)
+        );
         assert_eq!(Credential::Token("t".into()).inbox_prefix(), None);
     }
 

@@ -42,7 +42,10 @@ Roles and gates are in `docs/roles.md`; notes and worktrees in `docs/protocol.md
    the compiler both change, Core's pull request comes first and the compiler pins it.
 7. Review bot, two rounds at most once hosted CI is green (`@codex review`): fix a
    finding that is a defect of the change; file anything else as a new issue, link it,
-   resolve the thread. After the second round go on, listing what is open.
+   resolve the thread. After the second round go on, listing what is open. For hgl-ai,
+   one round is enough (HPH, 2026-11-28: "4. Yes to both", hgl-ai#118). The bot reviews
+   every push; fix or file its findings and resolve their threads. Do not wait for a
+   further round after fixing findings; read any bot review that arrives before landing.
 8. Take it out of draft, comment `[…] Ready:` with the links, the exact head and the
    check counts, add `codex-ready`, and send a `ready` note with the head. Do not merge.
    A `sendback` makes the task yours again; answer it with new commits.
