@@ -197,9 +197,11 @@ before hub users takes one shared token until it moves.
   elsewhere (another host or seat) takes the class of the task's record set last, unless
   the note that made it carries a class: that note moved the task (`gh sendback --class C
   --to SEAT`, ROLE-15) and its class is the task's there. Each `HGL_TREES` record carries the
-  stream sequence of the note that made its tree (`seq`): the task's newest implementor tree
-  is its current seat, and `gh approve` and `gh sendback` without `--to` go only there
-  (`landed` and `closed` still reach every seat that has a tree, PROTO-14).
+  stream sequence of the note that made its tree (`seq`) and of the newest `assign` or
+  `sendback` a turn in it ran (`handoff_seq`; a reused tree takes the later one, hgl-ai#44):
+  the seat of the task's implementor tree with the newest handoff (else `seq`) is its current
+  seat, and `gh approve` and `gh sendback` without `--to` go only there (`landed` and
+  `closed` still reach every seat that has a tree, PROTO-14).
 - **PROTO-17 — Failover.** A seat may list fallback bindings. A quota refusal
   is known from the CLI's structured output (an error event or result and its
   status), never from text on stderr. On one, the bridge holds the notes and

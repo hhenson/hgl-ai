@@ -14,7 +14,7 @@ use crate::adapter::{self, Parser, TurnInput};
 use crate::bus::BusApi;
 use crate::lock::{self, FileLock};
 use crate::proc::{self, Ended, Limits, Stop, TreeId, TreeSlot};
-use crate::{Bridge, SeatRt, prompt};
+use crate::{Bridge, IssueTitle, SeatRt, prompt};
 
 /// Where a turn runs.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -104,9 +104,34 @@ pub fn task_class(recorded: Classed, notes: &[(u64, u64, Note)], made_by: Option
     })
 }
 
+/// The stream sequence of the newest `assign` or `sendback` among these notes: a handoff
+/// that moved the task to this seat (PROTO-21).
+pub fn newest_handoff(notes: &[(u64, u64, Note)]) -> Option<u64> {
+    notes
+        .iter()
+        .filter(|(_, _, n)| matches!(n.kind, Kind::Assign | Kind::Sendback))
+        .map(|(seq, _, _)| *seq)
+        .max()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_newest_handoff_is_an_assign_or_sendback() {
+        let n = |seq, kind| classed(seq, kind, None);
+        assert_eq!(newest_handoff(&[]), None);
+        assert_eq!(
+            newest_handoff(&[
+                n(3, Kind::Assign),
+                n(9, Kind::Approved),
+                n(5, Kind::Sendback)
+            ]),
+            Some(5)
+        );
+        assert_eq!(newest_handoff(&[n(9, Kind::Question)]), None);
+    }
 
     fn classed(seq: u64, kind: Kind, class: Option<TaskClass>) -> (u64, u64, Note) {
         let s = |x: &str| hgl_ai_proto::Seat::new(x).unwrap();
@@ -265,6 +290,29 @@ pub struct TurnOut {
     pub binding_idx: usize,
 }
 
+/// The title naming a new branch of `task` (WORK §2 step 3), trimmed; `None`, with the
+/// reason logged, names it from the note's line.
+pub(crate) fn new_title(
+    lookup: Option<&(dyn IssueTitle + Send + Sync)>,
+    task: &TaskKey,
+) -> Option<String> {
+    let Some(lookup) = lookup else {
+        tracing::info!(%task, "hold: naming the new branch from the note");
+        return None;
+    };
+    match lookup.issue_title(&task.repo, task.issue) {
+        Ok(t) if !t.trim().is_empty() => Some(t.trim().to_string()),
+        Ok(_) => {
+            tracing::warn!(%task, "the issue title is empty; naming the new branch from the note");
+            None
+        }
+        Err(why) => {
+            tracing::warn!(%task, %why, "issue title unknown; naming the new branch from the note");
+            None
+        }
+    }
+}
+
 fn first_line(body: &str) -> String {
     body.lines().next().unwrap_or("").to_string()
 }
@@ -403,8 +451,12 @@ impl<B: BusApi> Bridge<B> {
                     Some((seq, c)) => {
                         let trees = self.trees.clone();
                         let (s, t, c, seq) = (name.clone(), task.clone(), c.clone(), *seq);
-                        match tokio::task::spawn_blocking(move || trees.create_for(&s, &t, &c, seq))
-                            .await
+                        // No GitHub call during a hold (ROLE-19).
+                        let lookup = job.hold.is_none().then(|| self.deps.title.clone());
+                        match tokio::task::spawn_blocking(move || {
+                            trees.create_for(&s, &t, &c, seq, &|| new_title(lookup.as_deref(), &t))
+                        })
+                        .await
                         {
                             Ok(Ok(created)) => {
                                 // Read before this tree's own record replaces the old one.
@@ -462,10 +514,19 @@ impl<B: BusApi> Bridge<B> {
         // The task's authors (ROLE-11): every family whose turns run in an implementor
         // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
         if let Some(f) = file.as_mut() {
-            let author = !matches!(job.target, Target::Tree { review: true, .. })
-                && !f.families.contains(&r.family);
+            let implementor = !matches!(job.target, Target::Tree { review: true, .. });
+            let author = implementor && !f.families.contains(&r.family);
             if author {
                 f.families.push(r.family);
+            }
+            // The newest handoff this tree ran, even one reusing it after another seat's
+            // tree was made: verdicts go to that tree's seat (PROTO-21).
+            let handoff = implementor
+                .then(|| newest_handoff(&job.notes))
+                .flatten()
+                .filter(|n| f.handoff_seq.is_none_or(|h| *n > h));
+            if let Some(n) = handoff {
+                f.handoff_seq = Some(n);
             }
             let reclassed = (f.class, f.class_seq) != (class, class_seq);
             if reclassed {
@@ -473,7 +534,7 @@ impl<B: BusApi> Bridge<B> {
                 f.class = class;
                 f.class_seq = class_seq;
             }
-            if author || reclassed {
+            if author || reclassed || handoff.is_some() {
                 match hgl_ai_tree::write_task(&dir, f) {
                     Ok(()) => {
                         let d = dir.clone();

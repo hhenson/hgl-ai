@@ -61,31 +61,11 @@ pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
             }
             s(&mut a, &["--json"]);
             s(&mut a, &models);
-            if t.resume.is_some() {
-                // `exec resume` takes no `--sandbox` or `-C`; the cwd is the process's.
-                s(&mut a, &["-c", "sandbox_mode=\"workspace-write\""]);
-            } else {
-                s(&mut a, &["--sandbox", "workspace-write"]);
+            for c in codex_profile(t.writable) {
+                s(&mut a, &["-c", &c]);
             }
-            let roots: Vec<String> = t
-                .writable
-                .iter()
-                .map(|p| toml_str(&p.to_string_lossy()))
-                .collect();
-            let roots = format!(
-                "sandbox_workspace_write.writable_roots=[{}]",
-                roots.join(",")
-            );
-            s(
-                &mut a,
-                &[
-                    "-c",
-                    "sandbox_workspace_write.network_access=true",
-                    "-c",
-                    &roots,
-                    "--skip-git-repo-check",
-                ],
-            );
+            s(&mut a, &["--skip-git-repo-check"]);
+            // `exec resume` takes no `-C`; the cwd is the process's.
             match t.resume {
                 Some(id) => s(&mut a, &[id]),
                 None => {
@@ -135,6 +115,36 @@ fn agy_input(prompt: &str) -> Vec<u8> {
     let mut line = msg.to_string().into_bytes();
     line.push(b'\n');
     line
+}
+
+/// The Codex permission profile a turn runs under ([`codex_profile`]).
+pub const CODEX_PROFILE: &str = "hgl_task";
+
+/// The `-c` overrides that select [`CODEX_PROFILE`]: the whole disk readable, `writable`
+/// (the task directory and the clone) writable, and the network on.
+///
+/// A named profile, not `sandbox_mode = "workspace-write"` with
+/// `sandbox_workspace_write.writable_roots`: that legacy policy makes the `.git` of every
+/// writable root read-only and, where `.git` is a `gitdir:` pointer (a worktree), its target
+/// too. A task's `src/.git` points into the clone's `worktrees/`, so `index.lock` could not
+/// be created even with the clone writable (hgl-ai#29, codex-cli 0.172.0). A profile's
+/// paths are taken as given. `exec resume` honours it too, also for a session started
+/// under the legacy policy.
+pub fn codex_profile(writable: &[PathBuf]) -> Vec<String> {
+    let mut fs = vec![format!("{}=\"read\"", toml_str(":root"))];
+    fs.extend(
+        writable
+            .iter()
+            .map(|p| format!("{}=\"write\"", toml_str(&p.to_string_lossy()))),
+    );
+    vec![
+        format!("default_permissions={}", toml_str(CODEX_PROFILE)),
+        format!(
+            "permissions.{CODEX_PROFILE}.filesystem={{{}}}",
+            fs.join(",")
+        ),
+        format!("permissions.{CODEX_PROFILE}.network.enabled=true"),
+    ]
 }
 
 fn toml_str(s: &str) -> String {
@@ -517,7 +527,7 @@ mod tests {
 
     #[test]
     fn codex_arguments() {
-        let w = [PathBuf::from("/w/w1/r-1")];
+        let w = [PathBuf::from("/w/w1/r-1"), PathBuf::from("/w/clones/r")];
         let r = resolved(Runtime::Codex, Family::Gpt, "gpt-6.1-sol", Some("high"));
         let t = TurnInput {
             prompt: "PROMPT",
@@ -526,54 +536,132 @@ mod tests {
             cwd: Path::new("/w/w1/r-1/src"),
             writable: &w,
         };
+        let profile = [
+            "-c",
+            "default_permissions=\"hgl_task\"",
+            "-c",
+            "permissions.hgl_task.filesystem={\":root\"=\"read\",\"/w/w1/r-1\"=\"write\",\"/w/clones/r\"=\"write\"}",
+            "-c",
+            "permissions.hgl_task.network.enabled=true",
+        ];
         let c = command(Path::new("codex"), &t);
         assert_eq!(c.input, b"PROMPT");
-        assert_eq!(
-            strs(&c),
-            [
-                "exec",
-                "--json",
-                "-m",
-                "gpt-6.1-sol",
-                "-c",
-                "model_reasoning_effort=high",
-                "--sandbox",
-                "workspace-write",
-                "-c",
-                "sandbox_workspace_write.network_access=true",
-                "-c",
-                "sandbox_workspace_write.writable_roots=[\"/w/w1/r-1\"]",
-                "--skip-git-repo-check",
-                "-C",
-                "/w/w1/r-1/src",
-                "-",
-            ]
-        );
+        let fresh = strs(&c);
+        let want: Vec<&str> = [
+            "exec",
+            "--json",
+            "-m",
+            "gpt-6.1-sol",
+            "-c",
+            "model_reasoning_effort=high",
+        ]
+        .into_iter()
+        .chain(profile)
+        .chain(["--skip-git-repo-check", "-C", "/w/w1/r-1/src", "-"])
+        .collect();
+        assert_eq!(fresh, want);
         let plain = resolved(Runtime::Codex, Family::Gpt, "gpt-6.1-sol", None);
         let r = TurnInput {
             resume: Some("T1"),
             resolved: &plain,
             ..t
         };
+        let want: Vec<&str> = ["exec", "resume", "--json", "-m", "gpt-6.1-sol"]
+            .into_iter()
+            .chain(profile)
+            .chain(["--skip-git-repo-check", "T1", "-"])
+            .collect();
+        let resumed = strs(&command(Path::new("codex"), &r));
+        assert_eq!(resumed, want);
+        // The legacy policy protects a worktree's gitdir (hgl-ai#29); it must not come back.
+        for a in fresh.iter().chain(&resumed) {
+            assert!(
+                !a.contains("sandbox") && !a.contains("writable_roots"),
+                "{a}"
+            );
+        }
+    }
+
+    #[test]
+    fn codex_profile_quotes_paths() {
+        let w = [PathBuf::from("/a b/\"q\"\\x")];
         assert_eq!(
-            strs(&command(Path::new("codex"), &r)),
-            [
-                "exec",
-                "resume",
-                "--json",
-                "-m",
-                "gpt-6.1-sol",
-                "-c",
-                "sandbox_mode=\"workspace-write\"",
-                "-c",
-                "sandbox_workspace_write.network_access=true",
-                "-c",
-                "sandbox_workspace_write.writable_roots=[\"/w/w1/r-1\"]",
-                "--skip-git-repo-check",
-                "T1",
-                "-",
-            ]
+            codex_profile(&w)[1],
+            r#"permissions.hgl_task.filesystem={":root"="read","/a b/\"q\"\\x"="write"}"#
         );
+    }
+
+    /// Live: a task tree's git writes under the profile a turn gets, through
+    /// `codex sandbox` (no model call). Needs `codex` on `PATH` (or `HGL_AI_CODEX`) and
+    /// `git`; run by hand: `cargo test -p hgl-ai-bridge codex_profile_live -- --ignored`.
+    /// `codex sandbox` cannot apply the legacy `workspace-write` policy, so this does not
+    /// show the old failure; for that, run one `codex exec` turn in a worktree with the
+    /// arguments of [`command`], asking it to `git commit`: the legacy arguments give
+    /// `index.lock: Read-only file system`, these commit.
+    #[test]
+    #[ignore = "needs codex and git; run by hand"]
+    fn codex_profile_live() {
+        use std::process::Command;
+        let run = |c: &mut Command| {
+            let o = c.output().expect("spawn");
+            assert!(
+                o.status.success(),
+                "{c:?}: {}",
+                String::from_utf8_lossy(&o.stderr)
+            );
+            String::from_utf8_lossy(&o.stdout).into_owned()
+        };
+        let base = std::env::temp_dir().join(format!("codex-profile-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let (task, clone, outside) = (
+            base.join("w1/r-1"),
+            base.join("clones/r"),
+            base.join("outside"),
+        );
+        std::fs::create_dir_all(&task).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let git = |dir: &Path| {
+            let mut c = Command::new("git");
+            c.arg("-C")
+                .arg(dir)
+                .args(["-c", "user.name=t", "-c", "user.email=t@t"]);
+            c
+        };
+        run(Command::new("git")
+            .args(["init", "-q", "--bare", "-b", "main"])
+            .arg(&clone));
+        let seed = base.join("seed");
+        run(Command::new("git")
+            .args(["init", "-q", "-b", "main"])
+            .arg(&seed));
+        run(git(&seed).args(["commit", "-q", "--allow-empty", "-m", "seed"]));
+        run(git(&seed).arg("push").arg("-q").arg(&clone).arg("main"));
+        let src = task.join("src");
+        run(git(&clone)
+            .args(["worktree", "add", "-q", "-b", "t"])
+            .arg(&src)
+            .arg("main"));
+        run(git(&src).args(["remote", "add", "origin"]).arg(&clone));
+
+        let program = std::env::var_os("HGL_AI_CODEX").unwrap_or_else(|| "codex".into());
+        let mut c = Command::new(program);
+        c.args(["sandbox", "-P", CODEX_PROFILE, "-C"]).arg(&src);
+        for o in codex_profile(&[task.clone(), clone.clone()]) {
+            c.arg("-c").arg(o);
+        }
+        let script = format!(
+            "echo x > f && git add f && git -c user.name=t -c user.email=t@t commit -qm t \
+             && git push -q origin HEAD:refs/heads/t && echo GIT-OK; \
+             touch '{}/f' 2>/dev/null && echo OUTSIDE-WRITTEN; true",
+            outside.display()
+        );
+        let out = run(c.args(["--", "sh", "-c", &script]));
+        assert!(out.contains("GIT-OK"), "{out}");
+        assert!(!out.contains("OUTSIDE-WRITTEN"), "{out}");
+        assert!(!outside.join("f").exists());
+        let pushed = run(git(&clone).args(["log", "--format=%s", "-1", "t"]));
+        assert_eq!(pushed.trim(), "t");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

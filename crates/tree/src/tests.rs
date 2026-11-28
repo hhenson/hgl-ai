@@ -63,6 +63,7 @@ fn implementor_tree_on_a_new_branch() {
             &task(980),
             &implement("[claude] Assign: demo#980 Fix the thing"),
             42,
+            &|| None,
         )
         .unwrap();
     assert!(!c.reused);
@@ -97,7 +98,13 @@ fn implementor_tree_on_a_new_branch() {
 
     let again = e
         .trees
-        .create_for(&seat("w1"), &task(980), &implement("other title"), 50)
+        .create_for(
+            &seat("w1"),
+            &task(980),
+            &implement("other title"),
+            50,
+            &|| panic!("a kept tree asks for no title"),
+        )
         .unwrap();
     assert!(again.reused);
     assert_eq!(again.file.seq, Some(42), "a kept tree keeps its own");
@@ -501,6 +508,82 @@ fn q_branches_and_older_ones_are_resumed() {
         assert_eq!(c.file.branch.as_deref(), Some(branch));
         assert_eq!(c.file.start, pushed);
     }
+}
+
+/// hgl-ai#27: a new branch is named from the issue's title, every word kept; the title is
+/// asked for only when no `q<issue>-*` branch exists, on the remote or on this host.
+#[test]
+fn only_a_new_branch_asks_for_the_issue_title() {
+    let e = env();
+    let asked = std::cell::Cell::new(0);
+    let title = |t: &'static str| {
+        let asked = &asked;
+        move || {
+            asked.set(asked.get() + 1);
+            Some(t.to_string())
+        }
+    };
+    let note = implement("Class: standard (docs/roles.md §3)");
+    let c = e
+        .trees
+        .create_for(
+            &seat("w1"),
+            &task(7),
+            &note,
+            1,
+            &title("[T; N] array literals"),
+        )
+        .unwrap();
+    assert_eq!(
+        c.file.branch.as_deref(),
+        Some("codex/q7-t-n-array-literals")
+    );
+    assert_eq!(asked.get(), 1);
+
+    // Unknown: the note's line names it.
+    let c = e
+        .trees
+        .create_for(&seat("w1"), &task(8), &note, 2, &|| None)
+        .unwrap();
+    assert_eq!(
+        c.file.branch.as_deref(),
+        Some("codex/q8-class-standard-docs-roles-md-3")
+    );
+
+    // Pushed under another name: resumed, nothing asked.
+    e.git
+        .run(
+            &e.seed,
+            [
+                "checkout",
+                "--quiet",
+                "-B",
+                "codex/q9-old-title",
+                "origin/main",
+            ],
+        )
+        .unwrap();
+    commit(&e.git, &e.seed, "q9.txt", "q9\n", "q9 work");
+    e.git
+        .run(&e.seed, ["push", "--quiet", "origin", "codex/q9-old-title"])
+        .unwrap();
+    let c = e
+        .trees
+        .create_for(&seat("w1"), &task(9), &note, 3, &title("New title"))
+        .unwrap();
+    assert_eq!(c.file.branch.as_deref(), Some("codex/q9-old-title"));
+    assert_eq!(asked.get(), 1, "a pushed branch asks for no title");
+
+    // Made on this host and not pushed (the task moved to another seat): kept, nothing asked.
+    let c = e
+        .trees
+        .create_for(&seat("w2"), &task(7), &note, 4, &title("Renamed"))
+        .unwrap();
+    assert_eq!(
+        c.file.branch.as_deref(),
+        Some("codex/q7-t-n-array-literals")
+    );
+    assert_eq!(asked.get(), 1, "a local branch asks for no title");
 }
 
 /// Carbon's check 7d: a repository whose name cannot be a bucket key part (`.github`) is
