@@ -617,6 +617,32 @@ pub(crate) mod tests {
         worker.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn persistence_retries_a_transient_failure() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<&str>();
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = attempts.clone();
+        let worker = tokio::spawn(persist_loop(
+            rx,
+            |p| (*p).to_owned(),
+            move |_| {
+                let count = count.clone();
+                async move {
+                    if count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                        Err("unavailable")
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            Duration::from_millis(1),
+        ));
+        tx.send("session").unwrap();
+        drop(tx);
+        worker.await.unwrap();
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
     /// One app's fold, for its own test: tests run at once, each on its own hub, and
     /// their sequences coincide, so nothing here is shared between apps.
     #[derive(Default)]
