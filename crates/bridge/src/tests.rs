@@ -2081,7 +2081,8 @@ async fn a_build_note_at_an_agent_seat_is_refused() {
 /// The bot's P1 (hgl-ai PR 1): the hub stops answering (a partition), so no refresh says
 /// the lease is lost while it runs out. The seat stops, its turn and notes with it, once the
 /// lease has gone unrefreshed for half the bucket's `max_age`: before it can expire and
-/// another host take it. When the hub answers again the bridge serves the seat again.
+/// another host take it. Until the hub answers again the seat cannot be taken again; then
+/// the bridge serves it again.
 ///
 /// hgl-ai#41: the bounds are measured from the last refresh the hub confirmed (the fake
 /// records it; no refresh succeeds once `refresh_down` returns), not from when the test cut
@@ -2131,11 +2132,15 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
         !h.bus.sent_containing("was not refreshed for").is_empty()
     })
     .await;
+    // While the hub does not answer the seat cannot be taken again: nothing more runs.
+    eventually("a take refused", || h.bus.lease_takes_refused() > 0).await;
+    assert_eq!(h.calls("codex").len(), 1, "one turn while the hub is down");
     h.bus.refresh_down(false);
     eventually("served again, the note run", || {
         h.bus.events(a).last() == Some(&Ev::Ack)
     })
     .await;
+    assert_eq!(h.calls("codex").len(), 2);
     assert_eq!(
         h.bus.sent_containing("was not refreshed for").len(),
         1,
