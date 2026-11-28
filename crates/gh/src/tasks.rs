@@ -108,13 +108,54 @@ pub async fn run(bus: &Bus) {
     }
 }
 
-async fn keep(bus: &Bus, idx: &mut NotesIndex, written: &mut Option<String>) -> crate::Result<()> {
+/// What a round does with `tasks`, given what it wrote last and what the key holds.
+#[derive(Debug, PartialEq, Eq)]
+enum Write {
+    /// The same as last time: nothing.
+    Keep,
+    /// Put the new text.
+    Put,
+    /// No task: delete what the key holds (an empty value is a delete on the bus).
+    Clear(String),
+    /// No task, and the key holds nothing: nothing, but remember it.
+    Absent,
+}
+
+fn decide(text: &str, written: Option<&str>, held: Option<&str>) -> Write {
+    match (text.is_empty(), written, held) {
+        (_, Some(w), _) if w == text => Write::Keep,
+        (false, ..) => Write::Put,
+        (true, _, Some(h)) if !h.is_empty() => Write::Clear(h.to_string()),
+        (true, ..) => Write::Absent,
+    }
+}
+
+pub(crate) async fn keep(
+    bus: &Bus,
+    idx: &mut NotesIndex,
+    written: &mut Option<String>,
+) -> crate::Result<()> {
     idx.refresh(bus).await?;
     let text = render(idx, &bus.trees().await?);
-    if written.as_deref() != Some(text.as_str()) {
-        store::put_latest(bus, state::KEY_TASKS, &text).await?;
-        *written = Some(text);
+    if written.as_deref() == Some(text.as_str()) {
+        return Ok(());
     }
+    // Read only when there is nothing to put: whether an earlier text is left to clear.
+    let held = if text.is_empty() {
+        bus.state_get(state::KEY_TASKS).await?.map(|e| e.value)
+    } else {
+        None
+    };
+    match decide(&text, written.as_deref(), held.as_deref()) {
+        Write::Keep | Write::Absent => {}
+        Write::Put => {
+            store::put_latest(bus, state::KEY_TASKS, &text).await?;
+        }
+        Write::Clear(h) => {
+            store::clear_if(bus, state::KEY_TASKS, &h).await?;
+        }
+    }
+    *written = Some(text);
     Ok(())
 }
 
@@ -122,6 +163,22 @@ async fn keep(bus: &Bus, idx: &mut NotesIndex, written: &mut Option<String>) -> 
 mod tests {
     use super::*;
     use hgl_ai_proto::Seat;
+
+    /// No task: the key is never created empty (on the bus, an empty write of a key that
+    /// is not there fails its compare-and-set every round).
+    #[test]
+    fn no_task_writes_nothing_or_clears() {
+        assert_eq!(decide("", None, None), Write::Absent);
+        assert_eq!(
+            decide("", Some("a\n"), Some("a\n")),
+            Write::Clear("a\n".into())
+        );
+        assert_eq!(decide("", None, Some("a\n")), Write::Clear("a\n".into()));
+        assert_eq!(decide("", Some(""), None), Write::Keep);
+        assert_eq!(decide("b\n", None, None), Write::Put);
+        assert_eq!(decide("b\n", Some("a\n"), None), Write::Put);
+        assert_eq!(decide("b\n", Some("b\n"), None), Write::Keep);
+    }
 
     #[test]
     fn last_note_per_task_with_a_tree() {
