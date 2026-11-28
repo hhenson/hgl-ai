@@ -1424,7 +1424,7 @@ async fn own_inboxes_work_on_an_older_hub() {
 //
 // Raw JetStream requests under the hub's API prefix: `bus` uses it from hgl-ai#144.
 
-use async_nats::jetstream::{self, consumer, kv};
+use async_nats::jetstream::{self, consumer};
 use hgl_ai_install::users::{Target, access_table, local_subject};
 
 /// The user of each role with an account.
@@ -1505,13 +1505,6 @@ impl Hub {
 async fn seeded(hub: &Hub) -> jetstream::Context {
     hub.bus("hub-admin").await.provision().await.unwrap();
     let js = hub.admin_js().await;
-    js.create_key_value(kv::Config {
-        bucket: hgl_ai_install::users::KV_VERDICTS.into(),
-        history: 5,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
     let buckets: std::collections::BTreeSet<String> = access_table()
         .into_iter()
         .filter_map(|r| match r.target {

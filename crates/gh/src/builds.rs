@@ -196,21 +196,28 @@ fn taking(builders: &[BuilderRecord], label: &str) -> bool {
 
 /// The value in `key`: its text and what it says.
 async fn read(bus: &Bus, key: &str, w: &Want<'_>) -> Result<(String, Option<VerdictValue>)> {
-    let raw = bus
-        .verdict_get(key)
-        .await?
-        .map(|e| e.value)
+    let current = bus.verdict_get(key).await?;
+    let raw = current
+        .as_ref()
+        .map(|e| e.value.trim().to_string())
         .unwrap_or_default();
-    let raw = raw.trim().to_string();
     let v = VerdictValue::parse(&raw);
     if judged(&raw, &v, w).is_some() {
         return Ok((raw, v));
     }
     if let Some(legacy) = bus.state_get(key).await? {
-        let legacy = legacy.value.trim().to_string();
-        let parsed = VerdictValue::parse(&legacy);
-        if judged(&legacy, &parsed, w).is_some() || raw.is_empty() {
-            return Ok((legacy, parsed));
+        let text = legacy.value.trim().to_string();
+        let parsed = VerdictValue::parse(&text);
+        let legacy_matches = parsed.as_ref().is_some_and(|v| v.is_for(w.head, w.main));
+        let current_matches = v.as_ref().is_some_and(|v| v.is_for(w.head, w.main));
+        if judged(&text, &parsed, w).is_some()
+            || (legacy_matches
+                && (!current_matches
+                    || current
+                        .as_ref()
+                        .is_none_or(|e| legacy.created_nanos > e.created_nanos)))
+        {
+            return Ok((text, parsed));
         }
     }
     Ok((raw, v))
@@ -276,7 +283,7 @@ pub async fn verdict_state(
                 v.id.as_deref().unwrap_or("?"),
                 v.builder.as_deref().unwrap_or("?")
             )),
-            (None, Some(v)) if v.word == VerdictWord::NotRun => {
+            (None, Some(v)) if v.is_for(head, main) && v.word == VerdictWord::NotRun => {
                 VerdictState::Missing(Some(format!(
                     "not run: {}",
                     v.reason.as_deref().unwrap_or("no reason given")

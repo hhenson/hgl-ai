@@ -306,7 +306,7 @@ before hub users takes one shared token until it moves.
 | `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` (also in `HGL_VERDICTS` during migration) | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
-Builders write verdicts to both buckets until cutover. Gate readers check `HGL_VERDICTS` first and fall back to `HGL_STATE` when it has no final verdict for the pair. Only builder users may write either copy.
+Builders write verdicts to both buckets until cutover. Gate readers prefer a final `HGL_VERDICTS` verdict, then a final legacy verdict; otherwise they use the newest matching non-final copy by the hub's write time. Only builder users may write either copy.
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.

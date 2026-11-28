@@ -185,6 +185,8 @@ pub struct StateEntry {
     pub revision: u64,
     /// Unix seconds of the write, by the hub's clock.
     pub created: i64,
+    /// Unix nanoseconds of the write, by the hub's clock.
+    pub created_nanos: i128,
 }
 
 /// Inbox consumer settings. [`Default`] is the protocol's (§3); other values
@@ -794,6 +796,7 @@ impl Bus {
                     value,
                     revision: e.revision,
                     created: e.created.unix_timestamp(),
+                    created_nanos: e.created.unix_timestamp_nanos(),
                 }))
             }
             None => Ok(None),
@@ -959,6 +962,7 @@ impl Bus {
                     value,
                     revision: e.revision,
                     created: e.created.unix_timestamp(),
+                    created_nanos: e.created.unix_timestamp_nanos(),
                 }))
             }
             None => Ok(None),

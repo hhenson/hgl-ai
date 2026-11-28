@@ -134,7 +134,8 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
     It writes `running` once checked out, bounded by `until` (its steps' time limits and
     15 minutes). Then it writes `pass`, `fail` (the failing step) or `not-run` (why), with
     the build id, its label and `r<rev>`, before the final `run.<id>`. The gate and
-    `build gate` read the new bucket first, falling back to `HGL_STATE` if the new copy is not final for the pair.
+    `build gate` prefer a final verdict in the new bucket, then a final legacy verdict.
+    Otherwise they use the newest matching non-final copy by the hub's write time.
     Provision the new bucket and updated hub permissions before deploying these readers
     and builders.
   - In a key, `pass` and `fail` are final. A later build of the same pair replaces only

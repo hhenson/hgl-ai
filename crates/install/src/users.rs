@@ -12,7 +12,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use hgl_ai_bus::Credential;
-use hgl_ai_proto::build::{KV_BUILD, KV_VERDICTS};
+use hgl_ai_proto::build::KV_BUILD;
+/// The local build verdict bucket, exported independently of `HGL_STATE`.
+pub use hgl_ai_proto::build::KV_VERDICTS;
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE,
     KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
@@ -540,10 +542,6 @@ pub fn render_authorization(reg: &Registry) -> String {
 
 /// The account that holds the streams and buckets, and the admin user.
 pub const HUB_ACCOUNT: &str = "HUB";
-
-/// The local build verdicts' own bucket (hgl-ai#145): an export cannot be "`HGL_STATE`
-/// but `verdict.*`".
-pub const KV_VERDICTS: &str = "HGL_VERDICTS";
 
 /// The console's durable `HGL_OWNER` feed (`hgl_ai_owner::FEED`).
 pub const CONSOLE_FEED: &str = "console";
