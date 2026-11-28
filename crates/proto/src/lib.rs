@@ -37,6 +37,18 @@ pub const KV_METRICS: &str = "HGL_METRICS";
 /// The console's own state (sign-in sessions, the pending `p2` batch); only the console
 /// reads or writes it.
 pub const KV_CONSOLE: &str = "HGL_CONSOLE";
+/// A hub user's inbox prefix (hgl-ai#111): `_INBOX.<nkey>`, its public NKey. Its JetStream
+/// and KV replies and deliveries go there, and `nats.conf` lets each user subscribe to its
+/// own prefix only, so no client sees another's. It stays under `_INBOX.`, which a hub
+/// whose `nats.conf` predates it allows every client: upgrade clients first, then the hub.
+pub fn user_inbox(nkey: &str) -> String {
+    format!("_INBOX.{nkey}")
+}
+/// Where a role's account finds the hub's JetStream API on a hub with an account per role
+/// (hgl-ai#141): `$JS.API.<x>` is `JS.HUB.API.<x>`, a bucket's `$KV.<b>.<k>` is
+/// `JS.HUB.API.$KV.<b>.<k>` (a JetStream context with this API prefix writes there), and
+/// note, owner and usage subjects and acknowledgements keep their names.
+pub const HUB_API_PREFIX: &str = "JS.HUB.API";
 /// The inbox prefix of the `viewer` hub user (the console's page, docs/owner.md §3): its
 /// replies and deliveries come here, the only subjects it may subscribe to, so it never
 /// sees another client's replies on `_INBOX.>`. The page uses the same (`web/src/hub.ts`).
@@ -645,6 +657,10 @@ pub struct LockRecord {
     /// Who holds it: host label, process and purpose.
     pub holder: String,
     pub acquired_at: String,
+    /// Random per acquisition, so no two leases share a value even with the same holder
+    /// in the same second. Absent from an older writer's record.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub token: String,
 }
 
 /// `HGL_METRICS/<repo>.<YYYYMMDD>`: one sample per repository and day (docs/owner.md §3).
@@ -707,6 +723,24 @@ mod tests {
 
     fn seat(s: &str) -> Seat {
         Seat::new(s).unwrap()
+    }
+
+    #[test]
+    fn lock_records_without_a_token_still_parse() {
+        let old: LockRecord =
+            serde_json::from_str(r#"{"holder":"h","acquired_at":"20261128T000000Z"}"#).unwrap();
+        assert_eq!(old.token, "");
+        assert_eq!(
+            serde_json::to_string(&old).unwrap(),
+            r#"{"holder":"h","acquired_at":"20261128T000000Z"}"#
+        );
+        let new = LockRecord {
+            token: "ab".into(),
+            ..old
+        };
+        let wire = serde_json::to_string(&new).unwrap();
+        assert!(wire.contains(r#""token":"ab""#));
+        assert_eq!(serde_json::from_str::<LockRecord>(&wire).unwrap(), new);
     }
 
     #[test]

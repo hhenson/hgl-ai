@@ -772,6 +772,34 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             ),
             Ok(_) => Check::ok("hub", format!("{} (stream and buckets present)", c.hub.url)),
         });
+        // A hub whose `nats.conf` predates per-user inboxes lets every user read every
+        // client's JetStream and KV replies (hgl-ai#111). The file when this host has it;
+        // else the live hub, as on a system install, whose `nats.conf` is not readable.
+        if reached && (c.server.is_some() || su.is_some()) {
+            let conf = c
+                .server
+                .as_ref()
+                .is_some_and(|s| s.auth == hgl_ai_config::HubAuth::Users)
+                .then(|| env.expand(&c.paths.data_dir).join("nats.conf"))
+                .and_then(|p| sys.read_to_string(&p).ok())
+                .is_some_and(|text| text.contains("\"_INBOX.>\""));
+            let detail = if conf {
+                Some("nats.conf lets every hub user read every client's replies (`_INBOX.>`)")
+            } else if hub.shared_inbox(c).await == Some(true) {
+                Some(
+                    "the hub lets this host's user subscribe to every client's replies (`_INBOX.>`)",
+                )
+            } else {
+                None
+            };
+            if let Some(d) = detail {
+                out.push(Check::warn(
+                    "hub inboxes",
+                    d,
+                    "once every client runs this version, rerun `hgl-ai server install` (docs/install.md, Hub users)",
+                ));
+            }
+        }
         // On the hub's host (this user's own server, or a server user found from the hub
         // unit, as for a `--client-user`): consumers on the telemetry streams that outlive
         // a page. No fleet part makes one; the `viewer` user can (docs/design.md §9).
@@ -2230,6 +2258,81 @@ mod tests {
             !cs.iter()
                 .any(|c| c.name == "console credential" && c.level == Level::Warn)
         );
+    }
+
+    /// A hub whose `nats.conf` still lets every user subscribe to `_INBOX.>` (hgl-ai#111).
+    #[tokio::test]
+    async fn warns_on_a_shared_inbox() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.server = Some(hgl_ai_config::Server::default());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let conf = f.env.expand(&cfg.paths.data_dir).join("nats.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        let mut reg = crate::users::Registry::default();
+        reg.issue("build-1", crate::users::Role::Seat, false)
+            .unwrap();
+        let users = crate::nats::Auth::Users(&reg);
+        let new = crate::nats::render_conf("127.0.0.1", 4222, Path::new("/s"), &users);
+        std::fs::write(&conf, &new).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(!cs.iter().any(|c| c.name == "hub inboxes"), "{cs:?}");
+        let nkey = &reg.get("build-1").unwrap().nkey;
+        std::fs::write(&conf, new.replace(&format!("_INBOX.{nkey}.>"), "_INBOX.>")).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        let c = cs.iter().find(|c| c.name == "hub inboxes").unwrap();
+        assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.fix.as_deref().unwrap().contains("server install"),
+            "{c:?}"
+        );
+    }
+
+    /// A system-installed hub (no `server` section; `nats.conf` is the server user's):
+    /// doctor asks the live hub whether `_INBOX.>` is open (r1 on #119, finding 1).
+    #[tokio::test]
+    async fn probes_the_hub_for_a_shared_inbox() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let shared = |v| FakeHub {
+            shared_inbox: v,
+            ..FakeHub::up()
+        };
+        // A plain client host does not ask.
+        let cs = run(&f, &shared(Some(true))).await;
+        assert!(!cs.iter().any(|c| c.name == "hub inboxes"), "{cs:?}");
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        assert!(cfg.server.is_none());
+        cfg.server_user = Some(hgl_ai_config::ServerUser {
+            name: "hgl-ai".into(),
+            home: "/var/lib/hgl-ai".into(),
+            console_url: None,
+            slack: false,
+            client_user: None,
+        });
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let c = run(&f, &shared(Some(true)))
+            .await
+            .into_iter()
+            .find(|c| c.name == "hub inboxes")
+            .unwrap();
+        assert_eq!(c.level, Level::Warn);
+        assert!(c.detail.contains("the hub lets"), "{c:?}");
+        for v in [Some(false), None] {
+            let cs = run(&f, &shared(v)).await;
+            assert!(!cs.iter().any(|c| c.name == "hub inboxes"), "{v:?}: {cs:?}");
+        }
+        // Unreachable: the `hub` check says so; no inbox verdict.
+        let cs = run(
+            &f,
+            &FakeHub {
+                shared_inbox: Some(true),
+                ..FakeHub::down()
+            },
+        )
+        .await;
+        assert!(!cs.iter().any(|c| c.name == "hub inboxes"), "{cs:?}");
     }
 
     /// On the hub's host only: consumers on the telemetry streams that outlive a page.
