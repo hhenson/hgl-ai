@@ -1673,6 +1673,15 @@ mod tests {
     #[test]
     fn the_printed_prompt_restores_echo_on_a_signal() {
         use std::os::unix::process::CommandExt as _;
+        // Always reap both process groups, including when an assertion fails.
+        struct ProcessGroup(std::process::Child);
+        impl Drop for ProcessGroup {
+            fn drop(&mut self) {
+                // SAFETY: the child was started as the leader of its own group.
+                unsafe { libc::kill(-(self.0.id() as i32), libc::SIGKILL) };
+                let _ = self.0.wait();
+            }
+        }
         let d = tempfile::tempdir().unwrap();
         let fifo = d.path().join("tty.in");
         let log = d.path().join("stty.log");
@@ -1702,18 +1711,34 @@ mod tests {
             );
             // Its own group, as at a terminal: the key's signal reaches every process
             // of the script.
-            let mut reader = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(&prog)
-                .process_group(0)
-                .spawn()
-                .unwrap();
+            let mut command = std::process::Command::new("sh");
+            command.arg("-c").arg(&prog).process_group(0);
+            // SAFETY: only async-signal-safe operations run between fork and exec.
+            unsafe {
+                command.pre_exec(|| {
+                    for sig in [libc::SIGINT, libc::SIGTERM, libc::SIGHUP] {
+                        if libc::signal(sig, libc::SIG_DFL) == libc::SIG_ERR {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    let mut mask = std::mem::zeroed();
+                    libc::sigemptyset(&mut mask);
+                    if libc::sigprocmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            let mut reader = ProcessGroup(command.spawn().unwrap());
             // A writer that keeps the terminal stand-in open and silent.
-            let mut writer = std::process::Command::new("sh")
-                .arg("-c")
-                .arg(format!("exec 3>{}; sleep 30", q(&fifo)))
-                .spawn()
-                .unwrap();
+            let _writer = ProcessGroup(
+                std::process::Command::new("sh")
+                    .arg("-c")
+                    .arg(format!("exec 3>{}; sleep 30", q(&fifo)))
+                    .process_group(0)
+                    .spawn()
+                    .unwrap(),
+            );
             let wait_log = |want: &dyn Fn(&str) -> bool, what: &str| {
                 let start = Instant::now();
                 while !std::fs::read_to_string(&log).is_ok_and(|l| want(&l)) {
@@ -1726,13 +1751,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(200));
             // SAFETY: a plain kill(2) of the reader's group.
             assert_eq!(
-                unsafe { libc::kill(-(reader.id() as i32), sig) },
+                unsafe { libc::kill(-(reader.0.id() as i32), sig) },
                 0,
                 "{name}"
             );
-            let st = reader.wait().unwrap();
-            let _ = writer.kill();
-            let _ = writer.wait();
+            let start = Instant::now();
+            let st = loop {
+                if let Some(st) = reader.0.try_wait().unwrap() {
+                    break st;
+                }
+                assert!(
+                    start.elapsed() < Duration::from_secs(10),
+                    "{name}: did not exit"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
             assert!(!st.success(), "{name}: {st:?}");
             wait_log(&|l| l.trim_end().ends_with("stty echo"), "echo stays off");
             assert!(!after.exists(), "{name}: the script went on");
