@@ -145,6 +145,15 @@ with the exact head. Run local builds in the foreground. When resolving merge
 conflicts, keep the merge commit separate from other fixes. Answer `sendback`
 with new commits; never force-push reviewed history unless told.
 
+Before `ready`, answer each item by ID in the Ready body with `n/a` or what
+you ran:
+- **PC-10 Restart:** stop between durable writes; restart and check each step finishes once.
+- **PC-11 Race:** run two turns or processes on one key; protect read, decide and write with one lock or revision check.
+- **PC-1 Stale head:** check verdicts, checks, labels and receipts against the exact current head and main when acting; test that an intervening push is refused.
+- **PC-12 Foreign sender:** test that only allowed authors' GitHub text is acted on and sender identity is authenticated.
+- **PC-4 Secrets:** check that untrusted titles, branches, bodies and logs are bounded, escaped and redacted before output, including errors.
+- **PC-22 Proof:** name a test that fails without the fix; report validation scope (unit tests or live NATS JetStream).
+
 **Reviewer.** Fresh context per review; the bridge has merged `head` onto
 `main` in `$HGL_AI_TASK_DIR/src`. Write adversarial programs, accepting and
 rejecting, with native runtime checks; check the status label of every rule
