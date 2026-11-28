@@ -451,7 +451,11 @@ impl Conn {
         dir: &Path,
         dialect: Dialect,
     ) -> std::io::Result<Arc<Conn>> {
-        Self::make(label, alias, program, dir, dialect, false, None)
+        let mut conn = Self::make(label, alias, program, dir, dialect, false, None)?;
+        Arc::get_mut(&mut conn)
+            .expect("new connection is unshared")
+            .socket = PathBuf::new();
+        Ok(conn)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ConnState> {
