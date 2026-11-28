@@ -278,52 +278,96 @@ static NOTE_LINE: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// The note state a comment's first line gives, if it is a note's first line.
+fn note_line(first: &str) -> Option<NoteState> {
+    let m = NOTE_LINE.captures(first)?;
+    Some(match m[1].to_ascii_lowercase().as_str() {
+        "ready" => NoteState::Ready,
+        "approved" => NoteState::Approved,
+        "blocked" => NoteState::Blocked,
+        "landed" => NoteState::Landed,
+        _ => NoteState::Sendback,
+    })
+}
+
 /// The latest note state among comments whose first line is a note's first line
 /// (`[codex] Ready: ...`, `[claude] (w3) Approved ...`).
 pub fn note_state(comments: &[Comment]) -> Option<NoteState> {
     let mut found: Vec<(&str, NoteState)> = comments
         .iter()
         .filter_map(|c| {
-            let first = c.body.lines().next()?.trim();
-            let m = NOTE_LINE.captures(first)?;
-            let st = match m[1].to_ascii_lowercase().as_str() {
-                "ready" => NoteState::Ready,
-                "approved" => NoteState::Approved,
-                "blocked" => NoteState::Blocked,
-                "landed" => NoteState::Landed,
-                _ => NoteState::Sendback,
-            };
-            Some((c.created_at.as_str(), st))
+            Some((
+                c.created_at.as_str(),
+                note_line(c.body.lines().next()?.trim())?,
+            ))
         })
         .collect();
     found.sort_by(|a, b| a.0.cmp(b.0));
     found.last().map(|f| f.1)
 }
 
-/// When the pull request became Ready at `head` (WORK-6 Ready order): the `created_at` of
-/// its latest `Ready` comment, when that comment names `head` (in full or by its first eight
-/// characters) and the latest note state is still `ready` or `approved`.
-pub fn ready_at<'a>(comments: &'a [Comment], head: &str) -> Option<&'a str> {
-    if !matches!(
-        note_state(comments),
-        Some(NoteState::Ready | NoteState::Approved)
-    ) {
-        return None;
-    }
-    let ready = comments
+/// The head a note's first line declares: the first `at <hex>`, 8 to 40 hex characters
+/// bounded by non-hex (`Ready: o/r#7 at 1f461fa7`, `Approved at 1f461fa7.`).
+static DECLARED_HEAD: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)\bat\s+([0-9a-f]{8,40})(?:[^0-9a-f]|$)").unwrap());
+
+fn declared_head(first: &str) -> Option<&str> {
+    DECLARED_HEAD
+        .captures(first)
+        .and_then(|m| m.get(1))
+        .map(|m| m.as_str())
+}
+
+/// Whether `token` (a declared head) names `head`: its prefix in full, in any letter case.
+fn names_head(token: &str, head: &str) -> bool {
+    head.get(..token.len())
+        .is_some_and(|p| p.eq_ignore_ascii_case(token))
+}
+
+/// Where the note comments leave Ready at `head` (WORK-6 Ready order), walked in creation
+/// order: a `Ready` comment declaring `head` marks it; `Sent back`, `Blocked`, `Landed`, a
+/// `Ready` at another head, or an `Approved` naming another head clears it; an `Approved`
+/// naming no head or `head` keeps it.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ReadyMark {
+    /// `created_at` of the `Ready` comment at `head` that still stands.
+    pub at: Option<String>,
+    /// `created_at` of the latest comment that cleared Ready at `head`: a `ready` note on
+    /// the hub at `head` counts only when later (its comment fell outside the comments read).
+    pub cleared: Option<String>,
+}
+
+/// The [`ReadyMark`] the note comments leave at `head`.
+pub fn ready_mark(comments: &[Comment], head: &str) -> ReadyMark {
+    let mut notes: Vec<(&str, NoteState, Option<&str>)> = comments
         .iter()
-        .filter(|c| {
-            let first = c.body.lines().next().unwrap_or("").trim();
-            NOTE_LINE
-                .captures(first)
-                .is_some_and(|m| m[1].eq_ignore_ascii_case("ready"))
+        .filter_map(|c| {
+            let first = c.body.lines().next()?.trim();
+            Some((
+                c.created_at.as_str(),
+                note_line(first)?,
+                declared_head(first),
+            ))
         })
-        .max_by(|a, b| a.created_at.cmp(&b.created_at))?;
-    let short = head.get(..8)?;
-    ready
-        .body
-        .contains(short)
-        .then_some(ready.created_at.as_str())
+        .collect();
+    notes.sort_by(|a, b| a.0.cmp(b.0));
+    let mut mark = ReadyMark::default();
+    for (at, st, declared) in notes {
+        let at_head = declared.is_some_and(|d| names_head(d, head));
+        let keeps = match st {
+            NoteState::Ready if at_head => {
+                mark.at = Some(at.to_string());
+                continue;
+            }
+            NoteState::Approved => declared.is_none() || at_head,
+            _ => false,
+        };
+        if !keeps {
+            mark.at = None;
+            mark.cleared = Some(at.to_string());
+        }
+    }
+    mark
 }
 
 static SIGNED: LazyLock<Regex> = LazyLock::new(|| {
@@ -505,25 +549,80 @@ mod tests {
             created_at: at.into(),
             updated_at: at.into(),
         };
-        let first = c("[codex] Ready: o/r#7 at 1f461fa7", "2026-01-01T01:00:00Z");
-        let back = c("[claude] Sent back: one finding", "2026-01-01T02:00:00Z");
-        let again = c(
-            &format!("[codex] (w5) Ready: o/r#7 at {H1}"),
-            "2026-01-01T03:00:00Z",
-        );
-        let approved = c("[claude] Approved at 1f461fa7.", "2026-01-01T04:00:00Z");
+        let t = |h: u32| format!("2026-01-01T{h:02}:00:00Z");
+        let at = |s: &str| Some(s.to_string());
+        let mark = |cs: &[Comment]| ready_mark(cs, H1);
+        let first = c("[codex] Ready: o/r#7 at 1f461fa7", &t(1));
+        let back = c("[claude] Sent back: one finding", &t(2));
+        let again = c(&format!("[codex] (w5) Ready: o/r#7 at {H1}"), &t(3));
+        let approved = c("[claude] Approved at 1F461FA7.", &t(4));
+        assert_eq!(mark(std::slice::from_ref(&first)).at, at(&t(1)));
+        // The latest Ready counts, and an approval at the head keeps it.
+        let all = [first.clone(), back.clone(), again.clone(), approved];
         assert_eq!(
-            ready_at(std::slice::from_ref(&first), H1),
-            Some("2026-01-01T01:00:00Z")
+            mark(&all),
+            ReadyMark {
+                at: at(&t(3)),
+                cleared: at(&t(2))
+            }
         );
-        // The latest Ready counts, and an approval keeps it.
-        let all = [first.clone(), back, again, approved];
-        assert_eq!(ready_at(&all, H1), Some("2026-01-01T03:00:00Z"));
-        assert_eq!(ready_at(&all[..3], H1), Some("2026-01-01T03:00:00Z"));
-        // Sent back and not Ready again; Ready at another head; no note at all.
-        assert_eq!(ready_at(&all[..2], H1), None);
-        assert_eq!(ready_at(&[first], &"2".repeat(40)), None);
-        assert_eq!(ready_at(&[c("checks pass", "x")], H1), None);
-        assert_eq!(ready_at(&[], H1), None);
+        assert_eq!(mark(&all[..3]).at, at(&t(3)));
+        // Walked in creation order, whatever order the comments came in.
+        let mut shuffled = all.clone();
+        shuffled.reverse();
+        assert_eq!(mark(&shuffled), mark(&all));
+        // Sent back, Blocked or Landed after the Ready clears it.
+        for clear in [
+            "[claude] Sent back: one finding",
+            "[claude] Sendback at 1f461fa7",
+            "[codex] Blocked: need a decision",
+            "[claude] (controller) Landed at 1f461fa7 as abcdef12",
+        ] {
+            let cs = [first.clone(), c(clear, &t(5))];
+            assert_eq!(
+                mark(&cs),
+                ReadyMark {
+                    at: None,
+                    cleared: at(&t(5))
+                },
+                "{clear}"
+            );
+        }
+        // An approval naming no head keeps it; one naming another head clears it.
+        let keep = [first.clone(), c("[claude] Approved.", &t(5))];
+        assert_eq!(mark(&keep).at, at(&t(1)));
+        let other = [first.clone(), c("[claude] Approved at 2222222222", &t(5))];
+        assert_eq!(mark(&other).at, None);
+        // A later Ready at another head clears it.
+        let moved = [first.clone(), c("[codex] Ready: o/r#7 at 22222222", &t(5))];
+        assert_eq!(mark(&moved).at, None);
+        assert_eq!(mark(&moved).cleared, at(&t(5)));
+        // The declared head must match in full: no substring elsewhere in the comment, no
+        // token longer than the head's prefix, no token under 8 characters.
+        for body in [
+            "[codex] Ready: o/r#7 (1f461fa7)",
+            "[codex] Ready: o/r#7 at 01f461fa7",
+            "[codex] Ready: o/r#7 at 1f461fa7f",
+            "[codex] Ready: o/r#7 at 1f461fa",
+            "[codex] Ready: o/r#7\nat 1f461fa7",
+            "[codex] Ready: o/r#7 at 2222222222 after 1f461fa7",
+            "[codex] Ready: o/r#7 at 1f461fa77bba922fe81383df4c475feb58b7c2330",
+        ] {
+            let cs = [c(body, &t(1))];
+            assert_eq!(mark(&cs).at, None, "{body}");
+        }
+        for body in [
+            "[codex] Ready: o/r#7 AT 1F461FA77BBA",
+            "[codex] Ready: o/r#7 at 1f461fa7: checks pass",
+            "[codex] Ready: o/r#7 at 1f461fa7zz",
+        ] {
+            assert_eq!(mark(&[c(body, &t(1))]).at, at(&t(1)), "{body}");
+        }
+        assert_eq!(ready_mark(&[first], &"2".repeat(40)).at, None);
+        assert_eq!(
+            mark(&[c("checks pass at 1f461fa7", "x")]),
+            ReadyMark::default()
+        );
+        assert_eq!(mark(&[]), ReadyMark::default());
     }
 }

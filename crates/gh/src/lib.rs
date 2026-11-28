@@ -224,7 +224,7 @@ impl Settings {
     /// coordinator_lands`). Never for a repository the owner merges, whatever the
     /// configuration says.
     pub fn coordinator_lands(&self, repo: &str) -> bool {
-        !hgl_ai_config::github::OWNER_MERGED.contains(&repo)
+        !hgl_ai_config::github::owner_merged(repo)
             && self.gates.get(repo).is_some_and(|g| g.coordinator_lands)
     }
 

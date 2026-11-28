@@ -142,7 +142,8 @@ relax_required = ["lint", "test (ubuntu-latest)", "cpp (plain, runtime and core)
 
 [github.gate.hgl-ai]
 checks = ["lint", "test (ubuntu-latest)", "test (macos-latest)"]
-coordinator_lands = true               # default false; refused for hgl_spec, hgl_core (owner merges)
+# coordinator_lands = true             # explicit opt-in, default false in every repository;
+                                       # refused for hgl_spec, hgl_core in any case (owner merges)
 
 [github.gate.hgl-project]
 checks = ["docs/readthedocs.org:hgl-project"]   # a commit status

@@ -47,8 +47,13 @@ pub struct RepoGate {
 }
 
 /// Repositories whose pull requests the owner merges: `coordinator_lands` is refused for
-/// them whatever the configuration says.
+/// them whatever the configuration says. Compared case-insensitively ([`owner_merged`]).
 pub const OWNER_MERGED: &[&str] = &["hgl_spec", "hgl_core"];
+
+/// Whether the owner merges `repo` ([`OWNER_MERGED`], in any letter case).
+pub fn owner_merged(repo: &str) -> bool {
+    OWNER_MERGED.iter().any(|r| r.eq_ignore_ascii_case(repo))
+}
 
 fn yes() -> bool {
     true
@@ -220,10 +225,7 @@ fn default_gates() -> BTreeMap<String, RepoGate> {
         ("hgl-compiler".to_string(), compiler),
         (
             "hgl-ai".to_string(),
-            RepoGate {
-                coordinator_lands: true,
-                ..checks(&["lint", "test (ubuntu-latest)", "test (macos-latest)"])
-            },
+            checks(&["lint", "test (ubuntu-latest)", "test (macos-latest)"]),
         ),
         (
             "hgl-project".to_string(),
@@ -257,7 +259,7 @@ fn default_pins() -> Vec<Pin> {
 pub fn validate_gates(gates: &BTreeMap<String, RepoGate>) -> Result<(), String> {
     match gates
         .iter()
-        .find(|(r, g)| g.coordinator_lands && OWNER_MERGED.contains(&r.as_str()))
+        .find(|(r, g)| g.coordinator_lands && owner_merged(r))
     {
         Some((r, _)) => Err(format!(
             "github.gate.{r}: coordinator_lands is refused; the owner merges {r}"
@@ -362,16 +364,15 @@ mod tests {
             toml::to_string(&on).unwrap().trim(),
             "coordinator_lands = true"
         );
-        // Of the built-in entries only hgl-ai opts in.
+        // No built-in entry opts in: only explicit configuration does.
         let all = gates();
-        let on: Vec<&str> = all
-            .iter()
-            .filter(|(_, g)| g.coordinator_lands)
-            .map(|(r, _)| r.as_str())
-            .collect();
-        assert_eq!(on, ["hgl-ai"]);
+        assert!(all.values().all(|g| !g.coordinator_lands), "{all:?}");
         validate_gates(&all).unwrap();
-        for r in OWNER_MERGED {
+        for r in OWNER_MERGED
+            .iter()
+            .map(|r| r.to_string())
+            .chain(["HGL_SPEC".into(), "Hgl_Core".into()])
+        {
             let mut g = all.clone();
             g.insert(
                 r.to_string(),

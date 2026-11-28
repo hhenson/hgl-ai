@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
-use crate::bot::{BotState, BotView, Comment, NoteState, Review, note_state, ready_at};
+use crate::bot::{BotState, BotView, Comment, NoteState, Review, note_state, ready_mark};
 use crate::{Error, Result, short};
 
 /// `CHECKS` of a row: the head commit's status check rollup.
@@ -158,9 +158,11 @@ impl Table {
 pub struct PrInfo {
     pub row: Row,
     pub note: Option<NoteState>,
-    /// `created_at` of the latest `Ready` comment at this head while the pull request is
-    /// still ready or approved ([`crate::bot::ready_at`]): its place in Ready order (WORK-6).
+    /// `created_at` of the `Ready` comment at this head that still stands
+    /// ([`crate::bot::ready_mark`]): its place in Ready order (WORK-6).
     pub ready_at: Option<String>,
+    /// `created_at` of the latest note comment that cleared Ready at this head.
+    pub ready_cleared: Option<String>,
     pub url: String,
     pub review_url: Option<String>,
 }
@@ -282,6 +284,7 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
         .map(Review::from_graphql)
         .collect();
     let view = BotView::of(bot, &comments, &reviews);
+    let mark = ready_mark(&comments, &head);
     let rollup = nodes(p, &["commits"])
         .first()
         .and_then(|c| c.get("commit"))
@@ -301,7 +304,8 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
             head: head.clone(),
         },
         note: note_state(&comments),
-        ready_at: ready_at(&comments, &head).map(String::from),
+        ready_at: mark.at,
+        ready_cleared: mark.cleared,
         url: p
             .get("url")
             .and_then(Value::as_str)
