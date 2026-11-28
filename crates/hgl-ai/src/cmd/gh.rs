@@ -162,6 +162,8 @@ impl GateArgs {
                 closes: self.closes,
                 tool_made: false,
                 merge_until: None,
+                // The landing sets it from its options.
+                after: Default::default(),
             },
             closes: self.closes,
             what: self.what.clone(),
@@ -564,12 +566,22 @@ fn report(ctx: &Ctx, l: Landing) -> anyhow::Result<i32> {
     if o.kind.satisfied() {
         Ok(EXIT_OK)
     } else {
-        let line = if o.kind == Kind::Updated {
-            format!("{} (CI runs on the update first)", o.line)
-        } else {
-            o.line.clone()
-        };
-        Err(NotReady(line).into())
+        Err(NotReady(not_ready_line(&l, ctx.json)).into())
+    }
+}
+
+/// The line of a gate that is not satisfied (exit 3). A `PARTIAL` also gives, outside
+/// `--json` (where `after` holds them), the lines of the steps done before the one that
+/// failed and what the retry still owes.
+fn not_ready_line(l: &Landing, json: bool) -> String {
+    let o = &l.outcome;
+    match o.kind {
+        Kind::Updated => format!("{} (CI runs on the update first)", o.line),
+        Kind::Partial if !json => std::iter::once(o.line.clone())
+            .chain(l.after.iter().map(|a| format!("  {a}")))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => o.line.clone(),
     }
 }
 
@@ -595,4 +607,37 @@ fn formula(
         None => print!("{text}"),
     }
     Ok(EXIT_OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// hgl-ai#133: a `PARTIAL` at the command line keeps the lines of the steps done.
+    #[test]
+    fn a_partial_keeps_its_lines() {
+        let outcome = hgl_ai_gh::gate::Outcome {
+            kind: Kind::Partial,
+            line: "alpha #7 is merged at 01e99ea5, but the comment is not done (x); run the same command again to finish PARTIAL".into(),
+            retry: false,
+            merge_commit: None,
+            head: String::new(),
+        };
+        let l = Landing {
+            outcome,
+            after: vec!["recorded alpha #7".into(), "the pins are not raised".into()],
+        };
+        assert_eq!(
+            not_ready_line(&l, false),
+            format!(
+                "{}\n  recorded alpha #7\n  the pins are not raised",
+                l.outcome.line
+            )
+        );
+        assert_eq!(
+            not_ready_line(&l, true),
+            l.outcome.line,
+            "--json has `after`"
+        );
+    }
 }

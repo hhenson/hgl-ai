@@ -204,8 +204,13 @@ pub async fn land<G: Gh>(
         if !r.ok() {
             // The record stays with the pins not done: the same command finishes them.
             outcome.kind = Kind::Partial;
+            let at = merge
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .map(|m| format!(" at {}", short(m)))
+                .unwrap_or_default();
             outcome.line = format!(
-                "{repo} #{number} is merged, but the {} pins are not raised ({}); run the same `hgl-ai gh land` again to finish PARTIAL",
+                "{repo} #{number} is merged{at}, but the {} pins are not raised ({}); run the same `hgl-ai gh land` again to finish PARTIAL",
                 s.wrapper,
                 r.line()
             );
@@ -255,7 +260,7 @@ async fn land_locked<G: Gh>(
         return Ok(done);
     }
     let deadline = Instant::now() + o.timeout;
-    let gate_opts = with_deadline(&o.gate, deadline);
+    let gate_opts = with_deadline(s, repo, o, deadline);
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
     {
         let after = Vec::new();
@@ -352,11 +357,26 @@ async fn resume_recorded<G: Gh>(
 
 /// The gate's options with the landing's `deadline`, which bounds the poll of an accepted
 /// merge (with the lock's lease, taken at the merge: [`crate::merge::until`]).
-fn with_deadline(gate: &gate::Opts, deadline: Instant) -> gate::Opts {
+fn with_deadline(s: &Settings, repo: &str, o: &LandOpts, deadline: Instant) -> gate::Opts {
     gate::Opts {
         merge_until: Some(tokio::time::Instant::from_std(deadline)),
-        ..*gate
+        after: steps(s, repo, o),
+        ..o.gate
     }
+}
+
+/// The steps after a merge that a landing with `o` does in `repo`.
+fn steps(s: &Settings, repo: &str, o: &LandOpts) -> gate::AfterSteps {
+    gate::AfterSteps {
+        notes: o.notify,
+        comment: o.comment,
+        pins: o.sync_pins && s.pin_sources().contains(&repo),
+    }
+}
+
+/// What a landing with `o` has left in `repo`, from its record `p`.
+fn left_of(s: &Settings, repo: &str, p: Option<&Progress>, o: &LandOpts) -> String {
+    gate::left_of(p, steps(s, repo, o), &s.wrapper)
 }
 
 /// After the gate decided, under the lock: a merge's steps; a pull request found merged
@@ -376,7 +396,10 @@ async fn settle<G: Gh>(
         Kind::Merged => {
             let p = match progress::read(bus, repo, number).await {
                 Ok(p) => p,
-                Err(e) => return stopped(repo, number, &outcome, &left_of(None, o), e),
+                Err(e) => {
+                    let left = left_of(s, repo, None, o);
+                    return stopped(repo, number, &outcome, &left, e);
+                }
             };
             finish(gh, s, bus, repo, number, outcome, o, lock, p).await
         }
@@ -446,13 +469,18 @@ async fn settle_merged<G: Gh>(
     }
     // Merged, and its landing not finished (an earlier attempt stopped right after
     // the merge, or it was merged without one): finish it now.
-    let pr = gate::fetch_pr(gh, s, repo, number).await?;
-    let merge = pr.merge_commit.clone().unwrap_or_default();
+    let (merge, pr_head) = match &outcome.merge_commit {
+        Some(m) => (m.clone(), outcome.head.clone()),
+        None => {
+            let pr = gate::fetch_pr(gh, s, repo, number).await?;
+            (pr.merge_commit.unwrap_or_default(), pr.head)
+        }
+    };
     let head = p
         .as_ref()
         .map(|p| p.head.clone())
         .filter(|h| !h.is_empty())
-        .unwrap_or_else(|| pr.head.clone());
+        .unwrap_or(pr_head);
     let mut resumed = Outcome::new(
         Kind::Resumed,
         format!(
@@ -499,11 +527,16 @@ pub(crate) async fn merge_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<Landing> {
+    // The pins are not this command's: a `PARTIAL` does not name them.
+    let o = &LandOpts {
+        sync_pins: false,
+        ..o.clone()
+    };
     let (Landing { outcome, mut after }, _) =
         match resume_recorded(gh, s, bus, repo, number, o, lock).await? {
             Some(done) => done,
             None => {
-                let gate_opts = with_deadline(&o.gate, Instant::now() + o.timeout);
+                let gate_opts = with_deadline(s, repo, o, Instant::now() + o.timeout);
                 let outcome = gate::evaluate(
                     gh,
                     s,
@@ -557,35 +590,10 @@ async fn finish<G: Gh>(
     {
         Ok(what) => Ok((Landing { outcome, after }, what)),
         Err(e) => {
-            let left = left_of(Some(&p), o);
+            let left = left_of(s, repo, Some(&p), o);
             let outcome = Outcome::partial(repo, number, &outcome.head, Some(&merge), &left, e)?;
             Ok((Landing { outcome, after }, String::new()))
         }
-    }
-}
-
-/// The steps after the merge that `p` does not show done, as a phrase ("main and the
-/// comment are"); with every step done, only the record is left to write.
-fn left_of(p: Option<&Progress>, o: &LandOpts) -> String {
-    let mut steps = vec![
-        (progress::LANDED_LOG, state::KEY_LANDED),
-        (progress::MAIN, state::KEY_MAIN),
-    ];
-    if o.notify {
-        steps.push((progress::NOTES, "the landed notes"));
-    }
-    if o.comment {
-        steps.push((progress::COMMENT, "the comment"));
-    }
-    let left: Vec<&str> = steps
-        .into_iter()
-        .filter(|(step, _)| !p.is_some_and(|p| p.has(step)))
-        .map(|(_, name)| name)
-        .collect();
-    match left.as_slice() {
-        [] => "its record is".to_string(),
-        [one] => format!("{one} is"),
-        [init @ .., last] => format!("{} and {last} are", init.join(", ")),
     }
 }
 
@@ -1053,6 +1061,8 @@ mod tests {
     #[test]
     fn a_partial_names_what_is_left() {
         let o = LandOpts::default();
+        let s = crate::testutil::settings();
+        let left_of = |p: Option<&Progress>, o: &LandOpts| left_of(&s, "alpha", p, o);
         assert_eq!(
             left_of(None, &o),
             "landed.log, main, the landed notes and the comment are"
@@ -1074,6 +1084,21 @@ mod tests {
             ..LandOpts::default()
         };
         assert_eq!(left_of(None, &quiet), "landed.log and main are");
+        // The gate's `PARTIAL` right after the merge names the same steps.
+        let g = with_deadline(&s, "alpha", &quiet, Instant::now()).after;
+        assert_eq!(
+            gate::left_of(None, g, &s.wrapper),
+            "landed.log and main are"
+        );
+        // A repository the wrapper's pins follow: `gh land` raises them too.
+        assert_eq!(
+            super::left_of(&s, "hgl-compiler", Some(&p), &o),
+            "the hgl-project pins are"
+        );
+        assert_eq!(
+            super::left_of(&s, "hgl-compiler", None, &quiet),
+            "landed.log, main and the hgl-project pins are"
+        );
 
         let merge = "01e99ea5e46457bac035ca8a2699b6b6575b32ed";
         let e = Error::Response {

@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 use crate::exec::{self, Gh};
 use crate::gate::{self, Outcome};
 use crate::land::{self, LandOpts};
+use crate::progress;
 use crate::{Error, Result, Settings, invalid, short};
 
 #[derive(Debug, Clone)]
@@ -242,15 +243,42 @@ pub async fn sync<G: Gh>(
     o: &PinOpts,
     dry_run: bool,
 ) -> Result<Synced> {
+    // A pin pull request merged by an earlier sync whose landing stopped after the merge:
+    // finish it first, or the pins read current and its landing is never finished.
+    let mut resumed = None;
+    if let Some(b) = bus {
+        for (n, head) in unfinished(gh, s, b).await? {
+            if dry_run {
+                return Ok(Synced::Would(format!(
+                    "would finish the landing of the pin pull request {}#{n}",
+                    s.wrapper
+                )));
+            }
+            let l = Box::pin(land::land(
+                gh,
+                s,
+                b,
+                &s.wrapper,
+                n,
+                &head,
+                &land_opts(o, None),
+            ))
+            .await?;
+            if !l.outcome.kind.landed() {
+                return Ok(Synced::NotLanded(l.outcome));
+            }
+            resumed = Some(l.outcome);
+        }
+    }
     let p = read_plan(gh, s).await?;
     let Some((_, primary, _)) = p.primary().cloned() else {
         return Ok(Synced::Current("no pins configured".into()));
     };
     if p.current() {
-        return Ok(Synced::Current(format!(
-            "pins current at {}",
-            short(&primary)
-        )));
+        return Ok(match resumed {
+            Some(o) => Synced::Landed(o),
+            None => Synced::Current(format!("pins current at {}", short(&primary))),
+        });
     }
     let (branch, title, message, body) = texts(s, &p, o)?;
     let w = s.full(&s.wrapper);
@@ -331,7 +359,26 @@ pub async fn sync<G: Gh>(
             (n, sha)
         }
     };
-    let lo = LandOpts {
+    let l = land::land(
+        gh,
+        s,
+        bus,
+        &s.wrapper,
+        number,
+        &head,
+        &land_opts(o, Some(title)),
+    )
+    .await?;
+    Ok(if l.outcome.kind.landed() {
+        Synced::Landed(l.outcome)
+    } else {
+        Synced::NotLanded(l.outcome)
+    })
+}
+
+/// How a pin pull request is landed.
+fn land_opts(o: &PinOpts, what: Option<String>) -> LandOpts {
+    LandOpts {
         // Made by the tool, not an agent: no author family for a review receipt to differ
         // from (ROLE-11); the review bot and the checks still gate it.
         gate: gate::Opts {
@@ -343,15 +390,37 @@ pub async fn sync<G: Gh>(
         comment: false,
         notify: false,
         sync_pins: false,
-        what: Some(title),
+        what,
         ..LandOpts::default()
-    };
-    let l = land::land(gh, s, bus, &s.wrapper, number, &head, &lo).await?;
-    Ok(if l.outcome.kind.landed() {
-        Synced::Landed(l.outcome)
-    } else {
-        Synced::NotLanded(l.outcome)
-    })
+    }
+}
+
+/// The wrapper's landings with a record that are merged and not finished, as (number,
+/// head): a record with the merge commit, or only the intent of a pull request GitHub
+/// shows merged. An intent whose pull request is not merged is left to the sync itself.
+async fn unfinished<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<Vec<(u64, String)>> {
+    let prefix = progress::key(&s.wrapper, 0);
+    let prefix = prefix.trim_end_matches('0');
+    let mut out = Vec::new();
+    for key in bus.state_keys(prefix).await? {
+        let Some(n) = key.strip_prefix(prefix).and_then(|n| n.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Some(p) = progress::read(bus, &s.wrapper, n).await? else {
+            continue;
+        };
+        let head = if p.merge.is_some() && !p.head.is_empty() {
+            p.head
+        } else {
+            let pr = gate::fetch_pr(gh, s, &s.wrapper, n).await?;
+            if !pr.merged {
+                continue;
+            }
+            if p.head.is_empty() { pr.head } else { p.head }
+        };
+        out.push((n, head));
+    }
+    Ok(out)
 }
 
 /// Point `refs/heads/<branch>` of `w` at `sha`: a branch left by an earlier attempt (or one

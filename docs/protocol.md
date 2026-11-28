@@ -318,11 +318,14 @@ not done: no second `landed.log` line, the notes with their first `created_at`, 
 second comment. It reports success only when all are done. A step after the merge
 that fails (pins that did not land, a GitHub error, a failed hub write, a lost landing
 lock) gives `PARTIAL` (exit 3): the merge commit, the steps not done, the error, and
-"run the same command again to finish"; the record is kept. An unreachable hub is
-still exit 10. A pull request found merged with neither a record nor a
-`landed.log` line has every step done then. `main` is written only whole: a failed
-read is tried three times, then the landing fails; a repository with no `main`
-(HTTP 404) is left out with a warning.
+"run the same command again to finish"; the record is kept. Without `--json` the
+lines of the steps done follow it. An unreachable hub is still exit 10. Before it
+reads the pins, `gh pins sync` (and so `gh land`) finishes any wrapper landing whose
+record shows it merged, or whose pull request GitHub shows merged; a pin pull request
+cut off after its merge is finished, not left behind pins that read current. A pull
+request found merged with neither a record nor a `landed.log` line has every step
+done then. `main` is written only whole: a failed read is tried three times, then the
+landing fails; a repository with no `main` (HTTP 404) is left out with a warning.
 
 `HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream
 sequence of the note that ended the task for the seat. A later end replaces an
