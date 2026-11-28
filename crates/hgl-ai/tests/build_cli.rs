@@ -856,6 +856,44 @@ fn turn_term_build(earlier_failure: bool, interrupt_first: bool) {
     }
 }
 
+#[test]
+fn local_build_from_subdirectory_discovers_dirty_checkout() {
+    let dir = Scratch::new("subdir");
+    let src = dir.0.join("src");
+    let sub = src.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    git(&src, &["init", "--quiet"]);
+    std::fs::write(src.join("root-marker"), "initial\n").unwrap();
+    git(&src, &["add", "root-marker"]);
+    git(&src, &["commit", "--quiet", "-m", "initial"]);
+    let head = git(&src, &["rev-parse", "HEAD"]);
+    std::fs::write(src.join("root-marker"), "changed\n").unwrap();
+    let recipe = dir.0.join("r.toml");
+    std::fs::write(
+        &recipe,
+        "repo = \"demo\"\n[[step]]\nname = \"root\"\nrun = \"test -f root-marker\"\n",
+    )
+    .unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .args(["--json", "build", "run", "demo", "--recipe"])
+        .arg(&recipe)
+        .arg("--build-dir")
+        .arg(dir.0.join("build"))
+        .arg("--log-dir")
+        .arg(dir.0.join("logs"))
+        .current_dir(&sub)
+        .env("HGL_AI_CONFIG", dir.0.join("none.toml"))
+        .env_remove("HGL_AI_TASK_DIR")
+        .env_remove("HGL_AI_TURN")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let s: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(s["head"], head);
+    assert_eq!(s["dirty"], true);
+}
+
 /// Carbon's finding 10 on #12: a range in an XML report is read from that report, which
 /// the summary names.
 #[test]
