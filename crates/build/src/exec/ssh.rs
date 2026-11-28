@@ -1438,11 +1438,12 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "linux")]
     fn long_control_socket_uses_private_runtime_and_is_stable() {
         let tmp = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
-        let (_runtime_dir, runtime) = short::tempdir();
-        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = Path::new("/proc/self/cwd").join(short::relative(tmp.path()));
         let dir = tmp.path().join("d".repeat(120));
         std::fs::create_dir(&dir).unwrap();
         let first = control_socket(&dir, "remote", Some(&runtime)).unwrap();

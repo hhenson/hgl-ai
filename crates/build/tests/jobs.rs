@@ -85,7 +85,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 struct Rig {
     _nats: Nats,
     _tmp: tempfile::TempDir,
-    _socket_tmp: short::ShortDir,
+    _socket_tmp: tempfile::TempDir,
     root: PathBuf,
     bus: Arc<Bus>,
     heads: [String; 2],
