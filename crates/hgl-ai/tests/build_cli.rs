@@ -250,8 +250,11 @@ fn builder_runs_a_remote_build_through_the_hub() {
         .unwrap();
     assert_eq!(o.status.code(), Some(3), "{}", text(&o));
 
+    let builder_home = hub.dir.0.join("builder-home");
+    std::fs::create_dir_all(&builder_home).unwrap();
     let builder = Proc(
         hub.cmd(&["builder", "run"])
+            .env("HOME", &builder_home)
             .env("HGL_AI_LOG", "info")
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(hub.dir.0.join("builder.log")).unwrap())
@@ -372,6 +375,75 @@ fn builder_runs_a_remote_build_through_the_hub() {
         "{}",
         text(&o)
     );
+
+    // A requester with its own home and work root has no local builder logs. Poison
+    // the paths in the hub summary too: opening a path supplied by the summary must
+    // not accidentally make this test pass. The builder retains its own status file.
+    let requester = hub.dir.0.join("requester");
+    let requester_home = requester.join("home");
+    let requester_task = requester.join("task");
+    std::fs::create_dir_all(&requester_home).unwrap();
+    std::fs::create_dir_all(&requester_task).unwrap();
+    let mut cfg = hgl_ai_config::Config::load(&hub.config).unwrap();
+    cfg.host = "requester".into();
+    cfg.paths.work_root = requester.join("work").display().to_string();
+    cfg.paths.data_dir = requester.join("data").display().to_string();
+    let requester_config = requester.join("config.toml");
+    cfg.save(&requester_config).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let bus = runtime.block_on(async {
+        let token = std::fs::read_to_string(&cfg.hub.token_file).unwrap();
+        hgl_ai_bus::Bus::connect_url(&cfg.hub.url, Some(token.trim().to_string()))
+            .await
+            .unwrap()
+    });
+    let mut remote_summary = s.clone();
+    remote_summary["log_dir"] = requester.join("missing").display().to_string().into();
+    for step in remote_summary["steps"].as_array_mut().unwrap() {
+        if step["log"].is_string() {
+            step["log"] = requester.join("missing.log").display().to_string().into();
+        }
+    }
+    runtime
+        .block_on(bus.build_put(
+            &hgl_ai_proto::build::run_key(&id),
+            &serde_json::to_vec(&remote_summary).unwrap(),
+        ))
+        .unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .arg("--config")
+        .arg(&requester_config)
+        .args(["build", "log", &id, "compile", "--bytes", &range])
+        .current_dir(&requester)
+        .env("HOME", &requester_home)
+        .env("HGL_AI_TASK_DIR", &requester_task)
+        .env_remove("HGL_AI_SEAT")
+        .env_remove("HGL_AI_CONFIG")
+        .env_remove("HGL_AI_TURN")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).starts_with("main.c:3:5: error:"),
+        "{}",
+        text(&o)
+    );
+    let request = runtime
+        .block_on(bus.reply_wait(
+            &hgl_ai_proto::Seat::new("logs-lab1").unwrap(),
+            Duration::from_secs(1),
+        ))
+        .unwrap()
+        .expect("requester did not send a log request over the hub");
+    let request: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(request["id"], id);
+    assert_eq!(request["step"], "compile");
+    runtime
+        .block_on(bus.build_put(
+            &hgl_ai_proto::build::run_key(&id),
+            &serde_json::to_vec(&s).unwrap(),
+        ))
+        .unwrap();
 
     // Cleanup is part of done: no checkout left, the clone kept.
     let work = hub.dir.0.join("work/builder");
