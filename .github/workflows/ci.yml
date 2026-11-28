@@ -26,6 +26,7 @@ env:
 
 jobs:
   lint:
+    name: ${{ matrix.os == 'ubuntu-latest' && 'lint' || format('lint ({0})', matrix.os) }}
     strategy:
       fail-fast: false
       matrix:
