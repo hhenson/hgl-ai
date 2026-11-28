@@ -1953,7 +1953,8 @@ async fn an_unmerged_record_is_finished_only_when_github_shows_it_merged() {
     // Retired: a restarted coordinator does not ask again.
     let mut a = crate::autoland::AutoLand::new(&s);
     a.round(&gh, &s, &b, &[]).await.unwrap();
-    assert_eq!(gh.calls().len(), 1, "asked once: {:?}", gh.calls());
+    // Read, then read again under the lock before it is retired; then never again.
+    assert_eq!(gh.calls().len(), 2, "{:?}", gh.calls());
     assert_eq!(coord_reports(&b).await, (vec![], vec![]));
 }
 
@@ -2596,6 +2597,348 @@ async fn a_gate_build_cut_off_before_its_job_went_out_is_sent_again() {
     assert!(notes[1].contains(&fresh), "{}", notes[1]);
     round().await;
     assert_eq!(build_notes(&b).await.len(), 2, "sent once");
+}
+
+/// The rule answering `pattern` (its first, `once` or not), changed by `f`.
+fn change_rule(gh: &FakeGh, pattern: &str, once: bool, f: impl FnOnce(&mut String)) {
+    let mut rules = gh.rules.lock().unwrap();
+    let r = rules
+        .iter_mut()
+        .find(|r| r.0 == pattern && r.2 == once)
+        .expect("the rule");
+    f(&mut r.1.stdout);
+}
+
+/// Review (r6 at b0cca78e, P1): a refused merge request read back merged by someone else,
+/// at another head or into another base, is not this landing's merge: not journaled, not
+/// announced, its intent gone.
+#[tokio::test]
+async fn a_refused_merge_read_back_merged_otherwise_is_not_journaled() {
+    for (what, from, to) in [
+        ("another head", HEAD.to_string(), "b".repeat(40)),
+        (
+            "another base",
+            "\"ref\": \"main\"".to_string(),
+            "\"ref\": \"release\"".to_string(),
+        ),
+    ] {
+        let Some(h) = hub() else { return };
+        let b = bus(&h).await;
+        coord_hub(&b, true).await;
+        let (s, infos) = ready_round();
+        let gh = coord_gh(&[], |g| g);
+        first_rule(
+            &gh,
+            FakeGh::default().fail(
+                "pulls/7/merge-async",
+                "gh: Pull Request is not mergeable (HTTP 405)",
+            ),
+        );
+        change_rule(&gh, "pulls/7", false, |body| {
+            assert!(body.contains(&from), "{what}: the fixture's form");
+            *body = body.replace(&from, &to);
+        });
+        let mut a = crate::autoland::AutoLand::new(&s);
+        a.round(&gh, &s, &b, &infos).await.unwrap();
+        assert_eq!(
+            posts(&gh, "pulls/7/merge-async"),
+            1,
+            "{what}: asked, refused"
+        );
+        assert!(
+            crate::progress::read(&b, "alpha", 7)
+                .await
+                .unwrap()
+                .is_none(),
+            "{what}: no record"
+        );
+        assert!(
+            b.state_get(state::KEY_LANDED).await.unwrap().is_none(),
+            "{what}"
+        );
+        assert_eq!(coord_reports(&b).await, (vec![], vec![]), "{what}");
+        assert!(landed_notes(&b).await.is_empty(), "{what}");
+    }
+}
+
+/// Review (r6 at b0cca78e, P1): an intent at `HEAD` whose pull request GitHub shows merged
+/// at that head but into another base is not recovered: the coordinator retires it,
+/// unannounced, and the controller's `land` finishes nothing for it.
+#[tokio::test]
+async fn an_intent_merged_into_another_base_is_not_recovered() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    coord_hub(&b, true).await;
+    let (s, _) = ready_round();
+    put_record(&b, &coord_record(None)).await;
+    let elsewhere = fixture("pr-merged.json").replace("\"ref\": \"main\"", "\"ref\": \"release\"");
+    assert!(elsewhere.contains("release"), "the fixture's form");
+    let gh = FakeGh::default().on("pulls/7", &elsewhere);
+    let mut a = crate::autoland::AutoLand::new(&s);
+    a.round(&gh, &s, &b, &[]).await.unwrap();
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none(),
+        "retired"
+    );
+    assert_eq!(coord_reports(&b).await, (vec![], vec![]));
+
+    let gh = coord_gh(&[], |g| g);
+    for r in gh
+        .rules
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .filter(|r| r.0 == "pulls/7")
+    {
+        r.1.stdout = elsewhere.clone();
+    }
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::AlreadyMerged,
+        "{}",
+        l.outcome.line
+    );
+    assert!(
+        l.after.iter().any(|a| a.contains("not main")),
+        "{:?}",
+        l.after
+    );
+    assert!(b.state_get(state::KEY_LANDED).await.unwrap().is_none());
+    assert!(landed_notes(&b).await.is_empty());
+}
+
+/// Review (codex P1, r6 at b0cca78e): only the fleet's comments are notes. An outsider's
+/// `Ready` after the fleet's sendback does not make the pull request Ready; an outsider's
+/// `Blocked` does not stop a Ready one.
+#[tokio::test]
+async fn only_the_fleets_comments_decide_ready() {
+    let comments = |extra: &[(&str, &str, &str)]| {
+        let mut v: Vec<serde_json::Value> =
+            serde_json::from_str(&fixture("comments-clean.json")).unwrap();
+        for (who, body, at) in [(
+            "octo",
+            "[claude] Ready: alpha#7 at 1f461fa7",
+            "2026-01-01T05:50:00Z",
+        )]
+        .iter()
+        .chain(extra)
+        {
+            v.push(serde_json::json!({
+                "user": {"login": who}, "body": body, "created_at": at, "updated_at": at
+            }));
+        }
+        serde_json::to_string(&v).unwrap()
+    };
+    let sendback = (
+        "octo",
+        "[codex] (controller) Sent back at 1f461fa7",
+        "2026-01-01T06:10:00Z",
+    );
+    for (what, extra, merges) in [
+        (
+            "a forged Ready after a sendback",
+            vec![
+                sendback,
+                (
+                    "stranger",
+                    "[claude] Ready: alpha#7 at 1f461fa7",
+                    "2026-01-01T06:20:00Z",
+                ),
+            ],
+            false,
+        ),
+        (
+            "a stranger's Blocked",
+            vec![(
+                "stranger",
+                "[codex] Blocked: alpha#7",
+                "2026-01-01T06:20:00Z",
+            )],
+            true,
+        ),
+    ] {
+        let Some(h) = hub() else { return };
+        let b = bus(&h).await;
+        coord_hub(&b, true).await;
+        let (s, infos) = ready_round();
+        let gh = coord_gh(&[], |g| g);
+        let text = comments(&extra);
+        change_rule(&gh, "issues/7/comments", false, |body| *body = text.clone());
+        let mut a = crate::autoland::AutoLand::new(&s);
+        a.round(&gh, &s, &b, &infos).await.unwrap();
+        assert_eq!(
+            posts(&gh, "pulls/7/merge-async"),
+            usize::from(merges),
+            "{what}"
+        );
+    }
+}
+
+/// Review (r6 at b0cca78e, P2): the coordinator's intent at `HEAD`, the pull request now
+/// open at another head. The controller's `merge-if-clean` is not blocked by it: under
+/// the lock it is retired as obsolete. The coordinator's round retires such an intent too.
+#[tokio::test]
+async fn a_stale_intent_is_retired_under_the_lock() {
+    let other = "e".repeat(40);
+    let moved = fixture("pr-open.json").replace(HEAD, &other);
+    {
+        let Some(h) = hub() else { return };
+        let b = bus(&h).await;
+        coord_hub(&b, true).await;
+        let (s, _) = ready_round();
+        put_record(&b, &coord_record(None)).await;
+        let gh = FakeGh::default()
+            .on("pulls/7", &moved)
+            .on(
+                "git/ref/heads/main",
+                &format!("{{\"object\":{{\"sha\":\"{ALPHA_MAIN}\"}}}}"),
+            )
+            .on("git/commits/", "{\"parents\":[]}");
+        let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+            .await
+            .unwrap();
+        assert!(
+            !l.outcome.line.contains("is the coordinator's"),
+            "{}",
+            l.outcome.line
+        );
+        assert!(
+            crate::progress::read(&b, "alpha", 7)
+                .await
+                .unwrap()
+                .is_none(),
+            "retired"
+        );
+    }
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    coord_hub(&b, true).await;
+    let (s, mut infos) = ready_round();
+    put_record(&b, &coord_record(None)).await;
+    infos[0].row.head = other.clone();
+    infos[0].ready_at = None;
+    let gh = FakeGh::default().on("pulls/7", &moved);
+    let mut a = crate::autoland::AutoLand::new(&s);
+    a.round(&gh, &s, &b, &infos).await.unwrap();
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none(),
+        "retired"
+    );
+    assert_eq!(coord_reports(&b).await, (vec![], vec![]));
+}
+
+/// Review (r6 at b0cca78e, P2): a job sent again never sets back its summary: one the
+/// builder has moved on (here final) stays.
+#[tokio::test]
+async fn sending_a_job_again_keeps_a_later_summary() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    park_a_builder(&b).await;
+    let parked = b.builders().await.unwrap().remove(0);
+    let id = hgl_ai_proto::build::new_build_id();
+    let job: hgl_ai_proto::build::BuildJob = serde_json::from_value(serde_json::json!({
+        "v": hgl_ai_proto::build::BUILD_VERSION, "id": id, "repo": "alpha", "head": HEAD,
+        "issue": 7, "reply_to": format!("r-{id}"), "requester": "coordinator",
+    }))
+    .unwrap();
+    let mut done = hgl_ai_build::request::queued(&job, &parked);
+    done.status = hgl_ai_proto::build::BuildStatus::Pass;
+    hgl_ai_build::store::run_put(&b, &done).await.unwrap();
+    let at = hgl_ai_proto::utc_now_stamp();
+    hgl_ai_build::request::send_at(&b, Seat::new("coord").unwrap(), &parked, &job, Some(&at))
+        .await
+        .unwrap();
+    let kept = hgl_ai_build::store::run_get(&b, &id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(kept.status, hgl_ai_proto::build::BuildStatus::Pass);
+    // Absent, it is created queued.
+    let fresh = hgl_ai_proto::build::new_build_id();
+    let job2 = serde_json::from_str::<hgl_ai_proto::build::BuildJob>(
+        &serde_json::to_string(&job).unwrap().replace(&id, &fresh),
+    )
+    .unwrap();
+    hgl_ai_build::request::send(&b, Seat::new("coord").unwrap(), &parked, &job2)
+        .await
+        .unwrap();
+    let new = hgl_ai_build::store::run_get(&b, &fresh)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(new.status, hgl_ai_proto::build::BuildStatus::Queued);
+}
+
+/// Review (r6 at b0cca78e, P2): refused credentials while polling an accepted merge reach
+/// the round, the intent kept for a later attempt.
+#[tokio::test]
+async fn a_401_while_polling_the_merge_reaches_the_round() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    coord_hub(&b, true).await;
+    let (s, infos) = ready_round();
+    let pending =
+        "{\"status\":\"pending\",\"details\":{\"uuid\":\"u-1\",\"merge_method\":\"merge\"}}";
+    let gh = coord_gh(&[], |g| g);
+    first_rule(
+        &gh,
+        FakeGh::default().fail("merge-async/u-1", "gh: Bad credentials (HTTP 401)"),
+    );
+    first_rule(
+        &gh,
+        FakeGh::default().on("pulls/7/merge-async --input", pending),
+    );
+    let mut a = crate::autoland::AutoLand::new(&s);
+    let e = a.round(&gh, &s, &b, &infos).await.unwrap_err();
+    assert!(matches!(e, Error::Auth(_)), "{e}");
+    let rec = crate::progress::read(&b, "alpha", 7)
+        .await
+        .unwrap()
+        .expect("the intent");
+    assert_eq!((rec.head.as_str(), rec.merge.as_deref()), (HEAD, None));
+}
+
+/// Audit (r6 at b0cca78e): refused credentials on the gate's branch update reach the
+/// caller, rather than read as this pull request's block. Only a landing without a local
+/// build verdict updates a branch (one with a verdict merges onto the `main` it was built
+/// on), so it is the controller's `merge-if-clean` here.
+#[tokio::test]
+async fn a_401_on_the_branch_update_reaches_the_caller() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let (mut s, _) = ready_round();
+    s.gates.entry("alpha".into()).or_default().verdicts.clear();
+    let gh = coord_gh(&[], |g| g);
+    first_rule(
+        &gh,
+        FakeGh::default().on(
+            "compare/",
+            "{\"ahead_by\":1,\"files\":[{\"filename\":\"src/both.rs\"}]}",
+        ),
+    );
+    first_rule(
+        &gh,
+        FakeGh::default().fail("update-branch", "gh: Bad credentials (HTTP 401)"),
+    );
+    let e = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+        .await
+        .unwrap_err();
+    assert!(matches!(e, Error::Auth(_)), "{e}");
+    assert!(
+        gh.calls().iter().any(|c| c.contains("update-branch")),
+        "{:?}",
+        gh.calls()
+    );
 }
 
 /// `tasks` with no task is never written empty (an empty create fails every round), and

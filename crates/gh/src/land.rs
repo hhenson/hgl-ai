@@ -222,7 +222,7 @@ async fn land_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<(Landing, String)> {
-    if let Some(outcome) = owned_elsewhere(bus, repo, number, head, o).await? {
+    if let Some(outcome) = owned_elsewhere(gh, s, bus, repo, number, head, o, lock).await? {
         let after = Vec::new();
         return Ok((Landing { outcome, after }, String::new()));
     }
@@ -294,18 +294,39 @@ async fn land_locked<G: Gh>(
 /// A landing record is finished and deleted only by whoever it is written for
 /// ([`Progress::by`]): the coordinator's by the coordinator, after its reports; the
 /// controller's by `gh land` or `gh merge-if-clean`. `Some` refuses another's.
-async fn owned_elsewhere(
+///
+/// Another's intent (no merge recorded) that no longer stands ([`gate::intent_obsolete`]:
+/// the pull request closed, open at another head, or merged other than as intended) is
+/// retired here, under the lock, so a stale intent never blocks the other lander.
+#[allow(clippy::too_many_arguments)]
+async fn owned_elsewhere<G: Gh>(
+    gh: &G,
+    s: &Settings,
     bus: &Bus,
     repo: &str,
     number: u64,
     head: &str,
     o: &LandOpts,
+    lock: &LandLock,
 ) -> Result<Option<Outcome>> {
     let Some(p) = progress::read(bus, repo, number).await? else {
         return Ok(None);
     };
     if p.by.as_deref() == o.gate.record_by {
         return Ok(None);
+    }
+    if p.merge.is_none() {
+        let pr = gate::fetch_pr(gh, s, repo, number).await?;
+        if gate::intent_obsolete(&p, &pr) {
+            lock.confirm("retiring a stale landing intent").await?;
+            progress::delete(bus, repo, number).await?;
+            eprintln!(
+                "{repo} #{number}: the {}'s intent at {} no longer stands; retired",
+                p.by.as_deref().unwrap_or("controller"),
+                short(&p.head)
+            );
+            return Ok(None);
+        }
     }
     let owner = p.by.as_deref().unwrap_or("controller");
     let line = format!(
@@ -391,6 +412,14 @@ async fn settle<G: Gh>(
             let merge = pr.merge_commit.clone().unwrap_or_default();
             // An intent counts only for the head GitHub merged: another head merged is not
             // this landing's merge.
+            if pr.base != "main" {
+                // Merged into another branch: no landing on `main` to finish or announce.
+                let after = vec![format!(
+                    "{repo} #{number} was merged into {}, not main; left",
+                    pr.base
+                )];
+                return Ok((Landing { outcome, after }, String::new()));
+            }
             let p = p.filter(|p| p.merge.is_some() || p.head.eq_ignore_ascii_case(&pr.head));
             if p.is_none() && !o.adopt_merged {
                 let after = vec![format!(
@@ -467,7 +496,7 @@ pub(crate) async fn merge_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<Landing> {
-    if let Some(outcome) = owned_elsewhere(bus, repo, number, head, o).await? {
+    if let Some(outcome) = owned_elsewhere(gh, s, bus, repo, number, head, o, lock).await? {
         let after = Vec::new();
         return Ok(Landing { outcome, after });
     }
@@ -649,9 +678,10 @@ async fn commented<G: Gh>(
         ),
     )
     .await?;
-    Ok(list
+    // The fleet's own comment: another's with the same first line is not the note's.
+    let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
+    Ok(crate::bot::note_comments(&comments, &s.note_authors)
         .iter()
-        .map(Comment::from_rest)
         .any(|c| c.body.lines().next().map(str::trim) == Some(first.trim())))
 }
 
@@ -867,6 +897,8 @@ pub(crate) async fn author_seats<G: Gh>(
     )
     .await?;
     let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
+    // A Ready's signer only from the fleet's comments: anyone can sign one.
+    let comments = crate::bot::note_comments(&comments, &s.note_authors);
     let pick = if current {
         state::current_seats
     } else {

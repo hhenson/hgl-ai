@@ -291,13 +291,17 @@ impl AutoLand {
             let t = Try {
                 repo,
                 number,
-                head: p.head,
+                head: p.head.clone(),
             };
             if p.merge.is_none() {
-                let open = infos
-                    .iter()
-                    .any(|i| i.row.repo == t.repo && i.row.number == t.number);
-                if open {
+                // Open at the intent's head in this round's read: the candidates' to decide.
+                // Open at another head, or not read: GitHub says whether the intent stands.
+                let current = infos.iter().any(|i| {
+                    i.row.repo == t.repo
+                        && i.row.number == t.number
+                        && i.row.head.eq_ignore_ascii_case(&t.head)
+                });
+                if current {
                     continue;
                 }
                 let pr = match gate::fetch_pr(gh, s, &t.repo, t.number).await {
@@ -308,11 +312,11 @@ impl AutoLand {
                         continue;
                     }
                 };
-                // Merged at another head than the intent's: not this landing's merge.
-                let ours = pr.merged && pr.head.eq_ignore_ascii_case(&t.head);
-                if !ours {
-                    if pr.state != "open" {
-                        self.retire(s, bus, &t).await?;
+                // Merged other than as intended (another head, another base): not this
+                // landing's merge.
+                if !gate::merged_as_intended(&pr, &t.head) {
+                    if gate::intent_obsolete(&p, &pr) {
+                        self.retire(gh, s, bus, &t).await?;
                     }
                     continue;
                 }
@@ -325,7 +329,7 @@ impl AutoLand {
     /// Delete an intent of its own whose pull request GitHub shows closed without a
     /// merge, under the landing lock and only if the record is still that intent; and the
     /// gate builds asked for it.
-    async fn retire(&self, s: &Settings, bus: &Bus, t: &Try) -> Result<()> {
+    async fn retire<G: Gh>(&self, gh: &G, s: &Settings, bus: &Bus, t: &Try) -> Result<()> {
         let who = holder(s, &format!("coordinator {}#{}", t.repo, t.number));
         let lock = match LandLock::acquire(bus, &t.repo, &who, Duration::ZERO).await {
             Ok(l) => l,
@@ -336,17 +340,22 @@ impl AutoLand {
             Err(e) => return Err(e),
         };
         let r = async {
-            let still = progress::read(bus, &t.repo, t.number)
+            // Under the lock: the record still that intent, and GitHub still says it no
+            // longer stands.
+            let Some(p) = progress::read(bus, &t.repo, t.number)
                 .await?
-                .is_some_and(|p| ours(&p) && p.merge.is_none() && p.head == t.head);
-            if !still {
+                .filter(|p| ours(p) && p.merge.is_none() && p.head == t.head)
+            else {
+                return Ok(());
+            };
+            if !gate::intent_obsolete(&p, &gate::fetch_pr(gh, s, &t.repo, t.number).await?) {
                 return Ok(());
             }
             lock.confirm("retiring a landing record").await?;
             progress::delete(bus, &t.repo, t.number).await?;
             self.builds.forget(bus, &t.repo, t.number).await?;
             tracing::info!(
-                "{} #{}: closed without a merge of its head; its landing record is retired",
+                "{} #{}: its intent no longer stands; its landing record is retired",
                 t.repo,
                 t.number
             );

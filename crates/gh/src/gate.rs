@@ -260,7 +260,8 @@ pub struct Facts {
     /// How many commits `main` has that the head does not.
     pub behind: Option<u64>,
     pub bot: Option<BotView>,
-    /// The pull request's comments, read with the bot's ([`Need::BotComments`]).
+    /// The pull request's note comments, the fleet's ([`crate::bot::note_comments`]), read
+    /// with the bot's ([`Need::BotComments`]).
     pub comments: Option<Vec<Comment>>,
     pub bot_reviews: Option<Vec<Review>>,
     /// Parents of the pull request's head.
@@ -908,6 +909,24 @@ async fn read_back<G: Gh>(
     Ok(pr)
 }
 
+/// Whether `pr` is merged as a landing at `head` intends: that head, into `main`.
+pub fn merged_as_intended(pr: &Pr, head: &str) -> bool {
+    pr.merged && pr.head.eq_ignore_ascii_case(head) && pr.base == "main"
+}
+
+/// Whether a landing's intent (a record with no merge) no longer stands, by the pull
+/// request now: merged other than as intended ([`merged_as_intended`]), closed, or open at
+/// another head.
+pub fn intent_obsolete(p: &Progress, pr: &Pr) -> bool {
+    if p.merge.is_some() {
+        return false;
+    }
+    if pr.merged {
+        return !merged_as_intended(pr, &p.head);
+    }
+    pr.state != "open" || !pr.head.eq_ignore_ascii_case(&p.head)
+}
+
 /// The head of `main` of a repository.
 pub async fn main_head<G: Gh>(gh: &G, s: &Settings, repo: &str) -> Result<String> {
     let v = exec::get(gh, &format!("repos/{}/git/ref/heads/main", s.full(repo))).await?;
@@ -995,7 +1014,8 @@ async fn fill<G: Gh>(
                 exec::get_list(gh, &format!("repos/{r}/issues/{n}/comments?per_page=100")).await?;
             let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
             f.bot = Some(BotView::of(&s.review_bot, &comments, &[]));
-            f.comments = Some(comments);
+            // Ready is read from the fleet's comments only; the bot's view keeps them all.
+            f.comments = Some(crate::bot::note_comments(&comments, &s.note_authors));
         }
         Need::BotReviews => {
             let list =
@@ -1162,6 +1182,7 @@ async fn before_merge<G: Gh>(
         )
         .await?;
         let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
+        let comments = crate::bot::note_comments(&comments, &s.note_authors);
         if let Err(why) = ready_standing(&comments, asked) {
             return Ok(stop(Kind::Blocked, format!("at the merge: {why}"), false));
         }
@@ -1238,6 +1259,8 @@ pub async fn evaluate<G: Gh>(
                     Ok(_) => {
                         Outcome::new(Kind::Updated, format!("{line} UPDATED"), true, &f.pr.head)
                     }
+                    // Refused credentials or the rate limit are the caller's, not a block.
+                    Err(e @ (Error::Auth(_) | Error::RateLimited(_))) => return Err(e),
                     Err(e) => Outcome::new(
                         Kind::Blocked,
                         format!("{line} update failed ({e}) BLOCKED"),
@@ -1287,6 +1310,26 @@ pub async fn evaluate<G: Gh>(
                 )
                 .await?;
                 let after = read_back(gh, s, repo, number, res == Merge::Merged).await?;
+                // Journaled only as this landing's merge: its head, into `main`. Another head
+                // or base merged (a refused request read back merged by someone else) is not.
+                if after.merged && !merged_as_intended(&after, &f.pr.head) {
+                    if let Some(b) = bus
+                        && let Err(e) = progress::delete(b, repo, number).await
+                    {
+                        eprintln!("{repo} #{number}: removing the landing record: {e}");
+                    }
+                    return Ok(Outcome::new(
+                        Kind::Blocked,
+                        format!(
+                            "{line} merged at {} into {}, not this landing's {} into main BLOCKED",
+                            short(&after.head),
+                            after.base,
+                            short(&f.pr.head)
+                        ),
+                        false,
+                        &f.pr.head,
+                    ));
+                }
                 if after.merged {
                     let m = after.merge_commit.clone().unwrap_or_default();
                     if let Some(b) = bus {

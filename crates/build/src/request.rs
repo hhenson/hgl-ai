@@ -89,7 +89,9 @@ pub async fn send_at(
     job: &BuildJob,
     created_at: Option<&str>,
 ) -> Result<(), StoreError> {
-    store::run_put(bus, &queued(job, b)).await?;
+    // Created only if absent: sent again, it never sets back a summary the builder has
+    // moved on (running, or final).
+    store::run_create(bus, &queued(job, b)).await?;
     let body = serde_json::to_string(job).map_err(|e| StoreError::Other(e.to_string()))?;
     let mut n = Note::new(sender, b.inbox.clone(), Kind::Build, body);
     if let Some(at) = created_at {
