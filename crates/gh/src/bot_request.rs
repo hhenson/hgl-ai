@@ -79,9 +79,9 @@ pub async fn check<G: Gh>(
         return Ok(Request::Recorded(c.created_at.clone()));
     }
     let pull = gate::fetch_pr(gh, s, repo, pr).await?;
-    if pull.merged || pull.state != "open" || pull.head != head {
+    if pull.merged || pull.state != "open" || pull.draft || pull.head != head {
         return Ok(Request::Refused(format!(
-            "{repo}#{pr} is closed, merged, or its head moved"
+            "{repo}#{pr} is closed, merged, a draft, or its head moved"
         )));
     }
     let path = format!("repos/{}/pulls/{pr}/reviews?per_page=100", s.full(repo));
@@ -121,8 +121,8 @@ pub async fn request<G: Gh>(
             Request::Recorded(created) => (created, Request::Already),
             Request::Needed => {
                 let pull = gate::fetch_pr(gh, s, repo, pr).await?;
-                if pull.merged || pull.state != "open" || pull.head != head {
-                    return Ok(Request::Refused(format!("{repo}#{pr} is closed, merged, or its head moved")));
+                if pull.merged || pull.state != "open" || pull.draft || pull.head != head {
+                    return Ok(Request::Refused(format!("{repo}#{pr} is closed, merged, a draft, or its head moved")));
                 }
                 lock.confirm("bot review request").await?;
                 let posted = exec::write(gh, "POST", &format!("repos/{}/issues/{pr}/comments", s.full(repo)), &[("body", &body(head))]).await?;
