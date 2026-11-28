@@ -840,17 +840,16 @@ async fn comment<G: Gh>(
         return Ok(false);
     }
     let comments = exec::get_list(gh, &format!("{path}?per_page=100")).await?;
-    if comments.iter().any(|c| {
+    let already_posted = comments.iter().any(|c| {
         c["body"]
             .as_str()
             .is_some_and(|body| body.trim_end().ends_with(&marker))
-    }) {
-        return Ok(true);
-    }
-    if comments
-        .iter()
-        .map(Comment::from_rest)
-        .any(|c| bot::note_state(&[c]) == Some(NoteState::Sendback))
+    });
+    if !already_posted
+        && comments
+            .iter()
+            .map(Comment::from_rest)
+            .any(|c| bot::note_state(&[c]) == Some(NoteState::Sendback))
     {
         return Ok(false);
     }
@@ -862,6 +861,9 @@ async fn comment<G: Gh>(
         || current.base != "main"
     {
         return Ok(false);
+    }
+    if already_posted {
+        return Ok(true);
     }
     lease.refresh().await?;
     match exec::write_json(gh, "POST", &path, &serde_json::json!({"body": posted})).await {

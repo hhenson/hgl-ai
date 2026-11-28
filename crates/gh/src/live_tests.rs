@@ -1806,11 +1806,14 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
     moved.task.issue = 7; // The new tree matches by branch, not by the original task number.
     b.tree_put(&moved).await.unwrap();
 
-    let recovered = FakeGh::default().on(
-        "comments?per_page",
-        &serde_json::json!([posted]).to_string(),
-    );
-    // The accepted comment is recoverable even after the PR disappears from the batch.
+    let recovered = FakeGh::default()
+        .on(
+            "comments?per_page",
+            &serde_json::json!([posted]).to_string(),
+        )
+        .on("pulls/7", &fixture("pr-open.json"));
+    // The accepted comment is recoverable when the PR is still open at the same head,
+    // even if the PR is missing from the batch.
     crate::routing::round(&recovered, &s, &b, &[])
         .await
         .unwrap();
@@ -1839,8 +1842,8 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
     assert!(notes[1].note.body.contains("sendback to w2"));
     assert_eq!(
         recovered.calls().len(),
-        1,
-        "only recover the GitHub comment"
+        2,
+        "read the accepted comment and current PR once without posting again"
     );
 
     // The earlier reviewer gets the rerun even though r1 has less queued work now.
@@ -1929,6 +1932,57 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
             .iter()
             .any(|r| r.receipt.head == head && r.receipt.verdict == Verdict::Clean)
     );
+
+    // The accepted comment is still present, but the PR has moved or closed since
+    // the outbox entry was saved. Even a stale batch can say it is still current.
+    let closed_head = "e".repeat(40);
+    let closed = fixture("pr-open.json")
+        .replace(HEAD, &closed_head)
+        .replace("\"state\": \"open\"", "\"state\": \"closed\"");
+    for (reviewed, current_pr) in [
+        ("d".repeat(40), fixture("pr-open.json")),
+        (closed_head, closed),
+    ] {
+        let mut findings = receipt(&reviewed, Verdict::Findings);
+        let seq = b.send(&findings).await.unwrap().seq;
+        let cursor = serde_json::json!({
+            "after": seq - 1,
+            "digest": [],
+            "outbox": {
+                "seq": seq,
+                "action": {"Sendback": {"pr": 7, "issue": 980, "branch": "codex/q980-fix", "fallback": s.controller}},
+                "line": null
+            }
+        });
+        b.state_put("coord.routing", &cursor.to_string())
+            .await
+            .unwrap();
+        let comments = serde_json::json!([{
+            "body": format!("<!-- hgl-ai coordinator sendback {reviewed} {seq} -->\n"),
+        }]);
+        let gh = FakeGh::default()
+            .on("comments?per_page", &comments.to_string())
+            .on("pulls/7", &current_pr);
+        crate::routing::round(&gh, &s, &b, &read(&reviewed))
+            .await
+            .unwrap();
+        findings.recipient = s.controller.clone();
+        let notes = b
+            .read_notes(
+                &[s.controller.clone(), w1.clone(), w3.clone()],
+                seq,
+                10,
+                Duration::ZERO,
+            )
+            .await
+            .unwrap();
+        assert_eq!(notes.len(), 1);
+        assert_eq!(
+            notes[0].note, findings,
+            "a stale sendback goes to the controller as the original receipt"
+        );
+        assert_eq!(gh.calls().len(), 2);
+    }
 
     // An old outbox without a branch cannot rule out a branch-based handoff when
     // GitHub omits the PR from its batch. Forward the original findings in that case.
