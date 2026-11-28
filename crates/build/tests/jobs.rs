@@ -826,7 +826,7 @@ async fn the_hub_lease_names_the_builder() {
     assert!(err.contains("served by lab9 pid 4242 (builder)"), "{err}");
     assert!(other.release().await.unwrap());
     // A builder of this host that died left its lease: taken over.
-    let id = hgl_ai_bridge::holder::host_id(&r.root.join("data"));
+    let id = hgl_ai_bridge::holder::host_id(&r.cfg.data_dir().unwrap());
     let _gone = r
         .bus
         .lock_acquire(
