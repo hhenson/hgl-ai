@@ -12,6 +12,7 @@ hgl-ai-proto.workspace = true
 hgl-ai-config.workspace = true
 hgl-ai-bus.workspace = true
 hgl-ai-build.workspace = true
+hgl-ai-owner.workspace = true
 tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true

@@ -1636,3 +1636,96 @@ async fn tasks_without_a_task_write_nothing() {
         .unwrap();
     assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
 }
+
+#[tokio::test]
+async fn bot_request_repeated_passes_use_hub_lease_and_scripted_github() {
+    use crate::bot_request::{self, Request};
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.owner = "owner".into();
+    s.repos = vec!["alpha".into()];
+    let head = "1f461fa77bba922fe81383df4c475feb58b7c233";
+    let created = "2026-01-01T00:00:00Z";
+    let comment = serde_json::json!([{"user":{"login":"owner"}, "created_at":created, "body":bot_request::body(head)}]).to_string();
+    let gh = FakeGh::default()
+        .on("api user", r#"{"login":"owner"}"#)
+        .on("pulls/7/reviews", "[]")
+        .on("pulls/7", &fixture("pr-open.json"))
+        .once("--paginate repos/owner/alpha/issues/7/comments", "[]")
+        .on("--paginate repos/owner/alpha/issues/7/comments", &comment)
+        .on(
+            "-X POST",
+            &serde_json::json!({"created_at":created}).to_string(),
+        );
+    let held = LandLock::acquire_named(&b, "lock.bot.alpha.7", "other", Duration::ZERO)
+        .await
+        .unwrap();
+    assert!(matches!(
+        bot_request::request(&gh, &s, &b, "alpha", 7, head).await,
+        Err(Error::Locked(_))
+    ));
+    assert!(!gh.calls().iter().any(|c| c.contains("-X POST")));
+    held.release().await;
+    assert_eq!(
+        bot_request::request(&gh, &s, &b, "alpha", 7, head)
+            .await
+            .unwrap(),
+        Request::Posted
+    );
+    assert_eq!(
+        bot_request::request(&gh, &s, &b, "alpha", 7, head)
+            .await
+            .unwrap(),
+        Request::Already
+    );
+    assert_eq!(
+        gh.calls().iter().filter(|c| c.contains("-X POST")).count(),
+        1
+    );
+    let log = b.state_get("decisions.log").await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1);
+    assert!(log.contains(head));
+}
+
+#[tokio::test]
+async fn bot_request_failure_never_records_a_post_and_retry_repairs_log() {
+    use crate::bot_request::{self, Request};
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.owner = "owner".into();
+    s.repos = vec!["alpha".into()];
+    let head = "1f461fa77bba922fe81383df4c475feb58b7c233";
+    let gh = FakeGh::default()
+        .on("api user", r#"{"login":"owner"}"#)
+        .on("pulls/7/reviews", "[]")
+        .on("pulls/7", &fixture("pr-open.json"))
+        .on("--paginate", "[]")
+        .fail("-X POST", "post failed");
+    assert!(
+        bot_request::request(&gh, &s, &b, "alpha", 7, head)
+            .await
+            .is_err()
+    );
+    assert!(b.state_get("decisions.log").await.unwrap().is_none());
+    let comment = serde_json::json!([{"user":{"login":"owner"}, "created_at":"2026-01-01T00:00:00Z", "body":bot_request::body(head)}]).to_string();
+    let gh = FakeGh::default()
+        .on("api user", r#"{"login":"owner"}"#)
+        .on("--paginate", &comment);
+    assert_eq!(
+        bot_request::request(&gh, &s, &b, "alpha", 7, head)
+            .await
+            .unwrap(),
+        Request::Already
+    );
+    assert!(!gh.calls().iter().any(|c| c.contains("-X POST")));
+    assert!(
+        b.state_get("decisions.log")
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .contains(head)
+    );
+}

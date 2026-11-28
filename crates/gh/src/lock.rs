@@ -69,6 +69,16 @@ impl LandLock {
         Self::acquire_every(bus, &land_lock_key(repo), holder, wait, REFRESH).await
     }
 
+    /// Take a named hub lease with the same renewal and ownership checks.
+    pub async fn acquire_named(
+        bus: &Bus,
+        name: &str,
+        holder: &str,
+        wait: Duration,
+    ) -> Result<LandLock> {
+        Self::acquire_every(bus, name, holder, wait, REFRESH).await
+    }
+
     pub(crate) async fn acquire_every(
         bus: &Bus,
         name: &str,

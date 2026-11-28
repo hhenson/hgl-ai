@@ -381,38 +381,24 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 },
         } => {
             use hgl_ai_gh::bot_request::{self, Request};
-            match bot_request::check(&gh, &s, &repo, pr, &head)
-                .await
-                .map_err(lift)?
-            {
-                Request::Already => println!("{repo}#{pr} at {head}: already requested"),
+            let outcome = if dry_run {
+                bot_request::verify_owner(&gh, &s).await.map_err(lift)?;
+                bot_request::check(&ReadOnly(gh), &s, &repo, pr, &head)
+                    .await
+                    .map_err(lift)?
+            } else {
+                let bus = Bus::connect(&cfg).await?;
+                bot_request::request(&gh, &s, &bus, &repo, pr, &head)
+                    .await
+                    .map_err(lift)?
+            };
+            match outcome {
+                Request::Needed => println!("would request bot review of {repo}#{pr} at {head}"),
+                Request::Already | Request::Recorded(_) => {
+                    println!("{repo}#{pr} at {head}: already requested or reviewed")
+                }
+                Request::Posted => println!("{repo}#{pr} at {head}: requested bot review"),
                 Request::Refused(reason) => return Err(NotReady(reason).into()),
-                Request::Needed if dry_run => {
-                    println!("would request bot review of {repo}#{pr} at {head}")
-                }
-                Request::Needed => {
-                    let bus = Bus::connect(&cfg).await?;
-                    let line = format!(
-                        "{} {}: bot review request for {repo}#{pr} at {head} (owner action)",
-                        hgl_ai_proto::utc_now_stamp(),
-                        s.controller
-                    );
-                    hgl_ai_owner::decision_append(&bus, &line).await?;
-                    // Recheck immediately before the write after recording the action.
-                    match bot_request::check(&gh, &s, &repo, pr, &head)
-                        .await
-                        .map_err(lift)?
-                    {
-                        Request::Needed => {
-                            bot_request::post(&gh, &s, &repo, pr, &head)
-                                .await
-                                .map_err(lift)?;
-                            println!("{repo}#{pr} at {head}: requested bot review");
-                        }
-                        Request::Already => println!("{repo}#{pr} at {head}: already requested"),
-                        Request::Refused(reason) => return Err(NotReady(reason).into()),
-                    }
-                }
             }
             Ok(EXIT_OK)
         }
