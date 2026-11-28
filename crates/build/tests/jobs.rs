@@ -1041,44 +1041,77 @@ async fn a_partitioned_builder_stops_before_its_lease_expires() {
     );
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn log_ranges_are_served_from_the_builder_and_only_for_summary_files() {
-    let Some(r) = Rig::start().await else { return };
+async fn log_fixture() -> Option<(Rig, hgl_ai_proto::build::Summary)> {
+    let r = Rig::start().await?;
     let recipe = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"printf abcdef; printf report > report.xml\"\nartifacts = [\"report.xml\"]\nmemcap_gb = 1\ntime = \"2m\"\n";
     store::recipe_put(&r.bus, recipe, None).await.unwrap();
     let job = r.job("20261127-110000-bababa", &r.heads[0]);
     r.send(&job).await;
     let summary = r.receipt(&job.id).await;
     assert_eq!(summary.status, BuildStatus::Pass);
-    let read = |step: Option<String>, bytes: Option<String>| {
-        hgl_ai_build::log::request(
-            &r.bus,
-            Seat::new("w1").unwrap(),
-            "lab1",
-            &job.id,
-            step,
-            bytes,
-        )
+    Some((r, summary))
+}
+
+async fn log_read(
+    r: &Rig,
+    summary: &hgl_ai_proto::build::Summary,
+    step: &str,
+    bytes: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    hgl_ai_build::log::request(
+        &r.bus,
+        Seat::new("w1").unwrap(),
+        "lab1",
+        &summary.id,
+        Some(step.into()),
+        bytes.map(str::to_string),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_ranges_are_bounded() {
+    let Some((r, summary)) = log_fixture().await else {
+        return;
     };
-    assert_eq!(
-        read(Some("check".into()), Some("1-4".into()))
-            .await
-            .unwrap(),
-        b"bcd"
-    );
-    let artifact = summary.steps[0].artifacts[0].clone();
-    assert_eq!(read(Some(artifact), None).await.unwrap(), b"report");
-    assert!(read(Some("status.json".into()), None).await.is_err());
-    assert!(read(Some("../status.json".into()), None).await.is_err());
     let log_path = PathBuf::from(summary.steps[0].log.as_ref().unwrap());
     std::fs::write(&log_path, vec![b'x'; 100_000]).unwrap();
     assert_eq!(
-        read(Some("check".into()), Some("0-999999".into()))
+        log_read(&r, &summary, "check", Some("0-999999"))
             .await
             .unwrap()
             .len(),
         64 << 10
     );
+    assert_eq!(
+        log_read(&r, &summary, "check", None).await.unwrap().len(),
+        64 << 10
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_access_is_limited_to_summary_steps_and_artifacts() {
+    let Some((r, summary)) = log_fixture().await else {
+        return;
+    };
+    assert_eq!(
+        log_read(&r, &summary, "check", Some("1-4")).await.unwrap(),
+        b"bcd"
+    );
+    assert_eq!(
+        log_read(&r, &summary, &summary.steps[0].artifacts[0], None)
+            .await
+            .unwrap(),
+        b"report"
+    );
+    assert!(log_read(&r, &summary, "status.json", None).await.is_err());
+    assert!(
+        log_read(&r, &summary, "../status.json", None)
+            .await
+            .is_err()
+    );
+    let log_path = PathBuf::from(summary.steps[0].log.as_ref().unwrap());
     let artifact_path = log_path
         .parent()
         .unwrap()
@@ -1090,7 +1123,7 @@ async fn log_ranges_are_served_from_the_builder_and_only_for_summary_files() {
     )
     .unwrap();
     assert!(
-        read(Some(summary.steps[0].artifacts[0].clone()), None)
+        log_read(&r, &summary, &summary.steps[0].artifacts[0], None)
             .await
             .is_err()
     );
