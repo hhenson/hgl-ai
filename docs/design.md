@@ -137,6 +137,8 @@ review_receipt = true                  # default: a clean receipt from another f
 verdicts = ["linux", "mac", "windows"] # local build verdicts the merge needs (a platform; `mac` is macOS)
 checks = ["lint", "test (ubuntu-latest)", "cpp (plain, runtime and core)", "cpp (plain, sdk)",
           "cpp (sanitize, runtime and core)", "cpp (sanitize, sdk)"]   # required (ROLE-20)
+relax_required = ["lint", "test (ubuntu-latest)", "cpp (plain, runtime and core)", "cpp (plain, sdk)",
+                  "cpp (sanitize, runtime and core)", "cpp (sanitize, sdk)"]
 
 [github.gate.hgl-ai]
 checks = ["lint", "test (ubuntu-latest)", "test (macos-latest)"]

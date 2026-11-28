@@ -191,7 +191,14 @@ fn default_gates() -> BTreeMap<String, RepoGate> {
             r"^docs/",
             r"^scripts/provision-hgraph-sdk\.sh$",
         ]),
-        relax_required: strings(&["lint", "test (ubuntu-latest)", "hgraph", "cpp"]),
+        relax_required: strings(&[
+            "lint",
+            "test (ubuntu-latest)",
+            "cpp (plain, runtime and core)",
+            "cpp (plain, sdk)",
+            "cpp (sanitize, runtime and core)",
+            "cpp (sanitize, sdk)",
+        ]),
         relax_optional: strings(&[r"^test \((macos|windows)-latest\)$"]),
     };
     let checks = |c: &[&str]| RepoGate {
@@ -276,7 +283,18 @@ mod tests {
         assert_eq!(of("homebrew-hgraph"), ["linux-formula"]);
         assert!(of("hgl_spec").is_empty() && of("hgl_core").is_empty());
         let compiler = of("hgl-compiler");
-        assert!(compiler.contains(&"lint".to_string()) && compiler.len() == 6);
+        assert_eq!(
+            compiler,
+            [
+                "lint",
+                "test (ubuntu-latest)",
+                "cpp (plain, runtime and core)",
+                "cpp (plain, sdk)",
+                "cpp (sanitize, runtime and core)",
+                "cpp (sanitize, sdk)",
+            ]
+        );
+        assert_eq!(all["hgl-compiler"].relax_required, compiler);
         // The relaxation's optional checks are not required, or it could never apply.
         for o in ["test (macos-latest)", "test (windows-latest)"] {
             assert!(!compiler.iter().any(|c| c == o), "{o}");
