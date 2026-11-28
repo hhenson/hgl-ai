@@ -810,15 +810,27 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                     }
                 ),
             )),
-            Ok(Some(b)) => out.push(Check::fail(
+            // The owner accepted one account's risk until the cutover (hgl-ai#141): a
+            // warning, so that it hides no other failure.
+            Ok(Some(b)) if !b.accounts => out.push(Check::warn(
                 "hub boundary",
                 format!(
-                    "the hub stored a write to {} this role may not make, {}: role \
-                     boundaries are not enforced",
+                    "single account: replies not isolated until the hgl-ai#147 cutover, see \
+                     hgl-ai#141 (a write to {} arrived {})",
                     hgl_ai_proto::KV_CANARY,
                     b.wrote.join(" and ")
                 ),
-                "move the hub to one account per role (hgl-ai#141)",
+                "the cutover to one account per role (hgl-ai#147)",
+            )),
+            Ok(Some(b)) => out.push(Check::fail(
+                "hub boundary",
+                format!(
+                    "on role accounts, the hub stored a write to {} this role may not \
+                     make, {}: role boundaries are not enforced",
+                    hgl_ai_proto::KV_CANARY,
+                    b.wrote.join(" and ")
+                ),
+                "check `hub accounts` on the hub; render nats.conf from the registry again",
             )),
             Ok(None) => {}
             Err(e) => out.push(Check::warn(
@@ -1997,10 +2009,28 @@ mod tests {
             }))),
         )
         .await;
+        // One account: the accepted risk until the cutover, a warning (hgl-ai#141).
+        let c = check(&cs, "hub boundary").unwrap();
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(
+            c.detail.starts_with("single account: replies not isolated")
+                && c.detail.contains("by the reply route"),
+            "{c:?}"
+        );
+        assert!(!any_fail(&cs), "{cs:?}");
+        // Role accounts and still a write: a failure.
+        let cs = run(
+            &f,
+            &with(Ok(Some(crate::hub::Boundary {
+                accounts: true,
+                wrote: vec!["directly"],
+            }))),
+        )
+        .await;
         let c = check(&cs, "hub boundary").unwrap();
         assert_eq!(c.level, Level::Fail, "{c:?}");
         assert!(
-            c.detail.contains("HGL_CANARY") && c.detail.contains("by the reply route"),
+            c.detail.contains("HGL_CANARY") && c.detail.contains("directly"),
             "{c:?}"
         );
         assert!(any_fail(&cs));

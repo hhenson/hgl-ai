@@ -162,8 +162,8 @@ the shared inbox until it restarts.
 `doctor` checks the role boundaries (hgl-ai#141):
 
 - `hub boundary` (every host): writes `HGL_CANARY`, which no role may, directly and as a
-  JetStream reply subject, and fails if anything arrives. It fails on a hub with every
-  user in one account.
+  JetStream reply subject. On role accounts it fails if anything arrives. On one
+  account, where the reply route arrives, it warns until the cutover (hgl-ai#147).
 - `hub accounts` (the hub): `nats.conf` against the registry: each role's users in its
   own account, the admin alone in `HUB`, no stream exports, no export wider than the
   access table. Users in one account warn.
