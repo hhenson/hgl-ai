@@ -186,6 +186,7 @@ struct Posts {
     views: Vec<Value>,
     lose_response: bool,
     rate_limit_open: Option<u64>,
+    socket_error: Option<String>,
     socket_opens: usize,
     history_calls: usize,
     history_error: Option<String>,
@@ -220,6 +221,9 @@ impl FakeSlack {
                         assert_eq!(headers["authorization"], "Bearer xapp-test");
                         let mut posts = state.posts.lock().unwrap();
                         posts.socket_opens += 1;
+                        if let Some(error) = &posts.socket_error {
+                            return Json(json!({"ok": false, "error": error})).into_response();
+                        }
                         if let Some(after) = posts.rate_limit_open.take() {
                             return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", after.to_string())]).into_response();
                         }
@@ -345,8 +349,9 @@ impl FakeSlack {
             }
             ws.send(Message::close(None, "")).await.unwrap();
         };
+        let mut connected = None;
         let ((), result) = timeout(Duration::from_secs(5), async {
-            tokio::join!(server, adapter.socket_session())
+            tokio::join!(server, adapter.socket_session(&mut connected))
         })
         .await
         .expect("adapter did not acknowledge a Slack envelope");
@@ -1044,6 +1049,56 @@ async fn startup_error_chain_keeps_only_safe_slack_error_codes() {
         assert!(!logged.contains("xoxb-"));
         assert!(!logged.contains("xapp-"));
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn socket_startup_failure_is_recorded_until_connection_succeeds() {
+    if Command::new("nats-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: nats-server is unavailable");
+        return;
+    }
+    let hub = Hub::new();
+    let _server = hub.start().await;
+    hub.bus("admin").await.provision().await.unwrap();
+    let slack = hub.bus("slack").await;
+    let reader = hub.bus("seat").await;
+    let fake = FakeSlack::start().await;
+    fake.state.posts.lock().unwrap().socket_error = Some("missing_scope".into());
+    let adapter = fake.adapter(&slack).await;
+    let key = hgl_ai_proto::SLACK_STARTUP_KEY;
+    let exercise = async {
+        loop {
+            if let Some(status) = reader.state_get(key).await.unwrap() {
+                assert!(status.value.contains("missing_scope"), "{}", status.value);
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+        fake.state.posts.lock().unwrap().socket_error = None;
+        let (stream, _) = fake.listener.accept().await.unwrap();
+        let _socket = ServerBuilder::new().accept(stream).await.unwrap();
+        loop {
+            if reader
+                .state_get(key)
+                .await
+                .unwrap()
+                .is_some_and(|s| s.value == "ok")
+            {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    };
+    timeout(Duration::from_secs(5), async {
+        tokio::select! {
+            () = adapter.socket_loop_with_sleep(|_| sleep(Duration::from_millis(20))) => panic!("socket loop stopped"),
+            () = exercise => (),
+        }
+    }).await.expect("startup status did not follow Socket Mode connection");
 }
 
 #[tokio::test(flavor = "current_thread")]

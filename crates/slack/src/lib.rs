@@ -223,11 +223,7 @@ pub async fn run(
             }
         }
     };
-    tokio::join!(
-        adapter.outbound_loop(),
-        adapter.socket_loop(),
-        clear_startup(&bus)
-    );
+    tokio::join!(adapter.outbound_loop(), adapter.socket_loop());
     Ok(())
 }
 
@@ -503,19 +499,41 @@ impl<'a> Adapter<'a> {
         F: FnMut(Duration) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        let mut retries = Backoff::default();
-        loop {
-            let started = Instant::now();
-            let result = self.socket_session().await;
-            if started.elapsed() >= HEALTHY {
-                retries = Backoff::default();
+        let (connected, ready) = tokio::sync::oneshot::channel();
+        let status = async {
+            if ready.await.is_ok() {
+                clear_startup(self.bus).await;
             }
-            wait(retry_delay(&mut retries, result.err(), "Slack Socket Mode")).await;
-        }
+        };
+        let sessions = async {
+            let mut connected = Some(connected);
+            let mut retries = Backoff::default();
+            loop {
+                let started = Instant::now();
+                let result = self.socket_session(&mut connected).await;
+                if started.elapsed() >= HEALTHY {
+                    retries = Backoff::default();
+                }
+                let delay = match result {
+                    Err(error) if connected.is_some() => {
+                        startup_failure(self.bus, &mut retries, &error).await
+                    }
+                    result => retry_delay(&mut retries, result.err(), "Slack Socket Mode"),
+                };
+                wait(delay).await;
+            }
+        };
+        tokio::join!(sessions, status);
     }
 
-    async fn socket_session(&self) -> Result<()> {
+    async fn socket_session(
+        &self,
+        connected: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
         let mut socket = self.web.socket().await?;
+        if let Some(connected) = connected.take() {
+            let _ = connected.send(());
+        }
         while let Some(frame) = timeout(Duration::from_secs(120), socket.next())
             .await
             .context("Slack Socket Mode went quiet")?
