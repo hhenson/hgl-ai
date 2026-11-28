@@ -218,6 +218,9 @@ struct SeatRt {
     busy_told: Mutex<HashSet<Target>>,
     /// Targets whose failed preparation the controller was told of (once until it works).
     prep_told: Mutex<HashSet<Target>>,
+    /// Targets whose stale tree the controller was told of with a `blocked` note, apart
+    /// from `prep_told` so a transient failure just before does not suppress it.
+    blocked_told: Mutex<HashSet<Target>>,
     /// Raised when a refresh finds the seat lease no longer ours, or could not refresh it
     /// within the deadline; why, in `lost_why`.
     lost: watch::Sender<bool>,
@@ -243,6 +246,7 @@ impl SeatRt {
             exhausted_told: AtomicBool::new(false),
             busy_told: Mutex::default(),
             prep_told: Mutex::default(),
+            blocked_told: Mutex::default(),
             lost: watch::Sender::new(false),
             ended: Mutex::new(ended),
             failures: Mutex::new(failures),
@@ -940,6 +944,7 @@ impl<B: BusApi> Bridge<B> {
         st.prep_failures.retain(|t, _| !cleared.contains(t));
         lock(&seat.busy_told).retain(|t| !cleared.contains(t));
         lock(&seat.prep_told).retain(|t| !cleared.contains(t));
+        lock(&seat.blocked_told).retain(|t| !cleared.contains(t));
         if let Err(e) = lock(&seat.ended).end(task.clone(), d.seq()) {
             tracing::warn!(seat = %seat.name(), %task, "caching the end of the task: {e}");
         }
@@ -1226,6 +1231,7 @@ impl<B: BusApi> Bridge<B> {
         if !matches!(out.outcome, Outcome::PrepFailed(_) | Outcome::Blocked(_)) {
             st.prep_failures.remove(&r.target);
             lock(&seat.prep_told).remove(&r.target);
+            lock(&seat.blocked_told).remove(&r.target);
         }
         match out.outcome {
             Outcome::Clean => {
@@ -1263,7 +1269,11 @@ impl<B: BusApi> Bridge<B> {
                 let wait = self.opts.prep_retry * (1u32 << (*n - 1).min(4));
                 st.busy.insert(r.target.clone(), Instant::now() + wait);
                 st.pending.splice(0..0, newest(ds));
-                if lock(&seat.prep_told).insert(r.target.clone()) {
+                let told = match out.outcome {
+                    Outcome::Blocked(_) => &seat.blocked_told,
+                    _ => &seat.prep_told,
+                };
+                if lock(told).insert(r.target.clone()) {
                     let (kind, what) = match out.outcome {
                         Outcome::Blocked(_) => {
                             (Kind::Blocked, "blocked: a turn would run on a stale tree")

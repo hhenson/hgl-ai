@@ -288,6 +288,7 @@ fn clean_removal_frees_everything() {
     assert_eq!(rm.salvage, None);
     assert_eq!(rm.key, "build-1.w1.demo-1");
     assert_eq!(rm.branch.as_deref(), Some("codex/q1-one"));
+    assert_eq!(rm.local_branch.as_deref(), Some("codex/q1-one"));
     assert!(rm.freed_bytes > 0);
     assert!(!c.dir.exists());
     let clone = e.root.join("work/clones/demo");
@@ -478,7 +479,12 @@ fn a_task_moved_to_another_seat_of_the_host_keeps_its_branch() {
     assert_eq!(w1.file.local(), Some("codex/q3-three@w1"));
     assert_eq!(w2.file.local(), Some("codex/q3-three"));
     // The first seat's removal leaves the branch the second still uses.
-    e.trees.remove(&seat("w2"), &task(3), false).unwrap();
+    let rm = e
+        .trees
+        .remove(&seat("w2"), &task(3), false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(rm.local_branch.as_deref(), Some("codex/q3-three"));
     assert_eq!(
         e.git
             .run(&w1.dir.join("src"), ["branch", "--show-current"])
@@ -489,7 +495,16 @@ fn a_task_moved_to_another_seat_of_the_host_keeps_its_branch() {
     let clone = e.root.join("work/clones/demo");
     let heads = e.trees.local_heads(&clone).unwrap();
     assert_eq!(heads, ["codex/q3-three@w1"], "w2's went with it");
-    e.trees.remove(&seat("w1"), &task(3), false).unwrap();
+    let rm = e
+        .trees
+        .remove(&seat("w1"), &task(3), false)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (rm.branch.as_deref(), rm.local_branch.as_deref()),
+        (Some("codex/q3-three"), Some("codex/q3-three@w1")),
+        "hgl-ai#89: the local branch deleted is the tree's own"
+    );
     assert!(e.trees.local_heads(&clone).unwrap().is_empty());
 }
 
@@ -768,6 +783,28 @@ fn trees_of_one_host_have_branches_of_their_own() {
     assert_eq!(head(&e, &src1), theirs, "left as it was");
     assert_eq!(
         std::fs::read_to_string(src1.join("b.txt")).unwrap(),
+        "w1's own\n"
+    );
+    e.git
+        .run(&src1, ["checkout", "--quiet", "--", "b.txt"])
+        .unwrap();
+
+    // hgl-ai#89: an untracked file in a new untracked directory, which the pushed commits
+    // add: blocked by the pre-check, not failed by the fast-forward.
+    std::fs::create_dir(src1.join("new")).unwrap();
+    std::fs::write(src1.join("new/d.txt"), "w1's own\n").unwrap();
+    std::fs::create_dir(src2.join("new")).unwrap();
+    commit(&e.git, &src2, "new/d.txt", "w2\n", "w2 adds a dir");
+    push(&e, &src2, &branch);
+    match e.trees.refresh_branch(&w1.dir, &w1.file).unwrap() {
+        Refresh::Blocked { why, files } => {
+            assert!(why.contains("uncommitted"), "{why}");
+            assert_eq!(files, ["new/d.txt"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(
+        std::fs::read_to_string(src1.join("new/d.txt")).unwrap(),
         "w1's own\n"
     );
 }

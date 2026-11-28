@@ -269,3 +269,58 @@ async fn a_conflicting_unpushed_change_blocks_the_handoff() {
     );
     stop(tx, j).await;
 }
+
+/// hgl-ai#89: a transient preparation failure just before does not suppress the `blocked`
+/// note; each is told once on its own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_prep_failure_before_does_not_suppress_blocked() {
+    let Moved { h, dir1, .. } = moved_to_w2().await;
+    let src1 = dir1.join("src");
+    commit(&h.git, &src1, "w2.txt", "w1's own\n", "w1 unpushed");
+    let (origin, away) = (h.root.join("demo.git"), h.root.join("demo.git.away"));
+    assert!(origin.is_dir(), "{}", origin.display());
+    std::fs::rename(&origin, &away).unwrap();
+    let (tx, j) = start_w1(&h).await;
+    let b = back(&h);
+    let told = |what: &str| h.bus.sent_containing(what);
+    eventually("prep failure told", || {
+        !told("could not prepare").is_empty()
+    })
+    .await;
+    std::fs::rename(&away, &origin).unwrap();
+    let blocked = || {
+        h.bus
+            .sent()
+            .into_iter()
+            .filter(|n| n.kind == Kind::Blocked)
+            .count()
+    };
+    eventually("blocked told", || blocked() == 1).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(blocked(), 1, "told once");
+    assert_eq!(told("could not prepare").len(), 1, "told once");
+    assert!(h.bus.events(b).is_empty(), "held: {:?}", h.bus.events(b));
+    stop(tx, j).await;
+}
+
+/// hgl-ai#89: the cleanup receipt names the local branch it deleted, the tree's own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cleanup_names_the_trees_own_branch() {
+    let Moved { h, branch, .. } = moved_to_w2().await;
+    let (tx, j) = h.start(&["w2"]);
+    let l = h.bus.push(
+        "w2",
+        note(Kind::Landed, "w2", 55, "[claude] Landed: demo#55"),
+    );
+    eventually("landed acked", || h.bus.events(l) == [Ev::Ack]).await;
+    let done = h.bus.sent_containing("Cleanup: demo#55 on build-1/w2");
+    assert_eq!(done.len(), 1, "{done:?}");
+    assert!(
+        done[0]
+            .body
+            .contains(&format!("deleted local branch {branch}@w2;")),
+        "{}",
+        done[0].body
+    );
+    stop(tx, j).await;
+}

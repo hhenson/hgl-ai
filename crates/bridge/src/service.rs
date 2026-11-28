@@ -257,7 +257,10 @@ pub(crate) fn cleanup_body(
             names.join(", "),
             human_bytes(freed)
         );
-        let branches: Vec<&str> = removed.iter().filter_map(|r| r.branch.as_deref()).collect();
+        let branches: Vec<&str> = removed
+            .iter()
+            .filter_map(|r| r.local_branch.as_deref())
+            .collect();
         if !branches.is_empty() {
             let _ = write!(s, ", deleted local branch {}", branches.join(", "));
         }

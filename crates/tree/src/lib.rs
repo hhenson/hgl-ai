@@ -191,7 +191,11 @@ pub struct Created {
 pub struct Removed {
     pub key: String,
     pub dir: PathBuf,
+    /// The task's branch (its name on the remote).
     pub branch: Option<String>,
+    /// The local branch deleted with it: the task's branch, or the tree's own
+    /// `<branch>@<seat>` when it had one.
+    pub local_branch: Option<String>,
     pub freed_bytes: u64,
     /// Patch of uncommitted changes and unpushed commits, when there were any.
     pub salvage: Option<PathBuf>,
@@ -653,9 +657,10 @@ impl Trees {
         }
         self.remove_dir(&dir)?;
         let branch = file.as_ref().and_then(|f| f.branch.clone());
+        let local_branch = file.as_ref().and_then(|f| f.local()).map(str::to_string);
         if let Some(clone) = &clone {
             let _ = self.git.output(clone, ["worktree", "prune"])?;
-            if let Some(b) = file.as_ref().and_then(|f| f.local()) {
+            if let Some(b) = &local_branch {
                 let _ = self.git.output(clone, ["branch", "-D", b])?;
             }
         }
@@ -664,6 +669,7 @@ impl Trees {
             key,
             dir,
             branch,
+            local_branch,
             freed_bytes,
             salvage,
         }))
@@ -876,9 +882,10 @@ impl Trees {
                 files: ours.into_iter().filter(|p| theirs.contains(p)).collect(),
             });
         }
-        let status = self
-            .git
-            .run(&src, ["status", "--porcelain", "--no-renames", "-z"])?;
+        let status = self.git.run(
+            &src,
+            ["status", "--porcelain", "--no-renames", "-uall", "-z"],
+        )?;
         let dirty: Vec<String> = status
             .split('\0')
             .filter_map(|e| e.get(3..))
