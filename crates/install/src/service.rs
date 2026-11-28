@@ -239,6 +239,35 @@ pub fn render_launchd_daemon(spec: &Spec, user: &str, home: &Path) -> String {
     )
 }
 
+/// The OS user an installed system service runs as (`User=`, `UserName`), read without
+/// privilege; `None` when it is not installed or names no user.
+pub fn system_user(sys: &dyn System, s: Service) -> Option<String> {
+    let os = sys.env().os;
+    let o = match os {
+        Os::Linux => {
+            sys.query(&Cmd::new("systemctl").args(["show", "-p", "LoadState,User", &s.unit()]))
+        }
+        Os::MacOs => sys.query(
+            &Cmd::new("plutil")
+                .args(["-extract", "UserName", "raw", "-o", "-"])
+                .arg(system_unit_path(os, s).display().to_string()),
+        ),
+    }
+    .ok()
+    .filter(|o| o.ok())?;
+    let user = match os {
+        Os::Linux => {
+            let mut lines = o.stdout.lines().map(str::trim);
+            if !lines.clone().any(|l| l == "LoadState=loaded") {
+                return None;
+            }
+            lines.find_map(|l| l.strip_prefix("User="))?
+        }
+        Os::MacOs => o.stdout.trim(),
+    };
+    (!user.is_empty()).then(|| user.to_string())
+}
+
 /// A system service's state, read without privilege.
 pub fn system_state(sys: &dyn System, s: Service) -> State {
     match sys.env().os {
@@ -895,5 +924,35 @@ WantedBy=default.target
         assert!(linger_line(Some(false)).unwrap().contains("enable-linger"));
         let m = Fake::new(d.path(), Os::MacOs);
         assert_eq!(linger(&m, true).unwrap(), None);
+    }
+
+    /// The user a system service runs as, read without privilege on either OS.
+    #[test]
+    fn a_system_service_user() {
+        let d = tempfile::tempdir().unwrap();
+        let f = Fake::new(d.path(), Os::Linux);
+        f.on(|c| match c.args.last().map(String::as_str) {
+            Some("hgl-ai-hub.service") => Output::success("LoadState=loaded\nUser=hgl-ai\n"),
+            Some("hgl-ai-coord.service") => Output::success("LoadState=loaded\nUser=\n"),
+            _ => Output::success("LoadState=not-found\nUser=\n"),
+        });
+        assert_eq!(system_user(&f, Service::Hub).as_deref(), Some("hgl-ai"));
+        assert_eq!(system_user(&f, Service::Coord), None, "no User=");
+        assert_eq!(system_user(&f, Service::Console), None, "not installed");
+        let m = Fake::new(d.path(), Os::MacOs);
+        m.on(|c| {
+            let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
+            match a.as_slice() {
+                ["-extract", "UserName", "raw", "-o", "-", p]
+                    if *p == "/Library/LaunchDaemons/io.github.hhenson.hgl-ai.hub.plist" =>
+                {
+                    Output::success("hgl-ai\n")
+                }
+                _ => Output::failure(1, "No value at that key path or invalid key path"),
+            }
+        });
+        assert_eq!(system_user(&m, Service::Hub).as_deref(), Some("hgl-ai"));
+        assert_eq!(system_user(&m, Service::Coord), None);
+        assert!(f.runs().is_empty() && m.runs().is_empty());
     }
 }

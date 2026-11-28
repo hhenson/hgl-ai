@@ -210,6 +210,12 @@ fn nats_for(sys: &dyn System, layout: &Layout) -> PathBuf {
 
 /// The client user's home, from the account database.
 fn account(sys: &dyn System, name: &str) -> Result<PathBuf> {
+    home_of(sys, name)
+        .ok_or_else(|| other(format!("--client-user {name}: no such user (or no home)")))
+}
+
+/// A user's home, from the account database (`getent`, `dscl`).
+pub(crate) fn home_of(sys: &dyn System, name: &str) -> Option<PathBuf> {
     let out = |c: Cmd| {
         sys.query(&c)
             .ok()
@@ -233,7 +239,6 @@ fn account(sys: &dyn System, name: &str) -> Result<PathBuf> {
     }
     .filter(|h| h.starts_with('/'))
     .map(PathBuf::from)
-    .ok_or_else(|| other(format!("--client-user {name}: no such user (or no home)")))
 }
 
 /// A `sh -c` program, run as the credential's owner: its directory (`$1`; new

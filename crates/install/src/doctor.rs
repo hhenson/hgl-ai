@@ -4,7 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
-use hgl_ai_config::{CODEX_PROFILE, Config, codex_profile};
+use hgl_ai_config::{CODEX_PROFILE, Config, ServerUser, codex_profile};
 use hgl_ai_proto::Runtime;
 use serde::Serialize;
 
@@ -264,17 +264,52 @@ fn secret_check(sys: &dyn System, name: &str, shown: &str) -> Check {
     }
 }
 
+/// This OS user's name, from `id -un`.
+fn user_name(sys: &dyn System) -> Option<String> {
+    sys.query(&Cmd::new("id").arg("-un"))
+        .ok()
+        .filter(|o| o.ok())
+        .map(|o| o.stdout.trim().to_string())
+        .filter(|n| !n.is_empty())
+}
+
+/// The server user of a hub host whose server side runs as its own OS user. The
+/// installer's configuration records it (`[server_user]`); the client user's, from
+/// `client install`, does not, so there it is the user the installed hub unit runs as.
+fn server_user(sys: &dyn System, c: &Config, me: Option<&str>) -> Option<ServerUser> {
+    if let Some(su) = &c.server_user {
+        return Some(su.clone());
+    }
+    if c.server.is_some() {
+        return None;
+    }
+    let name = service::system_user(sys, Service::Hub).filter(|n| Some(n.as_str()) != me)?;
+    let home = crate::system::home_of(sys, &name)?;
+    Some(ServerUser {
+        name,
+        home: home.display().to_string(),
+        console_url: None,
+        client_user: None,
+    })
+}
+
 /// The server side and the client side apart (docs/install.md): the server user's home
 /// is its own (mode 0700), and the console's credential is out of the client user's
-/// reach; on the server user's side, its credentials are its own, mode 0600.
-fn separation_checks(sys: &dyn System, c: &Config) -> Vec<Check> {
+/// reach (checked where the client runs: `client` false for an installer whose client
+/// is another user); on the server user's side, its credentials are its own, mode 0600.
+fn separation_checks(
+    sys: &dyn System,
+    c: &Config,
+    server_user: Option<&ServerUser>,
+    client: bool,
+) -> Vec<Check> {
     let env = sys.env();
     let mut out = Vec::new();
     let me = sys
         .query(&Cmd::new("id").arg("-u"))
         .ok()
         .and_then(|o| o.stdout.trim().parse::<u32>().ok());
-    if let Some(su) = &c.server_user {
+    if let Some(su) = server_user {
         let home = env.expand(&su.home);
         let stat = match env.os {
             crate::Os::Linux => Cmd::new("stat").args(["-c", "%U %a"]),
@@ -307,22 +342,24 @@ fn separation_checks(sys: &dyn System, c: &Config) -> Vec<Check> {
             ),
         });
         let cred = home.join(".config/hgl-ai/hub-users/console.cred");
-        out.push(if sys.can_read(&cred) {
-            Check::fail(
-                "console credential",
-                format!(
-                    "{} is readable by you, the client user: an agent could speak as the owner",
-                    cred.display()
-                ),
-                format!(
-                    "`sudo chmod 700 {}` and `sudo chmod 600 {}`",
-                    su.home,
-                    cred.display()
-                ),
-            )
-        } else {
-            Check::ok("console credential", "not readable by the client user")
-        });
+        if client {
+            out.push(if sys.can_read(&cred) {
+                Check::fail(
+                    "console credential",
+                    format!(
+                        "{} is readable by you, the client user: an agent could speak as the owner",
+                        cred.display()
+                    ),
+                    format!(
+                        "`sudo chmod 700 {}` and `sudo chmod 600 {}`",
+                        su.home,
+                        cred.display()
+                    ),
+                )
+            } else {
+                Check::ok("console credential", "not readable by the client user")
+            });
+        }
     } else if let Some(srv) = &c.server {
         let cred = env.config_dir().join("hub-users/console.cred");
         if srv.units == hgl_ai_config::Units::User && sys.exists(&cred) {
@@ -536,8 +573,27 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             )
         },
     );
+    let me = user_name(sys);
+    let su = cfg
+        .as_ref()
+        .and_then(|c| server_user(sys, c, me.as_deref()));
+    // The installer of a hub host whose client runs as another user (`--client-user`):
+    // the client's checks are that user's, against its home.
+    let client_user = cfg
+        .as_ref()
+        .and_then(|c| c.server_user.as_ref())
+        .and_then(|s| s.client_user.clone())
+        .filter(|u| Some(u.as_str()) != me.as_deref());
+    if let Some(u) = &client_user {
+        out.push(Check::ok(
+            "client user",
+            format!(
+                "{u} runs this host's client (bridge, agents); its checks: `sudo -u {u} -i hgl-ai doctor`"
+            ),
+        ));
+    }
 
-    if let Some(c) = &cfg {
+    if let Some(c) = cfg.as_ref().filter(|_| client_user.is_none()) {
         let tp = env.expand(&c.hub.token_file);
         let shown = &c.hub.token_file;
         let cred = token::read_credential(sys, &tp);
@@ -615,12 +671,13 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             .as_ref()
             .is_some_and(|s| s.units == hgl_ai_config::Units::System)
     });
-    let clis = if server_side {
+    let no_client = server_side || client_user.is_some();
+    let clis = if no_client {
         Vec::new()
     } else {
         skill::installed_clis(sys)
     };
-    for rt in Runtime::ALL.iter().copied().filter(|_| !server_side) {
+    for rt in Runtime::ALL.iter().copied().filter(|_| !no_client) {
         let name = format!("cli {rt}");
         let used = seat_uses(cfg.as_ref(), rt);
         let Some((_, bin)) = clis.iter().find(|(r, _)| *r == rt) else {
@@ -663,8 +720,9 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             .server
             .as_ref()
             .is_some_and(|s| s.units == hgl_ai_config::Units::System);
-        // The server user (a system install) has no client of its own.
-        let mut svcs = if system_units {
+        // The server user (a system install) has no client of its own, nor has an
+        // installer whose client is another user.
+        let mut svcs = if system_units || client_user.is_some() {
             Vec::new()
         } else {
             vec![
@@ -672,7 +730,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 (Service::Builder, reinstall.clone()),
             ]
         };
-        if c.server.is_some() || c.server_user.is_some() {
+        if c.server.is_some() || su.is_some() {
             svcs.push((Service::Hub, "`hgl-ai server install`".into()));
             svcs.push((Service::Coord, "`hgl-ai server install`".into()));
             svcs.push((
@@ -682,7 +740,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         }
         // The client's own services (bridge, builder) are never the server user's.
         let client = |s: Service| matches!(s, Service::Bridge | Service::Builder);
-        let system = |s: Service| system_units || (!client(s) && c.server_user.is_some());
+        let system = |s: Service| system_units || (!client(s) && su.is_some());
         for (s, install) in svcs {
             let name = format!("service {}", s.short());
             let st = if system(s) {
@@ -739,8 +797,17 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         if let Some(con) = &c.console {
             out.extend(console_checks(sys, con));
         }
-        out.extend(separation_checks(sys, c));
-        if let Ok(Some(on)) = service::linger(sys, false) {
+        out.extend(separation_checks(
+            sys,
+            c,
+            su.as_ref(),
+            client_user.is_none(),
+        ));
+        // Lingering keeps the client's user services up: not this user's to check when
+        // the client is another user.
+        if client_user.is_none()
+            && let Ok(Some(on)) = service::linger(sys, false)
+        {
             out.push(if on {
                 Check::ok("lingering", "on")
             } else {
@@ -756,6 +823,8 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         let shown = &c.paths.work_root;
         out.push(if server_side {
             Check::ok("work_root", "none on the server side")
+        } else if let Some(u) = &client_user {
+            Check::ok("work_root", format!("none here: the client runs as {u}"))
         } else if !sys.exists(&wr) {
             Check::fail(
                 "work_root",
@@ -781,7 +850,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 ),
             }
         });
-        if !server_side
+        if !no_client
             && sys.exists(&wr)
             && let Some((_, bin)) = clis.iter().find(|(r, _)| *r == Runtime::Codex)
         {
@@ -795,7 +864,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
     }
 
     let tool = |name: &str| sys.which(name);
-    if !server_side {
+    if !no_client {
         out.push(match tool("tmux") {
             Some(p) => Check::ok("tmux", p.display().to_string()),
             None => Check::warn(
@@ -838,6 +907,10 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         Some(p) => Check::ok("git", p.display().to_string()),
         None => Check::fail("git", "not on PATH", "install git"),
     });
+    // `gh` is the client's (and, with a token, the coordinator's).
+    if client_user.is_some() && token_file.is_none() {
+        return out;
+    }
     out.push(match tool("gh") {
         None => Check::fail("gh", "not on PATH", "install gh"),
         Some(p) => match sys.query(&{
@@ -1179,6 +1252,173 @@ mod tests {
         let su = get(&cs, "server user");
         assert_eq!(su.level, Level::Fail);
         assert!(su.fix.unwrap().contains("sudo chmod 700 /var/lib/hgl-ai"));
+    }
+
+    /// The installer of a hub host whose client runs as `agents` (`--client-user`): no
+    /// client checks against the installer's home, and a pointer to `agents`' doctor.
+    #[tokio::test]
+    async fn installer_with_a_separate_client_user() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.seats.clear();
+        cfg.server_user = Some(hgl_ai_config::ServerUser {
+            name: "hgl-ai".into(),
+            home: "/var/lib/hgl-ai".into(),
+            console_url: None,
+            client_user: Some("agents".into()),
+        });
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        // The installer has no client credential, skills or work_root of its own.
+        std::fs::remove_file(f.env.home.join(".config/hgl-ai/hub.token")).unwrap();
+        std::fs::remove_dir_all(f.env.home.join("hgl-ai")).unwrap();
+        for rt in [Runtime::Claude, Runtime::Codex] {
+            std::fs::remove_file(skill::skill_path(&f.env, rt)).unwrap();
+        }
+        let whoami = std::rc::Rc::new(std::cell::RefCell::new("owner".to_string()));
+        let who = whoami.clone();
+        f.on(move |c| {
+            let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
+            match (c.program.as_str(), a.as_slice()) {
+                (_, ["auth", "status", "--json"]) => Output::success(r#"{"loggedIn": true}"#),
+                (_, ["sandbox", ..] | ["exec", "resume", ..]) => codex_ok(&a),
+                ("id", ["-un"]) => Output::success(format!("{}\n", who.borrow())),
+                ("id", _) => Output::success("1000\n"),
+                ("loginctl", _) => Output::success("no\n"),
+                ("systemctl", [_, "is-active", _]) => Output::failure(3, "inactive"),
+                ("systemctl", ["show", ..]) => {
+                    Output::success("LoadState=loaded\nActiveState=active\nUser=hgl-ai\n")
+                }
+                ("stat", _) => Output::success("hgl-ai 700\n"),
+                ("df", _) => Output::success(DF),
+                _ => Output::success(""),
+            }
+        });
+        let cs = run(&f, &FakeHub::down()).await;
+        let names: Vec<&str> = cs.iter().map(|c| c.name.as_str()).collect();
+        let cu = cs.iter().find(|c| c.name == "client user").unwrap();
+        assert_eq!(cu.level, Level::Ok);
+        assert!(
+            cu.detail.contains("`sudo -u agents -i hgl-ai doctor`"),
+            "{cu:?}"
+        );
+        for n in [
+            "token",
+            "hub",
+            "hub auth",
+            "cli claude",
+            "cli codex",
+            "skill claude",
+            "service bridge",
+            "service builder",
+            "codex profile",
+            "tmux",
+            "lingering",
+            "gh",
+            "console credential",
+        ] {
+            assert!(
+                !names.contains(&n),
+                "{n} checked for the installer: {names:?}"
+            );
+        }
+        assert!(
+            !cs.iter().any(|c| c.line().contains("hub.token")),
+            "no advice to copy the client credential here: {cs:?}"
+        );
+        let wr = cs.iter().find(|c| c.name == "work_root").unwrap();
+        assert_eq!(
+            (wr.level, wr.detail.as_str()),
+            (Level::Ok, "none here: the client runs as agents")
+        );
+        assert_eq!(
+            cs.iter().find(|c| c.name == "server user").unwrap().level,
+            Level::Ok
+        );
+        let hub = cs.iter().find(|c| c.name == "service hub").unwrap();
+        assert_eq!(hub.detail, "running (system)");
+        assert!(!any_fail(&cs), "{cs:?}");
+
+        // The same configuration, read as `agents` itself: the client is here.
+        *whoami.borrow_mut() = "agents".into();
+        let cs = run(&f, &FakeHub::down()).await;
+        assert!(!cs.iter().any(|c| c.name == "client user"));
+        assert_eq!(
+            cs.iter().find(|c| c.name == "token").unwrap().level,
+            Level::Fail
+        );
+        assert!(cs.iter().any(|c| c.name == "console credential"));
+    }
+
+    /// The client user of a hub host: its configuration (`client install`) names no
+    /// server user, so doctor finds it from the installed hub unit and checks the
+    /// separation.
+    #[tokio::test]
+    async fn client_user_finds_the_server_user() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let respond = |f: &Fake, unit: &'static str| {
+            f.on(move |c| {
+                let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
+                match (c.program.as_str(), a.as_slice()) {
+                    (_, ["auth", "status", "--json"]) => Output::success(r#"{"loggedIn": true}"#),
+                    (_, ["sandbox", ..] | ["exec", "resume", ..]) => codex_ok(&a),
+                    ("id", ["-un"]) => Output::success("agents\n"),
+                    ("id", _) => Output::success("1001\n"),
+                    ("loginctl", _) => Output::success("yes\n"),
+                    ("systemctl", [_, "is-active", _]) => Output::success("active\n"),
+                    ("systemctl", ["show", "-p", "LoadState,User", u])
+                        if *u == "hgl-ai-hub.service" =>
+                    {
+                        Output::success(unit)
+                    }
+                    ("systemctl", ["show", ..]) => {
+                        Output::success("LoadState=loaded\nActiveState=active\n")
+                    }
+                    ("getent", ["passwd", "hgl-ai"]) => {
+                        Output::success("hgl-ai:x:998:998::/var/lib/hgl-ai:/usr/sbin/nologin\n")
+                    }
+                    ("stat", _) => Output::success("hgl-ai 700\n"),
+                    ("df", _) => Output::success(DF),
+                    _ => Output::success(""),
+                }
+            })
+        };
+        respond(&f, "LoadState=loaded\nUser=hgl-ai\n");
+        let cs = run(&f, &FakeHub::up()).await;
+        let get = |cs: &[Check], n: &str| {
+            cs.iter()
+                .find(|c| c.name == n)
+                .cloned()
+                .unwrap_or_else(|| panic!("no check {n}: {cs:?}"))
+        };
+        let su = get(&cs, "server user");
+        assert_eq!(su.level, Level::Ok);
+        assert_eq!(su.detail, "hgl-ai owns /var/lib/hgl-ai (mode 700)");
+        assert_eq!(get(&cs, "console credential").level, Level::Ok);
+        assert_eq!(get(&cs, "service hub").detail, "running (system)");
+        assert_eq!(get(&cs, "service bridge").detail, "running");
+        assert!(!cs.iter().any(|c| c.name == "client user"));
+        assert!(!any_fail(&cs), "{cs:?}");
+
+        f.readable
+            .borrow_mut()
+            .insert("/var/lib/hgl-ai/.config/hgl-ai/hub-users/console.cred".into());
+        let cs = run(&f, &FakeHub::up()).await;
+        assert_eq!(get(&cs, "console credential").level, Level::Fail);
+
+        // No hub unit (a client-only host), or one that runs as this user: nothing to
+        // separate.
+        for unit in [
+            "LoadState=not-found\nUser=\n",
+            "LoadState=loaded\nUser=agents\n",
+        ] {
+            respond(&f, unit);
+            let cs = run(&f, &FakeHub::up()).await;
+            for n in ["server user", "console credential", "service hub"] {
+                assert!(!cs.iter().any(|c| c.name == n), "{n} for {unit:?}");
+            }
+        }
     }
 
     /// The server user's own side: its secrets are mode 0600 and its own.

@@ -222,7 +222,9 @@ own hub user `console`.
    passkey; later sign-ins use the passkey. A new device: a provider again.
 
 The console's credential and secrets belong to the server user; `doctor`, run as
-you, checks that you (and so your agents) cannot read them.
+the client user, checks that it (and so its agents) cannot read them. It finds the
+server user from the hub's system unit. With `--client-user NAME`, `doctor` as you
+checks the server side only and points at `sudo -u NAME -i hgl-ai doctor`.
 
 ## Agents
 
