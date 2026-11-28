@@ -54,7 +54,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// proxy's directories. Short paths, for the control socket.
 struct World {
     _tmp: tempfile::TempDir,
-    _socket_tmp: tempfile::TempDir,
+    _socket_tmp: short::ShortDir,
     socket_path: PathBuf,
     root: PathBuf,
     origin: String,

@@ -366,7 +366,16 @@ impl Conn {
         dir: &Path,
         dialect: Dialect,
     ) -> std::io::Result<Arc<Conn>> {
-        Self::make(label, alias, program, dir, dialect, true)
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        Self::make(
+            label,
+            alias,
+            program,
+            dir,
+            dialect,
+            true,
+            runtime.as_deref().map(Path::new),
+        )
     }
 
     fn make(
@@ -376,18 +385,19 @@ impl Conn {
         dir: &Path,
         dialect: Dialect,
         owned: bool,
+        runtime: Option<&Path>,
     ) -> std::io::Result<Arc<Conn>> {
         std::fs::create_dir_all(dir)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        let runtime = runtime.filter(|p| !p.as_os_str().is_empty());
         let socket = if !owned
             && runtime.is_none()
             && dir.join(format!("{label}.sock")).as_os_str().len() > socket_limit()
         {
             PathBuf::new()
         } else {
-            control_socket(dir, label, runtime.as_deref().map(Path::new))?
+            control_socket(dir, label, runtime)?
         };
         let (tx, _) = tokio::sync::watch::channel(false);
         Ok(Arc::new(Conn {
@@ -421,7 +431,16 @@ impl Conn {
         dir: &Path,
         dialect: Dialect,
     ) -> std::io::Result<Arc<Conn>> {
-        Self::make(label, alias, program, dir, dialect, false)
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        Self::make(
+            label,
+            alias,
+            program,
+            dir,
+            dialect,
+            false,
+            runtime.as_deref().map(Path::new),
+        )
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ConnState> {
@@ -1335,13 +1354,21 @@ mod tests {
 
     #[test]
     fn borrowed_long_path_without_runtime_connects_directly() {
-        if std::env::var_os("XDG_RUNTIME_DIR").is_some() {
-            return;
-        }
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join("d".repeat(120));
-        let conn = Conn::borrowed("r", "host", "ssh".into(), &dir, Dialect::Posix).unwrap();
-        assert!(conn.opts().iter().any(|o| o == "ControlPath=none"));
+        for runtime in [None, Some(Path::new(""))] {
+            let conn = Conn::make(
+                "r",
+                "host",
+                "ssh".into(),
+                &dir,
+                Dialect::Posix,
+                false,
+                runtime,
+            )
+            .unwrap();
+            assert!(conn.opts().iter().any(|o| o == "ControlPath=none"));
+        }
     }
 
     #[test]
@@ -1411,12 +1438,11 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
     fn long_control_socket_uses_private_runtime_and_is_stable() {
         let tmp = tempfile::tempdir().unwrap();
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        let runtime = Path::new("/proc/self/cwd").join(short::relative(tmp.path()));
+        let (_runtime_dir, runtime) = short::tempdir();
+        std::fs::set_permissions(&runtime, std::fs::Permissions::from_mode(0o700)).unwrap();
         let dir = tmp.path().join("d".repeat(120));
         std::fs::create_dir(&dir).unwrap();
         let first = control_socket(&dir, "remote", Some(&runtime)).unwrap();

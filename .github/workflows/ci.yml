@@ -105,7 +105,6 @@ jobs:
       - run: cargo test --workspace --locked
         env:
           HGL_AI_OOM_TESTS: "1"
-          TMPDIR: ${{ runner.temp }}
       - if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
         run: cargo clean --workspace
       - if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
