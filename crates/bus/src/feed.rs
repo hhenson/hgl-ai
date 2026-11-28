@@ -3,14 +3,15 @@
 //! `HGL_THREADS` and `HGL_METRICS` buckets. The meaning of the events is the `owner`
 //! crate's; this module moves bytes.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
 use async_nats::jetstream::{
-    self, AckKind,
+    self, AckKind, ErrorCode,
     context::{Publish, PublishErrorKind},
     message::StreamMessage,
-    stream::{DirectGetErrorKind, RawMessageErrorKind, Stream},
+    response::Response,
+    stream::{DirectGetErrorKind, RawMessage, RawMessageErrorKind, Stream},
 };
 use futures::StreamExt;
 use hgl_ai_proto::{
@@ -96,17 +97,7 @@ fn raw_msg(m: StreamMessage) -> StreamMsg {
     }
 }
 
-fn subject_matches(filter: &str, subject: &str) -> bool {
-    let mut tokens = subject.split('.');
-    for part in filter.split('.') {
-        match tokens.next() {
-            Some(_) if part == ">" => return true,
-            Some(t) if part == "*" || part == t => {}
-            _ => return false,
-        }
-    }
-    tokens.next().is_none()
-}
+const OWNER_GET: &str = "STREAM.MSG.GET.HGL_OWNER";
 
 /// A durable consumer of `HGL_OWNER` (the console's): every event once, in order, one
 /// in flight at a time.
@@ -143,7 +134,7 @@ impl Bus {
             .get_stream_no_info(STREAM_OWNER)
             .await
             .map_err(|e| nats("opening the owner stream", e))?;
-        self.owner_raw_at(&stream, seq)
+        self.owner_raw(&stream, seq, None)
             .await?
             .map(raw_msg)
             .ok_or_else(|| {
@@ -154,16 +145,74 @@ impl Bus {
             })
     }
 
-    async fn owner_raw_at<I>(&self, stream: &Stream<I>, seq: u64) -> Result<Option<StreamMessage>> {
-        let subject = self.api_subject(&format!("STREAM.MSG.GET.{STREAM_OWNER}"));
-        self.guarded(&subject, async {
-            match stream.get_raw_message(seq).await {
+    async fn owner_raw<I>(
+        &self,
+        stream: &Stream<I>,
+        seq: u64,
+        filter: Option<&str>,
+    ) -> Result<Option<StreamMessage>> {
+        self.guarded(&self.api_subject(OWNER_GET), async {
+            let message = match filter {
+                Some(filter) => stream.get_first_raw_message_by_subject(filter, seq).await,
+                None => stream.get_raw_message(seq).await,
+            };
+            match message {
                 Ok(m) => Ok(Some(m)),
                 Err(e) if e.kind() == RawMessageErrorKind::NoMessageFound => Ok(None),
                 Err(e) => Err(nats(&format!("reading owner event {seq}"), e)),
             }
         })
         .await
+    }
+
+    /// The first match at or after `since`. Older JetStream servers accept the
+    /// subject and sequence form, so the caller can apply the time cutoff there.
+    async fn first_owner_match(
+        &self,
+        stream: &Stream,
+        filter: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<StreamMessage>> {
+        let state = &stream.cached_info().state;
+        if (since.timestamp(), since.timestamp_subsec_nanos())
+            > (
+                state.first_timestamp.unix_timestamp(),
+                state.first_timestamp.nanosecond(),
+            )
+        {
+            #[derive(serde::Deserialize)]
+            struct Reply {
+                message: RawMessage,
+            }
+            let request = serde_json::json!({
+                "start_time": since.to_rfc3339(),
+                "next_by_subj": filter,
+            });
+            let response: Response<Reply> = self
+                .guarded(&self.api_subject(OWNER_GET), async {
+                    self.js
+                        .request(OWNER_GET, &request)
+                        .await
+                        .map_err(|e| nats("finding owner history by time", e))
+                })
+                .await?;
+            match response {
+                Response::Ok(reply) => {
+                    return StreamMessage::try_from(reply.message)
+                        .map(Some)
+                        .map_err(|e| nats("decoding an owner event", e));
+                }
+                Response::Err { error } if error.error_code() == ErrorCode::NO_MESSAGE_FOUND => {
+                    return Ok(None);
+                }
+                Response::Err { error } if error.error_code() == ErrorCode::INVALID_JSON => {}
+                Response::Err { error } => {
+                    return Err(nats("finding owner history by time", error));
+                }
+            }
+        }
+        self.owner_raw(stream, state.first_sequence, Some(filter))
+            .await
     }
 
     /// Publish one owner-channel event to `subject` (under `hgl.owner.` or `hgl.console.`)
@@ -348,31 +397,38 @@ impl Bus {
         max: usize,
     ) -> Result<Vec<StreamMsg>> {
         let state = &stream.cached_info().state;
-        let mut out = Vec::new();
         if state.messages == 0 {
-            return Ok(out);
+            return Ok(Vec::new());
         }
-        // Walk the retained interval newest first, with a bounded number of requests
-        // in flight. A deleted sequence is a hole, and new writes lie past the interval.
-        let since = (since.timestamp(), since.timestamp_subsec_nanos());
-        let mut messages =
-            futures::stream::iter((state.first_sequence..=state.last_sequence).rev())
-                .map(|seq| self.owner_raw_at(stream, seq))
-                .buffered(16);
-        while let Some(message) = messages.next().await {
-            let Some(m) = message? else { continue };
-            if (m.time.unix_timestamp(), m.time.nanosecond()) < since {
-                break;
-            }
-            if filters.is_empty() || filters.iter().any(|f| subject_matches(f, &m.subject)) {
-                out.push(raw_msg(m));
-                if out.len() == max {
+        // JetStream jumps to matching subjects, skipping holes and unrelated payloads.
+        // Keep only the newest unique sequences from the snapshot, even if filters overlap.
+        let mut newest = BTreeMap::new();
+        let cutoff = (since.timestamp(), since.timestamp_subsec_nanos());
+        for filter in filters
+            .iter()
+            .map(String::as_str)
+            .chain(filters.is_empty().then_some(">"))
+        {
+            let filter = if filter.is_empty() { ">" } else { filter };
+            let mut next = self.first_owner_match(stream, filter, since).await?;
+            while let Some(message) = next {
+                let seq = message.sequence;
+                if seq > state.last_sequence {
                     break;
                 }
+                if (message.time.unix_timestamp(), message.time.nanosecond()) >= cutoff {
+                    newest.insert(seq, message);
+                    if newest.len() > max {
+                        newest.pop_first();
+                    }
+                }
+                if seq == state.last_sequence {
+                    break;
+                }
+                next = self.owner_raw(stream, seq + 1, Some(filter)).await?;
             }
         }
-        out.reverse();
-        Ok(out)
+        Ok(newest.into_values().map(raw_msg).collect())
     }
 
     /// One thread record and its revision.
