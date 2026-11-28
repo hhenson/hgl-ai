@@ -6,7 +6,7 @@ import { TABLES } from "./tables";
 const NOW = Date.UTC(2026, 10, 28, 10, 0, 0);
 
 function store() {
-  const s = new Store({ staleAfterMs: 3 * 86_400_000 }, () => NOW, 1);
+  const s = new Store({ staleAfterMs: 3 * 86_400_000, hostsTtlMs: 120_000 }, () => NOW, 1);
   const seen: Record<string, Transaction[]> = {};
   for (const t of TABLES) s.subscribe(t.id, (tx) => (seen[t.id] ??= []).push(tx));
   return { s, seen };
@@ -115,5 +115,33 @@ describe("timestamps", () => {
     // The same second: the later line in landed.log is the newer.
     expect(byStamp("20261128T101005Z", "20261128T101005Z", { id: "a", order: 3 }, { id: "b", order: 4 })).toBeLessThan(0);
     expect(byStamp(null, "20261128T101005Z")).toBeLessThan(0);
+  });
+});
+
+describe("host records", () => {
+  const host = (h: string) => JSON.stringify({ host: h, seats: [], memcap_gb: 1, work_root_free_gb: 1, updated_at: "x" });
+
+  it("go when their heartbeat lapses, though expiry sends no delete", () => {
+    let now = NOW;
+    const s = new Store({ staleAfterMs: 86_400_000, hostsTtlMs: 120_000 }, () => now, 1);
+    s.put("HGL_HOSTS", "lab1", host("lab1"), NOW - 10_000);
+    s.put("HGL_HOSTS", "lab2", host("lab2"), NOW - 200_000);
+    s.flush();
+    expect(s.rows("hosts").map((r) => r.id)).toEqual(["lab1"]);
+    now = NOW + 115_000; // lab1's last heartbeat is now 125 s old
+    s.flush();
+    expect(s.rows("hosts")).toEqual([]);
+    s.put("HGL_HOSTS", "lab1", host("lab1"), now, true); // a heartbeat
+    s.flush();
+    expect(s.rows("hosts").map((r) => r.id)).toEqual(["lab1"]);
+  });
+
+  it("are aged on the hub's clock, not the page's", () => {
+    // The page's clock is 300 s ahead of the hub's: a live write shows it.
+    const s = new Store({ staleAfterMs: 86_400_000, hostsTtlMs: 120_000 }, () => NOW, 1);
+    s.put("HGL_HOSTS", "lab1", host("lab1"), NOW - 300_000 - 10_000);
+    s.put("HGL_STATE", "mode", "normal", NOW - 300_000, true);
+    s.flush();
+    expect(s.rows("hosts").map((r) => r.id)).toEqual(["lab1"]);
   });
 });

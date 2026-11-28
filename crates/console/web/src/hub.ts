@@ -29,7 +29,7 @@ async function watch(nc: NatsConnection, store: Store, bucket: Bucket, stopped: 
       // Nothing to catch up on: the bucket is empty, or its values have all come.
       let quiet = setTimeout(() => store.synced(bucket), 1500);
       for await (const e of iter) {
-        store.put(bucket, e.key, e.operation === "PUT" ? e.string() : null);
+        store.put(bucket, e.key, e.operation === "PUT" ? e.string() : null, e.created.getTime(), e.isUpdate);
         clearTimeout(quiet);
         if (e.isUpdate) store.synced(bucket);
         else quiet = setTimeout(() => store.synced(bucket), 1500);

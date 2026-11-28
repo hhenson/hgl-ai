@@ -144,6 +144,8 @@ async fn the_page_and_its_files_are_the_consoles_own() {
     assert_eq!(s["user"], "This Dude (owner@example.com)");
     assert_eq!(s["csrf"].as_str().unwrap().len(), 64, "{s}");
     assert!(s["open_questions"].is_null(), "no hub, no count");
+    assert_eq!(s["stale_after_secs"], 3 * 86_400, "[limits] stale_after");
+    assert_eq!(s["hosts_ttl_secs"], 120);
 
     // The viewer credential, for this signed-in page only, never cached.
     let r = b.get("/api/viewer").await;

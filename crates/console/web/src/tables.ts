@@ -158,6 +158,11 @@ export interface Context {
   staleAfterMs: number;
   /** Open questions by priority, from the console's API (the page cannot read threads). */
   openQuestions?: Record<string, number> | null;
+  /** A host or builder record lives this long without a heartbeat (`HOSTS_TTL`). */
+  hostsTtlMs: number;
+  /** When each `HGL_HOSTS` key was last written, on this page's clock. Its expiry sends
+   *  a watch nothing, so an older record is dropped here. */
+  hostsAt?: Map<string, number>;
 }
 
 /** Runs and landings shown; burndown days per repository. */
@@ -191,6 +196,8 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
   out.hosts = [];
   out.builders = [];
   for (const key of sortedKeys(raw.HGL_HOSTS)) {
+    const at = ctx.hostsAt?.get(key);
+    if (at !== undefined && ctx.now - at > ctx.hostsTtlMs) continue;
     const v = json(raw.HGL_HOSTS.get(key)!);
     if (!v) continue;
     if (key.startsWith("builder.")) {

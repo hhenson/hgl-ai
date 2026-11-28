@@ -35,7 +35,11 @@ export function App({ store }: { store: Store }) {
     return () => window.removeEventListener("hashchange", on);
   }, []);
   useEffect(() => {
-    store.setContext({ openQuestions: session.data?.open_questions ?? null });
+    const d = session.data;
+    store.setContext({
+      openQuestions: d?.open_questions ?? null,
+      ...(d ? { staleAfterMs: d.stale_after_secs * 1000, hostsTtlMs: d.hosts_ttl_secs * 1000 } : {}),
+    });
   }, [store, session.data]);
   useEffect(() => {
     if (!viewer.data) return;

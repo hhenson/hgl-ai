@@ -6,6 +6,8 @@ export interface Session {
   user: string;
   csrf: string;
   open_questions: Record<string, number> | null;
+  stale_after_secs: number;
+  hosts_ttl_secs: number;
 }
 
 async function get<T>(path: string): Promise<T> {

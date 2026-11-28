@@ -27,19 +27,34 @@ export class Store {
   private timer: ReturnType<typeof setTimeout> | null = null;
   /** Keys seen since a bucket's watch (re)started; the rest go when it has caught up. */
   private syncing = new Map<Bucket, Set<string>>();
+  /** When each `HGL_HOSTS` key was written, on the hub's clock. */
+  private hostsWritten = new Map<string, number>();
+  /** This page's clock minus the hub's, as live writes show it (the smallest gap seen). */
+  private skew: number | null = null;
   meta: Meta = { connection: "connecting", detail: "", updated: null, notes: {}, counts: {} };
 
   constructor(
-    private ctx: Omit<Context, "now"> = { staleAfterMs: 3 * 86_400_000 },
+    private ctx: Omit<Context, "now" | "hostsAt"> = { staleAfterMs: 3 * 86_400_000, hostsTtlMs: 120_000 },
     private now: () => number = Date.now,
     /** How long changes gather before the tables are derived again. */
     private delayMs = 50,
   ) {}
 
-  /** A value put (`value`) or deleted (`null`). */
-  put(bucket: Bucket, key: string, value: string | null): void {
+  /** A value put (`value`) or deleted (`null`); `written` is when the hub stored it, and
+   *  `live` whether it arrived as it happened (not while a watch caught up). */
+  put(bucket: Bucket, key: string, value: string | null, written?: number, live = false): void {
     if (value === null) this.raw[bucket].delete(key);
     else this.raw[bucket].set(key, value);
+    if (written !== undefined) {
+      if (live) {
+        const gap = this.now() - written;
+        this.skew = this.skew === null ? gap : Math.min(this.skew, gap);
+      }
+      if (bucket === "HGL_HOSTS") {
+        if (value === null) this.hostsWritten.delete(key);
+        else this.hostsWritten.set(key, written);
+      }
+    }
     this.syncing.get(bucket)?.add(key);
     this.meta = { ...this.meta, updated: this.now() };
     this.schedule();
@@ -58,7 +73,7 @@ export class Store {
     this.schedule();
   }
 
-  setContext(ctx: Partial<Omit<Context, "now">>): void {
+  setContext(ctx: Partial<Omit<Context, "now" | "hostsAt">>): void {
     this.ctx = { ...this.ctx, ...ctx };
     this.schedule();
   }
@@ -73,7 +88,9 @@ export class Store {
     if (this.timer) clearTimeout(this.timer);
     this.timer = null;
     const now = this.now();
-    const next = derive(this.raw, { ...this.ctx, now });
+    const skew = this.skew ?? 0;
+    const hostsAt = new Map([...this.hostsWritten].map(([k, t]) => [k, t + skew]));
+    const next = derive(this.raw, { ...this.ctx, now, hostsAt });
     for (const t of TABLES) {
       const tx = diffRows(this.rows_[t.id], next[t.id]);
       this.rows_[t.id] = next[t.id];

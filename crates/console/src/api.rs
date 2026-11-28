@@ -36,6 +36,11 @@ pub struct SessionOut {
     pub csrf: String,
     /// Open questions by priority (`p1`, `p2`, `p3`); absent while the hub is away.
     pub open_questions: Option<std::collections::BTreeMap<String, usize>>,
+    /// `[limits] stale_after`: a worktree older than this is stale.
+    pub stale_after_secs: u64,
+    /// How long a host or builder record lives without a heartbeat. Its expiry sends a
+    /// watch nothing, so the page drops a record older than this itself.
+    pub hosts_ttl_secs: u64,
 }
 
 /// `GET /api/session`
@@ -65,6 +70,8 @@ pub async fn session_info(State(app): AppState, h: HeaderMap) -> Response {
         user: app.auth.display(&s.user),
         csrf: s.csrf,
         open_questions,
+        stale_after_secs: app.cfg.stale_after().as_secs(),
+        hosts_ttl_secs: hgl_ai_bus::HOSTS_TTL.as_secs(),
     })
     .into_response()
 }
