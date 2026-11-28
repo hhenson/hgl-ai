@@ -2,9 +2,8 @@
 //! the rendered `nats.conf`: each role's permissions hold, and no seat can make a note or
 //! thread event that a seat's inbox or the console accepts as the owner's (OWN-5).
 
-use std::net::TcpListener;
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use hgl_ai_bus::{Bus, BusError, Credential};
@@ -32,14 +31,6 @@ struct Hub {
     accounts: bool,
     /// The WebSocket listener the console's page reads through.
     ws: Websocket,
-}
-
-fn free_port() -> u16 {
-    TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port()
 }
 
 impl Hub {
@@ -104,9 +95,9 @@ impl Hub {
         for name in omit {
             assert!(reg.remove(name), "{name}");
         }
-        let port = free_port();
-        let ws = Websocket {
-            port: free_port(),
+        // -1 asks nats-server to bind an ephemeral port itself.
+        let mut ws = Websocket {
+            port: 0,
             origins: vec!["http://localhost".into()],
         };
         let conf = d.path().join("nats.conf");
@@ -117,29 +108,67 @@ impl Hub {
                 &reg,
                 render_conf_ws(
                     "127.0.0.1",
-                    port,
+                    0,
                     &d.path().join("store"),
                     &Hub::auth(accounts, &reg),
                     Some(&ws),
                 ),
-            ),
+            )
+            .replace("port: 0\n", "port: -1\n"),
         )
         .unwrap();
+        let stderr_path = d.path().join("stderr.log");
+        let stderr = std::fs::File::create(&stderr_path).unwrap();
         let child = Command::new(bin)
             .arg("-c")
             .arg(&conf)
+            .arg("--ports_file_dir")
+            .arg(d.path())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::from(stderr))
             .spawn()
             .unwrap();
         let store = d.path().join("store");
         let conf_path = conf.clone();
-        let server = Server(child, d);
-        let up = (0..200).any(|_| {
+        let mut server = Server(child, d);
+        let ports_path = server
+            .1
+            .path()
+            .join(format!("nats-server_{}.ports", server.0.id()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let ports = loop {
+            let status = server.0.try_wait().expect("check nats-server status");
+            if status.is_some() || Instant::now() >= deadline {
+                if status.is_none() {
+                    let _ = server.0.kill();
+                }
+                let status =
+                    status.unwrap_or_else(|| server.0.wait().expect("wait for nats-server"));
+                let stderr = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+                panic!(
+                    "nats-server startup failed (status: {status}; timeout: {}):\n{stderr}",
+                    Instant::now() >= deadline
+                );
+            }
+            if let Ok(contents) = std::fs::read(&ports_path)
+                && let Ok(ports) = serde_json::from_slice::<serde_json::Value>(&contents)
+            {
+                break ports;
+            }
             std::thread::sleep(Duration::from_millis(50));
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-        });
-        assert!(up, "nats-server did not start");
+        };
+        let port_from = |key: &str| -> u16 {
+            ports[key][0]
+                .as_str()
+                .expect("listener URL")
+                .rsplit_once(':')
+                .expect("listener port")
+                .1
+                .parse()
+                .expect("valid listener port")
+        };
+        let port = port_from("nats");
+        ws.port = port_from("websocket");
         Some(Hub {
             _server: server,
             url: format!("nats://127.0.0.1:{port}"),
