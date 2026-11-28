@@ -215,9 +215,6 @@ pub async fn run(
         .await
         {
             Ok(adapter) => {
-                while !record_startup(&bus, None).await {
-                    sleep(slack_retry.delay(None)).await;
-                }
                 break adapter;
             }
             Err(e) => {
@@ -226,7 +223,11 @@ pub async fn run(
             }
         }
     };
-    tokio::join!(adapter.outbound_loop(), adapter.socket_loop());
+    tokio::join!(
+        adapter.outbound_loop(),
+        adapter.socket_loop(),
+        clear_startup(&bus)
+    );
     Ok(())
 }
 
@@ -242,15 +243,19 @@ async fn startup_failure(bus: &Bus, retries: &mut Backoff, error: &anyhow::Error
 
 async fn record_startup(bus: &Bus, error: Option<String>) -> bool {
     let value = error.as_deref().unwrap_or("ok");
-    if bus
-        .state_put(hgl_ai_proto::SLACK_STARTUP_KEY, value)
-        .await
-        .is_err()
-    {
-        tracing::warn!("could not write Slack startup status to the hub");
+    if let Err(error) = bus.state_put(hgl_ai_proto::SLACK_STARTUP_KEY, value).await {
+        tracing::warn!("could not write Slack startup status to the hub: {error}");
         return false;
     }
     true
+}
+
+// A refused or temporarily unavailable status write must not stall the adapter.
+async fn clear_startup(bus: &Bus) {
+    let mut retry = Backoff::default();
+    while !record_startup(bus, None).await {
+        sleep(retry.delay(None)).await;
+    }
 }
 
 fn retry_delay(retries: &mut Backoff, error: Option<anyhow::Error>, operation: &str) -> Duration {

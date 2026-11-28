@@ -762,6 +762,24 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             ),
             Ok(_) => Check::ok("hub", format!("{} (stream and buckets present)", c.hub.url)),
         });
+        let slack = (c
+            .server
+            .as_ref()
+            .is_some_and(|server| server.units == hgl_ai_config::Units::System)
+            && c.slack.is_some())
+            || su.as_ref().is_some_and(|user| user.slack);
+        if reached && slack {
+            let log = service::system_log_hint(env.os, Service::Slack);
+            out.push(match hub.slack_startup(c).await {
+                Ok(Some(error)) if error != "ok" => Check::warn(
+                    "Slack startup", error,
+                    format!("logs: {log}; for missing_scope, use groups:history, chat:write and app_mentions:read; the app token needs connections:write; remove channels:history, im:history and mpim:history, then reinstall the app. If the channel was made private, check its scopes and app membership; for not_in_channel invite the app; for channel_not_found check the channel ID"),
+                ),
+                Ok(Some(_)) => Check::ok("Slack startup", "startup succeeded"),
+                Ok(None) => Check::warn("Slack startup", "no startup status recorded", format!("logs: {log}; check that the adapter is running and refresh hub user permissions with `hgl-ai server install --slack --keep-token`")),
+                Err(_) => Check::warn("Slack startup", "cannot read startup status", "check hub connectivity and refresh hub user permissions with `hgl-ai server install --slack --keep-token`"),
+            });
+        }
         // A hub whose `nats.conf` predates per-user inboxes lets every user read every
         // client's JetStream and KV replies (hgl-ai#111). The file when this host has it;
         // else the live hub, as on a system install, whose `nats.conf` is not readable.
@@ -899,17 +917,6 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         }
         if slack {
             svcs.push((Service::Slack, "`hgl-ai server install --slack`".into()));
-        }
-        if slack {
-            let log = service::system_log_hint(env.os, Service::Slack);
-            out.push(match hub.slack_startup(c).await {
-                Ok(Some(error)) => Check::warn(
-                    "Slack startup", error,
-                    format!("logs: {log}; for missing_scope, use groups:history, chat:write and app_mentions:read; the app token needs connections:write; remove channels:history, im:history and mpim:history, then reinstall the app. If the channel was made private, check its scopes and app membership; for not_in_channel invite the app; for channel_not_found check the channel ID"),
-                ),
-                Ok(None) => Check::ok("Slack startup", "no recorded startup error"),
-                Err(_) => Check::warn("Slack startup", "cannot read startup status", "check hub connectivity and refresh hub user permissions with `hgl-ai server install --slack --keep-token`"),
-            });
         }
         // The client's own services (bridge, builder) are never the server user's.
         let client = |s: Service| matches!(s, Service::Bridge | Service::Builder);
@@ -1389,7 +1396,19 @@ mod tests {
         let startup = get(&cs, "Slack startup");
         assert_eq!(startup.level, Level::Ok);
         assert!(startup.fix.is_none());
+        let offline_hub = FakeHub::down();
+        let offline_checks = run(&f, &offline_hub).await;
+        assert!(!offline_hub.calls.borrow().contains(&"slack_startup"));
+        assert!(
+            !offline_checks
+                .iter()
+                .any(|check| check.name == "Slack startup")
+        );
         let mut hub = FakeHub::up();
+        hub.slack_error = None;
+        let unrecorded = get(&run(&f, &hub).await, "Slack startup");
+        assert_eq!(unrecorded.level, Level::Warn);
+        assert!(unrecorded.detail.contains("no startup status"));
         hub.slack_error = Some("conversations.history: missing_scope".into());
         let checks = run(&f, &hub).await;
         let startup = get(&checks, "Slack startup");
@@ -1528,7 +1547,7 @@ mod tests {
             name: "hgl-ai".into(),
             home: "/var/lib/hgl-ai".into(),
             console_url: None,
-            slack: false,
+            slack: true,
             client_user: Some("agents".into()),
         });
         crate::save_config(&f, &f.env, &cfg).unwrap();
@@ -1560,7 +1579,9 @@ mod tests {
                 _ => Output::success(""),
             }
         });
-        let cs = run(&f, &FakeHub::down()).await;
+        let offline_hub = FakeHub::down();
+        let cs = run(&f, &offline_hub).await;
+        assert!(!offline_hub.calls.borrow().contains(&"slack_startup"));
         let names: Vec<&str> = cs.iter().map(|c| c.name.as_str()).collect();
         let cu = cs.iter().find(|c| c.name == "client user").unwrap();
         assert_eq!(cu.level, Level::Ok);
@@ -1573,6 +1594,7 @@ mod tests {
             "token",
             "hub",
             "hub auth",
+            "Slack startup",
             "cli claude",
             "cli codex",
             "skill claude",

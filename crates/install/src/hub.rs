@@ -18,7 +18,7 @@ pub trait Hub {
     fn provision(&self, cfg: &Config) -> impl Future<Output = Result<(), BusError>>;
     /// Doctor: `Err` when unreachable, else the stream and buckets that are missing.
     fn health(&self, cfg: &Config) -> impl Future<Output = Result<Vec<String>, String>>;
-    /// Last Slack startup error, if one is recorded.
+    /// Slack startup status: `None` if unrecorded, `ok` on success, otherwise the error.
     fn slack_startup(&self, cfg: &Config) -> impl Future<Output = Result<Option<String>, String>>;
     /// Doctor: `Some(true)` when the hub lets this host's hub user subscribe to `_INBOX.>`,
     /// every client's replies (a `nats.conf` from before hgl-ai#111), `Some(false)` when it
@@ -100,7 +100,7 @@ impl Hub for BusHub {
         let bus = Bus::connect(cfg).await.map_err(|e| e.to_string())?;
         bus.state_get(hgl_ai_proto::SLACK_STARTUP_KEY)
             .await
-            .map(|record| record.and_then(|entry| (entry.value != "ok").then_some(entry.value)))
+            .map(|record| record.map(|entry| entry.value))
             .map_err(|e| e.to_string())
     }
 
@@ -216,7 +216,7 @@ pub(crate) mod fake {
             FakeHub {
                 reachable: true,
                 missing: Vec::new(),
-                slack_error: None,
+                slack_error: Some("ok".into()),
                 durables: Vec::new(),
                 calls: RefCell::new(Vec::new()),
                 creds: RefCell::new(Vec::new()),

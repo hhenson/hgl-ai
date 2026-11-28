@@ -1102,6 +1102,28 @@ async fn startup_retry_logs_and_persists_error_then_clears_it() {
     );
     assert!(record_startup(&slack, None).await);
     assert_eq!(seat.state_get(key).await.unwrap().unwrap().value, "ok");
+    let denied = hub.bus("console").await;
+    assert!(!record_startup(&denied, None).await);
+    let logged = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    assert!(
+        logged.contains("could not write Slack startup status to the hub:"),
+        "{logged}"
+    );
+    let clearing = clear_startup(&denied);
+    let progress = async {
+        sleep(Duration::from_millis(50)).await;
+        true
+    };
+    let ((), progressed) = tokio::join!(
+        async {
+            assert!(timeout(Duration::from_millis(300), clearing).await.is_err());
+        },
+        progress
+    );
+    assert!(
+        progressed,
+        "a refused status write must not block adapter work"
+    );
 }
 
 #[tokio::test]
