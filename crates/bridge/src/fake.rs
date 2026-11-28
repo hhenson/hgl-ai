@@ -56,6 +56,8 @@ struct Inner {
     refresh_down: AtomicBool,
     /// Lease takes refused while `refresh_down`.
     takes_refused: AtomicU64,
+    /// Lease refreshes hang, as when the hub stalls silently.
+    refresh_hangs: AtomicBool,
     /// `HGL_LOCKS` max_age in milliseconds; 0 is the protocol's.
     lease_max_age_ms: AtomicU64,
 }
@@ -215,6 +217,14 @@ impl FakeBus {
         self.0.takes_refused.load(Ordering::SeqCst)
     }
 
+    /// Lease refreshes hang (`true`) until it is cleared, or work. Set under the leases'
+    /// lock, which a refresh checks it under again after waiting: once this returns no
+    /// refresh that has not yet taken the lock answers.
+    pub fn refresh_hangs(&self, hang: bool) {
+        let _leases = g(&self.0.leases);
+        self.0.refresh_hangs.store(hang, Ordering::SeqCst);
+    }
+
     /// The `max_age` of `HGL_LOCKS` the bridge reads.
     pub fn set_lease_max_age(&self, d: Duration) {
         self.0
@@ -330,13 +340,17 @@ pub struct FakeLease {
     rev: u64,
 }
 
-impl LeaseApi for FakeLease {
-    async fn refresh(&mut self) -> Result<()> {
+impl FakeLease {
+    /// One refresh under the leases' guard; `None` when it hangs again.
+    fn refresh_once(&mut self) -> Option<Result<()>> {
         let mut leases = g(&self.bus.0.leases);
-        if self.bus.0.refresh_down.load(Ordering::SeqCst) {
-            return Err(no_responders());
+        if self.bus.0.refresh_hangs.load(Ordering::SeqCst) {
+            return None;
         }
-        match leases.get_mut(&self.name) {
+        if self.bus.0.refresh_down.load(Ordering::SeqCst) {
+            return Some(Err(no_responders()));
+        }
+        Some(match leases.get_mut(&self.name) {
             Some((_, rev)) if *rev == self.rev => {
                 *rev = self.bus.0.revision.fetch_add(1, Ordering::SeqCst) + 1;
                 self.rev = *rev;
@@ -346,6 +360,21 @@ impl LeaseApi for FakeLease {
             _ => Err(BusError::LeaseLost {
                 name: self.name.clone(),
             }),
+        })
+    }
+}
+
+impl LeaseApi for FakeLease {
+    async fn refresh(&mut self) -> Result<()> {
+        loop {
+            // Wait without the leases' guard (it is not held across an await), then check
+            // again under it: a hang set in between holds this refresh too.
+            while self.bus.0.refresh_hangs.load(Ordering::SeqCst) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            if let Some(r) = self.refresh_once() {
+                return r;
+            }
         }
     }
     async fn release(self) -> Result<bool> {

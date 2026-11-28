@@ -160,6 +160,7 @@ impl GateArgs {
                 no_update: self.no_update,
                 closes: self.closes,
                 tool_made: false,
+                merge_until: None,
             },
             closes: self.closes,
             what: self.what.clone(),

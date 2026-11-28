@@ -135,6 +135,17 @@ controller = "controller"              # default; the seat that gets the bridge'
 [github.gate.hgl-compiler]             # per repository; every key optional
 review_receipt = true                  # default: a clean receipt from another family (ROLE-11)
 verdicts = ["linux", "mac", "windows"] # local build verdicts the merge needs
+checks = ["lint", "test (ubuntu-latest)", "cpp (plain, runtime and core)", "cpp (plain, sdk)",
+          "cpp (sanitize, runtime and core)", "cpp (sanitize, sdk)"]   # required (ROLE-20)
+
+[github.gate.hgl-ai]
+checks = ["lint", "test (ubuntu-latest)", "test (macos-latest)"]
+
+[github.gate.hgl-project]
+checks = ["docs/readthedocs.org:hgl-project"]   # a commit status
+
+[github.gate.homebrew-hgraph]
+checks = ["linux-formula"]                      # hgl_spec, hgl_core: none
 
 [models.claude]
 frontier = "claude-opus-5-5"

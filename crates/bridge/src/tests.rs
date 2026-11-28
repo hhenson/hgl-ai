@@ -2323,6 +2323,72 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
     stop(tx, j).await;
 }
 
+/// hgl-ai#65: the hub stalls silently, so every refresh hangs until it times out (`every`).
+/// The refreshes run at once, so with any number of seats each stops before its lease can
+/// expire: its last refresh was at most `every` before the stall, at `every == max_age / 6`.
+async fn hanging_refreshes_stop_every_seat_before_its_lease_can_expire(n: usize) {
+    let mut h = harness();
+    let max_age = Duration::from_secs(3);
+    let every = max_age / 6;
+    h.bus.set_lease_max_age(max_age);
+    h.opts.heartbeat_every = every;
+    let names: Vec<String> = (1..=n).map(|i| format!("w{i}")).collect();
+    let w = h.cfg.seats[0].clone();
+    h.cfg.seats = names
+        .iter()
+        .map(|name| {
+            let mut s = w.clone();
+            s.name = seat(name);
+            s
+        })
+        .collect();
+    h.cfg.validate().unwrap();
+    let only: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (tx, j) = h.start(&only);
+    eventually("every seat served", || {
+        h.bus.last_host().is_some_and(|r| r.seats.len() == n)
+            && names
+                .iter()
+                .all(|s| h.bus.lease_holder(&format!("seat.{s}")).is_some())
+    })
+    .await;
+    h.bus.refresh_hangs(true);
+    let cut = std::time::Instant::now();
+    eventually("every seat stopped", || {
+        let told = h.bus.sent_containing("was not refreshed for");
+        names
+            .iter()
+            .all(|s| told.iter().any(|t| t.sender.as_str() == s))
+    })
+    .await;
+    let took = cut.elapsed();
+    assert!(
+        took < max_age - every,
+        "{n} seats: the last stopped after {took:?}, when its lease could have expired"
+    );
+    assert!(
+        took >= max_age / 2 - every,
+        "{n} seats: not before the deadline: {took:?}"
+    );
+    h.bus.refresh_hangs(false);
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hanging_refresh_stops_one_seat_before_its_lease_can_expire() {
+    hanging_refreshes_stop_every_seat_before_its_lease_can_expire(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_refreshes_stop_three_seats_before_their_leases_can_expire() {
+    hanging_refreshes_stop_every_seat_before_its_lease_can_expire(3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_refreshes_stop_twenty_seats_before_their_leases_can_expire() {
+    hanging_refreshes_stop_every_seat_before_its_lease_can_expire(20).await;
+}
+
 /// The bot's P2: a removal on `landed` that fails (here the salvage patch cannot be written)
 /// is not forgotten once the end is recorded: it is tried again until it works, and
 /// reported then.

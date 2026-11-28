@@ -213,6 +213,7 @@ async fn land_locked<G: Gh>(
         return Ok(done);
     }
     let deadline = Instant::now() + o.timeout;
+    let gate_opts = with_deadline(&o.gate, deadline);
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
     {
         let after = Vec::new();
@@ -246,7 +247,7 @@ async fn land_locked<G: Gh>(
             repo,
             number,
             head,
-            &o.gate,
+            &gate_opts,
             true,
             Some(lock),
         )
@@ -303,6 +304,15 @@ async fn resume_recorded<G: Gh>(
     eprintln!("{}", outcome.line);
     let (after, what) = after_merge(gh, s, bus, repo, number, &outcome, o, lock, Some(p)).await?;
     Ok(Some((Landing { outcome, after }, what)))
+}
+
+/// The gate's options with the landing's `deadline`, which bounds the poll of an accepted
+/// merge (with the lock's lease, taken at the merge: [`crate::merge::until`]).
+fn with_deadline(gate: &gate::Opts, deadline: Instant) -> gate::Opts {
+    gate::Opts {
+        merge_until: Some(tokio::time::Instant::from_std(deadline)),
+        ..*gate
+    }
 }
 
 /// After the gate decided, under the lock: a merge's steps; a pull request found merged
@@ -409,6 +419,7 @@ pub(crate) async fn merge_locked<G: Gh>(
         match resume_recorded(gh, s, bus, repo, number, o, lock).await? {
             Some(done) => done,
             None => {
+                let gate_opts = with_deadline(&o.gate, Instant::now() + o.timeout);
                 let outcome = gate::evaluate(
                     gh,
                     s,
@@ -416,7 +427,7 @@ pub(crate) async fn merge_locked<G: Gh>(
                     repo,
                     number,
                     head,
-                    &o.gate,
+                    &gate_opts,
                     true,
                     Some(lock),
                 )
@@ -905,6 +916,8 @@ mod tests {
                 .on("pulls/7", &fixture("pr-open.json"))
                 .on("issues/7/comments", &fixture("comments-clean.json"))
                 .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+                .on("check-runs", "{\"check_runs\":[]}")
+                .on("/status?per_page", "{\"statuses\":[]}")
                 .on("git/ref/heads/main", &main)
                 .on("graphql", "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}"),
         );
