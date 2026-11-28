@@ -40,16 +40,20 @@ pub enum Role {
     Builder,
     /// The owner's console: the owner's subjects, `HGL_THREADS`, `tick` notes.
     Console,
+    /// The console's page in a browser, over WebSocket (docs/owner.md §3): reads and
+    /// watches [`VIEWER_BUCKETS`] and nothing else; no write of any kind.
+    Viewer,
     /// Everything: provisioning the stream and buckets (`hgl-ai init`, `server install`).
     Admin,
 }
 
 impl Role {
-    pub const ALL: [Role; 5] = [
+    pub const ALL: [Role; 6] = [
         Role::Seat,
         Role::Coord,
         Role::Builder,
         Role::Console,
+        Role::Viewer,
         Role::Admin,
     ];
 
@@ -59,6 +63,7 @@ impl Role {
             Role::Coord => "coord",
             Role::Builder => "builder",
             Role::Console => "console",
+            Role::Viewer => "viewer",
             Role::Admin => "admin",
         }
     }
@@ -77,7 +82,7 @@ impl FromStr for Role {
             .into_iter()
             .find(|r| r.as_str() == s)
             .ok_or_else(|| {
-                format!("unknown hub role {s:?}: seat, coord, builder, console or admin")
+                format!("unknown hub role {s:?}: seat, coord, builder, console, viewer or admin")
             })
     }
 }
@@ -248,9 +253,39 @@ fn pull_from(stream: &str) -> [String; 2] {
     ]
 }
 
+/// The buckets the viewer reads: the telemetry (docs/owner.md §3).
+pub const VIEWER_BUCKETS: [&str; 6] =
+    [KV_HOSTS, KV_TREES, KV_STATE, KV_METRICS, KV_BUILD, KV_USAGE];
+
+/// The viewer's publishes: what reading and watching [`VIEWER_BUCKETS`] needs (bucket
+/// status, direct gets, the ordered push consumer a watch makes and its flow control),
+/// on those buckets' streams only. No consumer delete, no durable, no other stream.
+fn viewer() -> Permissions {
+    let mut allow = vec!["$JS.API.INFO".to_string(), "$JS.FC.>".to_string()];
+    for b in VIEWER_BUCKETS {
+        let s = kv(b);
+        allow.extend([
+            format!("$JS.API.STREAM.INFO.{s}"),
+            format!("$JS.API.DIRECT.GET.{s}"),
+            format!("$JS.API.DIRECT.GET.{s}.>"),
+            format!("$JS.API.STREAM.MSG.GET.{s}"),
+            format!("$JS.API.CONSUMER.CREATE.{s}"),
+            format!("$JS.API.CONSUMER.CREATE.{s}.>"),
+            format!("$JS.API.CONSUMER.INFO.{s}.*"),
+        ]);
+    }
+    Permissions {
+        publish_allow: allow,
+        publish_deny: Vec::new(),
+        subscribe_allow: vec!["_INBOX.>".into()],
+    }
+}
+
 pub fn permissions(role: Role) -> Option<Permissions> {
-    if role == Role::Admin {
-        return None;
+    match role {
+        Role::Admin => return None,
+        Role::Viewer => return Some(viewer()),
+        _ => {}
     }
     // Reads everyone needs: stream and bucket lookups, direct gets, consumer state,
     // flow control of the ordered consumers that list a bucket's keys.
@@ -351,7 +386,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             allow.push(format!("$KV.{KV_STATE}.decisions.log"));
             allow.push(format!("$KV.{KV_CONSOLE}.>"));
         }
-        Role::Admin => unreachable!(),
+        Role::Viewer | Role::Admin => unreachable!(),
     }
     Some(Permissions {
         publish_allow: allow,

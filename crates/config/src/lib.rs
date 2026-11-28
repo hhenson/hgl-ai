@@ -391,7 +391,14 @@ pub struct Server {
     /// Where the hub's services are installed.
     #[serde(default, skip_serializing_if = "Units::is_user")]
     pub units: Units,
+    /// The loopback WebSocket port the console's page reads the hub through (docs/owner.md
+    /// §3), served at `<console url>/nats`; `server install` sets it with the console.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub websocket_port: Option<u16>,
 }
+
+/// The WebSocket port `server install` picks when the console is installed.
+pub const DEFAULT_WEBSOCKET_PORT: u16 = 4223;
 
 /// `users`: a hub user per client with its role's permissions (OWN-5); `token`: one
 /// shared token, every client alike (older installs; `doctor` warns).
@@ -417,6 +424,7 @@ impl Default for Server {
             nats_version: "2.15.3".into(),
             auth: HubAuth::Users,
             units: Units::User,
+            websocket_port: None,
         }
     }
 }

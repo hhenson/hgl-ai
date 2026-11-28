@@ -47,6 +47,7 @@ impl Hub {
             ("hub-coord", Role::Coord),
             ("lab1-builder", Role::Builder),
             ("console", Role::Console),
+            ("viewer", Role::Viewer),
             ("hub-admin", Role::Admin),
         ] {
             let text = reg.issue(name, role, false).unwrap();
@@ -130,6 +131,16 @@ impl Hub {
 
 fn seat(s: &str) -> Seat {
     Seat::new(s).unwrap()
+}
+
+/// Refused: the API's permission error, or, where the server drops the lookup itself
+/// (a stream the user may not even look up), no answer.
+fn refused(r: Result<impl std::fmt::Debug, BusError>) {
+    match r {
+        Err(BusError::Denied { .. }) => {}
+        Err(e) if e.to_string().contains("timed out") => {}
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }
 
 fn denied(r: Result<impl std::fmt::Debug, BusError>) -> String {
@@ -559,4 +570,149 @@ async fn only_builders_write_verdicts() {
     let n = Note::new(seat("builder-lab1"), seat("controller"), Kind::Note, "x");
     builder.send(&n).await.unwrap();
     denied(builder.build_put("recipe.demo", b"repo = \"evil\"").await);
+}
+
+/// The console's page reads and watches the telemetry buckets as `viewer`, and can do
+/// nothing else: no write, no notes, no threads, no console state, no other stream.
+#[tokio::test]
+async fn the_viewer_reads_the_telemetry_and_nothing_else() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let seat_bus = hub.bus("build-1").await;
+    seat_bus.state_put("mode", "normal").await.unwrap();
+    seat_bus
+        .send(&Note::new(seat("w1"), seat("w2"), Kind::Note, "hello"))
+        .await
+        .unwrap();
+    hub.bus("console")
+        .await
+        .console_put("session.x", &serde_json::json!({"secret": 1}))
+        .await
+        .unwrap();
+    let v = hub.bus("viewer").await;
+    assert_eq!(v.who(), "hub user viewer (viewer)");
+
+    // Reads: a value, each bucket's keys.
+    assert_eq!(v.state_get("mode").await.unwrap().unwrap().value, "normal");
+    v.hosts().await.unwrap();
+    v.trees().await.unwrap();
+    v.metrics().await.unwrap();
+    v.usage().await.unwrap();
+    v.builders().await.unwrap();
+    v.build_keys("run.").await.unwrap();
+
+    // A watch (what the page does) sees a later write.
+    let raw = hub.raw("viewer").await;
+    let js = async_nats::jetstream::new(raw.clone());
+    let kv = js.get_key_value("HGL_STATE").await.unwrap();
+    let mut watch = kv.watch_all().await.unwrap();
+    seat_bus.state_put("hold", "landing").await.unwrap();
+    let got = tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(e) = watch.next().await {
+            let e = e.unwrap();
+            if e.key == "hold" {
+                return e;
+            }
+        }
+        panic!("the watch ended")
+    })
+    .await
+    .expect("the watch sees the write");
+    assert_eq!(&got.value[..], b"landing");
+
+    // No write of any kind.
+    denied(v.state_put("mode", "drain").await);
+    denied(
+        v.send(&Note::new(seat("w1"), seat("w2"), Kind::Note, "forged"))
+            .await,
+    );
+    denied(
+        v.metrics_put(&MetricsSample {
+            repo: "alpha".into(),
+            date: "20261128".into(),
+            open: 1,
+            opened: 0,
+            closed: 0,
+            labels: Default::default(),
+            taken_at: "20261128T000000Z".into(),
+        })
+        .await,
+    );
+    denied(v.build_put("run.x", b"{}").await);
+    // Nothing outside the telemetry: notes, threads, the console's state.
+    refused(
+        v.history(
+            hgl_ai_proto::STREAM_NOTES,
+            "hgl.notes.>",
+            chrono::DateTime::UNIX_EPOCH,
+            10,
+        )
+        .await
+        .map(|h| h.len()),
+    );
+    refused(v.threads::<serde_json::Value>().await);
+    refused(v.console_list::<serde_json::Value>("session.").await);
+    // Not even a direct get on the console's bucket, or a consumer delete.
+    for subject in [
+        "$JS.API.DIRECT.GET.KV_HGL_CONSOLE.$KV.HGL_CONSOLE.session.x",
+        "$JS.API.STREAM.MSG.GET.KV_HGL_THREADS",
+        "$JS.API.CONSUMER.DELETE.KV_HGL_STATE.any",
+        "$JS.API.STREAM.PURGE.KV_HGL_STATE",
+        "$KV.HGL_STATE.mode",
+        "hgl.notes.w1",
+        "hgl.owner.x",
+    ] {
+        // Allowed, each of these gets an answer (the API, or a stream's ack); refused, the
+        // server drops it and nothing answers.
+        let r =
+            tokio::time::timeout(Duration::from_secs(1), raw.request(subject, "{}".into())).await;
+        assert!(
+            matches!(r, Err(_) | Ok(Err(_))),
+            "{subject}: answered {r:?}"
+        );
+    }
+    // A consumer aimed at a notes subject instead of the viewer's inbox does not make the
+    // server write a note for it (a push consumer delivers only to subscribers, and the
+    // viewer may subscribe to its inbox only).
+    let before = seat_bus
+        .history(
+            hgl_ai_proto::STREAM_NOTES,
+            "hgl.notes.>",
+            chrono::DateTime::UNIX_EPOCH,
+            100,
+        )
+        .await
+        .unwrap()
+        .len();
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        raw.request(
+            "$JS.API.CONSUMER.CREATE.KV_HGL_STATE",
+            serde_json::json!({"stream_name": "KV_HGL_STATE", "config": {
+                "deliver_subject": "hgl.notes.w9", "deliver_policy": "all", "ack_policy": "none"
+            }})
+            .to_string()
+            .into(),
+        ),
+    )
+    .await;
+    assert!(matches!(r, Ok(Ok(_))), "{r:?}");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let after = seat_bus
+        .history(
+            hgl_ai_proto::STREAM_NOTES,
+            "hgl.notes.>",
+            chrono::DateTime::UNIX_EPOCH,
+            100,
+        )
+        .await
+        .unwrap()
+        .len();
+    assert_eq!(after, before, "no note from the viewer's consumer");
+    assert_eq!(
+        seat_bus.state_get("mode").await.unwrap().unwrap().value,
+        "normal",
+        "nothing the viewer did changed a value"
+    );
 }
