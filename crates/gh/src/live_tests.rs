@@ -513,17 +513,12 @@ async fn a_lost_landing_lock_stops_the_landing() {
 
     // Merged already: nothing is recorded under a lost lock.
     let gh = mergeable().on("contents/", "{}");
-    let merged = crate::gate::Outcome {
-        kind: crate::gate::Kind::Merged,
-        line: "merged".into(),
-        retry: false,
-        merge_commit: Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed".into()),
-        head: HEAD.into(),
-    };
-    let mut p = crate::progress::Progress::new(HEAD, None);
+    let m = crate::gate::LandedMerge::for_test(HEAD, "01e99ea5e46457bac035ca8a2699b6b6575b32ed");
+    let merged = crate::gate::Outcome::landed(crate::gate::Kind::Merged, "merged".into(), &m);
+    let mut p = crate::progress::Progress::intent(HEAD);
     let mut lines = Vec::new();
     let r = land::after_merge(
-        &gh, &s, &a, "alpha", 7, &merged, &o, &held, &mut p, &mut lines,
+        &gh, &s, &a, "alpha", 7, &merged, &m, &o, &held, &mut p, &mut lines,
     )
     .await;
     match r {
@@ -1318,7 +1313,7 @@ async fn a_merge_still_pending_keeps_its_record() {
         .await
         .unwrap()
         .expect("the record is kept");
-    assert_eq!((rec.head.as_str(), rec.merge.as_deref()), (HEAD, None));
+    assert_eq!((rec.head.as_str(), rec.merge()), (HEAD, None));
     // The lock is free again.
     LandLock::acquire(&b, "alpha", "other", Duration::ZERO)
         .await
@@ -1384,11 +1379,7 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(
-        (rec.head.as_str(), rec.merge.as_deref()),
-        (HEAD, None),
-        "the intent"
-    );
+    assert_eq!((rec.head.as_str(), rec.merge()), (HEAD, None), "the intent");
     assert!(b.state_get(state::KEY_MAIN).await.unwrap().is_none());
 
     let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
@@ -1425,12 +1416,34 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         "done"
     );
 
-    // Asked with an older head (the gate updated the branch before the merge): the merged
-    // head is reported, and the line ends in its status word (r6 on #133).
+    // Asked with an older head (the gate updated the branch before the merge): not
+    // adopted (hgl-ai#123, confirm_merge). BLOCKED names the merged head, and asked with it
+    // the landing is found finished, its line ending in its status word (r6 on #133).
     let older = "e".repeat(40);
-    let again = land::land(&gh, &s, &b, "alpha", 7, &older, &o)
-        .await
-        .unwrap();
+    for again in [
+        land::land(&gh, &s, &b, "alpha", 7, &older, &o)
+            .await
+            .unwrap(),
+        land::merge_once(&gh, &s, &b, "alpha", 7, &older, &o)
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(
+            again.outcome.kind,
+            crate::gate::Kind::Blocked,
+            "{}",
+            again.outcome.line
+        );
+        assert!(
+            again
+                .outcome
+                .line
+                .contains(&format!("merged at {} into main", crate::short(HEAD))),
+            "{}",
+            again.outcome.line
+        );
+    }
+    let again = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
     assert_eq!(again.outcome.kind, crate::gate::Kind::AlreadyMerged);
     assert_eq!(again.outcome.head, HEAD);
     assert_eq!(again.outcome.merge_commit.as_deref(), Some(MERGE));
@@ -1443,11 +1456,10 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         "{}",
         again.outcome.line
     );
-    let again = land::merge_once(&gh, &s, &b, "alpha", 7, &older, &o)
+    let again = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
         .await
         .unwrap();
     assert_eq!(again.outcome.kind, crate::gate::Kind::AlreadyMerged);
-    assert_eq!(again.outcome.head, HEAD);
     assert!(
         again.after[0].starts_with("landed earlier"),
         "{:?}",
@@ -1497,7 +1509,7 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(rec.merge.as_deref(), Some(MERGE));
+    assert_eq!(rec.merge(), Some(MERGE));
     assert_eq!(rec.done, [crate::progress::LANDED_LOG]);
     assert!(landed_notes(&b).await.is_empty());
 
@@ -2196,7 +2208,7 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
     let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
     let pin_head = "d".repeat(40);
     // The compiler's landing: every step under the lock done, the pins left.
-    let mut src = crate::progress::Progress::new(HEAD, Some(MERGE.into()));
+    let mut src = crate::progress::Progress::recorded(HEAD, Some(MERGE));
     for step in [
         crate::progress::LANDED_LOG,
         crate::progress::MAIN,
@@ -2209,7 +2221,7 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
         .await
         .unwrap();
     // The pin pull request's: merged, its `landed.log` write failed.
-    let pin = crate::progress::Progress::new(&pin_head, Some(pin_merge.into()));
+    let pin = crate::progress::Progress::recorded(&pin_head, Some(pin_merge));
     crate::progress::write(&b, "hgl-project", 50, &pin)
         .await
         .unwrap();
@@ -2255,7 +2267,7 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
 
     // Only the intent was recorded (the merge commit's write failed), and GitHub shows it
     // merged: `gh pins sync` finishes it too.
-    let pin = crate::progress::Progress::new(&pin_head, None);
+    let pin = crate::progress::Progress::intent(&pin_head);
     crate::progress::write(&b, "hgl-project", 51, &pin)
         .await
         .unwrap();
@@ -2268,7 +2280,7 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
         .replace("codex/980-format-patterns", "codex/pins-compiler-cccccccc");
     // A wrapper pull request that is not a pin one, merged, its notes and comment left:
     // its own command finishes it, with them; the sync does not.
-    let mut other = crate::progress::Progress::new(HEAD, Some(MERGE.into()));
+    let mut other = crate::progress::Progress::recorded(HEAD, Some(MERGE));
     other.mark(crate::progress::LANDED_LOG);
     other.mark(crate::progress::MAIN);
     crate::progress::write(&b, "hgl-project", 53, &other)
@@ -2989,7 +3001,7 @@ async fn a_pin_landing_finished_by_another_sync_is_done() {
     let mut s = settings();
     s.repos = vec!["hgl-compiler".into()];
     let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
-    let pin = crate::progress::Progress::new(&"d".repeat(40), Some(pin_merge.into()));
+    let pin = crate::progress::Progress::recorded(&"d".repeat(40), Some(pin_merge));
     crate::progress::write(&b, "hgl-project", 50, &pin)
         .await
         .unwrap();
@@ -3067,4 +3079,259 @@ async fn an_open_pin_pull_request_landed_by_another_sync_is_done() {
     assert_eq!(posts(&gh.gh, "merge-async"), 0, "not merged again");
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "landed once: {log}");
+}
+
+/// The merged fixture at another head, into another base, or as another merge commit.
+fn merged_otherwise(what: &str) -> String {
+    let f = fixture("pr-merged.json");
+    match what {
+        "another head" => f.replace(HEAD, &"b".repeat(40)),
+        "another base" => {
+            assert!(f.contains("\"ref\": \"main\""), "the fixture's form");
+            f.replace("\"ref\": \"main\"", "\"ref\": \"release\"")
+        }
+        "another merge" => f.replace(MERGE, &"c".repeat(40)),
+        _ => unreachable!(),
+    }
+}
+
+/// `src`'s one rule put first in `gh`: it answers ahead of the rest.
+fn put_first(gh: &FakeGh, src: FakeGh) {
+    let r = src.rules.lock().unwrap().remove(0);
+    gh.rules.lock().unwrap().insert(0, r);
+}
+
+/// Nothing landed: no `landed.log`, no `main`, no `landed` notes, no comment.
+async fn nothing_landed(b: &Bus, gh: &FakeGh, what: &str) {
+    assert!(
+        b.state_get(state::KEY_LANDED).await.unwrap().is_none(),
+        "{what}"
+    );
+    assert!(
+        b.state_get(state::KEY_MAIN).await.unwrap().is_none(),
+        "{what}"
+    );
+    assert!(landed_notes(b).await.is_empty(), "{what}");
+    assert_eq!(posts(gh, "issues/7/comments"), 0, "{what}");
+}
+
+/// hgl-ai#123, part 1, `land::resume_recorded`: a record with a merge is not evidence
+/// alone. GitHub, read now, shows that merge at the record's head into `main`, or nothing
+/// is finished: BLOCKED, the record untouched.
+#[tokio::test]
+async fn a_recorded_merge_github_does_not_show_is_not_finished() {
+    for what in ["another head", "another base", "another merge"] {
+        let Some(h) = hub() else { return };
+        let b = bus(&h).await;
+        authored_and_reviewed(&b).await;
+        let mut s = settings();
+        s.repos = vec!["alpha".into()];
+        s.pins = vec![];
+        let rec = crate::progress::Progress::recorded(HEAD, Some(MERGE));
+        store::put_latest(
+            &b,
+            &crate::progress::key("alpha", 7),
+            &serde_json::to_string(&rec).unwrap(),
+        )
+        .await
+        .unwrap();
+        let gh = landing_gh(|g| g);
+        put_first(
+            &gh,
+            FakeGh::default().on("pulls/7", &merged_otherwise(what)),
+        );
+        for l in [
+            land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+                .await
+                .unwrap(),
+            land::land(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+                .await
+                .unwrap(),
+        ] {
+            assert_eq!(
+                l.outcome.kind,
+                crate::gate::Kind::Blocked,
+                "{what}: {}",
+                l.outcome.line
+            );
+            assert!(
+                l.outcome.line.contains("its landing record says merged"),
+                "{what}"
+            );
+        }
+        assert_eq!(
+            crate::progress::read(&b, "alpha", 7).await.unwrap(),
+            Some(rec),
+            "{what}: untouched"
+        );
+        nothing_landed(&b, &gh, what).await;
+    }
+}
+
+/// hgl-ai#123, part 1, `land::landed_earlier`: a `landed.log` line for the number, no
+/// record. Found finished only when GitHub shows that merge at the head asked for into
+/// `main`; else BLOCKED, naming what GitHub shows.
+#[tokio::test]
+async fn a_landed_log_line_github_does_not_show_is_not_landed() {
+    for what in ["another head", "another base", "another merge"] {
+        let Some(h) = hub() else { return };
+        let b = bus(&h).await;
+        let mut s = settings();
+        s.repos = vec!["alpha".into()];
+        s.pins = vec![];
+        let line = state::landed_line("20261128T000000Z", "alpha", 7, MERGE);
+        store::append_bounded(&b, state::KEY_LANDED, &line, 100)
+            .await
+            .unwrap();
+        let gh = FakeGh::default().on("pulls/7", &merged_otherwise(what));
+        let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            l.outcome.kind,
+            crate::gate::Kind::Blocked,
+            "{what}: {}",
+            l.outcome.line
+        );
+        assert!(
+            l.outcome.line.contains("has it landed as 01e99ea5"),
+            "{}",
+            l.outcome.line
+        );
+        assert!(!l.outcome.kind.satisfied());
+    }
+    // As recorded: found landed, as before.
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let s = settings();
+    let line = state::landed_line("20261128T000000Z", "alpha", 7, MERGE);
+    store::append_bounded(&b, state::KEY_LANDED, &line, 100)
+        .await
+        .unwrap();
+    let gh = FakeGh::default().on("pulls/7", &fixture("pr-merged.json"));
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::AlreadyMerged,
+        "{}",
+        l.outcome.line
+    );
+}
+
+/// hgl-ai#123, part 1, `land::settle_merged` (adoption): a pull request merged with no
+/// record and no `landed.log` line is finished only at the head asked for into `main`.
+#[tokio::test]
+async fn a_merge_without_a_record_is_adopted_only_as_asked() {
+    for what in ["another head", "another base"] {
+        let Some(h) = hub() else { return };
+        let b = bus(&h).await;
+        authored_and_reviewed(&b).await;
+        let mut s = settings();
+        s.repos = vec!["alpha".into()];
+        s.pins = vec![];
+        let gh = landing_gh(|g| g);
+        put_first(
+            &gh,
+            FakeGh::default().on("pulls/7", &merged_otherwise(what)),
+        );
+        let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            l.outcome.kind,
+            crate::gate::Kind::Blocked,
+            "{what}: {}",
+            l.outcome.line
+        );
+        assert!(
+            crate::progress::read(&b, "alpha", 7)
+                .await
+                .unwrap()
+                .is_none(),
+            "{what}"
+        );
+        nothing_landed(&b, &gh, what).await;
+    }
+}
+
+/// hgl-ai#123, part 1, `pins::unfinished`: a pin landing record is finished only when the
+/// pin pull request is merged as the record intended: its head, into `main`.
+#[tokio::test]
+async fn a_pin_record_merged_otherwise_is_not_unfinished() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let head = "d".repeat(40);
+    let rec = crate::progress::Progress::intent(&head);
+    store::put_latest(
+        &b,
+        &crate::progress::key("hgl-project", 60),
+        &serde_json::to_string(&rec).unwrap(),
+    )
+    .await
+    .unwrap();
+    let gh = pins_current_gh(60, pin_merge);
+    assert_eq!(
+        crate::pins::unfinished(&gh, &s, &b).await.unwrap(),
+        [(60, head.clone())],
+        "merged as intended"
+    );
+    for (what, from, to) in [
+        (
+            "another base",
+            "\"ref\": \"main\"".to_string(),
+            "\"ref\": \"release\"".to_string(),
+        ),
+        ("another head", head.clone(), "e".repeat(40)),
+    ] {
+        let gh = pins_current_gh(60, pin_merge);
+        for r in gh
+            .rules
+            .lock()
+            .unwrap()
+            .iter_mut()
+            .filter(|r| r.0 == "hgl-project/pulls/60")
+        {
+            assert!(r.1.stdout.contains(&from), "{what}: the fixture's form");
+            r.1.stdout = r.1.stdout.replace(&from, &to);
+        }
+        assert!(
+            crate::pins::unfinished(&gh, &s, &b)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{what}"
+        );
+    }
+}
+
+/// hgl-ai#123, part 1, `land::plan`: the dry run says what the run does, a pull request
+/// merged at another head BLOCKED.
+#[tokio::test]
+async fn the_dry_run_holds_a_merge_to_the_intended_head() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let s = settings();
+    let gh = FakeGh::default().on("pulls/7", &merged_otherwise("another head"));
+    let l = land::plan(
+        &gh,
+        &s,
+        Some(&b),
+        "alpha",
+        7,
+        HEAD,
+        &land::LandOpts::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Blocked,
+        "{}",
+        l.outcome.line
+    );
 }

@@ -259,6 +259,9 @@ pub struct SeenReceipt {
 #[derive(Debug, Clone, Default)]
 pub struct Facts {
     pub pr: Pr,
+    /// The head the landing record's intent named, if one is there: the head a merge found
+    /// is confirmed against ([`confirm_merge`]); else the head asked for.
+    pub intended: Option<String>,
     pub main: Option<String>,
     pub unresolved: Option<u64>,
     /// How many commits `main` has that the head does not.
@@ -401,6 +404,10 @@ pub enum Kind {
     WouldUpdate,
 }
 
+fn is_landed_kind(kind: Kind) -> bool {
+    matches!(kind, Kind::Merged | Kind::AlreadyMerged | Kind::Resumed)
+}
+
 impl Kind {
     pub fn word(self) -> &'static str {
         match self {
@@ -439,17 +446,129 @@ pub struct Outcome {
     pub merge_commit: Option<String>,
     /// The head the gate judged.
     pub head: String,
+    /// What a landed kind (`Merged`, `AlreadyMerged`, `Resumed`) stands on; only
+    /// [`Outcome::landed`] sets it.
+    landed: Option<LandedMerge>,
+}
+
+/// A merge GitHub shows as a landing intended it ([`confirm_merge`]): its head into `main`,
+/// with a merge commit. Only `confirm_merge` builds one, and every step after a merge
+/// (`landed.log`, `main`, the notes, the comment) and every landed outcome needs one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LandedMerge {
+    head: String,
+    merge: String,
+}
+
+impl LandedMerge {
+    pub fn head(&self) -> &str {
+        &self.head
+    }
+    pub fn merge(&self) -> &str {
+        &self.merge
+    }
+    /// One as a test needs it.
+    #[cfg(test)]
+    pub(crate) fn for_test(head: &str, merge: &str) -> LandedMerge {
+        LandedMerge {
+            head: head.into(),
+            merge: merge.into(),
+        }
+    }
+}
+
+/// What a pull request read says of the merge a landing intended ([`confirm_merge`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Confirm {
+    AsIntended(LandedMerge),
+    /// Not merged, or merged with no merge commit shown yet.
+    NotMerged,
+    /// Merged other than intended: another head, another base, or another merge commit
+    /// than the one recorded.
+    Otherwise {
+        head: String,
+        base: String,
+        merge: Option<String>,
+    },
+}
+
+impl Confirm {
+    /// Why it is not as intended, for a BLOCKED line.
+    pub fn otherwise(&self, intended: &str) -> String {
+        match self {
+            Confirm::Otherwise { head, base, merge } => format!(
+                "merged at {} into {base}{}, not as intended at {} into main",
+                short(head),
+                merge
+                    .as_deref()
+                    .map(|m| format!(" as {}", short(m)))
+                    .unwrap_or_default(),
+                short(intended)
+            ),
+            Confirm::NotMerged => "not merged".into(),
+            Confirm::AsIntended(_) => "merged as intended".into(),
+        }
+    }
+}
+
+/// The one decision of whether `pr` is merged as a landing intended (hgl-ai#123): merged,
+/// into `main`, at `intended` (the head the merge request named: the record's, or else the
+/// head the caller asked for), with a merge commit, equal to `recorded` when one is given (a
+/// record's or a `landed.log` line's). `pr` must be read in the same invocation.
+pub fn confirm_merge(pr: &Pr, intended: &str, recorded: Option<&str>) -> Confirm {
+    let merge = pr.merge_commit.clone().filter(|m| !m.is_empty());
+    if !pr.merged {
+        return Confirm::NotMerged;
+    }
+    let as_intended = pr.base == "main" && pr.head.eq_ignore_ascii_case(intended);
+    let same_merge = |m: &str| recorded.is_none_or(|r| r.eq_ignore_ascii_case(m));
+    match merge {
+        Some(m) if as_intended && same_merge(&m) => Confirm::AsIntended(LandedMerge {
+            head: pr.head.clone(),
+            merge: m,
+        }),
+        None if as_intended => Confirm::NotMerged,
+        merge => Confirm::Otherwise {
+            head: pr.head.clone(),
+            base: pr.base.clone(),
+            merge,
+        },
+    }
 }
 
 impl Outcome {
-    pub(crate) fn new(kind: Kind, line: String, retry: bool, head: &str) -> Outcome {
+    /// Any outcome but a landed one, which needs [`Outcome::landed`].
+    pub fn new(kind: Kind, line: String, retry: bool, head: &str) -> Outcome {
+        assert!(
+            !is_landed_kind(kind),
+            "{kind:?} is built only by Outcome::landed, from a LandedMerge"
+        );
         Outcome {
             kind,
             line,
             retry,
             merge_commit: None,
             head: head.to_string(),
+            landed: None,
         }
+    }
+
+    /// A landed outcome (`Merged`, `AlreadyMerged`, `Resumed`), standing on `m`.
+    pub fn landed(kind: Kind, line: String, m: &LandedMerge) -> Outcome {
+        assert!(is_landed_kind(kind), "{kind:?} is not a landed kind");
+        Outcome {
+            kind,
+            line,
+            retry: false,
+            merge_commit: Some(m.merge.clone()),
+            head: m.head.clone(),
+            landed: Some(m.clone()),
+        }
+    }
+
+    /// The merge a landed outcome stands on; `None` for any other.
+    pub fn landed_merge(&self) -> Option<&LandedMerge> {
+        self.landed.as_ref().filter(|_| is_landed_kind(self.kind))
     }
     /// A step after the merge failed with `e`: `PARTIAL` (exit 3), naming the merge, what is
     /// left (`left`, a phrase: "main and the landed notes are") and the error; the same
@@ -517,14 +636,24 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         |kind: Kind, line: String, retry: bool| Step::Done(Outcome::new(kind, line, retry, head));
     let prefix = format!("{repo} #{} {}", pr.number, pr.branch);
     if pr.merged {
-        let mut o = Outcome::new(
-            Kind::AlreadyMerged,
-            format!("{repo} #{} already MERGED", pr.number),
-            false,
-            head,
-        );
-        o.merge_commit = pr.merge_commit.clone().filter(|m| !m.is_empty());
-        return Step::Done(o);
+        let intended = f.intended.as_deref().unwrap_or(asked);
+        return match confirm_merge(pr, intended, None) {
+            Confirm::AsIntended(m) => Step::Done(Outcome::landed(
+                Kind::AlreadyMerged,
+                format!("{repo} #{} already MERGED", pr.number),
+                &m,
+            )),
+            Confirm::NotMerged => done(
+                Kind::Wait,
+                format!("{prefix} merged, its merge commit not shown yet WAIT"),
+                true,
+            ),
+            c => done(
+                Kind::Blocked,
+                format!("{prefix} {} BLOCKED", c.otherwise(intended)),
+                false,
+            ),
+        };
     }
     if pr.state != "open" {
         return done(
@@ -1253,6 +1382,13 @@ pub async fn evaluate<G: Gh>(
         pr: fetch_pr(gh, s, repo, number).await?,
         ..Facts::default()
     };
+    // A merge found is confirmed against the head the record's intent named, if any.
+    if let Some(b) = bus {
+        f.intended = progress::read(b, repo, number)
+            .await?
+            .map(|p| p.head)
+            .filter(|h| hgl_ai_proto::check_head(h).is_ok());
+    }
     let issue = opts
         .closes
         .or_else(|| state::issue_from_branch(&f.pr.branch, &s.branch_prefix))
@@ -1298,7 +1434,7 @@ pub async fn evaluate<G: Gh>(
                 }
                 // The intent first: a failure from here on leaves a record a retry resumes.
                 if let Some(b) = bus {
-                    progress::write(b, repo, number, &Progress::new(&f.pr.head, None)).await?;
+                    progress::write(b, repo, number, &Progress::intent(&f.pr.head)).await?;
                 }
                 // The lease as it is now, just confirmed: not as it was when the landing began.
                 let lease = match (lock, bus) {
@@ -1324,23 +1460,44 @@ pub async fn evaluate<G: Gh>(
                     }
                     Err(e) => return Err(e),
                 };
-                if after.merged {
-                    let m = after.merge_commit.clone().unwrap_or_default();
-                    if let Some(b) = bus {
-                        let p = Progress::new(&f.pr.head, Some(m.clone()));
-                        if let Err(e) = progress::write(b, repo, number, &p).await {
+                match confirm_merge(&after, &f.pr.head, None) {
+                    Confirm::AsIntended(m) => {
+                        if let Some(b) = bus
+                            && let Err(e) =
+                                progress::write(b, repo, number, &Progress::merged(&m)).await
+                        {
                             let left = left_of(None, opts.after, &s.wrapper);
-                            return Outcome::partial(repo, number, &f.pr.head, Some(&m), &left, e);
+                            return Outcome::partial(
+                                repo,
+                                number,
+                                &f.pr.head,
+                                Some(m.merge()),
+                                &left,
+                                e,
+                            );
                         }
+                        return Ok(Outcome::landed(
+                            Kind::Merged,
+                            format!("{line} -> MERGED {} MERGED", short(m.merge())),
+                            &m,
+                        ));
                     }
-                    let mut o = Outcome::new(
-                        Kind::Merged,
-                        format!("{line} -> MERGED {} MERGED", short(&m)),
-                        false,
-                        &f.pr.head,
-                    );
-                    o.merge_commit = Some(m);
-                    return Ok(o);
+                    // Merged, but not as this request named it (another head or base): not
+                    // this landing's merge, and its intent no longer stands.
+                    c @ Confirm::Otherwise { .. } => {
+                        if let Some(b) = bus
+                            && let Err(e) = progress::delete(b, repo, number).await
+                        {
+                            eprintln!("{repo} #{number}: removing the landing record: {e}");
+                        }
+                        return Ok(Outcome::new(
+                            Kind::Blocked,
+                            format!("{line} {} BLOCKED", c.otherwise(&f.pr.head)),
+                            false,
+                            &f.pr.head,
+                        ));
+                    }
+                    Confirm::NotMerged => {}
                 }
                 let why = match res {
                     Merge::Refused(why) => why,
@@ -1402,6 +1559,7 @@ mod tests {
     /// Facts under which the gate merges.
     fn allowed() -> Facts {
         Facts {
+            intended: None,
             pr: Pr::from_rest(&json("pr-open.json")).unwrap(),
             main: Some(MAIN.into()),
             unresolved: Some(0),
@@ -1542,6 +1700,108 @@ mod tests {
         let mut f = allowed();
         f.pr.state = "closed".into();
         blocked(&f, "closed");
+    }
+
+    /// hgl-ai#123, part 1: `confirm_merge` is the one decision of "merged as intended".
+    #[test]
+    fn merged_only_as_intended() {
+        let pr = |head: &str, base: &str, merge: Option<&str>, merged: bool| Pr {
+            head: head.into(),
+            base: base.into(),
+            merge_commit: merge.map(String::from),
+            merged,
+            ..Pr::from_rest(&json("pr-merged.json")).unwrap()
+        };
+        let m = "01e99ea5e46457bac035ca8a2699b6b6575b32ed";
+        let other = "b".repeat(40);
+        match confirm_merge(&pr(HEAD, "main", Some(m), true), HEAD, None) {
+            Confirm::AsIntended(l) => assert_eq!((l.head(), l.merge()), (HEAD, m)),
+            c => panic!("{c:?}"),
+        }
+        // In any letter case, and with the merge recorded.
+        let upper = HEAD.to_uppercase();
+        assert!(matches!(
+            confirm_merge(
+                &pr(HEAD, "main", Some(m), true),
+                &upper,
+                Some(&m.to_uppercase())
+            ),
+            Confirm::AsIntended(_)
+        ));
+        for (what, p, recorded) in [
+            ("another head", pr(&other, "main", Some(m), true), None),
+            ("another base", pr(HEAD, "release", Some(m), true), None),
+            (
+                "another merge than recorded",
+                pr(HEAD, "main", Some(m), true),
+                Some(other.as_str()),
+            ),
+        ] {
+            let c = confirm_merge(&p, HEAD, recorded);
+            assert!(matches!(c, Confirm::Otherwise { .. }), "{what}: {c:?}");
+            assert!(
+                c.otherwise(HEAD).contains("not as intended at 1f461fa7"),
+                "{what}"
+            );
+        }
+        assert_eq!(
+            confirm_merge(&pr(HEAD, "main", Some(m), false), HEAD, None),
+            Confirm::NotMerged
+        );
+        assert_eq!(
+            confirm_merge(&pr(HEAD, "main", Some(""), true), HEAD, None),
+            Confirm::NotMerged,
+            "no merge commit shown yet"
+        );
+    }
+
+    /// hgl-ai#123, part 1, `gate::decide`: a pull request merged other than intended is
+    /// BLOCKED, never AlreadyMerged; the record's intent, when given, is what it is held to.
+    #[test]
+    fn a_merged_pull_request_is_held_to_the_intended_head() {
+        let mut f = allowed();
+        f.pr.merged = true;
+        let o = outcome(&f, &rules(), &Opts::default());
+        assert_eq!(o.kind, Kind::AlreadyMerged);
+        assert_eq!(o.landed_merge().map(|m| m.head()), Some(HEAD));
+        // Asked for another head than merged.
+        let other = "b".repeat(40);
+        match decide(&f, REPO, &other, &rules(), &Opts::default()) {
+            Step::Done(o) => {
+                assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+                assert!(
+                    o.line.contains("merged at 1f461fa7 into main"),
+                    "{}",
+                    o.line
+                );
+                assert!(o.landed_merge().is_none());
+            }
+            s => panic!("{s:?}"),
+        }
+        // A record's intent at another head: held to it, not to the head asked for.
+        f.intended = Some(other.clone());
+        blocked(&f, "not as intended at bbbbbbbb");
+        f.intended = Some(HEAD.into());
+        assert_eq!(
+            decide(&f, REPO, &other, &rules(), &Opts::default()),
+            Step::Done(outcome(&f, &rules(), &Opts::default()))
+        );
+        // Into another base.
+        f.intended = None;
+        f.pr.base = "release".into();
+        blocked(&f, "into release");
+        // Merged, its merge commit not shown yet: wait.
+        f.pr.base = "main".into();
+        f.pr.merge_commit = None;
+        let o = outcome(&f, &rules(), &Opts::default());
+        assert_eq!((o.kind, o.retry), (Kind::Wait, true), "{}", o.line);
+    }
+
+    /// hgl-ai#123, part 1: a landed kind exists only on a `LandedMerge`.
+    #[test]
+    #[should_panic(expected = "built only by Outcome::landed")]
+    fn a_landed_kind_needs_a_landed_merge() {
+        let _ = Outcome::new(Kind::Merged, "merged".into(), false, HEAD);
     }
 
     #[test]
@@ -2459,6 +2719,39 @@ mod tests {
     }
 
     const MERGED_ASYNC: &str = "{\"status\":\"merged\",\"details\":{\"message\":\"m\"}}";
+
+    /// hgl-ai#123, part 1, `gate::evaluate`: the read after the merge request shows the
+    /// pull request merged at another head (someone merged it meanwhile): not this
+    /// landing's merge, BLOCKED with no merge commit taken.
+    #[tokio::test]
+    async fn a_merge_read_back_at_another_head_is_not_this_landing() {
+        let s = without_receipts(settings(), &[REPO]);
+        let other = fixture("pr-merged.json").replace(HEAD, &"b".repeat(40));
+        let gh = fake()
+            .once("pulls/7", &fixture("pr-open.json"))
+            .on("pulls/7", &other);
+        let o = evaluate(
+            &gh,
+            &s,
+            None,
+            REPO,
+            7,
+            HEAD,
+            &Opts::default(),
+            true,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+        assert!(
+            o.line.contains("merged at bbbbbbbb into main"),
+            "{}",
+            o.line
+        );
+        assert!(o.landed_merge().is_none() && o.merge_commit.is_none());
+    }
 
     fn fake() -> FakeGh {
         FakeGh::default()

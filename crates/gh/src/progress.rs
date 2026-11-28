@@ -9,6 +9,7 @@
 use hgl_ai_bus::Bus;
 use serde::{Deserialize, Serialize};
 
+use crate::gate::LandedMerge;
 use crate::{Result, state, store};
 
 /// The steps after a merge, in order. `pins` only for `gh land` of a repository the
@@ -23,9 +24,10 @@ pub const PINS: &str = "pins";
 pub struct Progress {
     /// The head the merge is (or was) for.
     pub head: String,
-    /// The merge commit, once the pull request is merged.
+    /// The merge commit, once GitHub shows the pull request merged as intended: set only
+    /// from a [`LandedMerge`] ([`Progress::merged`], [`Progress::set_merged`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub merge: Option<String>,
+    merge: Option<String>,
     /// Steps done, from the list above.
     #[serde(default)]
     pub done: Vec<String>,
@@ -37,14 +39,43 @@ pub struct Progress {
 }
 
 impl Progress {
-    pub fn new(head: &str, merge: Option<String>) -> Progress {
+    /// The intent of a landing about to merge at `head`: no merge yet.
+    pub fn intent(head: &str) -> Progress {
         Progress {
             head: head.to_string(),
-            merge,
+            merge: None,
             done: Vec::new(),
             notes_at: None,
             updated_at: hgl_ai_proto::utc_now_stamp(),
         }
+    }
+
+    /// The record of a merge GitHub showed as intended.
+    pub fn merged(m: &LandedMerge) -> Progress {
+        let mut p = Progress::intent(m.head());
+        p.set_merged(m);
+        p
+    }
+
+    /// The merge commit recorded, if any: evidence only with a pull request read that
+    /// confirms it ([`crate::gate::confirm_merge`]).
+    pub fn merge(&self) -> Option<&str> {
+        self.merge.as_deref()
+    }
+
+    /// Record `m` as this landing's merge: its head and merge commit.
+    pub fn set_merged(&mut self, m: &LandedMerge) {
+        self.head = m.head().to_string();
+        self.merge = Some(m.merge().to_string());
+        self.updated_at = hgl_ai_proto::utc_now_stamp();
+    }
+
+    /// A record as a test writes it, its merge given as is.
+    #[cfg(test)]
+    pub(crate) fn recorded(head: &str, merge: Option<&str>) -> Progress {
+        let mut p = Progress::intent(head);
+        p.merge = merge.map(String::from);
+        p
     }
 
     pub fn has(&self, step: &str) -> bool {
@@ -134,7 +165,7 @@ mod tests {
 
     #[test]
     fn records_and_the_log() {
-        let mut p = Progress::new("h", None);
+        let mut p = Progress::intent("h");
         assert!(!p.has(MAIN));
         p.mark(MAIN);
         p.mark(MAIN);

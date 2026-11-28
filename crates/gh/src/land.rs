@@ -17,7 +17,7 @@ use hgl_ai_proto::{Kind as NoteKind, Note, Seat, utc_now_stamp};
 
 use crate::bot::{Comment, ready_signers};
 use crate::exec::{self, Gh};
-use crate::gate::{self, Kind, Opts, Outcome};
+use crate::gate::{self, Kind, LandedMerge, Opts, Outcome};
 use crate::lock::{LandLock, holder};
 use crate::progress::{self, Progress};
 use crate::table::{self, TableWord, hold_active};
@@ -102,13 +102,7 @@ async fn wait_for_table(
             TableWord::Limit => {
                 let line =
                     format!("{repo} #{number}: the review bot reports its usage limit BOTLIMIT");
-                return Ok(Some(Outcome {
-                    kind: Kind::BotLimit,
-                    line,
-                    retry: false,
-                    merge_commit: None,
-                    head: head.to_string(),
-                }));
+                return Ok(Some(Outcome::new(Kind::BotLimit, line, false, head)));
             }
             TableWord::NotYet(why) => {
                 if Instant::now() + TABLE_POLL >= deadline {
@@ -256,7 +250,7 @@ async fn land_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<(Landing, String)> {
-    if let Some(done) = resume_recorded(gh, s, bus, repo, number, o, lock).await? {
+    if let Some(done) = resume_recorded(gh, s, bus, repo, number, head, o, lock).await? {
         return Ok(done);
     }
     let deadline = Instant::now() + o.timeout;
@@ -270,15 +264,14 @@ async fn land_locked<G: Gh>(
     let outcome = loop {
         if let Some(until) = wait_for_hold(bus, deadline).await? {
             // The time is up under the hold: stop, and do not spend the call it defers.
-            let outcome = Outcome {
-                kind: Kind::Hold,
-                line: format!(
+            let outcome = Outcome::new(
+                Kind::Hold,
+                format!(
                     "{repo} #{number}: hold still active at the deadline (hold until {until}) HOLD"
                 ),
-                retry: false,
-                merge_commit: None,
-                head: head.to_string(),
-            };
+                false,
+                head,
+            );
             return Ok((
                 Landing {
                     outcome,
@@ -326,63 +319,102 @@ async fn land_locked<G: Gh>(
 /// record and a `landed.log` line, the landing is finished (another attempt finished it
 /// while this one waited for the lock): `AlreadyMerged`, without the gate, whose table and
 /// bot limit no longer apply to it.
+#[allow(clippy::too_many_arguments)]
 async fn resume_recorded<G: Gh>(
     gh: &G,
     s: &Settings,
     bus: &Bus,
     repo: &str,
     number: u64,
+    asked: &str,
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<Option<(Landing, String)>> {
     let Some(p) = progress::read(bus, repo, number).await? else {
-        return landed_earlier(gh, s, bus, repo, number).await;
+        return landed_earlier(gh, s, bus, repo, number, asked).await;
     };
     // Only the intent: whether the merge happened is GitHub's to say (the gate asks).
-    let Some(merge) = p.merge.clone() else {
+    let Some(recorded) = p.merge().map(String::from) else {
         return Ok(None);
     };
-    let mut outcome = Outcome::new(
+    // The record alone is not evidence: GitHub, read now, must show that merge.
+    let pr = gate::fetch_pr(gh, s, repo, number).await?;
+    let m = match gate::confirm_merge(&pr, &p.head, Some(&recorded)) {
+        gate::Confirm::AsIntended(m) => m,
+        c => {
+            let line = format!(
+                "{repo} #{number}: its landing record says merged at {} as {}, but GitHub shows it {}; left BLOCKED",
+                short(&p.head),
+                short(&recorded),
+                c.otherwise(&p.head)
+            );
+            let outcome = Outcome::new(Kind::Blocked, line, false, &p.head);
+            return Ok(Some((
+                Landing {
+                    outcome,
+                    after: Vec::new(),
+                },
+                String::new(),
+            )));
+        }
+    };
+    let outcome = Outcome::landed(
         Kind::Resumed,
         format!(
             "{repo} #{number} was merged at {} by an earlier attempt; finishing its landing MERGED",
-            short(&merge)
+            short(m.merge())
         ),
-        false,
-        &p.head,
+        &m,
     );
-    outcome.merge_commit = Some(merge);
     eprintln!("{}", outcome.line);
     Ok(Some(
         finish(gh, s, bus, repo, number, outcome, o, lock, Some(p)).await?,
     ))
 }
 
-/// A landing with no record whose `landed.log` line is there: finished. The head is the
-/// pull request's, the one merged: the caller's may be older (the gate updated the branch
-/// before the merge).
+/// A landing with no record whose `landed.log` line is there: finished, when GitHub shows
+/// that merge, at the head asked for, into `main`. Another head merged is BLOCKED, naming
+/// it: asked again with that head, it is found landed.
 async fn landed_earlier<G: Gh>(
     gh: &G,
     s: &Settings,
     bus: &Bus,
     repo: &str,
     number: u64,
+    asked: &str,
 ) -> Result<Option<(Landing, String)>> {
-    let Some(merge) = progress::landed_merge(bus, repo, number).await? else {
+    let Some(logged) = progress::landed_merge(bus, repo, number).await? else {
         return Ok(None);
     };
-    let head = gate::fetch_pr(gh, s, repo, number).await?.head;
-    let mut outcome = Outcome::new(
+    let pr = gate::fetch_pr(gh, s, repo, number).await?;
+    let m = match gate::confirm_merge(&pr, asked, Some(&logged)) {
+        gate::Confirm::AsIntended(m) => m,
+        c => {
+            let line = format!(
+                "{repo} #{number}: {} has it landed as {}, but GitHub shows it {} BLOCKED",
+                state::KEY_LANDED,
+                short(&logged),
+                c.otherwise(asked)
+            );
+            let outcome = Outcome::new(Kind::Blocked, line, false, &pr.head);
+            return Ok(Some((
+                Landing {
+                    outcome,
+                    after: Vec::new(),
+                },
+                String::new(),
+            )));
+        }
+    };
+    let outcome = Outcome::landed(
         Kind::AlreadyMerged,
         format!(
             "{repo} #{number} at {} landed earlier at {} already MERGED",
-            short(&head),
-            short(&merge)
+            short(m.head()),
+            short(m.merge())
         ),
-        false,
-        &head,
+        &m,
     );
-    outcome.merge_commit = Some(merge);
     let after = vec![format!(
         "landed earlier: {repo} #{number} is in {}",
         state::KEY_LANDED
@@ -493,8 +525,13 @@ async fn settle_merged<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<(Landing, String)> {
+    // The gate confirmed it first ([`gate::confirm_merge`]: the record's intent, or else
+    // the head asked for, into `main`); only then the `landed.log` shortcut, for that merge.
+    let m = outcome.landed_merge().cloned().ok_or_else(|| {
+        Error::Invalid(format!("{repo} #{number}: merged with no confirmed merge"))
+    })?;
     let p = progress::read(bus, repo, number).await?;
-    if p.is_none() && progress::landed(bus, repo, number, None).await? {
+    if p.is_none() && progress::landed(bus, repo, number, Some(m.merge())).await? {
         let after = vec![format!(
             "landed earlier: {repo} #{number} is in {}",
             state::KEY_LANDED
@@ -502,32 +539,18 @@ async fn settle_merged<G: Gh>(
         let outcome = outcome.clone();
         return Ok((Landing { outcome, after }, String::new()));
     }
-    // Merged, and its landing not finished (an earlier attempt stopped right after
-    // the merge, or it was merged without one): finish it now.
-    let (merge, pr_head) = match &outcome.merge_commit {
-        Some(m) => (m.clone(), outcome.head.clone()),
-        None => {
-            let pr = gate::fetch_pr(gh, s, repo, number).await?;
-            (pr.merge_commit.unwrap_or_default(), pr.head)
-        }
-    };
-    let head = p
-        .as_ref()
-        .map(|p| p.head.clone())
-        .filter(|h| !h.is_empty())
-        .unwrap_or(pr_head);
-    let mut resumed = Outcome::new(
+    // Merged as intended, and its landing not finished (an earlier attempt stopped right
+    // after the merge, or it was merged at the asked head without one): finish it now.
+    let resumed = Outcome::landed(
         Kind::Resumed,
         format!(
             "{repo} #{number} is merged at {} and its landing was not finished; finishing it MERGED",
-            short(&merge)
+            short(m.merge())
         ),
-        false,
-        &head,
+        &m,
     );
-    resumed.merge_commit = Some(merge.clone());
     eprintln!("{}", resumed.line);
-    let p = p.unwrap_or_else(|| Progress::new(&head, Some(merge)));
+    let p = p.unwrap_or_else(|| Progress::merged(&m));
     finish(gh, s, bus, repo, number, resumed, o, lock, Some(p)).await
 }
 
@@ -568,7 +591,7 @@ pub(crate) async fn merge_locked<G: Gh>(
         ..o.clone()
     };
     let (Landing { outcome, mut after }, _) =
-        match resume_recorded(gh, s, bus, repo, number, o, lock).await? {
+        match resume_recorded(gh, s, bus, repo, number, head, o, lock).await? {
             Some(done) => done,
             None => {
                 let gate_opts = with_deadline(s, repo, o, Instant::now() + o.timeout);
@@ -615,11 +638,18 @@ async fn finish<G: Gh>(
     lock: &LandLock,
     prog: Option<Progress>,
 ) -> Result<(Landing, String)> {
-    let merge = outcome.merge_commit.clone().unwrap_or_default();
-    let mut p = prog.unwrap_or_else(|| Progress::new(&outcome.head, Some(merge.clone())));
+    // No step after a merge without a merge GitHub showed as intended.
+    let Some(m) = outcome.landed_merge().cloned() else {
+        return Err(Error::Invalid(format!(
+            "{repo} #{number}: no confirmed merge to finish ({})",
+            outcome.line
+        )));
+    };
+    let merge = m.merge().to_string();
+    let mut p = prog.unwrap_or_else(|| Progress::merged(&m));
     let mut after = Vec::new();
     match after_merge(
-        gh, s, bus, repo, number, &outcome, o, lock, &mut p, &mut after,
+        gh, s, bus, repo, number, &outcome, &m, o, lock, &mut p, &mut after,
     )
     .await
     {
@@ -645,14 +675,15 @@ pub(crate) async fn after_merge<G: Gh>(
     repo: &str,
     number: u64,
     outcome: &Outcome,
+    m: &LandedMerge,
     o: &LandOpts,
     lock: &LandLock,
     p: &mut Progress,
     after: &mut Vec<String>,
 ) -> Result<String> {
-    let merge = outcome.merge_commit.clone().unwrap_or_default();
+    let merge = m.merge().to_string();
     let resumed = outcome.kind == Kind::Resumed;
-    p.merge = Some(merge.clone());
+    p.set_merged(m);
     let merged = format!("{repo} #{number} is merged at {}", short(&merge));
     let mut recorded = false;
     if !p.has(progress::LANDED_LOG) {
@@ -1102,7 +1133,7 @@ mod tests {
             left_of(None, &o),
             "landed.log, main, the landed notes and the comment are"
         );
-        let mut p = Progress::new(HEAD, Some("m".into()));
+        let mut p = Progress::recorded(HEAD, Some("m"));
         p.mark(progress::LANDED_LOG);
         p.mark(progress::MAIN);
         assert_eq!(
