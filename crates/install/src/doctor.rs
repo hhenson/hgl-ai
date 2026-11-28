@@ -801,24 +801,38 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 ));
             }
         }
-        // Any host: does a write outside this host's role reach the hub (hgl-ai#141)?
+        // On the hub's host: the accounts `nats.conf` gives the users (hgl-ai#141), when this
+        // host can read it.
+        let hub_host = reached && (c.server.is_some() || su.is_some());
+        let dir = env.expand(&c.paths.data_dir);
+        let audit = c
+            .server
+            .as_ref()
+            .filter(|s| hub_host && s.auth == hgl_ai_config::HubAuth::Users)
+            .and_then(|_| sys.read_to_string(&dir.join("nats.conf")).ok())
+            .map(|text| {
+                let reg = crate::users::Registry::load(sys, &dir).unwrap_or_default();
+                crate::users::audit(&text, &reg)
+            });
+        // Any host: the live probe detects a write outside this host's role that reaches the
+        // hub; it never shows that none can. That the boundary holds is the audit's
+        // (r6 on #192): `ok` only on the hub, from an audited account layout.
         let boundary = if reached {
-            hub.boundary(c).await
+            hub.boundary(&health_cfg).await
         } else {
             Ok(None)
         };
+        let canary = hgl_ai_proto::KV_CANARY;
         match &boundary {
-            Ok(Some(b)) if b.wrote.is_empty() => out.push(Check::ok(
+            Ok(None) => {}
+            Ok(Some(b)) if !b.wrote.is_empty() && b.accounts => out.push(Check::fail(
                 "hub boundary",
                 format!(
-                    "a write outside this role's rights stored nothing, directly or by the \
-                     reply route ({})",
-                    if b.accounts {
-                        "role accounts"
-                    } else {
-                        "one account"
-                    }
+                    "on role accounts, the hub stored a write to {canary} this role may not \
+                     make, {}: role boundaries are not enforced",
+                    b.wrote.join(" and ")
                 ),
+                "check `hub accounts` on the hub; render nats.conf from the registry again",
             )),
             // The owner accepted one account's risk until the cutover (hgl-ai#141): a
             // warning, so that it hides no other failure.
@@ -826,40 +840,51 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 "hub boundary",
                 format!(
                     "single account: replies not isolated until the hgl-ai#147 cutover, see \
-                     hgl-ai#141 (a write to {} arrived {})",
-                    hgl_ai_proto::KV_CANARY,
-                    b.wrote.join(" and ")
+                     hgl-ai#141{}",
+                    if b.wrote.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" (a write to {canary} arrived {})", b.wrote.join(" and "))
+                    }
                 ),
                 "the cutover to one account per role (hgl-ai#147)",
             )),
-            Ok(Some(b)) => out.push(Check::fail(
-                "hub boundary",
-                format!(
-                    "on role accounts, the hub stored a write to {} this role may not \
-                     make, {}: role boundaries are not enforced",
-                    hgl_ai_proto::KV_CANARY,
-                    b.wrote.join(" and ")
-                ),
-                "check `hub accounts` on the hub; render nats.conf from the registry again",
-            )),
-            Ok(None) => {}
+            Ok(Some(_)) => {
+                let unaudited = match &audit {
+                    Some(Ok(a)) if a.layout == crate::users::Layout::Accounts => {
+                        (!a.problems.is_empty())
+                            .then(|| "nats.conf fails the account audit (`hub accounts`)".into())
+                    }
+                    Some(Ok(_)) => {
+                        Some("nats.conf is not the account layout the hub serves".to_string())
+                    }
+                    Some(Err(e)) => Some(format!("cannot read nats.conf: {e}")),
+                    None => Some("no account audit here: nats.conf is the hub's".into()),
+                };
+                out.push(match unaudited {
+                    None => Check::ok(
+                        "hub boundary",
+                        "role accounts, and nats.conf passes the account audit; the live \
+                         probe saw no breach",
+                    ),
+                    Some(why) => Check::warn(
+                        "hub boundary",
+                        format!(
+                            "cannot test: {why}; the live probe saw no breach, which proves \
+                             none"
+                        ),
+                        "run `hgl-ai doctor` on the hub, as its server user, where \
+                         `hub accounts` audits nats.conf",
+                    ),
+                });
+            }
             Err(e) => out.push(Check::warn(
                 "hub boundary",
                 format!("cannot test: {e}"),
                 "`hgl-ai init` provisions the canary bucket",
             )),
         }
-        // On the hub's host: the accounts `nats.conf` gives the users (hgl-ai#141). The file
-        // when this host has it; else what the hub showed this host's user.
-        if reached && (c.server.is_some() || su.is_some()) {
-            let users = c
-                .server
-                .as_ref()
-                .is_some_and(|s| s.auth == hgl_ai_config::HubAuth::Users);
-            let dir = env.expand(&c.paths.data_dir);
-            let conf = users
-                .then(|| sys.read_to_string(&dir.join("nats.conf")).ok())
-                .flatten();
+        if hub_host {
             let rerender = "render nats.conf from the registry again (`hgl-ai server \
                             install`); do not edit its accounts by hand";
             let one = |n: String| {
@@ -870,35 +895,29 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                      (hgl-ai#141)",
                 )
             };
-            match conf {
-                Some(text) => {
-                    let reg = crate::users::Registry::load(sys, &dir).unwrap_or_default();
-                    match crate::users::audit(&text, &reg) {
-                        Err(e) => out.push(Check::warn(
-                            "hub accounts",
-                            format!("cannot read nats.conf: {e}"),
-                            rerender,
-                        )),
-                        Ok(a) => match a.layout {
-                            crate::users::Layout::Token => {}
-                            crate::users::Layout::OneAccount { users } => {
-                                out.push(one(format!("{users} hub users")));
-                            }
-                            crate::users::Layout::Accounts if a.problems.is_empty() => {
-                                out.push(Check::ok(
-                                    "hub accounts",
-                                    "one account per role, the admin alone in HUB, service \
-                                     exports within the access table",
-                                ));
-                            }
-                            crate::users::Layout::Accounts => out.push(Check::fail(
-                                "hub accounts",
-                                a.problems.join("; "),
-                                rerender,
-                            )),
-                        },
+            match &audit {
+                Some(Err(e)) => out.push(Check::warn(
+                    "hub accounts",
+                    format!("cannot read nats.conf: {e}"),
+                    rerender,
+                )),
+                Some(Ok(a)) => match a.layout {
+                    crate::users::Layout::Token => {}
+                    crate::users::Layout::OneAccount { users } => {
+                        out.push(one(format!("{users} hub users")));
                     }
-                }
+                    crate::users::Layout::Accounts if a.problems.is_empty() => {
+                        out.push(Check::ok(
+                            "hub accounts",
+                            "one account per role, the admin alone in HUB, service exports \
+                             and imports within the access table",
+                        ));
+                    }
+                    crate::users::Layout::Accounts => {
+                        out.push(Check::fail("hub accounts", a.problems.join("; "), rerender))
+                    }
+                },
+                // What the hub showed this host's user: its layout, not an audit.
                 None => match &boundary {
                     Ok(Some(b)) if b.accounts => out.push(Check::ok(
                         "hub accounts",
@@ -910,7 +929,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 },
             }
             // Hosts whose client cannot use role accounts yet: the cutover waits for them.
-            out.push(match hub.hosts(c).await {
+            out.push(match hub.hosts(&health_cfg).await {
                 Ok(hosts) => {
                     let old: Vec<&str> = hosts
                         .iter()
@@ -1644,10 +1663,13 @@ mod tests {
             cs.iter()
                 .any(|c| c.name == "telemetry consumers" && c.level == Level::Ok)
         );
-        assert_eq!(*hub.calls.borrow(), ["health", "shared_inbox", "durables"]);
+        assert_eq!(
+            *hub.calls.borrow(),
+            ["health", "shared_inbox", "boundary", "hosts", "durables"]
+        );
         assert_eq!(
             *hub.creds.borrow(),
-            vec![f.env.home.join("builder.cred").display().to_string(); 3]
+            vec![f.env.home.join("builder.cred").display().to_string(); 5]
         );
     }
 
@@ -1823,9 +1845,16 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let f = healthy(d.path());
         let cs = run(&f, &FakeHub::up()).await;
+        // A client host cannot audit the hub's nats.conf: `hub boundary` cannot say the
+        // boundary holds there (r6 on #192).
+        let b = check(&cs, "hub boundary").unwrap();
+        assert!(
+            b.level == Level::Warn && b.detail.starts_with("cannot test: no account audit here"),
+            "{b:?}"
+        );
         let bad: Vec<_> = cs
             .iter()
-            .filter(|c| c.level != Level::Ok && c.name != "cli agy")
+            .filter(|c| c.level != Level::Ok && c.name != "cli agy" && c.name != "hub boundary")
             .collect();
         assert!(bad.is_empty(), "{bad:?}");
         assert!(!any_fail(&cs));
@@ -2455,10 +2484,26 @@ mod tests {
             boundary: b,
             ..FakeHub::up()
         };
+        // A client host: no breach seen is no proof, and it cannot audit nats.conf.
         let cs = run(&f, &FakeHub::up()).await;
         let c = check(&cs, "hub boundary").unwrap();
-        assert_eq!(c.level, Level::Ok, "{c:?}");
-        assert!(c.detail.contains("role accounts"), "{c:?}");
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(c.detail.contains("no account audit here"), "{c:?}");
+        // One account, no write seen: the ruled warning, no breach claimed.
+        let cs = run(
+            &f,
+            &with(Ok(Some(crate::hub::Boundary {
+                accounts: false,
+                wrote: Vec::new(),
+            }))),
+        )
+        .await;
+        let c = check(&cs, "hub boundary").unwrap();
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(
+            c.detail.starts_with("single account") && !c.detail.contains("arrived"),
+            "{c:?}"
+        );
         // A plain client host has no hub-side checks.
         assert!(check(&cs, "hub accounts").is_none() && check(&cs, "hub clients").is_none());
         let cs = run(
@@ -2552,10 +2597,29 @@ mod tests {
         );
         let c = check(&cs, "hub clients").unwrap();
         assert_eq!(c.level, Level::Ok, "{c:?}");
+        // The hub serves role accounts (the probe's prefix), nats.conf says one account.
+        let c = check(&cs, "hub boundary").unwrap();
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(c.detail.contains("not the account layout"), "{c:?}");
 
+        // `hub boundary` is `ok` only from the audit: role accounts served, nats.conf
+        // audited clean, no breach seen.
         conf(&crate::nats::Auth::Accounts(&reg));
         let cs = run(&f, &FakeHub::up()).await;
         assert_eq!(check(&cs, "hub accounts").unwrap().level, Level::Ok);
+        let c = check(&cs, "hub boundary").unwrap();
+        assert_eq!(c.level, Level::Ok, "{c:?}");
+        assert!(c.detail.contains("passes the account audit"), "{c:?}");
+        // The same nats.conf, but a write seen: the breach wins.
+        let breached = FakeHub {
+            boundary: Ok(Some(crate::hub::Boundary {
+                accounts: true,
+                wrote: vec!["by the reply route"],
+            })),
+            ..FakeHub::up()
+        };
+        let cs = run(&f, &breached).await;
+        assert_eq!(check(&cs, "hub boundary").unwrap().level, Level::Fail);
         // A user moved into `HUB`: the admin is not alone there.
         let text = std::fs::read_to_string(dir.join("nats.conf")).unwrap();
         let seat = reg.get("build-1").unwrap().nkey.clone();
@@ -2574,9 +2638,17 @@ mod tests {
         let c = check(&cs, "hub accounts").unwrap();
         assert_eq!(c.level, Level::Fail, "{c:?}");
         assert!(c.detail.contains("build-1 (seat) is in HUB"), "{c:?}");
+        let c = check(&cs, "hub boundary").unwrap();
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(c.detail.contains("fails the account audit"), "{c:?}");
         std::fs::write(dir.join("nats.conf"), "accounts {").unwrap();
         let cs = run(&f, &FakeHub::up()).await;
         assert_eq!(check(&cs, "hub accounts").unwrap().level, Level::Warn);
+        let c = check(&cs, "hub boundary").unwrap();
+        assert!(
+            c.level == Level::Warn && c.detail.contains("cannot read nats.conf"),
+            "{c:?}"
+        );
 
         let hub = FakeHub {
             hosts: vec![

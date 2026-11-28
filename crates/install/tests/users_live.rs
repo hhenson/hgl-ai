@@ -1486,8 +1486,8 @@ fn write_pattern(t: &Target) -> Option<String> {
     match t {
         Target::Keys { bucket, keys } => Some(format!("$KV.{bucket}.{keys}")),
         Target::Subjects(s) => Some(s.clone()),
-        // Its keys are written by none but the control key.
-        Target::Probe { bucket, .. } => Some(format!("$KV.{bucket}.>")),
+        // No role writes the canary.
+        Target::Canary(bucket) => Some(format!("$KV.{bucket}.>")),
         _ => None,
     }
 }
@@ -1538,7 +1538,7 @@ async fn seeded(hub: &Hub) -> jetstream::Context {
     let buckets: std::collections::BTreeSet<String> = access_table()
         .into_iter()
         .filter_map(|r| match r.target {
-            Target::Keys { bucket, .. } => Some(bucket),
+            Target::Keys { bucket, .. } | Target::Canary(bucket) => Some(bucket),
             _ => None,
         })
         .collect();
@@ -1674,24 +1674,15 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                             assert_eq!(pull(&c, 2).await.len(), 2, "a batch: {what}");
                         }
                     }
-                    Target::Probe { bucket, key } => {
-                        // Keys by direct get; a consumer filtered to the probe, pulled
-                        // and acknowledged; no other consumer, durable or listing.
+                    Target::Canary(bucket) => {
+                        // Keys by direct get, a lookup by subject; no consumer of any form,
+                        // no listing.
                         let store = js.get_key_value(bucket).await.expect(&what);
-                        assert_eq!(store.get(key).await.expect(&what).unwrap(), "hgl-ai canary");
+                        assert_eq!(store.get("seed.a").await.expect(&what).unwrap(), "seed");
                         let s = js.get_stream(format!("KV_{bucket}")).await.unwrap();
-                        let c = s
-                            .create_consumer(consumer::pull::Config {
-                                name: Some(format!("probe-{role}")),
-                                ack_policy: consumer::AckPolicy::Explicit,
-                                filter_subject: format!("$KV.{bucket}.{key}"),
-                                ..Default::default()
-                            })
+                        s.get_last_raw_message_by_subject(&format!("$KV.{bucket}.seed.a"))
                             .await
                             .expect(&what);
-                        let got = pull(&c, 1).await;
-                        assert_eq!(got.len(), 1, "{what}");
-                        got[0].double_ack().await.expect(&what);
                         let p = hgl_ai_proto::HUB_API_PREFIX;
                         let sn = format!("KV_{bucket}");
                         unanswered(
@@ -2146,26 +2137,36 @@ async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
         let Some(hub) = hub else { return };
         let admin = seeded(&hub).await;
         let canary = format!("KV_{}", hgl_ai_proto::KV_CANARY);
-        // The canary's messages but the control writes.
         let count = || async {
             let mut s = admin.get_stream(&canary).await.unwrap();
-            let all = s.info().await.unwrap().state.messages;
-            let control = s
-                .info_with_subjects(format!("$KV.{}.control.*", hgl_ai_proto::KV_CANARY))
-                .await
-                .unwrap()
-                .count()
-                .await;
-            all - control as u64
+            s.info().await.unwrap().state.messages
         };
+        // Evidence that arrives stays: no age limit, no rollup, no purge, no delete; on a
+        // new canary, on one a bucket config made before (an upgrade), and provisioned
+        // again (r6 on #192).
+        let effective = || async {
+            let mut s = admin.get_stream(&canary).await.unwrap();
+            let c = s.info().await.unwrap().config.clone();
+            assert_eq!(c.max_age, Duration::ZERO);
+            assert!(!c.allow_rollup && c.deny_purge && c.deny_delete, "{c:?}");
+        };
+        effective().await;
+        admin.delete_stream(&canary).await.unwrap();
+        admin
+            .create_key_value(kv::Config {
+                bucket: hgl_ai_proto::KV_CANARY.into(),
+                max_age: Duration::from_secs(7 * 86_400),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        for _ in 0..2 {
+            hub.bus("hub-admin").await.provision().await.unwrap();
+            effective().await;
+        }
+        let purge = admin.get_stream(&canary).await.unwrap().purge().await;
+        assert!(purge.is_err(), "{purge:?}");
         let before = count().await;
-        // The probe never ages out of the canary (bot on #192); control writes carry a
-        // TTL; provisioning again keeps both.
-        hub.bus("hub-admin").await.provision().await.unwrap();
-        let mut s = admin.get_stream(&canary).await.unwrap();
-        let config = s.info().await.unwrap().config.clone();
-        assert_eq!(config.max_age, Duration::ZERO);
-        assert!(config.allow_message_ttl);
         for (_, who) in ROLE_USERS {
             let cfg = hub.host_cfg(who);
             assert_eq!(
@@ -2184,7 +2185,7 @@ async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
         }
         let after = count().await;
         if accounts {
-            assert_eq!(after, before, "nothing but the control write arrived");
+            assert_eq!(after, before, "nothing arrived");
         } else {
             assert_eq!(after, before + ROLE_USERS.len() as u64);
         }
@@ -2203,23 +2204,6 @@ async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
         let r = BusHub.boundary(&bare_admin).await;
         assert!(matches!(&r, Err(e) if e.contains("names no role")), "{r:?}");
         assert_eq!(count().await, after, "no untried credential wrote");
-
-        // A canary that refuses writes: the control write cannot land, so an absent reply
-        // key proves nothing, and no verdict is a pass (r6 on #192).
-        {
-            let mut stream = admin.get_stream(&canary).await.unwrap();
-            let mut config = stream.info().await.unwrap().config.clone();
-            config.max_messages = stream.info().await.unwrap().state.messages as i64;
-            config.discard = jetstream::stream::DiscardPolicy::New;
-            admin.update_stream(config.clone()).await.unwrap();
-            let r = BusHub.boundary(&hub.host_cfg("build-1")).await;
-            assert!(
-                matches!(&r, Err(e) if e.contains("no control write landed")),
-                "accounts {accounts}: {r:?}"
-            );
-            config.max_messages = -1;
-            admin.update_stream(config).await.unwrap();
-        }
 
         let rec = |host: &str, accounts_capable| hgl_ai_proto::HostRecord {
             host: host.into(),

@@ -14,10 +14,10 @@ use std::str::FromStr;
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    CANARY_CONTROL, CANARY_PROBE, CONSOLE_PREFIX, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS,
-    KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX,
-    OWNER_PREFIX, SLACK_FEED, SLACK_OWNER_FILTER, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
-    SUBJECT_PREFIX, USAGE_PREFIX, VIEWER_INBOX, VIEWER_STATE_KEYS,
+    CONSOLE_PREFIX, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK,
+    KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
+    SLACK_OWNER_FILTER, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, USAGE_PREFIX,
+    VIEWER_INBOX, VIEWER_STATE_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -324,18 +324,14 @@ fn viewer() -> Permissions {
 }
 
 /// What `hub boundary` needs of `HGL_CANARY` on one account, as on role accounts
-/// ([`Target::Probe`]): its state, its keys by direct get, a consumer filtered to the probe
-/// only (no durable form, no list), pulls and acknowledgements, and the control write.
+/// ([`Target::Canary`]): its state, a lookup by sequence or subject (the reply route's
+/// try), and its keys by direct get. No consumer, no write.
 fn canary_legacy() -> Vec<String> {
     let s = kv(KV_CANARY);
     vec![
         format!("$JS.API.STREAM.INFO.{s}"),
+        format!("$JS.API.STREAM.MSG.GET.{s}"),
         format!("$JS.API.DIRECT.GET.{s}.$KV.{KV_CANARY}.>"),
-        format!("$JS.API.CONSUMER.CREATE.{s}.*.$KV.{KV_CANARY}.{CANARY_PROBE}"),
-        format!("$JS.API.CONSUMER.INFO.{s}.*"),
-        format!("$JS.API.CONSUMER.MSG.NEXT.{s}.*"),
-        format!("$JS.ACK.{s}.*.>"),
-        format!("$KV.{KV_CANARY}.{CANARY_CONTROL}.*"),
     ]
 }
 
@@ -622,9 +618,9 @@ pub enum Target {
     BySequence(String),
     /// Publishing on `subject` (with wildcards), into whichever stream holds it.
     Subjects(String),
-    /// `hub boundary`'s probe: `bucket`'s state and keys by direct get, and consumers
-    /// filtered to `key` only, each pulled and acknowledged by its (unlisted) name.
-    Probe { bucket: String, key: String },
+    /// `hub boundary`'s canary bucket: its state, a lookup by sequence or subject, and its
+    /// keys by direct get; no consumer.
+    Canary(String),
 }
 
 /// One row: a target and each role's access to it, in [`ACCOUNT_ROLES`] order.
@@ -704,19 +700,8 @@ pub fn access_table() -> Vec<Row> {
         // The console reads the permalink index; delivery state is the adapter's.
         row(keys(KV_SLACK, "links.*.*"), [No, No, No, R, No]),
         row(all(KV_SLACK), [No, No, No, No, RW]),
-        // `hub boundary`: every role reads the canary and acknowledges its probe; its
-        // `doctor.*` keys none writes; its control key all do.
-        row(
-            Target::Probe {
-                bucket: KV_CANARY.into(),
-                key: CANARY_PROBE.into(),
-            },
-            [R, R, R, R, R],
-        ),
-        row(
-            keys(KV_CANARY, &format!("{CANARY_CONTROL}.*")),
-            [W, W, W, W, W],
-        ),
+        // `hub boundary`: every role reads the canary; none writes it.
+        row(Target::Canary(KV_CANARY.into()), [R, R, R, R, R]),
     ]
 }
 
@@ -789,14 +774,11 @@ impl Target {
                     out.push(api(&format!("STREAM.INFO.{s}")));
                     out.push(api(&format!("STREAM.MSG.GET.{s}")));
                 }
-                Target::Probe { bucket, key } => {
+                Target::Canary(bucket) => {
                     let s = kv(bucket);
                     out.push(api(&format!("STREAM.INFO.{s}")));
+                    out.push(api(&format!("STREAM.MSG.GET.{s}")));
                     out.push(api_stream(&format!("DIRECT.GET.{s}.$KV.{bucket}.>")));
-                    out.push(api(&format!("CONSUMER.CREATE.{s}.*.$KV.{bucket}.{key}")));
-                    out.push(api(&format!("CONSUMER.INFO.{s}.*")));
-                    out.push(api_stream(&format!("CONSUMER.MSG.NEXT.{s}.*")));
-                    out.push(plain(format!("$JS.ACK.{s}.*.>")));
                 }
                 Target::Subjects(_) => {}
             }
@@ -1027,6 +1009,29 @@ pub fn audit(text: &str, reg: &Registry) -> std::result::Result<Audit, String> {
             && !matches!(js.as_deref(), Some("disabled" | "false" | "disable"));
         if js_on && name != HUB_ACCOUNT {
             problems.push(format!("{name} has JetStream"));
+        }
+        // Imports: from `HUB` only, services only, each one the table gives the account's
+        // role, under the local name `render_accounts` gives it.
+        let role = ACCOUNT_ROLES.iter().find(|r| r.account() == name.as_str());
+        for i in acct.get("imports").map(Value::items).unwrap_or_default() {
+            let Some(svc) = i.get("service") else {
+                problems.push(format!("{name} has an import that is not a service"));
+                continue;
+            };
+            let from = str_of(svc.get("account")).unwrap_or_default();
+            let subject = str_of(svc.get("subject")).unwrap_or_default();
+            let Some(role) = role.filter(|_| from == HUB_ACCOUNT) else {
+                problems.push(format!("{name} imports {subject} from {from:?}"));
+                continue;
+            };
+            if !role_services(*role).iter().any(|s| s.subject == subject) {
+                problems.push(format!("{name} imports {subject}, beyond the access table"));
+                continue;
+            }
+            let to = str_of(i.get("to")).unwrap_or_else(|| subject.clone());
+            if to != local_subject(&subject) {
+                problems.push(format!("{name} imports {subject} as {to}"));
+            }
         }
         for e in acct.get("exports").map(Value::items).unwrap_or_default() {
             if let Some(s) = str_of(e.get("stream")) {
@@ -1532,7 +1537,6 @@ mod tests {
             writes(Role::Seat),
             [
                 "$KV.HGL_BUILD.run.>",
-                "$KV.HGL_CANARY.control.*",
                 "$KV.HGL_ENDED.>",
                 "$KV.HGL_HOSTS.>",
                 "$KV.HGL_LOCKS.>",
@@ -1545,15 +1549,14 @@ mod tests {
             ]
         );
         let mut coord = writes(Role::Seat);
-        coord.insert(5, "$KV.HGL_METRICS.>".into());
+        coord.insert(4, "$KV.HGL_METRICS.>".into());
         assert_eq!(writes(Role::Coord), coord);
         let mut builder = writes(Role::Seat);
-        builder.insert(8, "$KV.HGL_VERDICTS.>".into());
+        builder.insert(7, "$KV.HGL_VERDICTS.>".into());
         assert_eq!(writes(Role::Builder), builder);
         assert_eq!(
             writes(Role::Console),
             [
-                "$KV.HGL_CANARY.control.*",
                 "$KV.HGL_CONSOLE.>",
                 "$KV.HGL_STATE.decisions.log",
                 "$KV.HGL_THREADS.>",
@@ -1562,14 +1565,7 @@ mod tests {
                 "hgl.owner.thread.*",
             ]
         );
-        assert_eq!(
-            writes(Role::Slack),
-            [
-                "$KV.HGL_CANARY.control.*",
-                "$KV.HGL_SLACK.>",
-                SLACK_OWNER_FILTER
-            ]
-        );
+        assert_eq!(writes(Role::Slack), ["$KV.HGL_SLACK.>", SLACK_OWNER_FILTER]);
         // Seats read `HGL_OWNER` by sequence: no consumer, no feed, no ack.
         for r in [Role::Seat, Role::Coord, Role::Builder] {
             assert!(has(r, "$JS.API.STREAM.MSG.GET.HGL_OWNER"));
@@ -1743,6 +1739,12 @@ mod tests {
             .unwrap()
             .to_string();
         let exports_at = "    exports: [\n";
+        // One more import in the SEAT account's own list.
+        let seat_import = |text: &str, entry: &str| {
+            let at = text.find("  SEAT {\n").unwrap();
+            let list = at + text[at..].find("    imports: [\n").unwrap() + "    imports: [\n".len();
+            format!("{}      {entry}\n{}", &text[..list], &text[list..])
+        };
         let cases: Vec<(String, String)> = vec![
             (
                 text.replacen(
@@ -1795,6 +1797,28 @@ mod tests {
                     1,
                 ),
                 "SEAT exports x: only HUB exports".to_string(),
+            ),
+            (
+                seat_import(
+                    &text,
+                    "{ service: { account: HUB, subject: \"$KV.HGL_CONSOLE.>\" }, to: \"JS.HUB.API.$KV.HGL_CONSOLE.>\" }",
+                ),
+                "SEAT imports $KV.HGL_CONSOLE.>, beyond the access table".to_string(),
+            ),
+            (
+                seat_import(&text, "{ service: { account: COORD, subject: \"x\" } }"),
+                "SEAT imports x from \"COORD\"".to_string(),
+            ),
+            (
+                seat_import(&text, "{ stream: { account: HUB, subject: \"hgl.>\" } }"),
+                "SEAT has an import that is not a service".to_string(),
+            ),
+            (
+                seat_import(
+                    &text,
+                    "{ service: { account: HUB, subject: \"$JS.API.INFO\" }, to: \"$JS.API.INFO\" }",
+                ),
+                "SEAT imports $JS.API.INFO as $JS.API.INFO".to_string(),
             ),
             (
                 text.replacen(&hub_line, "", 1).replacen(

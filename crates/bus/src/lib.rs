@@ -59,11 +59,10 @@ use async_nats::jetstream::{self, AckKind, context::Publish, kv, stream};
 use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
-    BROADCAST, CANARY_PROBE, CANARY_PROBE_VALUE, CONSOLE_PREFIX, EndedRecord, HUB_API_PREFIX,
-    HostRecord, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK,
-    KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord, Note, OWNER_PREFIX, STREAM_NOTES,
-    STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord, USAGE_PREFIX, ended_key,
-    utc_now_stamp,
+    BROADCAST, CONSOLE_PREFIX, EndedRecord, HUB_API_PREFIX, HostRecord, KV_CANARY, KV_CONSOLE,
+    KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE,
+    LockRecord, Note, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat,
+    TaskKey, TreeRecord, USAGE_PREFIX, ended_key, utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -592,37 +591,24 @@ impl Bus {
                 .map_err(|e| nats(&format!("provisioning bucket {bucket}"), e))?;
         }
         self.provision_canary().await?;
-        // The canary's fixed probe message (`doctor`, `hub boundary`).
-        self.js
-            .get_key_value(KV_CANARY)
-            .await
-            .map_err(|e| missing(&format!("bucket {KV_CANARY}"), e))?
-            .put(CANARY_PROBE, CANARY_PROBE_VALUE.into())
-            .await
-            .map_err(|e| nats(&format!("writing {KV_CANARY}/{CANARY_PROBE}"), e))?;
         Ok(())
     }
 
-    /// `HGL_CANARY` (`doctor`, `hub boundary`): a bucket with no age limit, so its probe
-    /// never expires, that allows per-message TTLs, which its control writes carry. A
-    /// forbidden write that arrives (one account, about 100 bytes a doctor run) stays until
-    /// purged. Once TTLs are on the server refuses a bucket update that would turn them
-    /// off, as a bucket config does: from then the stream is updated directly.
+    /// `HGL_CANARY` (`doctor`, `hub boundary`): a bucket no role writes, which stays empty
+    /// while the hub holds role boundaries. A forbidden write that arrives is evidence: no
+    /// age limit, no rollup and no purge, so nothing but the admin's stream delete takes
+    /// it away (r6 on #192). Created as a bucket, then its stream set so, on creation and
+    /// on upgrade alike (a bucket update would turn rollups back on).
     async fn provision_canary(&self) -> Result<()> {
         let name = format!("KV_{KV_CANARY}");
-        let description = "hgl-ai role boundary canary: only control.* is written by roles";
-        let current = self.js.get_stream(&name).await.ok();
-        let config = match current {
-            Some(s) if s.cached_info().config.allow_message_ttl => s.cached_info().config.clone(),
-            _ => {
+        let config = match self.js.get_stream(&name).await {
+            Ok(s) => s.cached_info().config.clone(),
+            Err(_) => {
                 self.js
-                    .create_or_update_key_value(kv::Config {
+                    .create_key_value(kv::Config {
                         bucket: KV_CANARY.to_string(),
-                        description: description.to_string(),
                         storage: stream::StorageType::File,
                         history: 1,
-                        max_age: Duration::ZERO,
-                        max_value_size: MAX_VALUE_BYTES as i32,
                         ..Default::default()
                     })
                     .await
@@ -637,11 +623,13 @@ impl Bus {
             }
         };
         let mut want = config.clone();
-        want.description = Some(description.to_string());
+        want.description = Some("hgl-ai role boundary canary; no role writes it".to_string());
         want.max_messages_per_subject = 1;
         want.max_age = Duration::ZERO;
         want.max_message_size = MAX_VALUE_BYTES as i32;
-        want.allow_message_ttl = true;
+        want.allow_rollup = false;
+        want.deny_purge = true;
+        want.deny_delete = true;
         if want != config {
             self.js
                 .update_stream(want)

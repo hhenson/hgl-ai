@@ -161,15 +161,17 @@ the shared inbox until it restarts.
 
 `doctor` checks the role boundaries (hgl-ai#141):
 
-- `hub boundary` (every host): writes `HGL_CANARY/doctor.*`, which no role may, directly
-  and as a JetStream reply subject. On role accounts it fails if anything arrives. On one
-  account, where the reply route arrives, it warns until the cutover (hgl-ai#147). It
-  passes only with proof: each direct write refused by name, and a control write that
-  landed after the reply. Otherwise it warns "cannot test". `hgl-ai init` writes the
-  probe it needs.
+- `hub boundary` (every host): tries writes to `HGL_CANARY`, which no role may make,
+  directly and as a JetStream reply subject, and reports one that arrives. That is a
+  breach detector, never proof of isolation:
+  - a write seen fails on role accounts;
+  - one account warns until the cutover (hgl-ai#147);
+  - `ok` only on the hub, when it serves role accounts and `nats.conf` passes the account
+    audit;
+  - elsewhere it warns "cannot test".
 - `hub accounts` (the hub): `nats.conf` against the registry: each role's users in its
   own account, the admin alone in `HUB`, no stream exports, no export wider than the
-  access table. Users in one account warn.
+  access table, imports within it. Users in one account warn.
 - `hub clients` (the hub): live hosts whose client cannot use role accounts yet.
 - `hub` looks up only the streams and buckets the host's role may read.
 
