@@ -23,6 +23,47 @@ const RETRY_MS = 3000;
 /** The `viewer` user may subscribe here only (`VIEWER_INBOX` in crates/proto). */
 export const INBOX_PREFIX = "_INBOX_VIEWER";
 
+/** What `follow` reads of a watch's entry. */
+export interface Entry {
+  key: string;
+  operation: string;
+  created: Date;
+  isUpdate: boolean;
+  string(): string;
+}
+
+/** How long a watch's catch-up may be quiet before it counts as caught up. */
+export const QUIET_MS = 1500;
+
+/**
+ * Feed a watch's entries to the store until it ends or throws. Caught up once an entry is
+ * live, or after `QUIET_MS` without one; the timer for that never outlives the watch, so a
+ * watch that fails mid-replay drops nothing it had not delivered, and never ends the next
+ * watch's catch-up early.
+ */
+export async function follow(
+  iter: AsyncIterable<Entry>,
+  store: Store,
+  source: Source,
+  stopped: () => boolean,
+  stop: () => void,
+): Promise<void> {
+  // Nothing to catch up on: nothing there, or its values have all come.
+  let quiet: ReturnType<typeof setTimeout> | undefined = setTimeout(() => store.synced(source), QUIET_MS);
+  try {
+    for await (const e of iter) {
+      store.put(source.bucket, e.key, e.operation === "PUT" ? e.string() : null, e.created.getTime(), e.isUpdate);
+      clearTimeout(quiet);
+      quiet = undefined;
+      if (e.isUpdate) store.synced(source);
+      else quiet = setTimeout(() => store.synced(source), QUIET_MS);
+      if (stopped()) stop();
+    }
+  } finally {
+    clearTimeout(quiet);
+  }
+}
+
 export async function watch(nc: NatsConnection, store: Store, source: Source, stopped: () => boolean): Promise<void> {
   const { bucket, key } = source;
   while (!stopped() && !nc.isClosed()) {
@@ -32,15 +73,7 @@ export async function watch(nc: NatsConnection, store: Store, source: Source, st
       // One key or the whole bucket: either way one filter, so the client asks for the
       // consumer in the filtered form, the only one the viewer may use.
       const iter = await kv.watch(key === undefined ? {} : { key });
-      // Nothing to catch up on: nothing there, or its values have all come.
-      let quiet = setTimeout(() => store.synced(source), 1500);
-      for await (const e of iter) {
-        store.put(bucket, e.key, e.operation === "PUT" ? e.string() : null, e.created.getTime(), e.isUpdate);
-        clearTimeout(quiet);
-        if (e.isUpdate) store.synced(source);
-        else quiet = setTimeout(() => store.synced(source), 1500);
-        if (stopped()) iter.stop();
-      }
+      await follow(iter, store, source, stopped, () => iter.stop());
     } catch (err) {
       console.warn(`watching ${key === undefined ? bucket : `${bucket}/${key}`}:`, err);
     }

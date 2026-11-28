@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
-import { Backoff, connectRetrying, hubUrl } from "./hub";
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { Backoff, connectRetrying, type Entry, follow, hubUrl, QUIET_MS } from "./hub";
+import { Store } from "./store";
 
 describe("hubUrl", () => {
   it("is the page's own origin", () => {
@@ -66,5 +67,72 @@ describe("Backoff", () => {
       expect(ms).toBeGreaterThan(0);
       expect(ms).toBeLessThanOrEqual(60_000);
     }
+  });
+});
+
+describe("follow", () => {
+  afterEach(() => void vi.useRealTimers());
+  const entry = (key: string, value: string, isUpdate = false): Entry => ({
+    key,
+    operation: "PUT",
+    created: new Date(0),
+    isUpdate,
+    string: () => value,
+  });
+  const fleet = (s: Store) => {
+    s.flush();
+    return Object.fromEntries(s.rows("fleet").map((r) => [r.id, r.value]));
+  };
+
+  it("a watch that fails mid-replay drops nothing it had not delivered", async () => {
+    vi.useFakeTimers();
+    const s = new Store(undefined, Date.now, 0);
+    const src = { bucket: "HGL_STATE" as const };
+    s.put("HGL_STATE", "mode", "drain");
+    s.put("HGL_STATE", "hold", "landing");
+    // The watch starts again, delivers `hold`, and fails before `mode` comes.
+    s.resync(src);
+    async function* failing(): AsyncGenerator<Entry> {
+      yield entry("hold", "landing");
+      throw new Error("the connection went");
+    }
+    await expect(follow(failing(), s, src, () => false, () => {})).rejects.toThrow("the connection went");
+    await vi.advanceTimersByTimeAsync(QUIET_MS * 2);
+    expect(fleet(s)).toMatchObject({ mode: "drain", hold: "landing" });
+
+    // The next watch's catch-up is its own: no earlier timer ends it.
+    s.resync(src);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    async function* slow(): AsyncGenerator<Entry> {
+      yield entry("hold", "landing");
+      await gate;
+      yield entry("mode", "drain");
+      yield entry("hold", "none-yet", true);
+    }
+    const done = follow(slow(), s, src, () => false, () => {});
+    await vi.advanceTimersByTimeAsync(QUIET_MS / 2);
+    release();
+    await done;
+    await vi.advanceTimersByTimeAsync(QUIET_MS * 2);
+    expect(fleet(s)).toMatchObject({ mode: "drain" });
+  });
+
+  it("is caught up when the watch is quiet, and what it did not deliver goes", async () => {
+    vi.useFakeTimers();
+    const s = new Store(undefined, Date.now, 0);
+    const src = { bucket: "HGL_STATE" as const, key: "hold" };
+    s.put("HGL_STATE", "hold", "landing");
+    s.resync(src);
+    let end!: () => void;
+    const open = new Promise<void>((r) => (end = r));
+    async function* empty(): AsyncGenerator<Entry> {
+      await open;
+    }
+    const done = follow(empty(), s, src, () => false, () => {});
+    await vi.advanceTimersByTimeAsync(QUIET_MS + 10);
+    expect(fleet(s)).toMatchObject({ hold: "none" });
+    end();
+    await done;
   });
 });
