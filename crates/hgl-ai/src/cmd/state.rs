@@ -130,22 +130,13 @@ pub async fn init(ctx: &Ctx) -> anyhow::Result<i32> {
             )
         }
     })?;
-    // What an upgrade must undo too: the viewer's consumers on a bucket it no longer reads
-    // (hgl-ai#173). The system installer's upgrade runs `init`; `server install` retires
-    // through `BusHub::provision`.
-    let gone = hgl_ai_install::hub::retire_viewer_consumers_as(&cfg)
+    // What an upgrade must undo too, the same on every provisioning path (hgl-ai#173,
+    // hgl-ai#181): the viewer's tree consumers, and every stored title once.
+    for line in hgl_ai_install::hub::upgrade_cleanup(&cfg, &bus)
         .await
-        .map_err(|e| anyhow::anyhow!("retiring the viewer's consumers: {e}"))?;
-    if !gone.is_empty() {
-        eprintln!("retired the viewer's consumers: {}", gone.join(", "));
-    }
-    // Public repositories only (hgl-ai#181): once per hub, every stored title goes, in
-    // every revision; the coordinator writes the public ones again.
-    if let Some(keys) = hgl_ai_gh::migrate::strip_once(&bus)
-        .await
-        .map_err(|e| anyhow::anyhow!("stripping stored titles: {e}"))?
+        .map_err(|e| anyhow::anyhow!("{e}"))?
     {
-        eprintln!("stripped stored titles from {}", keys.join(", "));
+        eprintln!("{line}");
     }
     let names = [
         STREAM_NOTES,

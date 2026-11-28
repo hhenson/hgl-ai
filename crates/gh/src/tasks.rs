@@ -163,7 +163,7 @@ const TITLES_PER_ROUND: usize = 5;
 
 /// Issue titles of the tasks with a worktree, read from GitHub once each (a task's title
 /// rarely changes; the page links to the issue).
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct Titles {
     known: BTreeMap<(String, u64), String>,
     tried: BTreeMap<(String, u64), Instant>,
@@ -175,6 +175,11 @@ impl Titles {
             .get(&(repo.to_string(), issue))
             .map(String::as_str)
             .filter(|t| !t.is_empty())
+    }
+
+    /// Forget every title of a repository `keep` does not keep (one no longer public).
+    pub fn retain_repos(&mut self, keep: impl Fn(&str) -> bool) {
+        self.known.retain(|(r, _), _| keep(r));
     }
 
     pub fn insert(&mut self, repo: &str, issue: u64, title: &str) {
@@ -263,13 +268,15 @@ pub(crate) async fn title<G: Gh>(
 /// Keep `tasks` current, every [`TASKS_EVERY`], until the process ends; titles from
 /// GitHub in a loop of their own, every [`TITLES_EVERY`], so a slow GitHub never holds the
 /// stages back.
-pub async fn run<G: Gh>(bus: &Bus, gh: &G, s: &Settings) {
+/// A title shows only for a repository `vis` holds as public (the coordinator's newest
+/// round; [`crate::migrate::Visibility`]).
+pub async fn run<G: Gh>(bus: &Bus, gh: &G, s: &Settings, vis: &crate::migrate::Visibility) {
     let titles = Mutex::new(Titles::default());
     let stages = async {
         let mut idx = NotesIndex::default();
         let mut written: Option<String> = None;
         loop {
-            if let Err(e) = round(bus, &mut idx, &titles, &mut written).await {
+            if let Err(e) = round(bus, &mut idx, &titles, &mut written, vis).await {
                 tracing::warn!("{}: {e}", state::KEY_TASKS);
             }
             tokio::time::sleep(TASKS_EVERY).await;
@@ -316,19 +323,29 @@ pub(crate) async fn keep(
     idx: &mut NotesIndex,
     written: &mut Option<String>,
 ) -> crate::Result<()> {
-    round(bus, idx, &Mutex::default(), written).await
+    round(bus, idx, &Mutex::default(), written, &Default::default()).await
 }
 
 /// Read the notes and trees and write `tasks` if it changed; titles as known now.
-async fn round(
+/// The visibility is held read from the render to the write: a repository turning private
+/// is never overtaken by a write of its title made with the older visibility.
+pub(crate) async fn round(
     bus: &Bus,
     idx: &mut NotesIndex,
     titles: &Mutex<Titles>,
     written: &mut Option<String>,
+    vis: &crate::migrate::Visibility,
 ) -> crate::Result<()> {
     idx.refresh(bus).await?;
     let trees = bus.trees().await?;
-    let text = render(idx, &trees, &lock(titles));
+    let vis = vis.read().await;
+    let public = |r: &str| crate::migrate::is_public(&vis, r);
+    let shown = {
+        let mut t = lock(titles);
+        t.retain_repos(public);
+        t.clone()
+    };
+    let text = render(idx, &trees, &shown);
     if written.as_deref() == Some(text.as_str()) {
         return Ok(());
     }

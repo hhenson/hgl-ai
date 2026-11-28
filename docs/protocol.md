@@ -315,7 +315,8 @@ before hub users takes one shared token until it moves.
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
 Titles in `backlog`, `prs`, `tasks` and `landed.log` are of public repositories only; a
-private one's row has an empty title or none (docs/owner.md §3). `migrated.public-titles`
+private one's row has an empty title or none, and its labels are one `# label <repo>
+private <n>` (docs/owner.md §3). `migrated.public-titles`
 records that `hgl-ai init` stripped the titles stored before.
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is

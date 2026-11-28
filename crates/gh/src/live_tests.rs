@@ -2643,3 +2643,175 @@ async fn stored_titles_of_private_repositories_are_migrated() {
         ["S pub #5 m Public landing\nS priv #6 m\nS other #7 m\n"]
     );
 }
+
+/// Planted titles and label names of `pub` (public) and `priv` (private) repositories, in
+/// every key and in a metrics sample, each key with an older revision too.
+async fn plant_titles(b: &Bus) {
+    let rows = [
+        (
+            state::KEY_BACKLOG,
+            "# read R\n# label pub bug 1\n# label priv customer-x 2\n\
+             pub\t1\tcodex\t20260101T000000Z\tPublic one\n\
+             priv\t2\tcodex\t20260101T000000Z\tBluebird\n",
+        ),
+        (
+            state::KEY_PRS,
+            "# read R\npub\t3\th\topen\tnone\t0\tnone\tT\n# pr\tpub\t3\t-\t-\tPublic pr\n\
+             priv\t4\th\topen\tnone\t0\tnone\tT\n# pr\tpriv\t4\t-\t-\tBluebird pr\n",
+        ),
+        (
+            state::KEY_TASKS,
+            "# title\tpub\t5\tPublic task\n# title\tpriv\t6\tBluebird task\n",
+        ),
+        (
+            state::KEY_LANDED,
+            "S pub #7 m Public landing\nS priv #8 m Bluebird landing\n",
+        ),
+    ];
+    for (k, v) in rows {
+        b.state_put(k, &format!("{v}# read older Bluebird\n"))
+            .await
+            .unwrap();
+        b.state_put(k, v).await.unwrap();
+    }
+    for (repo, label) in [("pub", "bug"), ("priv", "customer-x")] {
+        b.metrics_put(&hgl_ai_proto::MetricsSample {
+            repo: repo.into(),
+            date: "20260101".into(),
+            open: 2,
+            opened: 0,
+            closed: 0,
+            labels: std::collections::BTreeMap::from([(label.to_string(), 2)]),
+            taken_at: "T".into(),
+        })
+        .await
+        .unwrap();
+    }
+}
+
+/// What the viewer can read of the planted values, every kept revision included.
+async fn viewer_readable(b: &Bus) -> String {
+    let mut all = String::new();
+    for k in crate::migrate::KEYS {
+        all.push_str(&b.state_history(k).await.unwrap().join("\n"));
+        all.push('\n');
+    }
+    for m in b.metrics().await.unwrap() {
+        all.push_str(&format!("{} {:?}\n", m.repo, m.labels));
+    }
+    all
+}
+
+/// The coordinator without a GitHub sign-in scrubs every title and label name, as if
+/// every repository were private, before it stops.
+#[tokio::test]
+async fn a_coordinator_without_a_sign_in_scrubs_every_title() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    plant_titles(&b).await;
+    let gh = FakeGh::default().fail("auth status", "You are not logged into any GitHub hosts.");
+    let o = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: Duration::from_secs(300),
+    };
+    let r = coord::run(&gh, &settings(), Some(&b), &o, &mut Vec::new()).await;
+    assert!(matches!(r, Err(Error::Auth(_))), "{r:?}");
+    let seen = viewer_readable(&b).await;
+    for frag in ["Bluebird", "Public", "customer-x", "bug"] {
+        assert!(!seen.contains(frag), "{frag}: {seen}");
+    }
+    assert!(seen.contains("private"), "{seen}");
+}
+
+/// A repository found no longer public: its titles and label names go from every value at
+/// once, history included; the task-title loop shows none of its titles from then on;
+/// a public repository's stay.
+#[tokio::test]
+async fn a_repository_turning_private_is_stripped_at_once() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    plant_titles(&b).await;
+    let vis = crate::migrate::Visibility::default();
+    *vis.write().await = [("pub".to_string(), false), ("priv".to_string(), false)].into();
+    let now = [("pub".to_string(), false), ("priv".to_string(), true)].into();
+    let turned = crate::migrate::observe(&vis, now, &b).await.unwrap();
+    assert_eq!(turned, ["priv"]);
+    let seen = viewer_readable(&b).await;
+    for frag in ["Bluebird", "customer-x"] {
+        assert!(!seen.contains(frag), "{frag}: {seen}");
+    }
+    for frag in [
+        "Public one",
+        "Public pr",
+        "Public task",
+        "Public landing",
+        "bug",
+    ] {
+        assert!(seen.contains(frag), "{frag}: {seen}");
+    }
+    assert!(!crate::migrate::is_public(&*vis.read().await, "priv"));
+    // Nothing turned: nothing rewritten.
+    let rev = b
+        .state_get(state::KEY_LANDED)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision;
+    let same = [("pub".to_string(), false), ("priv".to_string(), true)].into();
+    assert!(
+        crate::migrate::observe(&vis, same, &b)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        b.state_get(state::KEY_LANDED)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision,
+        rev
+    );
+}
+
+/// The task-title loop writes a title only for a repository the coordinator's newest
+/// round holds as public, and forgets the titles of one that turned private.
+#[tokio::test]
+async fn task_titles_follow_the_coordinators_visibility() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    for (repo, issue) in [("pub", 1), ("priv", 2)] {
+        let tree: hgl_ai_proto::TreeRecord = serde_json::from_value(serde_json::json!({
+            "host": "lab1", "seat": "w1", "task": {"repo": repo, "issue": issue},
+            "path": "/w", "created_at": "20261128T000000Z",
+        }))
+        .unwrap();
+        b.tree_put(&tree).await.unwrap();
+    }
+    let titles = std::sync::Mutex::new(crate::tasks::Titles::default());
+    titles.lock().unwrap().insert("pub", 1, "Public task");
+    titles.lock().unwrap().insert("priv", 2, "Bluebird task");
+    let vis = crate::migrate::Visibility::default();
+    *vis.write().await = [("pub".to_string(), false), ("priv".to_string(), false)].into();
+    let mut idx = crate::tasks::NotesIndex::default();
+    let mut written = None;
+    crate::tasks::round(&b, &mut idx, &titles, &mut written, &vis)
+        .await
+        .unwrap();
+    let text = b.state_get(state::KEY_TASKS).await.unwrap().unwrap().value;
+    assert!(
+        text.contains("Bluebird task") && text.contains("Public task"),
+        "{text}"
+    );
+    // `priv` turns private, as a round finds it.
+    let now = [("pub".to_string(), false), ("priv".to_string(), true)].into();
+    crate::migrate::observe(&vis, now, &b).await.unwrap();
+    crate::tasks::round(&b, &mut idx, &titles, &mut written, &vis)
+        .await
+        .unwrap();
+    let history = b.state_history(state::KEY_TASKS).await.unwrap().join("\n");
+    assert!(!history.contains("Bluebird"), "{history}");
+    assert!(history.contains("Public task"), "{history}");
+    assert_eq!(titles.lock().unwrap().get("priv", 2), None, "forgotten");
+}

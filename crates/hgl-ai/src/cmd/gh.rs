@@ -384,14 +384,17 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                     .map_err(lift)?;
             } else {
                 let bus = Bus::connect(&cfg).await?;
-                let round = coord::run(&gh, &s, Some(&bus), &o, &mut out);
+                // The coordinator's view of which repositories are public, shared with
+                // the task titles (hgl-ai#181).
+                let vis = hgl_ai_gh::migrate::Visibility::default();
+                let round = coord::run_shared(&gh, &s, Some(&bus), &o, &mut out, &vis);
                 if once {
                     round.await.map_err(lift)?;
                 } else {
                     // Beside the rounds, every few seconds: each task's last note.
                     tokio::select! {
                         r = round => r.map_err(lift)?,
-                        () = hgl_ai_gh::tasks::run(&bus, &gh, &s) => {}
+                        () = hgl_ai_gh::tasks::run(&bus, &gh, &s, &vis) => {}
                     }
                 }
             }

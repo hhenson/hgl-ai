@@ -107,6 +107,22 @@ pub fn public_title(private: Option<bool>, t: &str) -> String {
     }
 }
 
+/// The label written for every label of a repository that is not public.
+pub const PRIVATE_LABEL: &str = "private";
+
+/// A repository's open issues per label as viewer-readable values hold them: by name for a
+/// public repository; for another (private, or visibility unknown), one [`PRIVATE_LABEL`]
+/// with the sum (an issue with two labels counts twice, as by name).
+pub fn public_labels(
+    private: Option<bool>,
+    labels: BTreeMap<String, u64>,
+) -> BTreeMap<String, u64> {
+    if private == Some(false) || labels.is_empty() {
+        return labels;
+    }
+    BTreeMap::from([(PRIVATE_LABEL.to_string(), labels.values().sum())])
+}
+
 /// Each queue row's title as [`public_title`] has it, by its repository's visibility.
 fn hide_private(queue: &mut [QueueRow], private: &BTreeMap<String, bool>) {
     for q in queue {
@@ -259,6 +275,7 @@ fragment Q on IssueConnection {{
 pub fn page_query() -> String {
     "query Page($owner: String!, $name: String!, $label: String!, $endCursor: String) {
   repository(owner: $owner, name: $name) {
+    isPrivate
     issues(states: OPEN, labels: [$label], first: 100, after: $endCursor, orderBy: {field: CREATED_AT, direction: ASC}) {
       pageInfo { hasNextPage endCursor }
       nodes { number title createdAt labels(first: 30) { nodes { name } } }
@@ -365,8 +382,11 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
             ) && n > 0
             {
                 labels.insert(name.to_string(), n);
-                b.labels.insert((repo.clone(), name.to_string()), n);
             }
+        }
+        let labels = public_labels(private.get(repo).copied(), labels);
+        for (name, n) in &labels {
+            b.labels.insert((repo.clone(), name.clone()), *n);
         }
         b.open.insert(repo.clone(), open);
         for (alias, label) in [("priority", PRIORITY), ("claimable", CLAIMABLE)] {
@@ -460,8 +480,12 @@ pub fn add_pages(r: &mut Reading, repos: &[String], pages: &[(String, Vec<Value>
                 .into_iter()
                 .flatten()
             {
+                // Each page by its own visibility: a title only if this page says public.
+                let private = p
+                    .pointer("/data/repository/isPrivate")
+                    .and_then(Value::as_bool);
                 if let Some((number, priority, created, title)) = candidate(n) {
-                    queue.push((i, number, priority, created, title));
+                    queue.push((i, number, priority, created, public_title(private, &title)));
                 }
             }
         }
@@ -800,6 +824,93 @@ mod tests {
             ("tasks", tasks),
             ("landed.log", landed),
         ]
+    }
+
+    /// A batch of one repository `alpha` with `isPrivate` as given (`None`: not said), a
+    /// label `customer-x` on 2 issues and `bug` on 3, and one claimable issue.
+    fn one_repo_batch(private: Option<bool>) -> Value {
+        let mut r = serde_json::json!({
+            "open": {"totalCount": 4},
+            "labels": {"nodes": [
+                {"name": "customer-x", "issues": {"totalCount": 2}},
+                {"name": "bug", "issues": {"totalCount": 3}}
+            ]},
+            "priority": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+            "claimable": {"nodes": [{"number": 1, "title": "First page title",
+                "createdAt": "2026-01-01T00:00:00Z", "labels": {"nodes": [{"name": CLAIMABLE}]}}],
+                "pageInfo": {"hasNextPage": true, "endCursor": "c1"}}
+        });
+        if let Some(p) = private {
+            r["isPrivate"] = p.into();
+        }
+        serde_json::json!({"data": {
+            "rateLimit": {"cost": 1, "remaining": 100, "resetAt": "x"},
+            "opened0": {"issueCount": 0}, "closed0": {"issueCount": 0}, "r0": r
+        }})
+    }
+
+    /// A later page is kept only by its own visibility: a page that says private, or says
+    /// nothing, keeps no title even when the first batch said public; and the reverse.
+    #[test]
+    fn later_pages_by_their_own_visibility() {
+        let repos = vec!["alpha".to_string()];
+        let page = |n: u64, private: Option<bool>| {
+            let mut repo = serde_json::json!({"issues": {"nodes": [{"number": n,
+                "title": format!("Page title {n}"), "createdAt": "2026-01-02T00:00:00Z",
+                "labels": {"nodes": [{"name": CLAIMABLE}]}}]}});
+            if let Some(p) = private {
+                repo["isPrivate"] = p.into();
+            }
+            serde_json::json!({"data": {"repository": repo}})
+        };
+        let titles = |first: Option<bool>| {
+            let mut r = parse_batch(&one_repo_batch(first), &repos, now()).unwrap();
+            let pages = vec![(
+                "alpha".to_string(),
+                vec![page(2, Some(false)), page(3, Some(true)), page(4, None)],
+            )];
+            add_pages(&mut r, &repos, &pages);
+            r.backlog
+                .queue
+                .iter()
+                .map(|q| (q.number, q.title.clone()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            titles(Some(false)),
+            [
+                (1, "First page title".to_string()),
+                (2, "Page title 2".to_string()),
+                (3, String::new()),
+                (4, String::new())
+            ]
+        );
+        assert!(titles(Some(true)).iter().all(|(_, t)| t.is_empty()));
+        assert!(titles(None).iter().all(|(_, t)| t.is_empty()));
+        assert!(page_query().contains("isPrivate"));
+    }
+
+    /// A private repository's, or an unknown one's, label names are counted under one
+    /// placeholder, in the backlog and in the day's sample alike.
+    #[test]
+    fn label_names_of_private_repositories() {
+        let repos = vec!["alpha".to_string()];
+        for private in [Some(true), None] {
+            let r = parse_batch(&one_repo_batch(private), &repos, now()).unwrap();
+            let text = r.backlog.render();
+            assert!(text.contains("# label alpha private 5\n"), "{text}");
+            assert!(
+                !text.contains("customer-x") && !text.contains("bug"),
+                "{text}"
+            );
+            assert_eq!(
+                r.samples[0].labels,
+                BTreeMap::from([(PRIVATE_LABEL.to_string(), 5)])
+            );
+        }
+        let r = parse_batch(&one_repo_batch(Some(false)), &repos, now()).unwrap();
+        assert!(r.backlog.render().contains("# label alpha customer-x 2\n"));
+        assert_eq!(r.samples[0].labels.get("bug"), Some(&3));
     }
 
     /// Public repositories only (hgl-ai#181): a private repository's title, or one of a

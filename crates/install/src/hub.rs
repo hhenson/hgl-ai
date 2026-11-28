@@ -115,8 +115,32 @@ pub async fn retire_viewer_consumers(
     Ok(gone)
 }
 
-/// [`retire_viewer_consumers`] as `cfg`'s hub user (the admin, when provisioning): every
-/// path that provisions the hub runs it, `server install` and `hgl-ai init` alike.
+/// What every path that provisions the hub runs after the provisioning (`server install`,
+/// `hgl-ai init`), as `cfg`'s hub user (the admin): retire the viewer's consumers on the
+/// buckets it no longer reads, then strip every stored title once (hgl-ai#181,
+/// [`hgl_ai_gh::migrate::strip_once`]). A failure is returned, for the caller to fail on;
+/// running it again finishes it. Returns what it did, a line each.
+pub async fn upgrade_cleanup(cfg: &Config, bus: &Bus) -> Result<Vec<String>, String> {
+    let mut did = Vec::new();
+    let gone = retire_viewer_consumers_as(cfg)
+        .await
+        .map_err(|e| format!("retiring the viewer's consumers: {e}"))?;
+    if !gone.is_empty() {
+        did.push(format!(
+            "retired the viewer's consumers: {}",
+            gone.join(", ")
+        ));
+    }
+    if let Some(keys) = hgl_ai_gh::migrate::strip_once(bus)
+        .await
+        .map_err(|e| format!("stripping stored titles: {e}"))?
+    {
+        did.push(format!("stripped stored titles from {}", keys.join(", ")));
+    }
+    Ok(did)
+}
+
+/// [`retire_viewer_consumers`] as `cfg`'s hub user.
 pub async fn retire_viewer_consumers_as(cfg: &Config) -> Result<Vec<String>, String> {
     retire_viewer_consumers(&jetstream_of(cfg).await?).await
 }
@@ -153,15 +177,12 @@ impl Hub for BusHub {
         Bus::connect(cfg).await.map(drop)
     }
 
-    /// Then retire the viewer's consumers on the buckets it no longer reads; a failure
-    /// there fails the provisioning.
+    /// Then [`upgrade_cleanup`]; a failure there fails the provisioning.
     async fn provision(&self, cfg: &Config) -> Result<(), BusError> {
-        Bus::connect(cfg).await?.provision().await?;
-        let gone = retire_viewer_consumers_as(cfg)
-            .await
-            .map_err(|e| BusError::Nats(format!("retiring the viewer's consumers: {e}")))?;
-        if !gone.is_empty() {
-            eprintln!("retired the viewer's consumers: {}", gone.join(", "));
+        let bus = Bus::connect(cfg).await?;
+        bus.provision().await?;
+        for line in upgrade_cleanup(cfg, &bus).await.map_err(BusError::Nats)? {
+            eprintln!("{line}");
         }
         Ok(())
     }

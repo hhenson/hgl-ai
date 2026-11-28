@@ -10,6 +10,7 @@ license.workspace = true
 hgl-ai-proto.workspace = true
 hgl-ai-config.workspace = true
 hgl-ai-bus.workspace = true
+hgl-ai-gh.workspace = true
 async-nats.workspace = true
 serde.workspace = true
 serde_json.workspace = true

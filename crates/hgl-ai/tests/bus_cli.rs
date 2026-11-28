@@ -266,6 +266,57 @@ fn init_strips_stored_titles_once() {
     assert_eq!(ok(&hub.run(&["state", "get", "backlog"])), public);
 }
 
+/// A key a delete marker hides still holds its history: `init` purges it at the marker's
+/// revision before it marks the migration done (r5 on #181).
+#[test]
+fn init_purges_the_history_behind_a_delete() {
+    let Some(hub) = Hub::start("tombstone") else {
+        return;
+    };
+    ok(&hub.run(&["init"]));
+    ok(&hub.run(&["state", "del", "migrated.public-titles"]));
+    let row = "demo\t1\tcodex\t20260101T000000Z\tDEPLOY_TOKEN: Bluebird\n";
+    ok(&hub.run_stdin(&["state", "put", "backlog", "-"], row));
+    let token = std::fs::read_to_string(hub.dir.0.join("hub.token")).unwrap();
+    let url = hub.url.clone();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let kv = rt.block_on(async {
+        let c = async_nats::ConnectOptions::with_token(token.trim().into())
+            .connect(url.as_str())
+            .await
+            .unwrap();
+        let kv = async_nats::jetstream::new(c)
+            .get_key_value("HGL_STATE")
+            .await
+            .unwrap();
+        // A soft delete: a marker on top, the row still in the history.
+        kv.delete("backlog").await.unwrap();
+        kv
+    });
+    let values = |_: &async_nats::jetstream::kv::Store| {
+        rt.block_on(async {
+            let mut cfg = hgl_ai_config::Config::new("t");
+            cfg.hub.url = hub.url.clone();
+            cfg.hub.token_file = hub.dir.0.join("hub.token").display().to_string();
+            hgl_ai_bus::Bus::connect(&cfg)
+                .await
+                .unwrap()
+                .state_history("backlog")
+                .await
+                .unwrap()
+        })
+    };
+    assert!(values(&kv).iter().any(|v| v.contains("Bluebird")));
+    let o = hub.run(&["init"]);
+    ok(&o);
+    assert!(
+        values(&kv).iter().all(|v| !v.contains("Bluebird")),
+        "{:?}",
+        values(&kv)
+    );
+    assert!(!out(&hub.run(&["state", "get", "migrated.public-titles"])).is_empty());
+}
+
 #[test]
 fn notes_send_wait_peek() {
     let Some(hub) = Hub::start("notes") else {

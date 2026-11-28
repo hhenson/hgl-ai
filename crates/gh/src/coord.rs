@@ -38,8 +38,41 @@ pub struct CoordOpts {
     pub interval: Duration,
 }
 
-/// One round's read: the pull requests, the allowance, and repositories with no answer.
-pub async fn round<G: Gh>(gh: &G, s: &Settings) -> Result<(Vec<PrInfo>, RateLimit, Vec<String>)> {
+/// The coordinator's start-up strip ([`crate::migrate::at_start`]), its visibility kept in
+/// `vis`; whether it is done.
+async fn start_cleanup<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    b: &Bus,
+    vis: &crate::migrate::Visibility,
+) -> bool {
+    match crate::migrate::at_start(gh, s, b).await {
+        Ok((keys, seen)) => {
+            *vis.write().await = seen;
+            tracing::info!("titles of non-public repositories stripped from {keys:?}");
+            true
+        }
+        Err(e) => {
+            tracing::warn!(
+                "stripping the titles of non-public repositories (tried again next round): {e}"
+            );
+            false
+        }
+    }
+}
+
+/// One round's read: the pull requests, the allowance, the repositories with no answer,
+/// and each repository's `isPrivate` (absent when not given).
+#[allow(clippy::type_complexity)]
+pub async fn round<G: Gh>(
+    gh: &G,
+    s: &Settings,
+) -> Result<(
+    Vec<PrInfo>,
+    RateLimit,
+    Vec<String>,
+    std::collections::BTreeMap<String, bool>,
+)> {
     let q = table::batch_query(s.repos.len());
     let mut vars = vec![("owner".to_string(), s.owner.clone())];
     for (i, r) in s.repos.iter().enumerate() {
@@ -47,7 +80,10 @@ pub async fn round<G: Gh>(gh: &G, s: &Settings) -> Result<(Vec<PrInfo>, RateLimi
     }
     let vars: Vec<(&str, String)> = vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     let pages = exec::graphql(gh, &q, &vars, false).await?;
-    table::parse_batch(&pages[0], &s.repos, &s.review_bot, &utc_now_stamp())
+    let (infos, rate, missing) =
+        table::parse_batch(&pages[0], &s.repos, &s.review_bot, &utc_now_stamp())?;
+    let seen = crate::migrate::parse_visibility(&pages[0], &s.repos);
+    Ok((infos, rate, missing, seen))
 }
 
 /// The GraphQL reset time from the REST `rate_limit` endpoint (it costs nothing), when a
@@ -243,21 +279,39 @@ pub async fn run<G: Gh>(
     o: &CoordOpts,
     out: &mut impl Write,
 ) -> Result<()> {
+    run_shared(gh, s, bus, o, out, &crate::migrate::Visibility::default()).await
+}
+
+/// [`run`], keeping `vis` (each repository's `isPrivate`, as the newest round read it) for
+/// the task-title loop beside it ([`crate::tasks::run`]).
+pub async fn run_shared<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: Option<&Bus>,
+    o: &CoordOpts,
+    out: &mut impl Write,
+    vis: &crate::migrate::Visibility,
+) -> Result<()> {
     let bus = if o.dry_run { None } else { bus };
     if let Err(auth) = exec::check_auth(gh).await {
         if let Err(e) = retry_alerts(bus, s).await {
             tracing::warn!("retrying coordinator alerts: {e}");
         }
+        // No GitHub to say which repositories are public: as if none were (hgl-ai#181).
+        if let Some(b) = bus
+            && let Err(e) = crate::migrate::strip_private(b, &|_| false).await
+        {
+            tracing::warn!("stripping titles without a GitHub sign-in: {e}");
+        }
         return Err(auth);
     }
     let mut prev: Vec<Row> = Vec::new();
     let mut pending = Vec::new();
+    // Public repositories only (hgl-ai#181): no title of another, in any revision. Tried
+    // again each round until it is done.
+    let mut cleaned = bus.is_none();
     if let Some(b) = bus {
-        // Public repositories only (hgl-ai#181): no title of another, in any revision.
-        match crate::migrate::at_start(gh, s, b).await {
-            Ok(keys) => tracing::info!("titles of non-public repositories stripped from {keys:?}"),
-            Err(e) => tracing::warn!("stripping the titles of non-public repositories: {e}"),
-        }
+        cleaned = start_cleanup(gh, s, b, vis).await;
         eprintln!(
             "coordinator: {} repositories of {} every {:?} into {st}/{}, every {:?} into {st}/{} and {}",
             s.repos.len(),
@@ -274,6 +328,9 @@ pub async fn run<G: Gh>(
     let mut last_backlog: Option<Instant> = None;
     let mut last_intake: Option<Instant> = None;
     loop {
+        if !cleaned && let Some(b) = bus {
+            cleaned = start_cleanup(gh, s, b, vis).await;
+        }
         let now = Utc::now();
         let mut hold = match bus {
             Some(b) => match b.state_get(state::KEY_HOLD).await {
@@ -309,7 +366,20 @@ pub async fn run<G: Gh>(
             tracing::warn!("retrying coordinator alerts: {e}");
         }
         match read {
-            Ok((infos, rate, missing)) => {
+            Ok((infos, rate, missing, seen)) => {
+                // A repository no longer public: its titles go everywhere at once.
+                if let Some(b) = bus {
+                    match crate::migrate::observe(vis, seen, b).await {
+                        Ok(turned) if !turned.is_empty() => {
+                            tracing::info!("no longer public, titles stripped: {turned:?}")
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            cleaned = false;
+                            tracing::warn!("stripping the titles of non-public repositories: {e}");
+                        }
+                    }
+                }
                 for m in &missing {
                     tracing::warn!("{}: no answer for this repository", s.full(m));
                 }

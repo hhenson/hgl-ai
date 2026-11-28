@@ -976,6 +976,18 @@ impl Bus {
         Ok(ack.sequence)
     }
 
+    /// The revision of `key`'s last entry, a delete or purge marker included (which
+    /// [`Bus::state_get`] hides); `None` for a key never written.
+    pub async fn state_revision(&self, key: &str) -> Result<Option<u64>> {
+        check_state_key(key)?;
+        let store = self.store(&self.state, KV_STATE).await?;
+        Ok(store
+            .entry(key)
+            .await
+            .map_err(|e| nats(&format!("state {key}"), e))?
+            .map(|e| e.revision))
+    }
+
     /// Every revision of `key` the bucket still keeps, oldest first, as stored (a delete or
     /// purge marker as an empty value): what a reader replaying the key's history sees.
     pub async fn state_history(&self, key: &str) -> Result<Vec<String>> {

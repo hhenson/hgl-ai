@@ -1467,6 +1467,7 @@ dependencies = [
  "hgl-ai-build",
  "hgl-ai-bus",
  "hgl-ai-config",
+ "hgl-ai-gh",
  "hgl-ai-owner",
  "hgl-ai-proto",
  "libc",

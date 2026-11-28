@@ -130,12 +130,15 @@ listener, at `<console url>/nats` on the console's own origin, as the hub user
 `viewer`. `viewer` reads five buckets, `HGL_HOSTS`, `HGL_STATE` (only the keys the page
 shows), `HGL_METRICS`, `HGL_BUILD` and `HGL_USAGE`, and nothing else (not `HGL_TREES`:
 its records hold paths), and sees no other client's replies. Titles are of public repositories only (HPH, 2026-11-28, on
-hgl-ai#181: "Public repos only"): a public repository's as GitHub has it, cut to 200
-characters; none of a private repository's, or of one whose visibility GitHub did not give,
-so the page shows `repo#N` and its link alone. Each writer takes the visibility from the
-same response as the title. `hgl-ai init` strips every stored title once per hub, and the
-coordinator at each start those of repositories not public, in every revision kept
-(`gh::migrate`). The header names the user by handle
+hgl-ai#181: "Public repos only"; the controller there: all free text of a private
+repository): a public repository's title as GitHub has it, cut to 200 characters; none of a
+private repository's, or of one whose visibility GitHub did not give, so the page shows
+`repo#N` and its link alone. Such a repository's label names are counted under one
+`private` label, in `backlog` and `HGL_METRICS`. Each writer takes the visibility from the
+same response as the title, page by page. Every provisioning path (`hgl-ai init`,
+`server install`) strips every stored title and label name once per hub; the coordinator at
+its start, and whenever a round finds a repository no longer public, strips those of every
+repository it does not see as public; all in every revision kept (`gh::migrate`). The header names the user by handle
 only. Its subject permissions are read-only, but replies are not enforced until hgl-ai#141 (docs/install.md,
 docs/design.md §9). The console hands its credential to a signed-in page
 (`GET /api/viewer`), which keeps it in memory only. A tab per area; the selected tab
