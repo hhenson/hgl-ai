@@ -552,8 +552,14 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
                 step.reason = Some("turn ended".into());
             }
         }
-        s.status = BuildStatus::Stopped;
-        s.reason = Some("turn ended".into());
+        s.status = summary::overall(&s.steps);
+        if matches!(
+            s.status,
+            BuildStatus::Pass | BuildStatus::Running | BuildStatus::Stopped
+        ) {
+            s.status = BuildStatus::Stopped;
+            s.reason = Some("turn ended".into());
+        }
     }
     store::write_final(&run_dir, &s)?;
     if let Some(b) = &bus {

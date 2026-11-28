@@ -668,21 +668,37 @@ fn detach_inside_a_turn_is_refused() {
 
 #[test]
 fn turn_term_stops_a_local_build_without_a_failure_verdict() {
+    turn_term_build(false);
+}
+
+#[test]
+fn turn_term_preserves_an_earlier_failure() {
+    turn_term_build(true);
+}
+
+fn turn_term_build(earlier_failure: bool) {
     use std::os::unix::process::CommandExt;
 
     let dir = Scratch::new("turn-term");
     let src = dir.0.join("src");
     std::fs::create_dir_all(&src).unwrap();
     let recipe = dir.0.join("recipe.toml");
+    let first = if earlier_failure {
+        "[[step]]\nname = \"fail\"\nrun = \"exit 1\"\n"
+    } else {
+        ""
+    };
     std::fs::write(
         &recipe,
-        "repo = \"demo\"\n[[step]]\nname = \"test\"\nrun = \"echo started; sleep 60\"\n",
+        format!(
+            "repo = \"demo\"\n{first}[[step]]\nname = \"test\"\nrun = \"echo started; sleep 60\"\n"
+        ),
     )
     .unwrap();
     let logs = dir.0.join("logs");
     let mut command = Command::new(env!("CARGO_BIN_EXE_hgl-ai"));
     command
-        .args(["--json", "build", "run", "demo", "--recipe"])
+        .args(["--json", "build", "run", "demo", "--keep-going", "--recipe"])
         .arg(&recipe)
         .arg("--dir")
         .arg(&src)
@@ -725,9 +741,17 @@ fn turn_term_stops_a_local_build_without_a_failure_verdict() {
     let output = child.wait_with_output().unwrap();
     let summary: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|_| panic!("{}", text(&output)));
-    assert_eq!(summary["status"], "stopped", "{}", text(&output));
-    assert_eq!(summary["reason"], "turn ended");
-    assert_eq!(summary["steps"][0]["status"], "stopped");
+    if earlier_failure {
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+        assert_eq!(summary["status"], "fail");
+        assert_eq!(summary["steps"][0]["status"], "fail");
+        assert_eq!(summary["steps"][1]["status"], "stopped");
+    } else {
+        assert_eq!(output.status.code(), Some(1), "{}", text(&output));
+        assert_eq!(summary["status"], "stopped", "{}", text(&output));
+        assert_eq!(summary["reason"], "turn ended");
+        assert_eq!(summary["steps"][0]["status"], "stopped");
+    }
 }
 
 /// Carbon's finding 10 on #12: a range in an XML report is read from that report, which
