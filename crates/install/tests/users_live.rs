@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use hgl_ai_bus::{Bus, BusError, Credential};
-use hgl_ai_install::nats::{Auth, render_conf};
+use hgl_ai_install::nats::{Auth, Websocket, render_conf_ws};
 use hgl_ai_install::users::{Registry, Role};
 use hgl_ai_proto::{Kind, MetricsSample, Note, Seat};
 
@@ -28,10 +28,25 @@ struct Hub {
     conf: std::path::PathBuf,
     store: std::path::PathBuf,
     port: u16,
+    /// The WebSocket listener the console's page reads through.
+    ws: Websocket,
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
 }
 
 impl Hub {
     fn start() -> Option<Hub> {
+        Hub::start_with(|_, conf| conf)
+    }
+
+    /// The hub with `edit` applied to its rendered `nats.conf`.
+    fn start_with(edit: impl Fn(&Registry, String) -> String) -> Option<Hub> {
         let bin = std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|d| d.join("nats-server"))
             .find(|p| p.is_file());
@@ -47,25 +62,32 @@ impl Hub {
             ("hub-coord", Role::Coord),
             ("lab1-builder", Role::Builder),
             ("console", Role::Console),
+            ("viewer", Role::Viewer),
             ("hub-admin", Role::Admin),
+            ("lab2", Role::Seat),
+            ("hub-slack", Role::Slack),
         ] {
             let text = reg.issue(name, role, false).unwrap();
             creds.insert(name, hgl_ai_bus::parse_credential(&text).unwrap().unwrap());
         }
-        let port = TcpListener::bind("127.0.0.1:0")
-            .unwrap()
-            .local_addr()
-            .unwrap()
-            .port();
+        let port = free_port();
+        let ws = Websocket {
+            port: free_port(),
+            origins: vec!["http://localhost".into()],
+        };
         let conf = d.path().join("nats.conf");
         std::fs::create_dir_all(d.path().join("store")).unwrap();
         std::fs::write(
             &conf,
-            render_conf(
-                "127.0.0.1",
-                port,
-                &d.path().join("store"),
-                &Auth::Users(&reg),
+            edit(
+                &reg,
+                render_conf_ws(
+                    "127.0.0.1",
+                    port,
+                    &d.path().join("store"),
+                    &Auth::Users(&reg),
+                    Some(&ws),
+                ),
             ),
         )
         .unwrap();
@@ -92,6 +114,7 @@ impl Hub {
             conf: conf_path,
             store,
             port,
+            ws,
         })
     }
 
@@ -101,7 +124,13 @@ impl Hub {
         let reg = self.reg.lock().unwrap();
         std::fs::write(
             &self.conf,
-            render_conf("127.0.0.1", self.port, &self.store, &Auth::Users(&reg)),
+            render_conf_ws(
+                "127.0.0.1",
+                self.port,
+                &self.store,
+                &Auth::Users(&reg),
+                Some(&self.ws),
+            ),
         )
         .unwrap();
         let env =
@@ -117,19 +146,76 @@ impl Hub {
             .unwrap()
     }
 
-    async fn raw(&self, who: &str) -> async_nats::Client {
+    fn seed(&self, who: &str) -> String {
         let Credential::Nkey { seed, .. } = self.creds[who].clone() else {
             unreachable!()
         };
-        async_nats::ConnectOptions::with_nkey(seed)
+        seed
+    }
+
+    /// A plain client of `who`, with its own inbox prefix as the bus sets it.
+    async fn raw(&self, who: &str) -> async_nats::Client {
+        self.raw_with(who, async_nats::ConnectOptions::new()).await
+    }
+
+    /// `who`, connected with `opts` (an event callback) and its own inbox prefix.
+    async fn raw_with(&self, who: &str, opts: async_nats::ConnectOptions) -> async_nats::Client {
+        opts.custom_inbox_prefix(self.inbox(who))
+            .nkey(self.seed(who))
             .connect(&self.url)
             .await
             .unwrap()
+    }
+
+    /// The inbox prefix of `who`'s replies.
+    fn inbox(&self, who: &str) -> String {
+        self.creds[who].inbox_prefix().unwrap()
+    }
+
+    /// What `doctor` asks the hub (`hub inboxes`): may `who`'s credential, as a host's
+    /// `hub.token`, subscribe to `_INBOX.>`?
+    async fn shared_inbox(&self, who: &str, bare: bool) -> Option<bool> {
+        use hgl_ai_install::Hub as _;
+        let Credential::Nkey { seed, user, role } = self.creds[who].clone() else {
+            unreachable!()
+        };
+        let text = if bare {
+            seed
+        } else {
+            Credential::render_nkey(&user.unwrap(), &role.unwrap(), &seed)
+        };
+        let dir = self.conf.with_file_name(format!("probe-{who}-{bare}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("hub.token");
+        std::fs::write(&f, text).unwrap();
+        let mut cfg = hgl_ai_config::Config::new("t");
+        cfg.hub.url = self.url.clone();
+        cfg.hub.token_file = f.display().to_string();
+        hgl_ai_install::BusHub.shared_inbox(&cfg).await
+    }
+
+    /// The viewer as the page connects: its own inbox prefix.
+    async fn viewer(&self) -> async_nats::Client {
+        self.raw_with(
+            "viewer",
+            async_nats::ConnectOptions::new().custom_inbox_prefix(hgl_ai_proto::VIEWER_INBOX),
+        )
+        .await
     }
 }
 
 fn seat(s: &str) -> Seat {
     Seat::new(s).unwrap()
+}
+
+/// Refused: the API's permission error, or, where the server drops the lookup itself
+/// (a stream the user may not even look up), no answer.
+fn refused(r: Result<impl std::fmt::Debug, BusError>) {
+    match r {
+        Err(BusError::Denied { .. }) => {}
+        Err(e) if e.to_string().contains("timed out") => {}
+        other => panic!("expected a refusal, got {other:?}"),
+    }
 }
 
 fn denied(r: Result<impl std::fmt::Debug, BusError>) -> String {
@@ -394,6 +480,7 @@ async fn a_reload_keeps_connections() {
     let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let d2 = drops.clone();
     let raw = async_nats::ConnectOptions::with_nkey(seed)
+        .custom_inbox_prefix(hub.inbox("build-1"))
         .event_callback(move |e| {
             let d2 = d2.clone();
             async move {
@@ -559,4 +646,734 @@ async fn only_builders_write_verdicts() {
     let n = Note::new(seat("builder-lab1"), seat("controller"), Kind::Note, "x");
     builder.send(&n).await.unwrap();
     denied(builder.build_put("recipe.demo", b"repo = \"evil\"").await);
+}
+
+/// `request` as `c`, with a second to answer: `None` when nothing answers (the server
+/// drops a request the user may not publish), else the reply's payload.
+async fn ask(c: &async_nats::Client, subject: &str, body: serde_json::Value) -> Option<String> {
+    match tokio::time::timeout(
+        Duration::from_secs(1),
+        c.request(subject.to_string(), body.to_string().into()),
+    )
+    .await
+    {
+        Ok(Ok(m)) => Some(String::from_utf8_lossy(&m.payload).into_owned()),
+        _ => None,
+    }
+}
+
+/// Each request gets no answer (asked all at once).
+async fn unanswered(c: &async_nats::Client, asks: Vec<(String, serde_json::Value)>) {
+    let answers = futures::future::join_all(
+        asks.into_iter()
+            .map(|(subject, body)| async move { (ask(c, &subject, body).await, subject) }),
+    )
+    .await;
+    for (answer, subject) in answers {
+        assert_eq!(answer, None, "{subject}");
+    }
+}
+
+/// A consumer create's body: an ordered push consumer, as a watch makes, delivering to
+/// `deliver` (`filter`: one subject, `filters`: several, neither: the whole stream).
+fn consumer_body(
+    stream: &str,
+    name: Option<&str>,
+    durable: Option<&str>,
+    deliver: &str,
+    filter: Option<&str>,
+    filters: &[&str],
+) -> serde_json::Value {
+    let mut config = serde_json::json!({
+        "deliver_subject": deliver,
+        "deliver_policy": "last_per_subject",
+        "ack_policy": "none",
+        "flow_control": true,
+        "idle_heartbeat": 5_000_000_000u64,
+    });
+    if let Some(n) = name {
+        config["name"] = n.into();
+    }
+    if let Some(d) = durable {
+        config["durable_name"] = d.into();
+    }
+    if let Some(f) = filter {
+        config["filter_subject"] = f.into();
+    }
+    if !filters.is_empty() {
+        config["filter_subjects"] = filters.into();
+    }
+    serde_json::json!({"stream_name": stream, "config": config})
+}
+
+/// Subscribe to `deliver`, ask for a consumer delivering there, and read for a second:
+/// the API's answer, if any, and the values delivered.
+async fn consume(
+    c: &async_nats::Client,
+    subject: &str,
+    body: serde_json::Value,
+) -> (Option<String>, Vec<String>) {
+    let deliver = body["config"]["deliver_subject"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let mut sub = c.subscribe(deliver).await.unwrap();
+    c.flush().await.unwrap();
+    let answer = ask(c, subject, body).await;
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        while let Some(m) = sub.next().await {
+            got.push(String::from_utf8_lossy(&m.payload).into_owned());
+        }
+    })
+    .await;
+    (answer, got)
+}
+
+/// What the hub holds that the viewer may not read: values of `HGL_STATE` outside the
+/// page's keys.
+const SECRET: &str = "not-for-the-viewer";
+
+/// The console's page reads and watches the telemetry buckets as `viewer`, and can do
+/// nothing else by subject: no write, no notes, no threads, no console state, no other
+/// stream, and of `HGL_STATE` only the page's keys. (Writes through replies are not
+/// enforced until hgl-ai#141.)
+#[tokio::test]
+async fn the_viewer_reads_the_telemetry_and_nothing_else() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let seat_bus = hub.bus("build-1").await;
+    seat_bus.state_put("mode", "normal").await.unwrap();
+    seat_bus
+        .state_put("decisions.log", &format!("{SECRET} decision\n"))
+        .await
+        .unwrap();
+    seat_bus
+        .state_put("coord.alerts", &format!("{SECRET} alert\n"))
+        .await
+        .unwrap();
+    let h = "a".repeat(40);
+    hub.bus("lab1-builder")
+        .await
+        .state_put(
+            "verdict.alpha.7.linux",
+            &format!("{h} {h} pass {SECRET} lab1"),
+        )
+        .await
+        .unwrap();
+    seat_bus
+        .send(&Note::new(seat("w1"), seat("w2"), Kind::Note, "hello"))
+        .await
+        .unwrap();
+    hub.bus("console")
+        .await
+        .console_put("session.x", &serde_json::json!({"secret": 1}))
+        .await
+        .unwrap();
+    let v = hub.bus("viewer").await;
+    assert_eq!(v.who(), "hub user viewer (viewer)");
+
+    // A key the page reads, by its subject (a direct get for the last value).
+    assert_eq!(v.state_get("mode").await.unwrap().unwrap().value, "normal");
+    // No other key: not by its subject, nor named in a request's body.
+    let raw = hub.viewer().await;
+    let secret = "$KV.HGL_STATE.decisions.log";
+    let mut asks: Vec<(String, serde_json::Value)> =
+        ["decisions.log", "coord.alerts", "verdict.alpha.7.linux"]
+            .iter()
+            .map(|k| {
+                (
+                    format!("$JS.API.DIRECT.GET.KV_HGL_STATE.$KV.HGL_STATE.{k}"),
+                    serde_json::json!({}),
+                )
+            })
+            .collect();
+    asks.extend(
+        [
+            (
+                "$JS.API.DIRECT.GET.KV_HGL_STATE",
+                serde_json::json!({"last_by_subj": secret}),
+            ),
+            (
+                "$JS.API.STREAM.MSG.GET.KV_HGL_STATE",
+                serde_json::json!({"last_by_subj": secret}),
+            ),
+            (
+                "$JS.API.DIRECT.GET.KV_HGL_STATE",
+                serde_json::json!({"seq": 2}),
+            ),
+        ]
+        .map(|(subject, body)| (subject.to_string(), body)),
+    );
+    unanswered(&raw, asks).await;
+    // The subject form names its key: a sequence in the body reads no other.
+    for seq in 1..=6 {
+        let r = ask(
+            &raw,
+            "$JS.API.DIRECT.GET.KV_HGL_STATE.$KV.HGL_STATE.mode",
+            serde_json::json!({"seq": seq}),
+        )
+        .await;
+        assert!(!r.unwrap_or_default().contains(SECRET), "seq {seq}");
+    }
+
+    // Consumers: only the filtered create form, on a key the page reads.
+    let state = "KV_HGL_STATE";
+    let d = |n: &str| format!("{}.probe.{n}", hgl_ai_proto::VIEWER_INBOX);
+    let refused_creates = [
+        // The bare, named and durable forms, which carry the filter in the body only.
+        (
+            format!("$JS.API.CONSUMER.CREATE.{state}"),
+            consumer_body(state, None, None, &d("a"), Some(secret), &[]),
+        ),
+        (
+            format!("$JS.API.CONSUMER.CREATE.{state}.b"),
+            consumer_body(state, Some("b"), None, &d("b"), Some(secret), &[]),
+        ),
+        (
+            format!("$JS.API.CONSUMER.DURABLE.CREATE.{state}.c"),
+            consumer_body(state, None, Some("c"), &d("c"), Some(secret), &[]),
+        ),
+        (
+            "$JS.API.CONSUMER.CREATE.KV_HGL_HOSTS".to_string(),
+            consumer_body("KV_HGL_HOSTS", None, None, &d("h"), None, &[]),
+        ),
+        (
+            "$JS.API.CONSUMER.DURABLE.CREATE.KV_HGL_HOSTS.h2".to_string(),
+            consumer_body("KV_HGL_HOSTS", None, Some("h2"), &d("h2"), None, &[]),
+        ),
+        // The filtered form on a key the page does not read.
+        (
+            format!("$JS.API.CONSUMER.CREATE.{state}.e.{secret}"),
+            consumer_body(state, Some("e"), None, &d("e"), Some(secret), &[]),
+        ),
+    ]
+    .map(|(subject, body)| {
+        let raw = &raw;
+        async move { (consume(raw, &subject, body).await, subject) }
+    });
+    for ((answer, got), subject) in futures::future::join_all(refused_creates).await {
+        assert_eq!((answer, got), (None, vec![]), "{subject}");
+    }
+    // The filtered form on a page key, with another filter in the body (or none): the
+    // server holds the body to the subject's filter.
+    let mismatched = [
+        (Some(secret), vec![]),
+        (None, vec![secret]),
+        (None, vec!["$KV.HGL_STATE.prs", secret]),
+    ]
+    .into_iter()
+    .enumerate()
+    .map(|(i, (filter, filters))| {
+        let name = format!("f{i}");
+        let subject = format!("$JS.API.CONSUMER.CREATE.{state}.{name}.$KV.HGL_STATE.prs");
+        let body = consumer_body(state, Some(&name), None, &d(&name), filter, &filters);
+        let raw = &raw;
+        async move { consume(raw, &subject, body).await }
+    });
+    for (answer, got) in futures::future::join_all(mismatched).await {
+        let answer = answer.expect("the API answers");
+        assert!(answer.contains("\"error\""), "{answer}");
+        assert!(got.iter().all(|g| !g.contains(SECRET)), "{got:?}");
+    }
+    // A filter-less body takes the subject's filter, or is refused: no other key comes.
+    let (_, got) = consume(
+        &raw,
+        &format!("$JS.API.CONSUMER.CREATE.{state}.f9.$KV.HGL_STATE.prs"),
+        consumer_body(state, Some("f9"), None, &d("f9"), None, &[]),
+    )
+    .await;
+    assert!(got.iter().all(|g| !g.contains(SECRET)), "{got:?}");
+    // And a filtered create on a page key works: the value comes.
+    let (answer, got) = consume(
+        &raw,
+        &format!("$JS.API.CONSUMER.CREATE.{state}.g.$KV.HGL_STATE.mode"),
+        consumer_body(
+            state,
+            Some("g"),
+            None,
+            &d("g"),
+            Some("$KV.HGL_STATE.mode"),
+            &[],
+        ),
+    )
+    .await;
+    let answer = answer.expect("the API answers");
+    assert!(!answer.contains("\"error\""), "{answer}");
+    assert_eq!(got, vec!["normal".to_string()]);
+
+    // No write by subject (through replies: hgl-ai#141).
+    denied(v.state_put("mode", "drain").await);
+    denied(
+        v.send(&Note::new(seat("w1"), seat("w2"), Kind::Note, "forged"))
+            .await,
+    );
+    denied(
+        v.metrics_put(&MetricsSample {
+            repo: "alpha".into(),
+            date: "20261128".into(),
+            open: 1,
+            opened: 0,
+            closed: 0,
+            labels: Default::default(),
+            taken_at: "20261128T000000Z".into(),
+        })
+        .await,
+    );
+    denied(v.build_put("run.x", b"{}").await);
+    // Nothing outside the telemetry: notes, threads, the console's state.
+    let (history, threads, sessions) = tokio::join!(
+        v.history(
+            hgl_ai_proto::STREAM_NOTES,
+            "hgl.notes.>",
+            chrono::DateTime::UNIX_EPOCH,
+            10,
+        ),
+        v.threads::<serde_json::Value>(),
+        v.console_list::<serde_json::Value>("session."),
+    );
+    refused(history.map(|h| h.len()));
+    refused(threads);
+    refused(sessions);
+    // Not even a direct get on the console's bucket, or a consumer delete.
+    let others = [
+        "$JS.API.DIRECT.GET.KV_HGL_CONSOLE.$KV.HGL_CONSOLE.session.x",
+        "$JS.API.STREAM.MSG.GET.KV_HGL_THREADS",
+        "$JS.API.CONSUMER.DELETE.KV_HGL_STATE.any",
+        "$JS.API.CONSUMER.LIST.KV_HGL_STATE",
+        "$JS.API.STREAM.PURGE.KV_HGL_STATE",
+        "$KV.HGL_STATE.mode",
+        "hgl.notes.w1",
+        "hgl.owner.x",
+    ]
+    .map(|subject| (subject.to_string(), serde_json::json!({})));
+    unanswered(&raw, others.to_vec()).await;
+    // A consumer aimed at a notes subject instead of the viewer's inbox does not make the
+    // server write a note for it (a push consumer delivers only to subscribers, and the
+    // viewer may subscribe to its inbox only).
+    let notes = || async {
+        seat_bus
+            .history(
+                hgl_ai_proto::STREAM_NOTES,
+                "hgl.notes.>",
+                chrono::DateTime::UNIX_EPOCH,
+                100,
+            )
+            .await
+            .unwrap()
+            .len()
+    };
+    let before = notes().await;
+    let r = ask(
+        &raw,
+        "$JS.API.CONSUMER.CREATE.KV_HGL_STATE.n.$KV.HGL_STATE.mode",
+        consumer_body(
+            state,
+            Some("n"),
+            None,
+            "hgl.notes.w9",
+            Some("$KV.HGL_STATE.mode"),
+            &[],
+        ),
+    )
+    .await;
+    assert!(r.is_some(), "the filtered form is allowed");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(notes().await, before, "no note from the viewer's consumer");
+    assert_eq!(
+        seat_bus.state_get("mode").await.unwrap().unwrap().value,
+        "normal",
+        "nothing the viewer did changed a value"
+    );
+}
+
+/// The viewer subscribes to its own inbox prefix only: not to `_INBOX.>`, where every
+/// other client's replies go (the console's reads of its sessions, threads, notes).
+#[tokio::test]
+async fn the_viewer_sees_no_other_clients_replies() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let console = hub.bus("console").await;
+    console
+        .console_put("session.x", &serde_json::json!({"csrf": SECRET}))
+        .await
+        .unwrap();
+    let (tx, mut events) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let v = hub
+        .raw_with(
+            "viewer",
+            async_nats::ConnectOptions::new()
+                .custom_inbox_prefix(hgl_ai_proto::VIEWER_INBOX)
+                .event_callback(move |e| {
+                    let tx = tx.clone();
+                    async move {
+                        let _ = tx.send(e.to_string());
+                    }
+                }),
+        )
+        .await;
+    let mut spy = v.subscribe("_INBOX.>").await.unwrap();
+    let mut all = v.subscribe(">").await.unwrap();
+    v.flush().await.unwrap();
+    let mut refusals = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        while let Some(e) = events.recv().await {
+            if e.to_ascii_lowercase().contains("permissions violation") {
+                refusals.push(e);
+                if refusals.len() == 2 {
+                    break;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        refusals.iter().any(|e| e.contains("\"_INBOX.>\"")),
+        "{refusals:?}"
+    );
+    // The console reads its state; the replies go to its `_INBOX.…`, not to the viewer.
+    for _ in 0..3 {
+        let s: Option<serde_json::Value> = console.console_get("session.x").await.unwrap();
+        assert!(s.is_some());
+        console
+            .console_list::<serde_json::Value>("session.")
+            .await
+            .unwrap();
+    }
+    for sub in [&mut spy, &mut all] {
+        let r = tokio::time::timeout(Duration::from_secs(1), sub.next()).await;
+        assert!(
+            !matches!(r, Ok(Some(_))),
+            "the viewer saw a message: {:?}",
+            r.ok().flatten().map(|m| m.subject)
+        );
+    }
+    // Its own prefix works.
+    let r = v
+        .request("$JS.API.STREAM.INFO.KV_HGL_HOSTS", "".into())
+        .await
+        .unwrap();
+    assert!(String::from_utf8_lossy(&r.payload).contains("KV_HGL_HOSTS"));
+}
+
+/// The page's own code (`web/src/hub.ts`) watches every source as the viewer over the
+/// hub's WebSocket listener, and is refused nothing: `web/src/hub.live.test.ts`, run here
+/// with the hub's address (skipped without `npm ci` in `crates/console/web`).
+#[tokio::test]
+async fn the_page_watches_as_the_viewer() {
+    let web = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../console/web");
+    let vitest = web.join("node_modules/.bin/vitest");
+    if !vitest.is_file() {
+        eprintln!("skipped: no {} (`npm ci` there)", vitest.display());
+        return;
+    }
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let seat_bus = hub.bus("build-1").await;
+    seat_bus.state_put("mode", "drain").await.unwrap();
+    seat_bus
+        .host_put(&hgl_ai_proto::HostRecord {
+            host: "lab1".into(),
+            seats: Vec::new(),
+            memcap_gb: 64,
+            work_root_free_gb: 100,
+            updated_at: "20261128T000000Z".into(),
+        })
+        .await
+        .unwrap();
+    // `hold` written again and again, so writes land while the page watches.
+    let writer = {
+        let b = hub.bus("build-1").await;
+        tokio::spawn(async move {
+            loop {
+                let _ = b.state_put("hold", "landing").await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            }
+        })
+    };
+    let ws = format!("ws://127.0.0.1:{}", hub.ws.port);
+    let seed = hub.seed("viewer");
+    let out = tokio::task::spawn_blocking(move || {
+        Command::new(vitest)
+            .args(["run", "src/hub.live.test.ts"])
+            .current_dir(&web)
+            .env("HGL_AI_LIVE_WS", ws)
+            .env("HGL_AI_LIVE_SEED", seed)
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    writer.abort();
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(out.status.success(), "{text}");
+    assert!(text.contains("1 passed"), "the live test ran: {text}");
+    // The page made no durable consumer: the doctor's check finds none.
+    let js = async_nats::jetstream::new(hub.raw("build-1").await);
+    assert_eq!(
+        hgl_ai_install::hub::lasting_consumers(&js).await.unwrap(),
+        Vec::<String>::new()
+    );
+}
+
+/// What subjects cannot stop: a `durable_name` or a long `inactive_threshold` in a filtered
+/// create's body. `doctor`'s listing, as a seat's hub user, finds both (docs/design.md §9).
+#[tokio::test]
+async fn a_lasting_consumer_the_viewer_makes_is_found() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let js = async_nats::jetstream::new(hub.raw("build-1").await);
+    assert_eq!(
+        hgl_ai_install::hub::lasting_consumers(&js).await.unwrap(),
+        Vec::<String>::new()
+    );
+    let raw = hub.viewer().await;
+    let deliver = format!("{}.d", hgl_ai_proto::VIEWER_INBOX);
+    let r = ask(
+        &raw,
+        "$JS.API.CONSUMER.CREATE.KV_HGL_HOSTS.kept.$KV.HGL_HOSTS.>",
+        consumer_body(
+            "KV_HGL_HOSTS",
+            Some("kept"),
+            Some("kept"),
+            &deliver,
+            Some("$KV.HGL_HOSTS.>"),
+            &[],
+        ),
+    )
+    .await
+    .expect("the API answers");
+    assert!(!r.contains("\"error\""), "{r}");
+    // Nor an inactive threshold: one of a day outlives the page as a durable would.
+    let mut body = consumer_body(
+        "KV_HGL_TREES",
+        Some("idle"),
+        None,
+        &format!("{deliver}.i"),
+        Some("$KV.HGL_TREES.>"),
+        &[],
+    );
+    body["config"]["inactive_threshold"] = 86_400_000_000_000u64.into();
+    let r = ask(
+        &raw,
+        "$JS.API.CONSUMER.CREATE.KV_HGL_TREES.idle.$KV.HGL_TREES.>",
+        body,
+    )
+    .await
+    .expect("the API answers");
+    assert!(!r.contains("\"error\""), "{r}");
+    assert_eq!(
+        hgl_ai_install::hub::lasting_consumers(&js).await.unwrap(),
+        vec![
+            "KV_HGL_HOSTS/kept".to_string(),
+            "KV_HGL_TREES/idle".to_string()
+        ]
+    );
+}
+
+/// A client of `who` that reports its refusals.
+async fn spy(
+    hub: &Hub,
+    who: &str,
+) -> (
+    async_nats::Client,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let c = hub
+        .raw_with(
+            who,
+            async_nats::ConnectOptions::new().event_callback(move |e| {
+                let tx = tx.clone();
+                async move {
+                    let s = e.to_string();
+                    if s.to_ascii_lowercase().contains("permissions violation") {
+                        let _ = tx.send(s);
+                    }
+                }
+            }),
+        )
+        .await;
+    (c, rx)
+}
+
+/// Up to `n` refusals, within a few seconds.
+async fn refusals(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>, n: usize) -> Vec<String> {
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        while got.len() < n {
+            match rx.recv().await {
+                Some(e) => got.push(e),
+                None => break,
+            }
+        }
+    })
+    .await;
+    got
+}
+
+/// Every hub user subscribes to its own inbox prefix only (hgl-ai#111): no seat, builder,
+/// coordinator, Slack adapter or console sees another user's JetStream and KV replies,
+/// such as the console's reads of its sessions, or a seat's of the notes.
+#[tokio::test]
+async fn no_user_sees_another_users_replies() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let console = hub.bus("console").await;
+    console
+        .console_put("session.x", &serde_json::json!({"csrf": SECRET}))
+        .await
+        .unwrap();
+    let seat_bus = hub.bus("build-1").await;
+    seat_bus.state_put("mode", SECRET).await.unwrap();
+
+    let mut spies = Vec::new();
+    for who in [
+        "build-1",
+        "lab2",
+        "hub-coord",
+        "lab1-builder",
+        "hub-slack",
+        "console",
+    ] {
+        let (c, mut rx) = spy(&hub, who).await;
+        let mut wild = vec!["_INBOX.>".to_string(), ">".into(), "_INBOX.*.>".into()];
+        for victim in ["console", "build-1"] {
+            if victim != who {
+                wild.push(format!("{}.>", hub.inbox(victim)));
+            }
+        }
+        let mut subs = Vec::new();
+        for w in &wild {
+            subs.push(c.subscribe(w.clone()).await.unwrap());
+        }
+        c.flush().await.unwrap();
+        let got = refusals(&mut rx, wild.len()).await;
+        for w in &wild {
+            assert!(
+                got.iter().any(|e| e.contains(&format!("\"{w}\""))),
+                "{who} may subscribe to {w}: {got:?}"
+            );
+        }
+        // Its own prefix works.
+        let probe = if who == "hub-slack" {
+            "$JS.API.STREAM.INFO.KV_HGL_SLACK"
+        } else {
+            "$JS.API.INFO"
+        };
+        let r = c.request(probe, "".into()).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&r.payload).contains("\"error\""),
+            "{who}: {:?}",
+            r.payload
+        );
+        spies.push((who, c, subs));
+    }
+
+    // The console reads its sessions, a seat its state; nobody else sees the replies.
+    for _ in 0..3 {
+        let s: Option<serde_json::Value> = console.console_get("session.x").await.unwrap();
+        assert!(s.unwrap().to_string().contains(SECRET));
+        console
+            .console_list::<serde_json::Value>("session.")
+            .await
+            .unwrap();
+        let m = seat_bus.state_get("mode").await.unwrap().unwrap();
+        assert_eq!(m.value, SECRET);
+    }
+    for (who, _c, subs) in &mut spies {
+        for sub in subs {
+            let r = tokio::time::timeout(Duration::from_millis(300), sub.next()).await;
+            assert!(
+                !matches!(r, Ok(Some(_))),
+                "{who} saw a message: {:?}",
+                r.ok().flatten().map(|m| m.subject)
+            );
+        }
+    }
+
+    // A seat's direct publish to the console's inbox is refused. JetStream replies and
+    // consumer deliver subjects are not checked until hgl-ai#141.
+    let c = hub.raw("console").await;
+    let into = format!("{}.forged", hub.inbox("console"));
+    let mut own = c.subscribe(into.clone()).await.unwrap();
+    c.flush().await.unwrap();
+    let (s, mut rx) = spy(&hub, "build-1").await;
+    s.publish(into.clone(), "forged".into()).await.unwrap();
+    s.flush().await.unwrap();
+    let got = refusals(&mut rx, 1).await;
+    assert!(got.iter().any(|e| e.contains(&into)), "{got:?}");
+    let r = tokio::time::timeout(Duration::from_millis(500), own.next()).await;
+    assert!(!matches!(r, Ok(Some(_))), "the forged reply arrived");
+
+    // A client on the shared `_INBOX` (one that predates this) gets no replies.
+    let Credential::Nkey { seed, .. } = hub.creds["build-1"].clone() else {
+        unreachable!()
+    };
+    let old = async_nats::ConnectOptions::with_nkey(seed)
+        .connect(&hub.url)
+        .await
+        .unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        old.request("$JS.API.INFO", "".into()),
+    )
+    .await;
+    assert!(!matches!(r, Ok(Ok(_))), "{r:?}");
+
+    // `doctor`'s probe: an upgraded hub refuses `_INBOX.>`; the admin and a bare seed
+    // cannot tell.
+    for who in ["build-1", "console", "hub-coord", "hub-slack", "viewer"] {
+        assert_eq!(hub.shared_inbox(who, false).await, Some(false), "{who}");
+    }
+    assert_eq!(hub.shared_inbox("hub-admin", false).await, None);
+    assert_eq!(hub.shared_inbox("build-1", true).await, None);
+}
+
+/// A client with its own inbox still works on a hub whose `nats.conf` predates them and
+/// allows every user `_INBOX.>`: upgrade clients first, then the hub (hgl-ai#111).
+#[tokio::test]
+async fn own_inboxes_work_on_an_older_hub() {
+    let Some(hub) = Hub::start_with(|reg, mut conf| {
+        for u in &reg.users {
+            conf = conf.replace(&format!("\"_INBOX.{}.>\"", u.nkey), "\"_INBOX.>\"");
+        }
+        assert!(!conf.contains("\"_INBOX.U"), "{conf}");
+        conf
+    }) else {
+        return;
+    };
+    hub.bus("hub-admin").await.provision().await.unwrap();
+    let seat_bus = hub.bus("build-1").await;
+    seat_bus.state_put("mode", "normal").await.unwrap();
+    assert_eq!(
+        seat_bus.state_get("mode").await.unwrap().unwrap().value,
+        "normal"
+    );
+    seat_bus.hosts().await.unwrap();
+    let console = hub.bus("console").await;
+    console
+        .console_put("session.y", &serde_json::json!({"csrf": "y"}))
+        .await
+        .unwrap();
+    assert!(
+        console
+            .console_get::<serde_json::Value>("session.y")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // `doctor`'s probe sees the open `_INBOX.>`.
+    for who in ["build-1", "console", "hub-slack"] {
+        assert_eq!(hub.shared_inbox(who, false).await, Some(true), "{who}");
+    }
 }

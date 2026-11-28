@@ -1893,3 +1893,55 @@ async fn a_lost_running_with_a_queued_replacement_is_asked_once() {
     }
     r.stop().await;
 }
+
+/// `tasks` with no task is never written empty (an empty create fails every round), and
+/// a text left from a task that is gone is cleared.
+#[tokio::test]
+async fn tasks_without_a_task_write_nothing() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut idx = crate::tasks::NotesIndex::default();
+    let mut written = None;
+    for _ in 0..2 {
+        crate::tasks::keep(&b, &mut idx, &mut written)
+            .await
+            .unwrap();
+    }
+    assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
+
+    let mut n = hgl_ai_proto::Note::new(
+        Seat::new("controller").unwrap(),
+        Seat::new("w1").unwrap(),
+        Kind::Assign,
+        "x",
+    );
+    n.repo = Some("alpha".into());
+    n.issue = 7;
+    b.send(&n).await.unwrap();
+    let tree: hgl_ai_proto::TreeRecord = serde_json::from_value(serde_json::json!({
+        "host": "lab1", "seat": "w1", "task": {"repo": "alpha", "issue": 7},
+        "path": "/w", "created_at": "20261128T000000Z",
+    }))
+    .unwrap();
+    b.tree_put(&tree).await.unwrap();
+    crate::tasks::keep(&b, &mut idx, &mut written)
+        .await
+        .unwrap();
+    let held = b.state_get(state::KEY_TASKS).await.unwrap().unwrap().value;
+    assert!(
+        held.starts_with("alpha\t7\tassign\tcontroller\tw1\t"),
+        "{held}"
+    );
+
+    b.tree_del(&tree.key()).await.unwrap();
+    crate::tasks::keep(&b, &mut idx, &mut written)
+        .await
+        .unwrap();
+    assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
+    // A new run (nothing written yet) finds nothing to clear.
+    let mut written = None;
+    crate::tasks::keep(&b, &mut idx, &mut written)
+        .await
+        .unwrap();
+    assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
+}

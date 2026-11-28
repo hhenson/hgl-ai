@@ -17,6 +17,7 @@ use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE,
     KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
     SLACK_OWNER_FILTER, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, USAGE_PREFIX,
+    VIEWER_INBOX, VIEWER_STATE_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,6 +41,11 @@ pub enum Role {
     Builder,
     /// The owner's console: the owner's subjects, `HGL_THREADS`, `tick` notes.
     Console,
+    /// The console's page in a browser, over WebSocket (docs/owner.md §3): reads and
+    /// watches [`VIEWER_BUCKETS`] and nothing else. Its subject permissions are read-only,
+    /// but replies are not enforced until hgl-ai#141: with one NATS account, JetStream
+    /// replies let any role write any subject.
+    Viewer,
     /// Slack Q&A: owner actions, its own feed and delivery state.
     Slack,
     /// Everything: provisioning the stream and buckets (`hgl-ai init`, `server install`).
@@ -47,11 +53,12 @@ pub enum Role {
 }
 
 impl Role {
-    pub const ALL: [Role; 6] = [
+    pub const ALL: [Role; 7] = [
         Role::Seat,
         Role::Coord,
         Role::Builder,
         Role::Console,
+        Role::Viewer,
         Role::Slack,
         Role::Admin,
     ];
@@ -62,6 +69,7 @@ impl Role {
             Role::Coord => "coord",
             Role::Builder => "builder",
             Role::Console => "console",
+            Role::Viewer => "viewer",
             Role::Slack => "slack",
             Role::Admin => "admin",
         }
@@ -81,7 +89,9 @@ impl FromStr for Role {
             .into_iter()
             .find(|r| r.as_str() == s)
             .ok_or_else(|| {
-                format!("unknown hub role {s:?}: seat, coord, builder, console, slack or admin")
+                format!(
+                    "unknown hub role {s:?}: seat, coord, builder, console, viewer, slack or admin"
+                )
             })
     }
 }
@@ -223,12 +233,25 @@ pub fn fingerprint(nkey: &str) -> String {
         .join("-")
 }
 
-/// A role's permissions: publish allow and deny, subscribe allow. `None`: no limits (admin).
+/// A role's publish permissions, allow and deny. `None`: no limits (admin). What a user
+/// may subscribe to is its own: [`subscribe_allow`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Permissions {
     pub publish_allow: Vec<String>,
     pub publish_deny: Vec<String>,
-    pub subscribe_allow: Vec<String>,
+}
+
+/// What the user with public key `nkey` may subscribe to: its own inbox prefix
+/// ([`hgl_ai_proto::user_inbox`]; the viewer's is [`VIEWER_INBOX`], which the console's
+/// page uses), never `_INBOX.>`, where every client's JetStream and KV replies would be
+/// (the console's sessions, threads, notes; hgl-ai#111).
+pub fn subscribe_allow(role: Role, nkey: &str) -> Vec<String> {
+    let inbox = if role == Role::Viewer {
+        VIEWER_INBOX.to_string()
+    } else {
+        hgl_ai_proto::user_inbox(nkey)
+    };
+    vec![format!("{inbox}.>")]
 }
 
 fn kv(bucket: &str) -> String {
@@ -252,9 +275,59 @@ fn pull_from(stream: &str) -> [String; 2] {
     ]
 }
 
+/// The buckets the viewer reads: the telemetry (docs/owner.md §3).
+pub const VIEWER_BUCKETS: [&str; 6] =
+    [KV_HOSTS, KV_TREES, KV_STATE, KV_METRICS, KV_BUILD, KV_USAGE];
+
+/// The viewer's publishes: what reading and watching [`VIEWER_BUCKETS`] needs, on those
+/// buckets' streams only, and of `HGL_STATE` only [`VIEWER_STATE_KEYS`]: bucket status,
+/// direct gets, the ordered push consumer a watch makes and its flow control. A consumer
+/// only in the filtered create form, `CONSUMER.CREATE.<stream>.<name>.<filter>`, whose
+/// filter the server holds the body to (one filter, the subject's); never the bare or
+/// durable form. What subjects cannot stop (a `durable_name` in the body, any
+/// `deliver_subject`, an `inactive_threshold`) `doctor` reports (docs/design.md §9). Subscribes
+/// to [`VIEWER_INBOX`] only ([`subscribe_allow`]): no other client's replies.
+fn viewer() -> Permissions {
+    let mut allow = vec!["$JS.API.INFO".to_string(), "$JS.FC.>".to_string()];
+    let mut deny = Vec::new();
+    for b in VIEWER_BUCKETS {
+        let s = kv(b);
+        allow.extend([
+            format!("$JS.API.STREAM.INFO.{s}"),
+            format!("$JS.API.CONSUMER.INFO.{s}.*"),
+        ]);
+        if b == KV_STATE {
+            for k in VIEWER_STATE_KEYS {
+                allow.extend([
+                    format!("$JS.API.DIRECT.GET.{s}.$KV.{b}.{k}"),
+                    format!("$JS.API.CONSUMER.CREATE.{s}.*.$KV.{b}.{k}"),
+                ]);
+            }
+        } else {
+            allow.extend([
+                format!("$JS.API.DIRECT.GET.{s}"),
+                format!("$JS.API.DIRECT.GET.{s}.>"),
+                format!("$JS.API.STREAM.MSG.GET.{s}"),
+                format!("$JS.API.CONSUMER.CREATE.{s}.*.$KV.{b}.>"),
+            ]);
+        }
+        deny.extend([
+            format!("$JS.API.CONSUMER.CREATE.{s}"),
+            format!("$JS.API.CONSUMER.CREATE.{s}.*"),
+            format!("$JS.API.CONSUMER.DURABLE.CREATE.{s}.>"),
+        ]);
+    }
+    Permissions {
+        publish_allow: allow,
+        publish_deny: deny,
+    }
+}
+
 pub fn permissions(role: Role) -> Option<Permissions> {
-    if role == Role::Admin {
-        return None;
+    match role {
+        Role::Admin => return None,
+        Role::Viewer => return Some(viewer()),
+        _ => {}
     }
     let slack_bucket = kv(KV_SLACK);
     if role == Role::Slack {
@@ -273,7 +346,6 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$JS.ACK.{STREAM_OWNER}.{SLACK_FEED}.>"),
             ],
             publish_deny: Vec::new(),
-            subscribe_allow: vec!["_INBOX.>".into()],
         });
     }
     // Reads everyone needs: stream and bucket lookups, direct gets, consumer state,
@@ -303,6 +375,8 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     for s in &streams {
         allow.extend(consumers_on(s));
     }
+    // `doctor` lists the consumers on the telemetry streams (durables the viewer made).
+    allow.extend(VIEWER_BUCKETS.map(|b| format!("$JS.API.CONSUMER.LIST.{}", kv(b))));
     allow.extend(pull_from(STREAM_NOTES));
     allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_USAGE}.*"));
     // The owner's subjects; denied to every client but the console.
@@ -380,7 +454,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             allow.push(format!("$KV.{KV_STATE}.decisions.log"));
             allow.push(format!("$KV.{KV_CONSOLE}.>"));
         }
-        Role::Slack | Role::Admin => unreachable!(),
+        Role::Viewer | Role::Slack | Role::Admin => unreachable!(),
     }
     deny.push(format!("$JS.API.DIRECT.GET.{slack_bucket}"));
     deny.push(format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"));
@@ -400,7 +474,6 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     Some(Permissions {
         publish_allow: allow,
         publish_deny: deny,
-        subscribe_allow: vec!["_INBOX.>".into()],
     })
 }
 
@@ -409,30 +482,31 @@ fn conf_list(items: &[String]) -> String {
     format!("[{}]", quoted.join(", "))
 }
 
-/// The `authorization { ... }` block of `nats.conf` for these users.
+/// The `authorization { ... }` block of `nats.conf` for these users: a publish block per
+/// role (`SEAT_PUBLISH`), and per user that and its own inbox to subscribe to.
 pub fn render_authorization(reg: &Registry) -> String {
     let mut s = String::from("authorization {\n");
     let used: std::collections::BTreeSet<Role> = reg.users.iter().map(|u| u.role).collect();
     let mut vars = BTreeMap::new();
     for role in used {
         let Some(p) = permissions(role) else { continue };
-        let var = role.as_str().to_ascii_uppercase();
+        let var = format!("{}_PUBLISH", role.as_str().to_ascii_uppercase());
         let mut publish = format!("allow = {}", conf_list(&p.publish_allow));
         if !p.publish_deny.is_empty() {
             publish.push_str(&format!(", deny = {}", conf_list(&p.publish_deny)));
         }
-        s.push_str(&format!(
-            "  {var} = {{\n    publish = {{ {publish} }}\n    subscribe = {{ allow = {} }}\n  }}\n",
-            conf_list(&p.subscribe_allow)
-        ));
+        s.push_str(&format!("  {var} = {{ {publish} }}\n"));
         vars.insert(role, var);
     }
     s.push_str("  users = [\n");
     for u in &reg.users {
         match vars.get(&u.role) {
             Some(v) => s.push_str(&format!(
-                "    {{ nkey: \"{}\", permissions: ${v} }}  # {} ({})\n",
-                u.nkey, u.name, u.role
+                "    {{ nkey: \"{}\", permissions: {{ publish: ${v}, subscribe: {{ allow: {} }} }} }}  # {} ({})\n",
+                u.nkey,
+                conf_list(&subscribe_allow(u.role, &u.nkey)),
+                u.name,
+                u.role
             )),
             None => s.push_str(&format!(
                 "    {{ nkey: \"{}\" }}  # {} ({})\n",
@@ -555,6 +629,70 @@ mod tests {
     }
 
     #[test]
+    fn the_viewer_reads_the_page_keys_through_its_own_inbox() {
+        let p = permissions(Role::Viewer).unwrap();
+        assert_eq!(subscribe_allow(Role::Viewer, "UX"), ["_INBOX_VIEWER.>"]);
+        assert_eq!(subscribe_allow(Role::Seat, "UX"), ["_INBOX.UX.>"]);
+        let allow = |s: &str| p.publish_allow.iter().any(|a| a == s);
+        // `HGL_STATE`: the page's keys by subject, never a request naming one in its body.
+        assert!(allow(
+            "$JS.API.DIRECT.GET.KV_HGL_STATE.$KV.HGL_STATE.landed.log"
+        ));
+        assert!(allow(
+            "$JS.API.CONSUMER.CREATE.KV_HGL_STATE.*.$KV.HGL_STATE.prs"
+        ));
+        assert!(!allow("$JS.API.DIRECT.GET.KV_HGL_STATE"));
+        assert!(!allow("$JS.API.STREAM.MSG.GET.KV_HGL_STATE"));
+        assert!(
+            p.publish_allow
+                .iter()
+                .filter(|a| a.contains("$KV.HGL_STATE."))
+                .all(|a| VIEWER_STATE_KEYS
+                    .iter()
+                    .any(|k| a.ends_with(&format!(".{k}")))),
+            "{:?}",
+            p.publish_allow
+        );
+        // Consumers only in the filtered form; the bare and durable forms denied outright.
+        assert!(
+            p.publish_allow
+                .iter()
+                .filter(|a| a.contains("CONSUMER.CREATE") || a.contains("DURABLE"))
+                .all(|a| a.contains(".*.$KV.")),
+            "{:?}",
+            p.publish_allow
+        );
+        for b in VIEWER_BUCKETS {
+            for d in [
+                format!("$JS.API.CONSUMER.CREATE.KV_{b}"),
+                format!("$JS.API.CONSUMER.CREATE.KV_{b}.*"),
+                format!("$JS.API.CONSUMER.DURABLE.CREATE.KV_{b}.>"),
+            ] {
+                assert!(p.publish_deny.contains(&d), "{d}");
+            }
+        }
+    }
+
+    /// The page (`crates/console/web`) uses the same inbox prefix and `HGL_STATE` keys.
+    #[test]
+    fn the_page_matches_the_viewer() {
+        let hub = include_str!("../../console/web/src/hub.ts");
+        assert!(
+            hub.contains(&format!("INBOX_PREFIX = \"{VIEWER_INBOX}\"")),
+            "hub.ts"
+        );
+        let tables = include_str!("../../console/web/src/tables.ts");
+        let keys: Vec<String> = VIEWER_STATE_KEYS
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect();
+        assert!(
+            tables.contains(&format!("STATE_KEYS = [{}] as const", keys.join(", "))),
+            "tables.ts"
+        );
+    }
+
+    #[test]
     fn registry_issue_rotate_remove() {
         let d = tempfile::tempdir().unwrap();
         let f = Fake::new(d.path(), Os::Linux);
@@ -612,10 +750,15 @@ mod tests {
             reg.issue(n, r, false).unwrap();
         }
         let block = render_authorization(&reg);
+        let hub = &reg.get("hub").unwrap().nkey;
         assert!(
-            block.contains("permissions: $SEAT }  # hub (seat)"),
+            block.contains(&format!(
+                "permissions: {{ publish: $SEAT_PUBLISH, subscribe: {{ allow: [\"_INBOX.{hub}.>\"] }} }} }}  # hub (seat)"
+            )),
             "{block}"
         );
+        // Every user its own inbox; none `_INBOX.>` (hgl-ai#111).
+        assert!(!block.contains("\"_INBOX.>\""), "{block}");
         assert!(block.contains("# hub-admin (admin)"));
         let Some(bin) =
             crate::sys::which_in(&std::env::var("PATH").unwrap_or_default(), "nats-server")

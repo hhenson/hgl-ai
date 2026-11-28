@@ -382,9 +382,16 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                     .map_err(lift)?;
             } else {
                 let bus = Bus::connect(&cfg).await?;
-                coord::run(&gh, &s, Some(&bus), &o, &mut out)
-                    .await
-                    .map_err(lift)?;
+                let round = coord::run(&gh, &s, Some(&bus), &o, &mut out);
+                if once {
+                    round.await.map_err(lift)?;
+                } else {
+                    // Beside the rounds, every few seconds: each task's last note.
+                    tokio::select! {
+                        r = round => r.map_err(lift)?,
+                        () = hgl_ai_gh::tasks::run(&bus) => {}
+                    }
+                }
             }
             Ok(EXIT_OK)
         }
