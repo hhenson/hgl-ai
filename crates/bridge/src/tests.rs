@@ -1413,7 +1413,13 @@ async fn the_lease_of_a_crashed_bridge_of_this_host_is_taken_over() {
 async fn a_lost_seat_lease_stops_the_seat() {
     let h = harness();
     let pid = h.calls.join("pid");
-    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    h.script(
+        "codex",
+        &format!(
+            "echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60",
+            p = pid.display()
+        ),
+    );
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1701,7 +1707,13 @@ async fn landed_without_a_tree_is_acked_silently() {
 async fn shutdown_stops_a_running_turn_after_the_grace_and_naks() {
     let h = harness();
     let pid = h.calls.join("pid");
-    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    h.script(
+        "codex",
+        &format!(
+            "echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60",
+            p = pid.display()
+        ),
+    );
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1726,7 +1738,13 @@ async fn shutdown_stops_a_running_turn_after_the_grace_and_naks() {
 async fn a_failed_inbox_fetcher_stops_the_running_turn() {
     let h = harness();
     let pid = h.calls.join("pid");
-    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    h.script(
+        "codex",
+        &format!(
+            "echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60",
+            p = pid.display()
+        ),
+    );
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1983,7 +2001,7 @@ fn held_after_the_first(h: &H) -> (PathBuf, PathBuf) {
     h.script(
         "codex",
         &format!(
-            "if [ \"$n\" -ge 2 ]; then echo $$ > '{p}'; while [ ! -e '{g}' ]; do sleep 0.05; done; fi\ncat '{f}'",
+            "if [ \"$n\" -ge 2 ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; while [ ! -e '{g}' ]; do sleep 0.05; done; fi\ncat '{f}'",
             p = pid.display(),
             g = gate.display(),
             f = fixture("codex-ok.jsonl")
@@ -2074,7 +2092,7 @@ async fn a_late_end_hands_back_the_newer_notes_of_the_turn_it_stops() {
     h.script(
         "codex",
         &format!(
-            "if [ \"$n\" -eq 2 ]; then echo $$ > '{p}'; sleep 60; fi\ncat '{f}'",
+            "if [ \"$n\" -eq 2 ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60; fi\ncat '{f}'",
             p = pid.display(),
             f = fixture("codex-ok.jsonl")
         ),
