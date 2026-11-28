@@ -6,7 +6,11 @@
 //!   died; a second turn in that directory cannot start.
 //! - Seat lock `<data_dir>/seats/<seat>.lock` ([`FileLock::try_exclusive`]): held by
 //!   whoever serves the seat on this host, the bridge or an interactive session
-//!   (PROTO-6), never both. It records the holder's pid.
+//!   (PROTO-6), never both. It records the holder's pid. Dropping it unlocks the open
+//!   file description explicitly (`LOCK_UN`): a child forked by another thread holds a
+//!   copy of the descriptor until it execs, and closing ours alone would leave the seat
+//!   held by that copy. A turn lock is not unlocked on drop: the turn's processes keep
+//!   it on purpose.
 
 use std::fs::{File, OpenOptions};
 use std::io::{Read as _, Seek as _, Write as _};
@@ -18,6 +22,20 @@ pub const TURN_LOCK: &str = "turn.lock";
 pub struct FileLock {
     file: File,
     path: PathBuf,
+    /// `LOCK_UN` on drop: a seat lock, not a turn lock.
+    unlock: bool,
+}
+
+impl Drop for FileLock {
+    fn drop(&mut self) {
+        #[cfg(unix)]
+        if self.unlock {
+            use std::os::fd::AsRawFd;
+            // SAFETY: flock(2) on our own open descriptor. Unlocks the open file
+            // description, whoever else holds a copy of it.
+            unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
+        }
+    }
 }
 
 impl FileLock {
@@ -42,6 +60,7 @@ impl FileLock {
         Ok(Some(FileLock {
             file,
             path: path.to_path_buf(),
+            unlock: true,
         }))
     }
 
@@ -66,6 +85,7 @@ impl FileLock {
         Ok(Some(FileLock {
             file,
             path: path.to_path_buf(),
+            unlock: false,
         }))
     }
 
@@ -192,5 +212,81 @@ mod tests {
         drop((shared, stdin));
         assert!(FileLock::turn_patiently(&t).await.unwrap().is_some());
         assert_eq!(std::fs::metadata(&t).unwrap().len(), 0, "emptied again");
+    }
+
+    /// A forked child holding copies of this process's descriptors until it is told to
+    /// exit: what a child forked by another thread is until its exec.
+    #[cfg(unix)]
+    struct Forked {
+        pid: libc::pid_t,
+        go: libc::c_int,
+    }
+
+    #[cfg(unix)]
+    impl Forked {
+        fn spawn() -> Forked {
+            let mut p = [0 as libc::c_int; 2];
+            // SAFETY: pipe2(2) into a two-element array; close-on-exec, so no other
+            // test's exec'd child keeps it.
+            assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            // SAFETY: the child calls only async-signal-safe functions (close, read,
+            // _exit) before it exits.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0, "fork");
+            if pid == 0 {
+                let mut b = 0u8;
+                // SAFETY: the child's copies of the pipe; read blocks until the parent
+                // closes its end.
+                unsafe {
+                    libc::close(p[1]);
+                    libc::read(p[0], (&raw mut b).cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            // SAFETY: the parent's read end, not used by it.
+            unsafe { libc::close(p[0]) };
+            Forked { pid, go: p[1] }
+        }
+
+        fn finish(self) {
+            let mut st = 0;
+            // SAFETY: our write end, then the child forked above.
+            unsafe {
+                libc::close(self.go);
+                assert_eq!(libc::waitpid(self.pid, &mut st, 0), self.pid);
+            }
+            assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
+        }
+    }
+
+    /// The seat lock is released when dropped, though a forked child still holds a copy
+    /// of its descriptor (#68).
+    #[cfg(unix)]
+    #[test]
+    fn seat_lock_released_despite_a_forked_copy() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("seat.lock");
+        let a = FileLock::try_exclusive(&p).unwrap().expect("free");
+        let child = Forked::spawn();
+        drop(a);
+        let again = FileLock::try_exclusive(&p).unwrap();
+        child.finish();
+        assert!(again.is_some(), "the forked copy does not keep the seat");
+    }
+
+    /// The turn lock is not unlocked on drop: a forked child (the turn's agent) keeps it
+    /// after the parent drops its lock, until it exits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn turn_lock_held_by_a_forked_child_after_drop() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join(TURN_LOCK);
+        let a = FileLock::turn(&p).unwrap().expect("free");
+        let child = Forked::spawn();
+        drop(a);
+        let during = FileLock::turn(&p).unwrap().is_none();
+        child.finish();
+        assert!(during, "the child still holds the turn lock");
+        assert!(FileLock::turn_patiently(&p).await.unwrap().is_some());
     }
 }
