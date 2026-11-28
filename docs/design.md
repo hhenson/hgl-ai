@@ -357,7 +357,7 @@ granted what the page's own watches need and no more (`users::permissions`):
 
 - Its inbox prefix is `_INBOX_VIEWER`, the only subjects it may subscribe to: it never
   sees another client's replies on `_INBOX.>` (the console's reads of sessions and
-  threads). Every other role still shares `_INBOX.>` (hgl-ai#111).
+  threads). Every other user's is `_INBOX.<public key>`, likewise its own (hgl-ai#111).
 - Of `HGL_STATE`, only `prs`, `backlog`, `landed.log`, `tasks`, `mode` and `hold`, by
   subject: direct gets `DIRECT.GET.<stream>.<subject>`, never the forms whose body names
   the key (`DIRECT.GET.<stream>`, `STREAM.MSG.GET`). No `verdict.*`, `decisions.log` or

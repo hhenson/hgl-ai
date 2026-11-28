@@ -233,12 +233,25 @@ pub fn fingerprint(nkey: &str) -> String {
         .join("-")
 }
 
-/// A role's permissions: publish allow and deny, subscribe allow. `None`: no limits (admin).
+/// A role's publish permissions, allow and deny. `None`: no limits (admin). What a user
+/// may subscribe to is its own: [`subscribe_allow`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Permissions {
     pub publish_allow: Vec<String>,
     pub publish_deny: Vec<String>,
-    pub subscribe_allow: Vec<String>,
+}
+
+/// What the user with public key `nkey` may subscribe to: its own inbox prefix
+/// ([`hgl_ai_proto::user_inbox`]; the viewer's is [`VIEWER_INBOX`], which the console's
+/// page uses), never `_INBOX.>`, where every client's JetStream and KV replies would be
+/// (the console's sessions, threads, notes; hgl-ai#111).
+pub fn subscribe_allow(role: Role, nkey: &str) -> Vec<String> {
+    let inbox = if role == Role::Viewer {
+        VIEWER_INBOX.to_string()
+    } else {
+        hgl_ai_proto::user_inbox(nkey)
+    };
+    vec![format!("{inbox}.>")]
 }
 
 fn kv(bucket: &str) -> String {
@@ -273,7 +286,7 @@ pub const VIEWER_BUCKETS: [&str; 6] =
 /// filter the server holds the body to (one filter, the subject's); never the bare or
 /// durable form. What subjects cannot stop (a `durable_name` in the body, any
 /// `deliver_subject`, an `inactive_threshold`) `doctor` reports (docs/design.md §9). Subscribes
-/// to [`VIEWER_INBOX`] only: no other client's replies.
+/// to [`VIEWER_INBOX`] only ([`subscribe_allow`]): no other client's replies.
 fn viewer() -> Permissions {
     let mut allow = vec!["$JS.API.INFO".to_string(), "$JS.FC.>".to_string()];
     let mut deny = Vec::new();
@@ -307,7 +320,6 @@ fn viewer() -> Permissions {
     Permissions {
         publish_allow: allow,
         publish_deny: deny,
-        subscribe_allow: vec![format!("{VIEWER_INBOX}.>")],
     }
 }
 
@@ -334,7 +346,6 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$JS.ACK.{STREAM_OWNER}.{SLACK_FEED}.>"),
             ],
             publish_deny: Vec::new(),
-            subscribe_allow: vec!["_INBOX.>".into()],
         });
     }
     // Reads everyone needs: stream and bucket lookups, direct gets, consumer state,
@@ -463,7 +474,6 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     Some(Permissions {
         publish_allow: allow,
         publish_deny: deny,
-        subscribe_allow: vec!["_INBOX.>".into()],
     })
 }
 
@@ -472,30 +482,31 @@ fn conf_list(items: &[String]) -> String {
     format!("[{}]", quoted.join(", "))
 }
 
-/// The `authorization { ... }` block of `nats.conf` for these users.
+/// The `authorization { ... }` block of `nats.conf` for these users: a publish block per
+/// role (`SEAT_PUBLISH`), and per user that and its own inbox to subscribe to.
 pub fn render_authorization(reg: &Registry) -> String {
     let mut s = String::from("authorization {\n");
     let used: std::collections::BTreeSet<Role> = reg.users.iter().map(|u| u.role).collect();
     let mut vars = BTreeMap::new();
     for role in used {
         let Some(p) = permissions(role) else { continue };
-        let var = role.as_str().to_ascii_uppercase();
+        let var = format!("{}_PUBLISH", role.as_str().to_ascii_uppercase());
         let mut publish = format!("allow = {}", conf_list(&p.publish_allow));
         if !p.publish_deny.is_empty() {
             publish.push_str(&format!(", deny = {}", conf_list(&p.publish_deny)));
         }
-        s.push_str(&format!(
-            "  {var} = {{\n    publish = {{ {publish} }}\n    subscribe = {{ allow = {} }}\n  }}\n",
-            conf_list(&p.subscribe_allow)
-        ));
+        s.push_str(&format!("  {var} = {{ {publish} }}\n"));
         vars.insert(role, var);
     }
     s.push_str("  users = [\n");
     for u in &reg.users {
         match vars.get(&u.role) {
             Some(v) => s.push_str(&format!(
-                "    {{ nkey: \"{}\", permissions: ${v} }}  # {} ({})\n",
-                u.nkey, u.name, u.role
+                "    {{ nkey: \"{}\", permissions: {{ publish: ${v}, subscribe: {{ allow: {} }} }} }}  # {} ({})\n",
+                u.nkey,
+                conf_list(&subscribe_allow(u.role, &u.nkey)),
+                u.name,
+                u.role
             )),
             None => s.push_str(&format!(
                 "    {{ nkey: \"{}\" }}  # {} ({})\n",
@@ -620,7 +631,8 @@ mod tests {
     #[test]
     fn the_viewer_reads_the_page_keys_through_its_own_inbox() {
         let p = permissions(Role::Viewer).unwrap();
-        assert_eq!(p.subscribe_allow, ["_INBOX_VIEWER.>"]);
+        assert_eq!(subscribe_allow(Role::Viewer, "UX"), ["_INBOX_VIEWER.>"]);
+        assert_eq!(subscribe_allow(Role::Seat, "UX"), ["_INBOX.UX.>"]);
         let allow = |s: &str| p.publish_allow.iter().any(|a| a == s);
         // `HGL_STATE`: the page's keys by subject, never a request naming one in its body.
         assert!(allow(
@@ -738,10 +750,15 @@ mod tests {
             reg.issue(n, r, false).unwrap();
         }
         let block = render_authorization(&reg);
+        let hub = &reg.get("hub").unwrap().nkey;
         assert!(
-            block.contains("permissions: $SEAT }  # hub (seat)"),
+            block.contains(&format!(
+                "permissions: {{ publish: $SEAT_PUBLISH, subscribe: {{ allow: [\"_INBOX.{hub}.>\"] }} }} }}  # hub (seat)"
+            )),
             "{block}"
         );
+        // Every user its own inbox; none `_INBOX.>` (hgl-ai#111).
+        assert!(!block.contains("\"_INBOX.>\""), "{block}");
         assert!(block.contains("# hub-admin (admin)"));
         let Some(bin) =
             crate::sys::which_in(&std::env::var("PATH").unwrap_or_default(), "nats-server")

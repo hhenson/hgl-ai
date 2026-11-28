@@ -42,6 +42,11 @@ fn free_port() -> u16 {
 
 impl Hub {
     fn start() -> Option<Hub> {
+        Hub::start_with(|_, conf| conf)
+    }
+
+    /// The hub with `edit` applied to its rendered `nats.conf`.
+    fn start_with(edit: impl Fn(&Registry, String) -> String) -> Option<Hub> {
         let bin = std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|d| d.join("nats-server"))
             .find(|p| p.is_file());
@@ -59,6 +64,8 @@ impl Hub {
             ("console", Role::Console),
             ("viewer", Role::Viewer),
             ("hub-admin", Role::Admin),
+            ("lab2", Role::Seat),
+            ("hub-slack", Role::Slack),
         ] {
             let text = reg.issue(name, role, false).unwrap();
             creds.insert(name, hgl_ai_bus::parse_credential(&text).unwrap().unwrap());
@@ -72,12 +79,15 @@ impl Hub {
         std::fs::create_dir_all(d.path().join("store")).unwrap();
         std::fs::write(
             &conf,
-            render_conf_ws(
-                "127.0.0.1",
-                port,
-                &d.path().join("store"),
-                &Auth::Users(&reg),
-                Some(&ws),
+            edit(
+                &reg,
+                render_conf_ws(
+                    "127.0.0.1",
+                    port,
+                    &d.path().join("store"),
+                    &Auth::Users(&reg),
+                    Some(&ws),
+                ),
             ),
         )
         .unwrap();
@@ -143,13 +153,45 @@ impl Hub {
         seed
     }
 
+    /// A plain client of `who`, with its own inbox prefix as the bus sets it.
     async fn raw(&self, who: &str) -> async_nats::Client {
         self.raw_with(who, async_nats::ConnectOptions::new()).await
     }
 
-    /// `who`, connected with `opts` (the viewer's inbox prefix, an event callback).
+    /// `who`, connected with `opts` (an event callback) and its own inbox prefix.
     async fn raw_with(&self, who: &str, opts: async_nats::ConnectOptions) -> async_nats::Client {
-        opts.nkey(self.seed(who)).connect(&self.url).await.unwrap()
+        opts.custom_inbox_prefix(self.inbox(who))
+            .nkey(self.seed(who))
+            .connect(&self.url)
+            .await
+            .unwrap()
+    }
+
+    /// The inbox prefix of `who`'s replies.
+    fn inbox(&self, who: &str) -> String {
+        self.creds[who].inbox_prefix().unwrap()
+    }
+
+    /// What `doctor` asks the hub (`hub inboxes`): may `who`'s credential, as a host's
+    /// `hub.token`, subscribe to `_INBOX.>`?
+    async fn shared_inbox(&self, who: &str, bare: bool) -> Option<bool> {
+        use hgl_ai_install::Hub as _;
+        let Credential::Nkey { seed, user, role } = self.creds[who].clone() else {
+            unreachable!()
+        };
+        let text = if bare {
+            seed
+        } else {
+            Credential::render_nkey(&user.unwrap(), &role.unwrap(), &seed)
+        };
+        let dir = self.conf.with_file_name(format!("probe-{who}-{bare}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("hub.token");
+        std::fs::write(&f, text).unwrap();
+        let mut cfg = hgl_ai_config::Config::new("t");
+        cfg.hub.url = self.url.clone();
+        cfg.hub.token_file = f.display().to_string();
+        hgl_ai_install::BusHub.shared_inbox(&cfg).await
     }
 
     /// The viewer as the page connects: its own inbox prefix.
@@ -438,6 +480,7 @@ async fn a_reload_keeps_connections() {
     let drops = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let d2 = drops.clone();
     let raw = async_nats::ConnectOptions::with_nkey(seed)
+        .custom_inbox_prefix(hub.inbox("build-1"))
         .event_callback(move |e| {
             let d2 = d2.clone();
             async move {
@@ -1134,4 +1177,203 @@ async fn a_lasting_consumer_the_viewer_makes_is_found() {
             "KV_HGL_TREES/idle".to_string()
         ]
     );
+}
+
+/// A client of `who` that reports its refusals.
+async fn spy(
+    hub: &Hub,
+    who: &str,
+) -> (
+    async_nats::Client,
+    tokio::sync::mpsc::UnboundedReceiver<String>,
+) {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let c = hub
+        .raw_with(
+            who,
+            async_nats::ConnectOptions::new().event_callback(move |e| {
+                let tx = tx.clone();
+                async move {
+                    let s = e.to_string();
+                    if s.to_ascii_lowercase().contains("permissions violation") {
+                        let _ = tx.send(s);
+                    }
+                }
+            }),
+        )
+        .await;
+    (c, rx)
+}
+
+/// Up to `n` refusals, within a few seconds.
+async fn refusals(rx: &mut tokio::sync::mpsc::UnboundedReceiver<String>, n: usize) -> Vec<String> {
+    let mut got = Vec::new();
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
+        while got.len() < n {
+            match rx.recv().await {
+                Some(e) => got.push(e),
+                None => break,
+            }
+        }
+    })
+    .await;
+    got
+}
+
+/// Every hub user subscribes to its own inbox prefix only (hgl-ai#111): no seat, builder,
+/// coordinator, Slack adapter or console sees another user's JetStream and KV replies,
+/// such as the console's reads of its sessions, or a seat's of the notes.
+#[tokio::test]
+async fn no_user_sees_another_users_replies() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let console = hub.bus("console").await;
+    console
+        .console_put("session.x", &serde_json::json!({"csrf": SECRET}))
+        .await
+        .unwrap();
+    let seat_bus = hub.bus("build-1").await;
+    seat_bus.state_put("mode", SECRET).await.unwrap();
+
+    let mut spies = Vec::new();
+    for who in [
+        "build-1",
+        "lab2",
+        "hub-coord",
+        "lab1-builder",
+        "hub-slack",
+        "console",
+    ] {
+        let (c, mut rx) = spy(&hub, who).await;
+        let mut wild = vec!["_INBOX.>".to_string(), ">".into(), "_INBOX.*.>".into()];
+        for victim in ["console", "build-1"] {
+            if victim != who {
+                wild.push(format!("{}.>", hub.inbox(victim)));
+            }
+        }
+        let mut subs = Vec::new();
+        for w in &wild {
+            subs.push(c.subscribe(w.clone()).await.unwrap());
+        }
+        c.flush().await.unwrap();
+        let got = refusals(&mut rx, wild.len()).await;
+        for w in &wild {
+            assert!(
+                got.iter().any(|e| e.contains(&format!("\"{w}\""))),
+                "{who} may subscribe to {w}: {got:?}"
+            );
+        }
+        // Its own prefix works.
+        let probe = if who == "hub-slack" {
+            "$JS.API.STREAM.INFO.KV_HGL_SLACK"
+        } else {
+            "$JS.API.INFO"
+        };
+        let r = c.request(probe, "".into()).await.unwrap();
+        assert!(
+            !String::from_utf8_lossy(&r.payload).contains("\"error\""),
+            "{who}: {:?}",
+            r.payload
+        );
+        spies.push((who, c, subs));
+    }
+
+    // The console reads its sessions, a seat its state; nobody else sees the replies.
+    for _ in 0..3 {
+        let s: Option<serde_json::Value> = console.console_get("session.x").await.unwrap();
+        assert!(s.unwrap().to_string().contains(SECRET));
+        console
+            .console_list::<serde_json::Value>("session.")
+            .await
+            .unwrap();
+        let m = seat_bus.state_get("mode").await.unwrap().unwrap();
+        assert_eq!(m.value, SECRET);
+    }
+    for (who, _c, subs) in &mut spies {
+        for sub in subs {
+            let r = tokio::time::timeout(Duration::from_millis(300), sub.next()).await;
+            assert!(
+                !matches!(r, Ok(Some(_))),
+                "{who} saw a message: {:?}",
+                r.ok().flatten().map(|m| m.subject)
+            );
+        }
+    }
+
+    // A seat's direct publish to the console's inbox is refused. JetStream replies and
+    // consumer deliver subjects are not checked until hgl-ai#141.
+    let c = hub.raw("console").await;
+    let into = format!("{}.forged", hub.inbox("console"));
+    let mut own = c.subscribe(into.clone()).await.unwrap();
+    c.flush().await.unwrap();
+    let (s, mut rx) = spy(&hub, "build-1").await;
+    s.publish(into.clone(), "forged".into()).await.unwrap();
+    s.flush().await.unwrap();
+    let got = refusals(&mut rx, 1).await;
+    assert!(got.iter().any(|e| e.contains(&into)), "{got:?}");
+    let r = tokio::time::timeout(Duration::from_millis(500), own.next()).await;
+    assert!(!matches!(r, Ok(Some(_))), "the forged reply arrived");
+
+    // A client on the shared `_INBOX` (one that predates this) gets no replies.
+    let Credential::Nkey { seed, .. } = hub.creds["build-1"].clone() else {
+        unreachable!()
+    };
+    let old = async_nats::ConnectOptions::with_nkey(seed)
+        .connect(&hub.url)
+        .await
+        .unwrap();
+    let r = tokio::time::timeout(
+        Duration::from_secs(3),
+        old.request("$JS.API.INFO", "".into()),
+    )
+    .await;
+    assert!(!matches!(r, Ok(Ok(_))), "{r:?}");
+
+    // `doctor`'s probe: an upgraded hub refuses `_INBOX.>`; the admin and a bare seed
+    // cannot tell.
+    for who in ["build-1", "console", "hub-coord", "hub-slack", "viewer"] {
+        assert_eq!(hub.shared_inbox(who, false).await, Some(false), "{who}");
+    }
+    assert_eq!(hub.shared_inbox("hub-admin", false).await, None);
+    assert_eq!(hub.shared_inbox("build-1", true).await, None);
+}
+
+/// A client with its own inbox still works on a hub whose `nats.conf` predates them and
+/// allows every user `_INBOX.>`: upgrade clients first, then the hub (hgl-ai#111).
+#[tokio::test]
+async fn own_inboxes_work_on_an_older_hub() {
+    let Some(hub) = Hub::start_with(|reg, mut conf| {
+        for u in &reg.users {
+            conf = conf.replace(&format!("\"_INBOX.{}.>\"", u.nkey), "\"_INBOX.>\"");
+        }
+        assert!(!conf.contains("\"_INBOX.U"), "{conf}");
+        conf
+    }) else {
+        return;
+    };
+    hub.bus("hub-admin").await.provision().await.unwrap();
+    let seat_bus = hub.bus("build-1").await;
+    seat_bus.state_put("mode", "normal").await.unwrap();
+    assert_eq!(
+        seat_bus.state_get("mode").await.unwrap().unwrap().value,
+        "normal"
+    );
+    seat_bus.hosts().await.unwrap();
+    let console = hub.bus("console").await;
+    console
+        .console_put("session.y", &serde_json::json!({"csrf": "y"}))
+        .await
+        .unwrap();
+    assert!(
+        console
+            .console_get::<serde_json::Value>("session.y")
+            .await
+            .unwrap()
+            .is_some()
+    );
+    // `doctor`'s probe sees the open `_INBOX.>`.
+    for who in ["build-1", "console", "hub-slack"] {
+        assert_eq!(hub.shared_inbox(who, false).await, Some(true), "{who}");
+    }
 }
