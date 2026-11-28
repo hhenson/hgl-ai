@@ -1669,6 +1669,34 @@ mod tests {
         assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 1);
     }
 
+    #[test]
+    fn the_printed_prompt_signal_test_handles_inherited_ignored_hup() {
+        use std::os::unix::process::CommandExt as _;
+
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "system::tests::the_printed_prompt_restores_echo_on_a_signal",
+        ]);
+        // SAFETY: signal is async-signal-safe and only affects the child.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::signal(libc::SIGHUP, libc::SIG_IGN) == libc::SIG_ERR {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "child test failed: {}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    }
+
     /// A signal at the printed prompt turns echo back on and stops the script.
     #[test]
     fn the_printed_prompt_restores_echo_on_a_signal() {
