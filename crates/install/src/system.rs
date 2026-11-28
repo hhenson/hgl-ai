@@ -247,9 +247,11 @@ impl Root<'_> {
         crate::run_ok(self.sys, &sudo).map(drop)
     }
 
+    /// Say `text`; printed, a comment, every line of it (the script runs as it reads).
     fn note(&mut self, text: &str) {
         if self.print_only {
-            self.script.push(format!("# {text}"));
+            let lines: Vec<String> = text.lines().map(|l| format!("# {l}")).collect();
+            self.script.push(lines.join("\n"));
         } else {
             self.sys.say(text);
         }
@@ -734,6 +736,11 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
             (owner.clone(), env.contract(&env.client_token_path()))
         }
     };
+    // The console's page reads the hub through `<console url>/nats`, which the TLS proxy
+    // serves: a step outside this host's services, so shown, never run.
+    if o.console {
+        root.note(&console_page_step(hgl_ai_config::DEFAULT_WEBSOCKET_PORT));
+    }
     let next = format!(
         "hgl-ai client install --hub {} --token-file {} --host {}",
         crate::server::local_url(&o.listen, o.port),
@@ -765,6 +772,15 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
     sys.say(&format!("Next, on this host, {who}:"));
     sys.say(&format!("  {next}"));
     Ok(None)
+}
+
+/// The proxy step the console's page needs (docs/install.md, The console): the hub's
+/// WebSocket listener on `port` at `<console url>/nats`.
+pub fn console_page_step(port: u16) -> String {
+    format!(
+        "console: its page reads the hub at <console url>/nats; run once (not run here):\n  \
+         tailscale serve --bg --https=443 --set-path /nats http://127.0.0.1:{port}"
+    )
 }
 
 /// What to do about a unit from before hgl-ai#63, whose log root opens in the server
@@ -1023,9 +1039,19 @@ mod tests {
             "sudo -u hgl-ai cat /var/lib/hgl-ai/.config/hgl-ai/hub.token | sh -c ",
             "sudo -u hgl-ai sh -c ",
             "# next, as yourself: hgl-ai client install --hub nats://192.0.2.10:4222 --token-file ~/.config/hgl-ai/hub.token --host hub",
+            // The console page's proxy step: shown, commented, never run.
+            "# console: its page reads the hub at <console url>/nats; run once (not run here):\n\
+             #   tailscale serve --bg --https=443 --set-path /nats http://127.0.0.1:4223",
         ] {
             assert!(script.contains(want), "missing {want:?} in\n{script}");
         }
+        assert!(
+            script
+                .lines()
+                .filter(|l| l.contains("tailscale"))
+                .all(|l| l.starts_with('#')),
+            "{script}"
+        );
         // The units run as the server user, with its home.
         let unit = std::fs::read_to_string(
             f.env
@@ -1150,6 +1176,14 @@ mod tests {
             "the token step runs as the server user: {runs:?}"
         );
         assert!(f.output().contains("Next, on this host, as yourself:"));
+        // Run, the console page's proxy step is shown too.
+        assert!(
+            f.output().contains(
+                "tailscale serve --bg --https=443 --set-path /nats http://127.0.0.1:4223"
+            ),
+            "{}",
+            f.output()
+        );
     }
 
     #[test]
@@ -1161,6 +1195,7 @@ mod tests {
         o.console_url = None;
         let script = install(&f, &o).unwrap().unwrap();
         assert!(!script.contains("hgl-ai-console.service"), "{script}");
+        assert!(!script.contains("tailscale"), "{script}");
     }
 
     #[test]

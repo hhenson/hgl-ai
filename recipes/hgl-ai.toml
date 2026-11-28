@@ -33,3 +33,14 @@ memcap_gb = 64
 time = "40m"
 parser = "cargo"
 needs = ["tool:cargo"]
+
+[[step]]
+name = "web"
+# The console's telemetry page: npm ci, types, vitest, the build; and the checked-in
+# web/dist must be what the sources build to (the binary embeds it).
+run = "cd crates/console/web && npm ci --no-audit --no-fund && npm run typecheck && npm test && npm run build && git diff --exit-code --stat -- dist && test -z \"$(git status --porcelain -- dist)\""
+platforms = ["linux", "macos"]
+memcap_gb = 8
+time = "15m"
+parser = "lines"
+needs = ["tool:node", "tool:npm"]
