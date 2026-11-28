@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { connectRetrying, hubUrl } from "./hub";
+import { Backoff, connectRetrying, hubUrl } from "./hub";
 
 describe("hubUrl", () => {
   it("is the page's own origin", () => {
@@ -11,6 +11,7 @@ describe("hubUrl", () => {
 describe("connectRetrying", () => {
   it("tries the first connection again until it succeeds", async () => {
     let tries = 0;
+    const backoff = new Backoff(3000, 60_000, () => 0);
     const failures: unknown[] = [];
     const waits: number[] = [];
     const c = await connectRetrying(
@@ -20,11 +21,14 @@ describe("connectRetrying", () => {
       },
       (e) => failures.push((e as Error).message),
       () => false,
+      backoff,
       async (ms) => void waits.push(ms),
     );
     expect(c).toBe("conn");
     expect(failures).toEqual(["down 1", "down 2"]);
-    expect(waits).toEqual([3000, 3000]);
+    expect(waits).toEqual([3000, 6000]);
+    // Connected: the next outage starts again from 3 s.
+    expect(backoff.next()).toBe(3000);
   });
 
   it("gives up once stopped", async () => {
@@ -37,9 +41,30 @@ describe("connectRetrying", () => {
       },
       () => {},
       () => stopped,
+      new Backoff(),
       async () => void (stopped = true),
     );
     expect(c).toBeNull();
     expect(tries).toBe(1);
+  });
+});
+
+describe("Backoff", () => {
+  it("doubles from 3 s to a 60 s cap, and starts again on reset", () => {
+    const b = new Backoff(3000, 60_000, () => 0);
+    expect(Array.from({ length: 7 }, () => b.next())).toEqual([3000, 6000, 12000, 24000, 48000, 60000, 60000]);
+    b.reset();
+    expect(b.next()).toBe(3000);
+  });
+
+  it("takes up to a quarter off at random, never above the cap", () => {
+    const low = new Backoff(3000, 60_000, () => 1);
+    expect([low.next(), low.next()]).toEqual([2250, 4500]);
+    const b = new Backoff();
+    for (let i = 0; i < 50; i++) {
+      const ms = b.next();
+      expect(ms).toBeGreaterThan(0);
+      expect(ms).toBeLessThanOrEqual(60_000);
+    }
   });
 });
