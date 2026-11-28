@@ -5,15 +5,29 @@ import type { ColDef, GridApi } from "ag-grid-community";
 import { AgGridReact } from "ag-grid-react";
 import { useEffect, useMemo, useRef } from "react";
 import type { Row } from "./diff";
-import { age } from "./parse";
+import { age, when } from "./parse";
 import type { Store } from "./store";
 import type { Column, TableDef } from "./tables";
+
+/** A value as the grid shows it. */
+function shown(c: Column, v: unknown): string {
+  if (c.kind === "age") return age(Number(v));
+  if (c.kind === "stamp") return when(String(v));
+  return String(v);
+}
+
+/** Stamps sort to the second; rows with the same stamp by their `order`, if any. */
+export function byStamp(a: unknown, b: unknown, ra?: Row, rb?: Row): number {
+  const x = String(a ?? ""), y = String(b ?? "");
+  if (x !== y) return x < y ? -1 : 1;
+  return Number(ra?.order ?? 0) - Number(rb?.order ?? 0);
+}
 
 /** At least as wide as the header and the first rows' text, up to a limit. */
 function width(c: Column, rows: Row[]): number {
   const text = rows.slice(0, 200).reduce((n, r) => {
     const v = r[c.field];
-    return Math.max(n, v == null ? 0 : (c.kind === "age" ? age(Number(v)) : String(v)).length);
+    return Math.max(n, v == null ? 0 : shown(c, v).length);
   }, 0);
   return Math.min(c.kind === "long" ? 220 : 260, Math.max(80, c.header.length * 8 + 76, text * 8 + 36));
 }
@@ -32,6 +46,11 @@ export function columnDefs(def: TableDef, rows: Row[]): ColDef<Row>[] {
       type: numeric ? "numericColumn" : undefined,
     };
     if (c.kind === "age") col.valueFormatter = (p) => (p.value == null ? "" : age(Number(p.value)));
+    if (c.kind === "stamp") {
+      col.valueFormatter = (p) => (p.value == null ? "" : when(String(p.value)));
+      col.filterValueGetter = (p) => (p.data?.[c.field] == null ? "" : when(String(p.data[c.field])));
+      col.comparator = (a, b, na, nb) => byStamp(a, b, na?.data, nb?.data);
+    }
     if (c.kind === "code") col.cellClass = "font-mono text-[0.9em]";
     if (c.kind === "long") Object.assign(col, { wrapText: true, autoHeight: true, flex: 3 });
     if (c.kind === "rank") Object.assign(col, { flex: 0, width: col.minWidth });

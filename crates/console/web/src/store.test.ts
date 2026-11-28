@@ -30,7 +30,7 @@ describe("Store", () => {
         work: "implement",
         stage: "assigned",
         last: "assign controller→w1",
-        last_at: "2026-11-28 08:15 UTC",
+        last_at: "20261128T081500Z",
         host: "lab1",
         age: 120,
         stale: null,
@@ -88,9 +88,9 @@ describe("Store", () => {
     expect(s.rows("runs")).toHaveLength(1);
     expect(s.rows("usage")[0]).toMatchObject({ id: "claude.0123456789ab/all/week", login: "team", used_pct: 41.3 });
     expect(s.rows("burndown")[0]).toMatchObject({ day: "2026-11-27", net: -2 });
-    expect(s.rows("landings").map((r) => r.id)).toEqual([
-      "20261127T040000Z alpha #5 0123abcd",
-      "20261127T040000Z alpha #5 0123abcd (2)",
+    expect(s.rows("landings").map((r) => [r.id, r.when, r.order])).toEqual([
+      ["20261127T040000Z alpha #5 0123abcd", "20261127T040000Z", 1],
+      ["20261127T040000Z alpha #5 0123abcd (2)", "20261127T040000Z", 0],
     ]);
     expect(Object.fromEntries(s.rows("fleet").map((r) => [r.id, r.value]))).toEqual({
       mode: "normal",
@@ -104,5 +104,16 @@ describe("Store", () => {
       const ids = s.rows(t.id).map((r) => r.id);
       expect(new Set(ids).size, t.id).toBe(ids.length);
     }
+  });
+});
+
+describe("timestamps", () => {
+  it("sort to the second, and a tie by the log's order", async () => {
+    const { byStamp } = await import("./Grid");
+    // Two landings in one minute: the later second is the newer.
+    expect(byStamp("20261128T101005Z", "20261128T101050Z")).toBeLessThan(0);
+    // The same second: the later line in landed.log is the newer.
+    expect(byStamp("20261128T101005Z", "20261128T101005Z", { id: "a", order: 3 }, { id: "b", order: 4 })).toBeLessThan(0);
+    expect(byStamp(null, "20261128T101005Z")).toBeLessThan(0);
   });
 });

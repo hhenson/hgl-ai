@@ -14,8 +14,9 @@ export function emptyRaw(): Raw {
   return Object.fromEntries(BUCKETS.map((b) => [b, new Map<string, string>()])) as Raw;
 }
 
-/** How a column is shown, filtered and sorted. */
-export type Kind = "text" | "long" | "code" | "num" | "rank" | "age";
+/** How a column is shown, filtered and sorted. A `stamp` holds the compact UTC stamp
+ *  (`20261127T041100Z`, which sorts to the second) and shows `2026-11-27 04:11 UTC`. */
+export type Kind = "text" | "long" | "code" | "num" | "rank" | "age" | "stamp";
 
 export interface Column {
   field: string;
@@ -56,7 +57,7 @@ export const TASKS: TableDef = {
   empty: "No task in flight.",
   columns: [
     c("seat", "Seat"), c("task", "Issue"), c("work", "Work"), c("stage", "Stage"), c("last", "Last note"),
-    c("last_at", "Last note at"), c("host", "Host"), c("age", "Age", "age"), c("stale", "Stale"),
+    c("last_at", "Last note at", "stamp"), c("host", "Host"), c("age", "Age", "age"), c("stale", "Stale"),
   ],
 };
 export const PRS: TableDef = {
@@ -73,7 +74,7 @@ export const QUEUE: TableDef = {
   caption: "Claimable issues in order, priority first",
   empty: "Nothing claimable.",
   sort: ["pos", "asc"],
-  columns: [c("pos", "#", "rank"), c("issue", "Issue"), c("class", "Class"), c("opened", "Opened"), c("title", "Title", "long")],
+  columns: [c("pos", "#", "rank"), c("issue", "Issue"), c("class", "Class"), c("opened", "Opened", "stamp"), c("title", "Title", "long")],
 };
 export const LABELS: TableDef = {
   id: "labels",
@@ -96,7 +97,7 @@ export const LANDINGS: TableDef = {
   caption: "The newest landings first",
   empty: "Nothing landed yet.",
   sort: ["when", "desc"],
-  columns: [c("when", "When"), c("pr", "Pull request"), c("merge", "Merge", "code")],
+  columns: [c("when", "When", "stamp"), c("pr", "Pull request"), c("merge", "Merge", "code")],
 };
 export const FLEET: TableDef = {
   id: "fleet",
@@ -111,7 +112,7 @@ export const RUNS: TableDef = {
   sort: ["started", "desc"],
   columns: [
     c("run", "Run", "code"), c("repo", "Repository"), c("head", "Head", "code"), c("host", "Builder"),
-    c("platform", "Platform"), c("status", "Status"), c("started", "Started"), c("wall_s", "Wall (s)", "num"),
+    c("platform", "Platform"), c("status", "Status"), c("started", "Started", "stamp"), c("wall_s", "Wall (s)", "num"),
     c("errors", "Errors", "num"), c("passed", "Passed", "num"), c("failed", "Failed", "num"),
   ],
 };
@@ -122,7 +123,7 @@ export const BUILDERS: TableDef = {
   columns: [
     c("builder", "Builder"), c("platform", "Platform"), c("arch", "Arch"), c("executor", "Executor"),
     c("state", "State"), c("reachable", "Reachable"), c("busy", "Busy", "num"), c("slots", "Slots", "num"),
-    c("free_gb", "Free disk (GB)", "num"), c("toolchains", "Toolchains", "long"), c("updated", "Updated"),
+    c("free_gb", "Free disk (GB)", "num"), c("toolchains", "Toolchains", "long"), c("updated", "Updated", "stamp"),
   ],
 };
 export const USAGE: TableDef = {
@@ -131,7 +132,7 @@ export const USAGE: TableDef = {
   empty: "No usage record.",
   columns: [
     c("login", "Login"), c("runtime", "Runtime"), c("host", "Host"), c("plan", "Plan"), c("scope", "Scope"),
-    c("window", "Window"), c("used_pct", "Used %", "num"), c("resets", "Resets"), c("observed", "Observed"),
+    c("window", "Window"), c("used_pct", "Used %", "num"), c("resets", "Resets", "stamp"), c("observed", "Observed", "stamp"),
     c("limit", "Limit reached"),
   ],
 };
@@ -206,7 +207,7 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
         slots: v.slots,
         free_gb: opt(v.free_gb),
         toolchains: tools.join(", "),
-        updated: when(v.updated_at ?? ""),
+        updated: opt(v.updated_at),
       });
       continue;
     }
@@ -236,7 +237,7 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
       work: t.review ? "review" : "implement",
       stage: stage(l, !!t.review),
       last: l ? `${l.kind} ${l.sender}→${l.recipient}` : null,
-      last_at: l ? when(l.at) : null,
+      last_at: l ? l.at : null,
       host: t.host,
       age: created === null ? null : Math.max(0, Math.floor((ctx.now - created) / 60000)),
       stale: old ? "stale" : null,
@@ -259,7 +260,7 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
   const backlog = parseBacklog(state("backlog"));
   out.queue = backlog.queue.map((q, i) => {
     const issue = `${q.repo}#${q.number}`;
-    return { id: issue, pos: i + 1, issue, class: q.class, opened: when(q.created), title: q.title };
+    return { id: issue, pos: i + 1, issue, class: q.class, opened: q.created, title: q.title };
   });
   out.labels = backlog.labels.map((l) => ({ id: `${l.repo}/${l.label}`, repo: l.repo, label: l.label, open: l.open }));
 
@@ -287,15 +288,18 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
   }
 
   const seen = new Map<string, number>();
-  out.landings = parseLanded(state("landed.log"))
+  const landed = parseLanded(state("landed.log"));
+  out.landings = landed
     .slice(0, LANDINGS_MAX)
-    .map((l) => {
+    .map((l, i) => {
       // The same line twice (a landing run again) is two rows.
       const n = (seen.get(l.line) ?? 0) + 1;
       seen.set(l.line, n);
       return {
         id: n === 1 ? l.line : `${l.line} (${n})`,
-        when: when(l.at),
+        when: l.at,
+        // The log's order: what breaks a tie between two landings of the same second.
+        order: landed.length - 1 - i,
         pr: l.repo ? `${l.repo} ${l.pr}` : null,
         merge: l.sha ? l.sha.slice(0, 8) : null,
       };
@@ -324,7 +328,7 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
       host: s.host,
       platform: s.platform,
       status: s.status,
-      started: when(s.started_at ?? ""),
+      started: opt(s.started_at),
       wall_s: Math.floor((s.wall_ms ?? 0) / 1000),
       errors: s.errors_total ?? 0,
       passed: s.tests?.passed ?? 0,
@@ -344,7 +348,7 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
       runtime: u.runtime,
       host: u.host,
       plan: opt(u.plan),
-      observed: when(u.observed_at ?? ""),
+      observed: opt(u.observed_at),
       limit: opt(u.limit_reached),
     };
     const buckets = (u.buckets ?? []) as Json[];
@@ -356,7 +360,7 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
         scope: b.scope,
         window: b.window,
         used_pct: Math.round(b.used_pct * 10) / 10,
-        resets: b.resets_at ? when(b.resets_at) : null,
+        resets: opt(b.resets_at),
       });
     }
   }
