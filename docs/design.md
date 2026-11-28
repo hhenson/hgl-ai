@@ -142,6 +142,7 @@ branch_prefix = "codex/"
 wrapper = "hgl-project"
 clone_url = "https://github.com/{owner}/{repo}.git"   # default
 controller = "controller"              # default; the seat that gets the bridge's and coordinator's notes
+queue_priority = ["hgl-compiler"]      # optional: these repositories first in the backlog's queue
 
 [github.gate.hgl-compiler]             # per repository; every key optional
 review_receipt = true                  # default: a clean receipt from another family (ROLE-11)
@@ -370,7 +371,10 @@ What subjects cannot stop:
 - A `durable_name` in a filtered create's body makes a durable consumer, and a long
   `inactive_threshold` one that lasts as long; either outlives the page. No part of the
   fleet makes one on the telemetry streams, so `doctor` on the hub's host lists any
-  durable or idle for over an hour (`telemetry consumers`).
+  durable or idle for over an hour (`telemetry consumers`). It also lists every consumer
+  delivering to `_INBOX_VIEWER.` on `HGL_TREES`, which the viewer read until hgl-ai#173;
+  `hgl-ai server install` and `hgl-ai init` (the system installer's upgrade) delete
+  those, and fail if they cannot.
 - `deliver_subject` may be any subject: the consumer delivers only the allowed keys'
   values, and only to a subject with interest.
 - `STREAM.INFO` with `subjects_filter` lists `HGL_STATE`'s key names, not their values.

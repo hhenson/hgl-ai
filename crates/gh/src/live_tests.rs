@@ -106,13 +106,21 @@ async fn compare_and_set_writers() {
     );
     assert!(b.state_get("hold").await.unwrap().is_none());
     for i in 0..5 {
-        store::append_bounded(&b, "landed.log", &format!("line {i}"), 3)
+        store::append_bounded(&b, "landed.log", &format!("line {i}"), 3, 1000)
             .await
             .unwrap();
     }
     assert_eq!(
         b.state_get("landed.log").await.unwrap().unwrap().value,
         "line 2\nline 3\nline 4\n"
+    );
+    // The byte bound holds in the one write: never a value over it, even for a moment.
+    store::append_bounded(&b, "landed.log", "line 5", 3, 14)
+        .await
+        .unwrap();
+    assert_eq!(
+        b.state_get("landed.log").await.unwrap().unwrap().value,
+        "line 4\nline 5\n"
     );
 }
 
@@ -537,7 +545,8 @@ async fn a_lost_landing_lock_stops_the_landing() {
     }
     assert!(a.state_get(state::KEY_LANDED).await.unwrap().is_none());
     assert!(a.state_get(state::KEY_MAIN).await.unwrap().is_none());
-    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    // Only the merged pull request read (its title): no write to GitHub.
+    assert_eq!(gh.calls(), ["api repos/hhenson/alpha/pulls/7"]);
     held.release().await;
     // The release of a lost lock leaves the new holder's lease alone.
     locked(LandLock::acquire(&a, "alpha", "build-1", Duration::ZERO).await);
@@ -1402,8 +1411,10 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "not merged again");
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "{log}");
+    // With the merged pull request's own title.
     assert!(
-        log.trim_end().ends_with(&format!("alpha #7 {MERGE}")),
+        log.trim_end()
+            .ends_with(&format!("alpha #7 {MERGE} Format patterns through helpers")),
         "{log}"
     );
     let main = b.state_get(state::KEY_MAIN).await.unwrap().unwrap().value;
@@ -2236,8 +2247,8 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "{log}");
     assert!(
-        log.trim_end()
-            .ends_with(&format!("hgl-project #50 {pin_merge}")),
+        // The merged pull request's own title after the sha (hgl-ai#173).
+        log.contains(&format!("hgl-project #50 {pin_merge} ")),
         "{log}"
     );
     let main = b.state_get(state::KEY_MAIN).await.unwrap().unwrap().value;
@@ -2295,7 +2306,9 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert!(
         log.trim_end()
-            .ends_with(&format!("hgl-project #51 {pin_merge}")),
+            .lines()
+            .last()
+            .is_some_and(|l| l.contains(&format!("hgl-project #51 {pin_merge} "))),
         "{log}"
     );
     assert!(
@@ -2436,9 +2449,15 @@ impl crate::exec::Gh for Racing {
             && !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
             let line = format!("20261128T000000Z hgl-project #{} {}", self.n, self.merge);
-            store::append_bounded(&self.bus, state::KEY_LANDED, &line, 100)
-                .await
-                .unwrap();
+            store::append_bounded(
+                &self.bus,
+                state::KEY_LANDED,
+                &line,
+                100,
+                state::LANDED_MAX_BYTES,
+            )
+            .await
+            .unwrap();
             crate::progress::delete(&self.bus, "hgl-project", self.n)
                 .await
                 .unwrap();
@@ -2537,4 +2556,90 @@ async fn an_open_pin_pull_request_landed_by_another_sync_is_done() {
     assert_eq!(posts(&gh.gh, "merge-async"), 0, "not merged again");
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "landed once: {log}");
+}
+
+/// Public repositories only (hgl-ai#181): rows written before, in every key that carries
+/// titles and in every revision the bucket keeps, are rewritten. `init`'s pass strips every
+/// title once; the coordinator's, at its start, what GitHub does not call public.
+#[tokio::test]
+async fn stored_titles_of_private_repositories_are_migrated() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let plant = |v: &[(&str, &str)]| {
+        v.iter()
+            .map(|(k, x)| (k.to_string(), x.to_string()))
+            .collect::<Vec<_>>()
+    };
+    let old = plant(&[
+        (
+            state::KEY_BACKLOG,
+            "# read R\npriv\t1\tcodex\t20260101T000000Z\tDEPLOY_TOKEN: Bluebird\n",
+        ),
+        (
+            state::KEY_PRS,
+            "# read R\npriv\t2\th\topen\tnone\t0\tnone\tT\n# pr\tpriv\t2\t-\t-\tBluebird pr\n",
+        ),
+        (
+            state::KEY_TASKS,
+            "priv\t3\tassign\tc\tw1\tA\n# title\tpriv\t3\tBluebird task\n",
+        ),
+        (state::KEY_LANDED, "S priv #4 m Bluebird landing\n"),
+    ]);
+    // Two revisions each, both holding a title.
+    for (k, v) in &old {
+        b.state_put(k, &format!("{v}# read older Bluebird\n"))
+            .await
+            .unwrap();
+        b.state_put(k, v).await.unwrap();
+    }
+    let keys = crate::migrate::strip_once(&b).await.unwrap().unwrap();
+    assert_eq!(keys.len(), 4, "{keys:?}");
+    for (k, _) in &old {
+        let history = b.state_history(k).await.unwrap();
+        assert!(
+            history.iter().all(|v| !v.contains("Bluebird")),
+            "{k}: {history:?}"
+        );
+        assert!(
+            history.len() <= 1,
+            "{k}: older revisions dropped: {history:?}"
+        );
+    }
+    assert_eq!(
+        b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value,
+        "S priv #4 m\n"
+    );
+    // Once per hub: a second `init` leaves what the coordinator wrote since.
+    b.state_put(state::KEY_LANDED, "S pub #5 m Public landing\n")
+        .await
+        .unwrap();
+    assert!(crate::migrate::strip_once(&b).await.unwrap().is_none());
+    assert!(
+        b.state_get(state::KEY_LANDED)
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .contains("Public landing")
+    );
+
+    // The coordinator's start: `pub` is public, `priv` private, `other` unknown.
+    let mut s = settings();
+    s.repos = ["pub", "priv", "other"].map(String::from).to_vec();
+    let gh = FakeGh::default().on(
+        "query Visibility",
+        r#"{"data":{"r0":{"isPrivate":false},"r1":{"isPrivate":true},"r2":null}}"#,
+    );
+    b.state_put(
+        state::KEY_LANDED,
+        "S pub #5 m Public landing\nS priv #6 m Bluebird\nS other #7 m Bluebird\n",
+    )
+    .await
+    .unwrap();
+    crate::migrate::at_start(&gh, &s, &b).await.unwrap();
+    let history = b.state_history(state::KEY_LANDED).await.unwrap();
+    assert_eq!(
+        history,
+        ["S pub #5 m Public landing\nS priv #6 m\nS other #7 m\n"]
+    );
 }

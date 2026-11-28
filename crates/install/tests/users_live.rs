@@ -1185,6 +1185,58 @@ async fn the_page_watches_as_the_viewer() {
     );
 }
 
+/// A viewer consumer on `HGL_TREES`, which the viewer no longer reads (hgl-ai#173), made by
+/// a page of an earlier version: `doctor`'s listing finds it, lasting or not, as a seat's
+/// hub user; `server install`'s retirement deletes it and leaves the fleet's own alone.
+#[tokio::test]
+async fn a_viewer_consumer_on_trees_is_found_and_retired() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = hub.bus("hub-admin").await;
+    admin.provision().await.unwrap();
+    let admin_js = async_nats::jetstream::new(hub.raw("hub-admin").await);
+    let trees = admin_js.get_stream("KV_HGL_TREES").await.unwrap();
+    let push = |name: &str, deliver: String| async_nats::jetstream::consumer::push::Config {
+        name: Some(name.to_string()),
+        deliver_subject: deliver,
+        filter_subject: "$KV.HGL_TREES.>".into(),
+        inactive_threshold: Duration::from_secs(30),
+        ..Default::default()
+    };
+    // What an old page made: short-lived, delivering to the viewer's inbox.
+    trees
+        .create_consumer(push("page", format!("{}.p", hgl_ai_proto::VIEWER_INBOX)))
+        .await
+        .unwrap();
+    // A fleet part's own watch, to its own inbox.
+    trees
+        .create_consumer(push("fleet", "_INBOX.build-1.w".into()))
+        .await
+        .unwrap();
+    let seat_js = async_nats::jetstream::new(hub.raw("build-1").await);
+    assert_eq!(
+        hgl_ai_install::hub::lasting_consumers(&seat_js)
+            .await
+            .unwrap(),
+        vec!["KV_HGL_TREES/page".to_string()]
+    );
+    assert_eq!(
+        hgl_ai_install::hub::retire_viewer_consumers(&admin_js)
+            .await
+            .unwrap(),
+        vec!["KV_HGL_TREES/page".to_string()]
+    );
+    assert_eq!(
+        hgl_ai_install::hub::lasting_consumers(&seat_js)
+            .await
+            .unwrap(),
+        Vec::<String>::new()
+    );
+    assert!(
+        trees.consumer_info("fleet").await.is_ok(),
+        "the fleet's stays"
+    );
+}
+
 /// What subjects cannot stop: a `durable_name` or a long `inactive_threshold` in a filtered
 /// create's body. `doctor`'s listing, as a seat's hub user, finds both (docs/design.md §9).
 #[tokio::test]
@@ -1216,17 +1268,17 @@ async fn a_lasting_consumer_the_viewer_makes_is_found() {
     assert!(!r.contains("\"error\""), "{r}");
     // Nor an inactive threshold: one of a day outlives the page as a durable would.
     let mut body = consumer_body(
-        "KV_HGL_TREES",
+        "KV_HGL_METRICS",
         Some("idle"),
         None,
         &format!("{deliver}.i"),
-        Some("$KV.HGL_TREES.>"),
+        Some("$KV.HGL_METRICS.>"),
         &[],
     );
     body["config"]["inactive_threshold"] = 86_400_000_000_000u64.into();
     let r = ask(
         &raw,
-        "$JS.API.CONSUMER.CREATE.KV_HGL_TREES.idle.$KV.HGL_TREES.>",
+        "$JS.API.CONSUMER.CREATE.KV_HGL_METRICS.idle.$KV.HGL_METRICS.>",
         body,
     )
     .await
@@ -1236,7 +1288,7 @@ async fn a_lasting_consumer_the_viewer_makes_is_found() {
         hgl_ai_install::hub::lasting_consumers(&js).await.unwrap(),
         vec![
             "KV_HGL_HOSTS/kept".to_string(),
-            "KV_HGL_TREES/idle".to_string()
+            "KV_HGL_METRICS/idle".to_string()
         ]
     );
 }

@@ -252,7 +252,12 @@ pub async fn run<G: Gh>(
     }
     let mut prev: Vec<Row> = Vec::new();
     let mut pending = Vec::new();
-    if bus.is_some() {
+    if let Some(b) = bus {
+        // Public repositories only (hgl-ai#181): no title of another, in any revision.
+        match crate::migrate::at_start(gh, s, b).await {
+            Ok(keys) => tracing::info!("titles of non-public repositories stripped from {keys:?}"),
+            Err(e) => tracing::warn!("stripping the titles of non-public repositories: {e}"),
+        }
         eprintln!(
             "coordinator: {} repositories of {} every {:?} into {st}/{}, every {:?} into {st}/{} and {}",
             s.repos.len(),

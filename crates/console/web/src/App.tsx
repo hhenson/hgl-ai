@@ -5,6 +5,7 @@ import * as Tabs from "@radix-ui/react-tabs";
 import { useQuery } from "@tanstack/react-query";
 import { useEffect, useState, useSyncExternalStore } from "react";
 import { getSession, getViewer } from "./api";
+import { BacklogBars, UsageMeters } from "./Charts";
 import { Grid } from "./Grid";
 import { start } from "./hub";
 import type { Connection, Store } from "./store";
@@ -39,7 +40,7 @@ export function App({ store }: { store: Store }) {
     const d = session.data;
     store.setContext({
       openQuestions: d?.open_questions ?? null,
-      ...(d ? { staleAfterMs: d.stale_after_secs * 1000, hostsTtlMs: d.hosts_ttl_secs * 1000 } : {}),
+      ...(d ? { staleAfterMs: d.stale_after_secs * 1000, hostsTtlMs: d.hosts_ttl_secs * 1000, githubOwner: d.github_owner } : {}),
     });
   }, [store, session.data]);
   useEffect(() => {
@@ -72,7 +73,7 @@ export function App({ store }: { store: Store }) {
   return (
     <>
       <a className="skip" href="#main">Skip to content</a>
-      <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line px-4 py-3">
+      <header className="flex flex-wrap items-center gap-x-4 gap-y-2 border-b border-line bg-panel px-4 py-3">
         <p className="m-0 font-semibold">hgl-ai console</p>
         <nav aria-label="Main">
           <ul className="m-0 flex list-none flex-wrap gap-x-4 gap-y-1 p-0">
@@ -107,6 +108,7 @@ export function App({ store }: { store: Store }) {
             // Every panel stays mounted, so a grid keeps its sort, filter and scroll.
             <Tabs.Content key={t.id} value={t.id} forceMount className="panel">
               {meta.notes[t.id] ? <p className="meta mt-3">{meta.notes[t.id]}</p> : null}
+              {t.chart === "usage" ? <UsageMeters store={store} /> : t.chart === "backlog" ? <BacklogBars store={store} /> : null}
               {t.tables.map((d) => (
                 <section key={d.id} aria-label={d.caption}>
                   <p className="caption">{d.caption}</p>

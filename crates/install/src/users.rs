@@ -275,9 +275,19 @@ fn pull_from(stream: &str) -> [String; 2] {
     ]
 }
 
-/// The buckets the viewer reads: the telemetry (docs/owner.md §3).
-pub const VIEWER_BUCKETS: [&str; 6] =
-    [KV_HOSTS, KV_TREES, KV_STATE, KV_METRICS, KV_BUILD, KV_USAGE];
+/// The buckets the viewer reads: the telemetry (docs/owner.md §3). Not `HGL_TREES`: its
+/// records hold the trees' paths; the page reads the trees from `HGL_STATE/tasks`.
+pub const VIEWER_BUCKETS: [&str; 5] = [KV_HOSTS, KV_STATE, KV_METRICS, KV_BUILD, KV_USAGE];
+
+/// Buckets the viewer read in an earlier version (`HGL_TREES` until hgl-ai#173). A viewer
+/// consumer made then may still deliver there: `doctor` audits them and `server install`
+/// retires them ([`crate::hub::retire_viewer_consumers`]).
+pub const VIEWER_RETIRED_BUCKETS: [&str; 1] = [KV_TREES];
+
+/// The buckets whose consumers `doctor` audits: what the viewer reads and once read.
+pub fn viewer_audit_buckets() -> impl Iterator<Item = &'static str> {
+    VIEWER_BUCKETS.into_iter().chain(VIEWER_RETIRED_BUCKETS)
+}
 
 /// The viewer's publishes: what reading and watching [`VIEWER_BUCKETS`] needs, on those
 /// buckets' streams only, and of `HGL_STATE` only [`VIEWER_STATE_KEYS`]: bucket status,
@@ -376,7 +386,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         allow.extend(consumers_on(s));
     }
     // `doctor` lists the consumers on the telemetry streams (durables the viewer made).
-    allow.extend(VIEWER_BUCKETS.map(|b| format!("$JS.API.CONSUMER.LIST.{}", kv(b))));
+    allow.extend(viewer_audit_buckets().map(|b| format!("$JS.API.CONSUMER.LIST.{}", kv(b))));
     allow.extend(pull_from(STREAM_NOTES));
     allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_USAGE}.*"));
     // The owner's subjects; denied to every client but the console.
@@ -1065,6 +1075,13 @@ mod tests {
             tables.contains(&format!("STATE_KEYS = [{}] as const", keys.join(", "))),
             "tables.ts"
         );
+        // And the same buckets: none it may not read, `HGL_TREES` (paths) not among them.
+        let buckets: Vec<String> = VIEWER_BUCKETS.iter().map(|b| format!("\"{b}\"")).collect();
+        assert!(
+            tables.contains(&format!("BUCKETS = [{}] as const", buckets.join(", "))),
+            "tables.ts"
+        );
+        assert!(!VIEWER_BUCKETS.contains(&KV_TREES));
     }
 
     #[test]

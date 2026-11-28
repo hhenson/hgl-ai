@@ -30,7 +30,7 @@ fn session(app: &App, h: &HeaderMap) -> Result<crate::Session, Response> {
 
 #[derive(Serialize)]
 pub struct SessionOut {
-    /// The user as the pages show them: `Handle (email)`.
+    /// The user's handle, never the email.
     pub user: String,
     /// For the page's POSTs (sign-out, and later answers).
     pub csrf: String,
@@ -41,6 +41,8 @@ pub struct SessionOut {
     /// How long a host or builder record lives without a heartbeat. Its expiry sends a
     /// watch nothing, so the page drops a record older than this itself.
     pub hosts_ttl_secs: u64,
+    /// `[github] owner`: the page links issues and pull requests to its repositories.
+    pub github_owner: String,
 }
 
 /// `GET /api/session`
@@ -67,11 +69,12 @@ pub async fn session_info(State(app): AppState, h: HeaderMap) -> Response {
         None => None,
     };
     Json(SessionOut {
-        user: app.auth.display(&s.user),
+        user: app.auth.handle_only(&s.user),
         csrf: s.csrf,
         open_questions,
         stale_after_secs: app.cfg.stale_after().as_secs(),
         hosts_ttl_secs: hgl_ai_bus::HOSTS_TTL.as_secs(),
+        github_owner: app.cfg.github.owner.clone(),
     })
     .into_response()
 }

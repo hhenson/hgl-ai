@@ -82,12 +82,33 @@
          "commit": {
           "oid": "2222222222222222222222222222222222222222",
           "statusCheckRollup": {
-           "state": "FAILURE"
+           "state": "FAILURE",
+           "contexts": {
+            "checkRunCount": 2,
+            "checkRunCountsByState": [
+             {
+              "state": "SUCCESS",
+              "count": 1
+             },
+             {
+              "state": "FAILURE",
+              "count": 1
+             }
+            ],
+            "statusContextCount": 1,
+            "statusContextCountsByState": [
+             {
+              "state": "SUCCESS",
+              "count": 1
+             }
+            ]
+           }
           }
          }
         }
        ]
-      }
+      },
+      "title": "Gate: a failing check"
      },
      {
       "number": 11,
@@ -185,12 +206,28 @@
          "commit": {
           "oid": "1111111111111111111111111111111111111111",
           "statusCheckRollup": {
-           "state": "SUCCESS"
+           "state": "SUCCESS",
+           "contexts": {
+            "checkRunCount": 3,
+            "checkRunCountsByState": [
+             {
+              "state": "SUCCESS",
+              "count": 2
+             },
+             {
+              "state": "SKIPPED",
+              "count": 1
+             }
+            ],
+            "statusContextCount": 0,
+            "statusContextCountsByState": []
+           }
           }
          }
         }
        ]
-      }
+      },
+      "title": "Parser:\ttabs in titles"
      },
      {
       "number": 13,
@@ -283,7 +320,8 @@
       }
      }
     ]
-   }
+   },
+   "isPrivate": false
   },
   "r1": {
    "name": "beta",
@@ -417,7 +455,8 @@
       }
      }
     ]
-   }
+   },
+   "isPrivate": false
   },
   "r2": null
  }

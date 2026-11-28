@@ -559,6 +559,21 @@ pub struct SeatRecord {
     pub runtime: Runtime,
     pub family: Family,
     pub model: String,
+    /// The turn the seat runs now; absent when it runs none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<SeatTurn>,
+}
+
+/// A seat's running turn, as its host advertises it (§9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeatTurn {
+    /// The task whose tree it runs in; absent for the seat's inbox.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<TaskKey>,
+    /// In the task's review tree.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub review: bool,
+    pub started_at: String,
 }
 
 /// `HGL_HOSTS/<host>` (§9).

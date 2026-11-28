@@ -5,9 +5,12 @@
 //! # read <UTC>
 //! # cost <n> remaining <n> resetAt <ISO>
 //! REPO<TAB>NUMBER<TAB>HEAD<TAB>draft|open<TAB>BOT<TAB>UNRESOLVED<TAB>CHECKS<TAB>UPDATED
+//! # pr<TAB>REPO<TAB>NUMBER<TAB>PASSED<TAB>TOTAL<TAB>TITLE
 //! ```
 //!
 //! UPDATED is the UTC time of the reading, in the compact form of a note's `created_at`.
+//! The `# pr` line after a row gives its checks passed and in all (`-` when GitHub gave no
+//! rollup) and its title, for the console's page; a reader of the rows alone skips it.
 //! Also here: `hold` from the GraphQL allowance, and the alerts a round raises.
 
 use std::collections::{BTreeMap, HashSet};
@@ -15,6 +18,7 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
+use crate::backlog::{clean_title, public_title};
 use crate::bot::{BotState, BotView, Comment, NoteState, Review, note_state};
 use crate::{Error, Result, short};
 
@@ -67,6 +71,16 @@ pub struct Row {
     pub unresolved: u64,
     pub checks: Checks,
     pub updated: String,
+    /// The `# pr` line: the head's checks passed and in all, and the title.
+    pub detail: PrDetail,
+}
+
+/// What the `# pr` line after a row adds.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct PrDetail {
+    /// Check runs and status contexts passed (success, neutral, skipped) and in all.
+    pub counts: Option<(u64, u64)>,
+    pub title: String,
 }
 
 /// GraphQL's own `rateLimit` (the REST figure for GraphQL is not reliable).
@@ -105,6 +119,18 @@ impl Table {
                 r.checks.as_str(),
                 r.updated
             ));
+            let d = &r.detail;
+            if d.counts.is_some() || !d.title.is_empty() {
+                let (p, n) = d.counts.map_or(("-".into(), "-".into()), |(p, n)| {
+                    (p.to_string(), n.to_string())
+                });
+                s.push_str(&format!(
+                    "# pr\t{}\t{}\t{p}\t{n}\t{}\n",
+                    r.repo,
+                    r.number,
+                    clean_title(&d.title)
+                ));
+            }
         }
         s
     }
@@ -113,7 +139,20 @@ impl Table {
     pub fn parse(text: &str) -> Table {
         let mut t = Table::default();
         for line in text.lines() {
-            if let Some(rest) = line.strip_prefix("# read ") {
+            if let Some(rest) = line.strip_prefix("# pr\t") {
+                if let [repo, num, p, n, title] = rest.splitn(5, '\t').collect::<Vec<_>>()[..]
+                    && let Some(r) = t
+                        .rows
+                        .iter_mut()
+                        .rev()
+                        .find(|r| r.repo == repo && num.parse() == Ok(r.number))
+                {
+                    r.detail = PrDetail {
+                        counts: p.parse().ok().zip(n.parse().ok()),
+                        title: title.to_string(),
+                    };
+                }
+            } else if let Some(rest) = line.strip_prefix("# read ") {
                 t.read = rest.trim().to_string();
             } else if let Some(rest) = line.strip_prefix("# cost ") {
                 let w: Vec<&str> = rest.split_whitespace().collect();
@@ -146,6 +185,7 @@ impl Table {
                     unresolved,
                     checks,
                     updated: updated.into(),
+                    detail: PrDetail::default(),
                 });
             }
         }
@@ -176,15 +216,19 @@ pub fn batch_query(n_repos: usize) -> String {
 {repos}}}
 fragment R on Repository {{
   name
+  isPrivate
   pullRequests(states: OPEN, first: 50, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
     totalCount
     nodes {{
-      number isDraft headRefOid headRefName baseRefName updatedAt url
+      number title isDraft headRefOid headRefName baseRefName updatedAt url
       reviewThreads(first: 100) {{ totalCount nodes {{ isResolved }} }}
       early: comments(first: 10) {{ nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
       late: comments(last: 30) {{ nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
       reviews(last: 30) {{ nodes {{ author {{ login }} commit {{ oid }} state url }} }}
-      commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state }} }} }} }}
+      commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state contexts(first: 0) {{
+        checkRunCount checkRunCountsByState {{ state count }}
+        statusContextCount statusContextCountsByState {{ state count }}
+      }} }} }} }} }}
     }}
   }}
 }}"
@@ -230,9 +274,10 @@ pub fn parse_batch(
             missing.push(repo.clone());
             continue;
         };
+        let private = r.get("isPrivate").and_then(Value::as_bool);
         let mut infos: Vec<PrInfo> = nodes(r, &["pullRequests"])
             .iter()
-            .filter_map(|p| pr_info(repo, p, bot, read))
+            .filter_map(|p| pr_info(repo, p, bot, read, private))
             .collect();
         infos.sort_by_key(|i| i.row.number);
         out.extend(infos);
@@ -257,7 +302,9 @@ pub fn parse_rate(data: &Value) -> Result<RateLimit> {
     })
 }
 
-fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
+/// `private`: the repository's `isPrivate`, `None` when the response did not say; a title
+/// is kept for a public repository only ([`public_title`]).
+fn pr_info(repo: &str, p: &Value, bot: &str, read: &str, private: Option<bool>) -> Option<PrInfo> {
     let number = p.get("number")?.as_u64()?;
     let head = p.get("headRefOid")?.as_str()?.to_string();
     let unresolved = nodes(p, &["reviewThreads"])
@@ -283,9 +330,8 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
         .first()
         .and_then(|c| c.get("commit"))
         .filter(|c| c.get("oid").and_then(Value::as_str) == Some(head.as_str()))
-        .and_then(|c| c.get("statusCheckRollup"))
-        .and_then(|r| r.get("state"))
-        .and_then(Value::as_str);
+        .and_then(|c| c.get("statusCheckRollup"));
+    let state = rollup.and_then(|r| r.get("state")).and_then(Value::as_str);
     Some(PrInfo {
         row: Row {
             repo: repo.to_string(),
@@ -293,9 +339,16 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
             draft: p.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
             bot: view.state_at(&head),
             unresolved,
-            checks: Checks::from_rollup(rollup),
+            checks: Checks::from_rollup(state),
             updated: read.to_string(),
             head: head.clone(),
+            detail: PrDetail {
+                counts: rollup.and_then(check_counts),
+                title: public_title(
+                    private,
+                    p.get("title").and_then(Value::as_str).unwrap_or(""),
+                ),
+            },
         },
         note: note_state(&comments),
         url: p
@@ -305,6 +358,30 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
             .to_string(),
         review_url: view.review_url(&head).map(String::from),
     })
+}
+
+/// Checks passed and in all of a `statusCheckRollup`: check runs that succeeded, were
+/// neutral or skipped, and status contexts that succeeded.
+fn check_counts(rollup: &Value) -> Option<(u64, u64)> {
+    let c = rollup.get("contexts")?;
+    let n = |k: &str| c.get(k).and_then(Value::as_u64);
+    let passed = |k: &str, ok: &[&str]| -> u64 {
+        c.get(k)
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|s| {
+                s.get("state")
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| ok.contains(&s))
+            })
+            .filter_map(|s| s.get("count").and_then(Value::as_u64))
+            .sum()
+    };
+    let total = n("checkRunCount")? + n("statusContextCount").unwrap_or(0);
+    let ok = passed("checkRunCountsByState", &["SUCCESS", "NEUTRAL", "SKIPPED"])
+        + passed("statusContextCountsByState", &["SUCCESS"]);
+    Some((ok, total))
 }
 
 /// A time as the protocol writes it: RFC 3339 (`2026-11-27T08:55:49Z`) or the compact
@@ -564,6 +641,36 @@ mod tests {
         assert_eq!(t.render(), text);
         assert_eq!(t.rows.len(), 6);
         assert!(Table::parse("garbage\nalpha\tx\n").rows.is_empty());
+        let r = &t.rows[0];
+        assert_eq!(r.detail.counts, Some((3, 3)));
+        assert_eq!(r.detail.title, "Parser: tabs in titles");
+        // No rollup, a line before its row or for no row: nothing, and nothing written.
+        let row = "alpha\t9\t9999\topen\tnone\t0\tnone\tT\n";
+        let t = Table::parse(&format!(
+            "# pr\talpha\t9\t1\t1\tEarly\n{row}# pr\tbeta\t9\t1\t1\tOther\n"
+        ));
+        assert_eq!(t.rows[0].detail, PrDetail::default());
+        assert_eq!(t.render(), format!("# read \n{row}"));
+        let t = Table::parse(&format!("{row}# pr\talpha\t9\t-\t-\tTitle only\n"));
+        assert_eq!(t.rows[0].detail.counts, None);
+        assert_eq!(
+            t.render(),
+            format!("# read \n{row}# pr\talpha\t9\t-\t-\tTitle only\n")
+        );
+    }
+
+    #[test]
+    fn check_counts_of_a_rollup() {
+        let v = serde_json::json!({"state": "FAILURE", "contexts": {
+            "checkRunCount": 4,
+            "checkRunCountsByState": [
+                {"state": "SUCCESS", "count": 1}, {"state": "NEUTRAL", "count": 1},
+                {"state": "SKIPPED", "count": 1}, {"state": "FAILURE", "count": 1}],
+            "statusContextCount": 2,
+            "statusContextCountsByState": [{"state": "SUCCESS", "count": 1}, {"state": "PENDING", "count": 1}]
+        }});
+        assert_eq!(check_counts(&v), Some((4, 6)));
+        assert_eq!(check_counts(&serde_json::json!({"state": "SUCCESS"})), None);
     }
 
     #[test]

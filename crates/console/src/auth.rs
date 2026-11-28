@@ -288,6 +288,12 @@ impl Auth {
         self.console.member(user)?.handle
     }
 
+    /// The user as the telemetry page's header shows them: the handle only, never the
+    /// email (the page is a client of the hub too); `signed in` without a handle.
+    pub fn handle_only(&self, user: &str) -> String {
+        self.handle_of(user).unwrap_or_else(|| "signed in".into())
+    }
+
     /// `This Dude (owner@example.com)`, or the key alone without a handle.
     pub fn display(&self, user: &str) -> String {
         match self.handle_of(user) {

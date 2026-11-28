@@ -16,7 +16,7 @@ Roles and gates are in `docs/roles.md`; notes and worktrees in `docs/protocol.md
   `wrong-behaviour`, `target-gap`, `diagnostic`, `performance`, `enhancement`,
   `documentation`, `tooling`, `meta`; at most one root cause `arch-F1`..`arch-F5`.
 - **WORK-3 — Order.** Triage assigns with an `assign` note: `codex-priority` first, then
-  oldest first. `After #N` waits until #N is closed; `Start when …` waits for that.
+  the repositories of `[github] queue_priority` in its order, then oldest first. `After #N` waits until #N is closed; `Start when …` waits for that.
 - **WORK-4 — Who wrote it.** Agent comments start with their runtime tag (`[codex]`,
   `[claude]`, `[agy]`) and, for a seat, its name (`[codex] (w2)`). An untagged comment
   is the owner's, and the owner's word decides. An agent quoting the owner writes the

@@ -211,6 +211,10 @@ pub struct Github {
         skip_serializing_if = "github::is_coord_interval"
     )]
     pub coord_interval: String,
+    /// Repositories whose claimable issues the backlog's queue puts first, in this order
+    /// (within `codex-priority`, then within `codex`); the rest follow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queue_priority: Vec<String>,
     /// GraphQL allowance at or below which the coordinator writes `hold`.
     #[serde(
         default = "github::hold_below",
@@ -298,6 +302,7 @@ impl Default for Github {
             controller: github::controller(),
             coord_seat: github::coord_seat(),
             coord_interval: github::coord_interval(),
+            queue_priority: Vec::new(),
             hold_below: github::hold_below(),
             global_paths: github::global_paths(),
             hygiene_files: github::hygiene_files(),

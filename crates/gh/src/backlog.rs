@@ -5,14 +5,17 @@
 //! # read <UTC>
 //! # open <repo> <count>
 //! # label <repo> <label> <count>
+//! # priority <repo> <repo> ...
 //! REPO<TAB>NUMBER<TAB>codex-priority|codex<TAB>CREATED<TAB>TITLE
 //! ```
 //!
 //! One `open` line per repository; one `label` line per repository and label with open
 //! issues, sorted (a label may contain spaces: the repository is the first word, the count the
 //! last). The rows are the claimable queue in order (docs/work.md WORK-1, WORK-3): every issue
-//! labelled `codex-priority`, then those labelled `codex`, each oldest first across the
-//! repositories (ties in the configured order of repositories, then by number). An issue also
+//! labelled `codex-priority`, then those labelled `codex`; within each, the repositories of
+//! `github.queue_priority` first, in its order, then the rest; then oldest first (ties in the
+//! configured order of repositories, then by number). The `priority` line, present when that
+//! list is not empty, names it. An issue also
 //! labelled `codex-claimed`, `codex-blocked`, `needs-owner` or `codex-ready` is left out.
 //! Times are UTC in the compact form of a note's `created_at`. A title has tabs, CR and LF as
 //! spaces and at most 200 characters.
@@ -78,6 +81,8 @@ pub struct Backlog {
     pub labels: BTreeMap<(String, String), u64>,
     /// The claimable queue, in the order it is taken.
     pub queue: Vec<QueueRow>,
+    /// `github.queue_priority`: the repositories whose issues come first, in order.
+    pub priority: Vec<String>,
 }
 
 /// Tabs, CR and LF as spaces.
@@ -90,6 +95,25 @@ pub fn clean_title(t: &str) -> String {
     one_line(t).chars().take(TITLE_MAX).collect()
 }
 
+/// What a viewer-readable key holds as an item's title (the owner's ruling on hgl-ai#181:
+/// public repositories only): a public repository's title as GitHub has it, as
+/// [`clean_title`] keeps it; nothing for a private repository, or one whose visibility was
+/// not read (`private`: GitHub's `isPrivate`, `None` when unknown), so the page shows
+/// `repo #N` and its link alone.
+pub fn public_title(private: Option<bool>, t: &str) -> String {
+    match private {
+        Some(false) => clean_title(t),
+        _ => String::new(),
+    }
+}
+
+/// Each queue row's title as [`public_title`] has it, by its repository's visibility.
+fn hide_private(queue: &mut [QueueRow], private: &BTreeMap<String, bool>) {
+    for q in queue {
+        q.title = public_title(private.get(&q.repo).copied(), &q.title);
+    }
+}
+
 impl Backlog {
     pub fn render(&self) -> String {
         let mut s = format!("# read {}\n", self.read);
@@ -98,6 +122,9 @@ impl Backlog {
         }
         for ((repo, label), n) in self.labels.iter().filter(|(_, n)| **n > 0) {
             s.push_str(&format!("# label {repo} {} {n}\n", one_line(label)));
+        }
+        if !self.priority.is_empty() {
+            s.push_str(&format!("# priority {}\n", self.priority.join(" ")));
         }
         for r in &self.queue {
             s.push_str(&format!(
@@ -124,6 +151,8 @@ impl Backlog {
                 {
                     b.open.insert(repo.to_string(), n);
                 }
+            } else if let Some(rest) = line.strip_prefix("# priority ") {
+                b.priority = rest.split_whitespace().map(String::from).collect();
             } else if let Some(rest) = line.strip_prefix("# label ") {
                 if let Some((repo, rest)) = rest.split_once(' ')
                     && let Some((label, n)) = rest.rsplit_once(' ')
@@ -170,6 +199,9 @@ pub struct Reading {
     pub missing: Vec<String>,
     /// Queue classes with more than one page: repository, label, the cursor after page one.
     pub more: Vec<(String, &'static str, String)>,
+    /// Each repository's `isPrivate`, as this read gave it; a repository absent is of
+    /// unknown visibility (private, for titles).
+    pub private: BTreeMap<String, bool>,
 }
 
 impl Reading {
@@ -210,6 +242,7 @@ pub fn batch_query(n_repos: usize) -> String {
   rateLimit {{ cost remaining resetAt limit }}
 {fields}}}
 fragment B on Repository {{
+  isPrivate
   open: issues(states: OPEN) {{ totalCount }}
   labels(first: 100) {{ nodes {{ name issues(states: OPEN) {{ totalCount }} }} }}
   priority: issues(states: OPEN, labels: [\"{PRIORITY}\"], first: 100, orderBy: {{field: CREATED_AT, direction: ASC}}) {{ ...Q }}
@@ -278,7 +311,8 @@ fn candidate(n: &Value) -> Option<(u64, bool, DateTime<Utc>, String)> {
     }
     let created = table::parse_time(n.get("createdAt")?.as_str()?)?;
     let title = n.get("title").and_then(Value::as_str).unwrap_or("");
-    Some((number, priority, created, clean_title(title)))
+    // The whole title: the read keeps it for a public repository only (`hide_private`).
+    Some((number, priority, created, one_line(title)))
 }
 
 fn count(v: &Value, path: &[&str]) -> Option<u64> {
@@ -305,6 +339,7 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
     let mut missing = Vec::new();
     let mut more = Vec::new();
     let mut queue = Vec::new();
+    let mut private = BTreeMap::new();
     for (i, repo) in repos.iter().enumerate() {
         let r = data.get(format!("r{i}")).filter(|r| !r.is_null());
         let got = r.and_then(|r| {
@@ -319,6 +354,9 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
             missing.push(repo.clone());
             continue;
         };
+        if let Some(p) = r.get("isPrivate").and_then(Value::as_bool) {
+            private.insert(repo.clone(), p);
+        }
         let mut labels = BTreeMap::new();
         for l in nodes(r, &["labels"]) {
             if let (Some(name), Some(n)) = (
@@ -363,12 +401,14 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
         return Err(resp("no repository answered"));
     }
     b.queue = order(queue, repos);
+    hide_private(&mut b.queue, &private);
     Ok(Reading {
         backlog: b,
         samples,
         rate,
         missing,
         more,
+        private,
     })
 }
 
@@ -427,6 +467,7 @@ pub fn add_pages(r: &mut Reading, repos: &[String], pages: &[(String, Vec<Value>
         }
     }
     r.backlog.queue = order(queue, repos);
+    hide_private(&mut r.backlog.queue, &r.private);
 }
 
 /// Read the backlog of every configured repository from GitHub, as at `now`.
@@ -448,7 +489,16 @@ pub async fn read<G: Gh>(gh: &G, s: &Settings, now: DateTime<Utc>) -> Result<Rea
         later.push((repo, exec::graphql(gh, &page_query(), &vars, true).await?));
     }
     add_pages(&mut r, &s.repos, &later);
+    prioritise(&mut r.backlog, &s.queue_priority);
     Ok(r)
+}
+
+/// Within each class, the issues of the repositories of `first` first, in its order; the
+/// order is otherwise kept.
+pub fn prioritise(b: &mut Backlog, first: &[String]) {
+    let rank = |repo: &str| first.iter().position(|f| f == repo).unwrap_or(first.len());
+    b.queue.sort_by_key(|q| (!q.priority, rank(&q.repo)));
+    b.priority = first.to_vec();
 }
 
 /// Write a reading to the hub: `backlog`, then each repository's sample of the day.
@@ -642,6 +692,35 @@ mod tests {
         assert_eq!(tie, [("beta", 3), ("alpha", 101), ("gamma", 21)]);
     }
 
+    /// `github.queue_priority` puts its repositories first within each class, and the
+    /// backlog names it.
+    #[test]
+    fn the_queue_by_repository_priority() {
+        let mut b = reading().backlog;
+        prioritise(&mut b, &["gamma".into(), "beta".into()]);
+        let q: Vec<(&str, u64)> = b
+            .queue
+            .iter()
+            .map(|x| (x.repo.as_str(), x.number))
+            .collect();
+        assert_eq!(
+            q,
+            [
+                ("beta", 8),
+                ("alpha", 105),
+                ("gamma", 21),
+                ("beta", 3),
+                ("alpha", 101),
+                ("alpha", 107),
+            ]
+        );
+        let text = b.render();
+        assert!(text.contains("\n# priority gamma beta\n"), "{text}");
+        assert_eq!(Backlog::parse(&text), b);
+        prioritise(&mut b, &[]);
+        assert!(!b.render().contains("# priority"));
+    }
+
     #[test]
     fn titles() {
         assert_eq!(clean_title("a\tb\r\nc"), "a b  c");
@@ -650,6 +729,127 @@ mod tests {
         assert_eq!(t.chars().count(), TITLE_MAX);
         assert_eq!(t.len(), 2 * TITLE_MAX);
         assert_eq!(clean_title("short"), "short");
+    }
+
+    /// A title of repository `alpha`, whose `isPrivate` is `private` (`None`: the response
+    /// does not say), through every writer of a viewer-readable title, each from its own
+    /// GitHub response as a round reads it: the backlog's batch, the pull request batch,
+    /// the task title query and the merged pull request (`landed.log`).
+    async fn every_writer(title: &str, private: Option<bool>) -> [(&'static str, String); 4] {
+        use serde_json::json;
+        let with = |mut repo: Value| {
+            if let Some(p) = private {
+                repo["isPrivate"] = p.into();
+            }
+            repo
+        };
+        let batch = json!({"data": {
+            "rateLimit": {"cost": 1, "remaining": 100, "resetAt": "2026-01-01T00:00:00Z"},
+            "opened0": {"issueCount": 0}, "closed0": {"issueCount": 0},
+            "r0": with(json!({
+                "open": {"totalCount": 1}, "labels": {"nodes": []},
+                "priority": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+                "claimable": {"nodes": [{"number": 1, "title": title,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "labels": {"nodes": [{"name": CLAIMABLE}]}}],
+                    "pageInfo": {"hasNextPage": false}}
+            }))
+        }});
+        let repos = vec!["alpha".to_string()];
+        let backlog = parse_batch(&batch, &repos, now()).unwrap().backlog.render();
+        let prs = json!({"data": {
+            "rateLimit": {"cost": 1, "remaining": 100, "resetAt": "x"},
+            "r0": with(json!({"name": "alpha", "pullRequests": {"nodes": [
+                {"number": 1, "title": title, "headRefOid": "h", "isDraft": false}
+            ]}}))
+        }});
+        let (infos, _, _) = table::parse_batch(&prs, &repos, "bot", "T").unwrap();
+        let prs = table::Table {
+            read: "T".into(),
+            rate: None,
+            rows: infos.into_iter().map(|i| i.row).collect(),
+        }
+        .render();
+        let s = crate::testutil::settings();
+        let answer = json!({"data": {"repository":
+            with(json!({"issueOrPullRequest": {"title": title}}))}});
+        let gh = crate::exec::fake::FakeGh::default().on("issueOrPullRequest", &answer.to_string());
+        let mut titles = crate::tasks::Titles::default();
+        titles.insert(
+            "alpha",
+            1,
+            &crate::tasks::title(&gh, &s, "alpha", 1).await.unwrap(),
+        );
+        let tree: hgl_ai_proto::TreeRecord = serde_json::from_value(json!({
+            "host": "h", "seat": "w1", "task": {"repo": "alpha", "issue": 1},
+            "path": "/fixture/tree", "created_at": "20260101T000000Z",
+        }))
+        .unwrap();
+        let tasks = crate::tasks::render(&crate::tasks::NotesIndex::default(), &[tree], &titles);
+        let mut merged = json!({"number": 1, "title": title, "head": {"sha": "h"},
+            "base": {"ref": "main", "repo": {}}});
+        if let Some(p) = private {
+            merged["base"]["repo"]["private"] = p.into();
+        }
+        let pr = crate::gate::Pr::from_rest(&merged).unwrap();
+        let landed =
+            crate::state::landed_line("S", "alpha", 1, "m", &crate::land::landed_title(&pr));
+        [
+            ("backlog", backlog),
+            ("prs", prs),
+            ("tasks", tasks),
+            ("landed.log", landed),
+        ]
+    }
+
+    /// Public repositories only (hgl-ai#181): a private repository's title, or one of a
+    /// repository whose visibility the response does not give, reaches none of the four
+    /// writers at any length, cut or whole; a public repository's passes as GitHub has it
+    /// (cut to [`TITLE_MAX`]).
+    #[tokio::test]
+    async fn only_public_titles_reach_the_writers() {
+        let shapes = [
+            "GH_TOKEN: Bluebird",
+            "DEPLOY_TOKEN: Bluebird",
+            r#"run "C:\Program Files\Bluebird\bin""#,
+            "read file:///Users/Bluebird/report",
+            "Bluebird@example.invalid",
+            "A plain Bluebird title",
+        ];
+        for shape in shapes {
+            for pad in [0, 160, 180, 190, 196, 260] {
+                let title = if pad == 0 {
+                    shape.to_string()
+                } else {
+                    format!("{} {shape}", "é".repeat(pad))
+                };
+                for private in [Some(true), None] {
+                    for (writer, out) in every_writer(&title, private).await {
+                        for frag in ["Bluebird", "éé", "Blue"] {
+                            assert!(
+                                !out.contains(frag),
+                                "{writer}, private {private:?}, pad {pad}: {out}"
+                            );
+                        }
+                    }
+                }
+                for (writer, out) in every_writer(&title, Some(false)).await {
+                    let shown = clean_title(&title);
+                    assert!(out.contains(&shown), "{writer}, public, pad {pad}: {out}");
+                }
+            }
+        }
+        // As GitHub has it: nothing replaced, only one line and the cut.
+        assert_eq!(
+            public_title(Some(false), "Fix\tdocs/work.md: GH_TOKEN"),
+            "Fix docs/work.md: GH_TOKEN"
+        );
+        assert_eq!(
+            public_title(Some(false), &"é".repeat(300)).chars().count(),
+            TITLE_MAX
+        );
+        assert_eq!(public_title(Some(true), "x"), "");
+        assert_eq!(public_title(None, "x"), "");
     }
 
     #[test]
