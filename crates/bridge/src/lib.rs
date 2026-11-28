@@ -1506,7 +1506,7 @@ impl<B: BusApi> Bridge<B> {
                     .unwrap_or_else(|| "unknown".into())
             ));
         }
-        let mut authors: HashSet<Family> = cur.into_iter().collect();
+        let mut authors: HashSet<Family> = HashSet::new();
         if let Some(dir) = self.trees.existing(seat.name(), task, false)
             && let Ok(f) = hgl_ai_tree::read_task(&dir)
         {

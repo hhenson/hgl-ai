@@ -1063,6 +1063,20 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
         &format!("cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")),
     );
     h.script("agy", &format!("cat '{}'", fixture("agy-ok.jsonl")));
+    // The refused family remains eligible to review the fallback's work.
+    h.bus.put_host(hgl_ai_proto::HostRecord {
+        host: "build-2".into(),
+        seats: vec![hgl_ai_proto::SeatRecord {
+            seat: seat("r9"),
+            role: Role::Reviewer,
+            runtime: Runtime::Codex,
+            family: Family::Gpt,
+            model: "gpt-6.2-astra".into(),
+        }],
+        memcap_gb: 64,
+        work_root_free_gb: 500,
+        updated_at: hgl_ai_proto::utc_now_stamp(),
+    });
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1070,6 +1084,12 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
     );
     // Held, not naked: the refusal spends no delivery (PROTO-8).
     eventually("acked once moved", || h.bus.events(a) == [Ev::Ack]).await;
+    let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-3")).unwrap();
+    assert_eq!(tf.families, [Family::Claude]);
+    assert_eq!(
+        h.bus.trees()["build-1.w1.demo-3"].families,
+        [Family::Claude]
+    );
     let moved = h
         .bus
         .sent_containing("moved from codex gpt/gpt-6.2-astra to agy claude/claude-opus-5-5");
@@ -1112,6 +1132,9 @@ async fn a_crash_naks_without_failover() {
     .await;
     assert!(h.bus.sent_containing("Failover").is_empty());
     assert!(h.calls("agy").is_empty());
+    let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-4")).unwrap();
+    assert_eq!(tf.families, [Family::Gpt]);
+    assert_eq!(h.bus.trees()["build-1.w1.demo-4"].families, [Family::Gpt]);
     stop(tx, j).await;
 }
 
@@ -2285,9 +2308,9 @@ async fn a_failed_over_seat_returns_to_its_primary_after_the_cool_down() {
     );
     // Both families worked on the task: its authors (ROLE-11).
     let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-7")).unwrap();
-    assert_eq!(tf.families, [Family::Gpt, Family::Claude]);
+    assert_eq!(tf.families, [Family::Claude, Family::Gpt]);
     let rec = h.bus.trees()["build-1.w1.demo-7"].clone();
-    assert_eq!(rec.families, [Family::Gpt, Family::Claude]);
+    assert_eq!(rec.families, [Family::Claude, Family::Gpt]);
     stop(tx, j).await;
 }
 

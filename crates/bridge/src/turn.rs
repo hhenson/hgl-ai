@@ -684,14 +684,8 @@ impl<B: BusApi> Bridge<B> {
             Ok(r) => r,
             Err(e) => return Outcome::PrepFailed(format!("seat binding: {e}")),
         };
-        // The task's authors (ROLE-11): every family whose turns run in an implementor
-        // tree, in `task.json` and its `HGL_TREES` record, which the merge gate reads.
         if let Some(f) = file.as_mut() {
             let implementor = !matches!(job.target, Target::Tree { review: true, .. });
-            let author = implementor && !f.families.contains(&r.family);
-            if author {
-                f.families.push(r.family);
-            }
             // The newest handoff this tree ran, even one reusing it after another seat's
             // tree was made: verdicts go to that tree's seat (PROTO-21).
             let handoff = implementor
@@ -707,7 +701,7 @@ impl<B: BusApi> Bridge<B> {
                 f.class = class;
                 f.class_seq = class_seq;
             }
-            if author || reclassed || handoff.is_some() {
+            if reclassed || handoff.is_some() {
                 match hgl_ai_tree::write_task(&dir, f) {
                     Ok(()) => {
                         let d = dir.clone();
@@ -716,11 +710,11 @@ impl<B: BusApi> Bridge<B> {
                             .unwrap_or(0);
                         let rec = self.trees.record(&dir, f, size);
                         if let Err(e) = self.bus.tree_put(&rec).await {
-                            tracing::warn!(key = %rec.key(), "registering the task's families and class: {e}");
+                            tracing::warn!(key = %rec.key(), "registering the task's class: {e}");
                         }
                     }
                     Err(e) => {
-                        return Outcome::PrepFailed(format!("recording the family and class: {e}"));
+                        return Outcome::PrepFailed(format!("recording the class: {e}"));
                     }
                 }
             }
@@ -812,6 +806,28 @@ impl<B: BusApi> Bridge<B> {
         }
         let exited_ok = run.ended.success();
         let parsed = parser.finish(exited_ok, &run.stderr_tail);
+        // A quota refusal did not run the turn. Record all other started turns,
+        // including failed or interrupted ones, because they may have changed the tree.
+        let started = !matches!(run.ended, Ended::SpawnFailed(_) | Ended::CannotStart(_))
+            && !(matches!(run.ended, Ended::Exited(_)) && parsed.quota);
+        if started
+            && let Target::Tree { review: false, .. } = &job.target
+            && let Some(f) = file.as_mut()
+            && !f.families.contains(&r.family)
+        {
+            f.families.push(r.family);
+            if let Err(e) = hgl_ai_tree::write_task(&dir, f) {
+                return Outcome::PrepFailed(format!("recording the family: {e}"));
+            }
+            let d = dir.clone();
+            let size = tokio::task::spawn_blocking(move || hgl_ai_tree::dir_size(&d))
+                .await
+                .unwrap_or(0);
+            let rec = self.trees.record(&dir, f, size);
+            if let Err(e) = self.bus.tree_put(&rec).await {
+                tracing::warn!(key = %rec.key(), "registering the task's family: {e}");
+            }
+        }
         if let (Some(id), Target::Tree { .. }) = (&parsed.session_id, &job.target)
             && let Err(e) = save_session(&dir, r.runtime.as_str(), id)
         {
