@@ -3,7 +3,9 @@
 
 use std::sync::LazyLock;
 
-use hgl_ai_proto::{Family, Kind, Note, ReviewReceipt, Seat, TreeRecord, check_head};
+use hgl_ai_proto::{
+    Family, HostRecord, Kind, Note, ReviewReceipt, Role, Seat, TreeRecord, check_head,
+};
 use regex::Regex;
 
 use crate::short;
@@ -169,6 +171,20 @@ pub(crate) fn matches_receipt(note: &Note, receipt: &ReviewReceipt) -> bool {
         && check_head(&receipt.head).is_ok()
         && check_head(&receipt.main).is_ok()
         && !receipt.model.trim().is_empty()
+}
+
+/// A current seat record can confirm or contradict the claimed reviewer family.
+pub(crate) fn reviewer_family_matches(
+    hosts: &[HostRecord],
+    receipt: &ReviewReceipt,
+) -> Option<bool> {
+    let mut records = hosts
+        .iter()
+        .flat_map(|host| &host.seats)
+        .filter(|seat| seat.seat == receipt.reviewer)
+        .peekable();
+    records.peek()?;
+    Some(records.all(|seat| seat.role == Role::Reviewer && seat.family == receipt.family))
 }
 
 /// Body of a `landed` note (PROTO-11).

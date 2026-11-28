@@ -4,9 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use hgl_ai_bus::{Bus, BusError, Lease, StreamNote, check_note};
 use hgl_ai_config::Github;
-use hgl_ai_proto::{
-    Family, HostRecord, Kind, Note, ReviewReceipt, Role, Seat, TaskKey, TreeRecord, Verdict,
-};
+use hgl_ai_proto::{Family, HostRecord, Kind, Note, Role, Seat, TaskKey, TreeRecord, Verdict};
 use serde::{Deserialize, Serialize};
 
 use crate::bot::{self, Comment, NoteState};
@@ -117,16 +115,6 @@ struct EarlierReview {
     focused_head: Option<String>,
 }
 
-fn reviewer_matches(hosts: &[HostRecord], receipt: &ReviewReceipt) -> bool {
-    let mut records = hosts
-        .iter()
-        .flat_map(|h| &h.seats)
-        .filter(|s| s.seat == receipt.reviewer)
-        .peekable();
-    records.peek().is_some()
-        && records.all(|s| s.role == Role::Reviewer && s.family == receipt.family)
-}
-
 impl History {
     fn record(
         &mut self,
@@ -177,7 +165,7 @@ impl History {
             }
             Kind::Receipt => {
                 if let Some(receipt) = state::routed_receipt(n)
-                    && reviewer_matches(hosts, &receipt)
+                    && state::reviewer_family_matches(hosts, &receipt) == Some(true)
                 {
                     self.pulls
                         .entry(key)
@@ -328,7 +316,7 @@ impl Facts<'_> {
                 let Some(receipt) = state::routed_receipt(n) else {
                     return self.forward();
                 };
-                if !reviewer_matches(&self.hosts, &receipt)
+                if state::reviewer_family_matches(&self.hosts, &receipt) != Some(true)
                     || !past.reviews.contains(&(receipt.head, n.sender.clone()))
                     || authors.contains(&receipt.family)
                     || self
@@ -856,6 +844,7 @@ async fn comment<G: Gh>(
 mod tests {
     use super::*;
     use hgl_ai_config::ReviewPool;
+    use hgl_ai_proto::ReviewReceipt;
 
     #[test]
     fn redirect_leaves_manual_work_and_desk_receipts_with_the_controller() {

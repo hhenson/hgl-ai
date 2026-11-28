@@ -866,6 +866,7 @@ const RECEIPT_WINDOW: usize = 1000;
 /// The review receipts for `repo` #`pr` among the controller's notes on the hub (HGL_NOTES
 /// keeps 14 days): `receipt` notes whose body holds PROTO-19 JSON for this pull request.
 pub async fn receipts(bus: &Bus, s: &Settings, repo: &str, pr: u64) -> Result<Vec<SeenReceipt>> {
+    let hosts = bus.hosts().await?;
     let mut out = Vec::new();
     let mut from = 1;
     let mut seats = vec![s.controller.clone()];
@@ -891,6 +892,7 @@ pub async fn receipts(bus: &Bus, s: &Settings, repo: &str, pr: u64) -> Result<Ve
             if let Some(r) = receipt
                 && r.repo == repo
                 && r.pr == pr
+                && state::reviewer_family_matches(&hosts, &r) != Some(false)
             {
                 let seen = SeenReceipt {
                     sender: sn.note.sender.to_string(),

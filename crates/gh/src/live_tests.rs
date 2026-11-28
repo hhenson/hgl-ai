@@ -1916,8 +1916,8 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
     let receipts = crate::gate::receipts(&b, &s, "alpha", 7).await.unwrap();
     assert_eq!(
         receipts.len(),
-        4,
-        "the router and its forwarded copy share one receipt"
+        3,
+        "the gate rejects the mismatched family and counts a forwarded receipt once"
     );
     assert!(
         receipts
