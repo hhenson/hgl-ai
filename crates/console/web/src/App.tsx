@@ -24,8 +24,9 @@ function tabFromHash(): string {
 }
 
 export function App({ store }: { store: Store }) {
-  const session = useQuery({ queryKey: ["session"], queryFn: getSession, refetchInterval: 30_000 });
-  const viewer = useQuery({ queryKey: ["viewer"], queryFn: getViewer, staleTime: Infinity, gcTime: Infinity });
+  const session = useQuery({ queryKey: ["session"], queryFn: getSession, refetchInterval: 30_000, refetchIntervalInBackground: true, retry: false });
+  const sessionValid = session.isSuccess && !session.isError;
+  const viewer = useQuery({ queryKey: ["viewer"], queryFn: getViewer, enabled: sessionValid, staleTime: Infinity, gcTime: Infinity });
   const meta = useSyncExternalStore(store.onMeta, store.getMeta);
   const [tab, setTab] = useState(tabFromHash);
 
@@ -42,10 +43,10 @@ export function App({ store }: { store: Store }) {
     });
   }, [store, session.data]);
   useEffect(() => {
-    if (!viewer.data) return;
+    if (!sessionValid || !viewer.data) return;
     const close = start(viewer.data, store);
     return () => void close();
-  }, [store, viewer.data]);
+  }, [store, viewer.data, sessionValid]);
   // On a narrow screen the tab strip scrolls sideways: keep the selected tab in view.
   useEffect(() => {
     document.getElementById(`tab-${tab}`)?.scrollIntoView({ block: "nearest", inline: "nearest" });

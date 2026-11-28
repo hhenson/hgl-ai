@@ -1102,6 +1102,7 @@ impl Bus {
         let record = LockRecord {
             holder: holder.to_string(),
             acquired_at: utc_now_stamp(),
+            token: lease_token(),
         };
         let value: bytes::Bytes = serde_json::to_vec(&record)
             .map_err(|e| nats(&format!("encoding lease {name}"), e))?
@@ -1156,6 +1157,7 @@ impl Bus {
         let record = LockRecord {
             holder: holder.to_string(),
             acquired_at: utc_now_stamp(),
+            token: lease_token(),
         };
         let value: bytes::Bytes = serde_json::to_vec(&record)
             .map_err(|e| nats(&format!("encoding lease {name}"), e))?
@@ -1196,6 +1198,7 @@ impl Bus {
             serde_json::from_slice(&e.value).unwrap_or_else(|_| LockRecord {
                 holder: "another holder".into(),
                 acquired_at: "an unknown time".into(),
+                token: String::new(),
             })
         }))
     }
@@ -1607,38 +1610,106 @@ impl Lease {
 
     /// Write the lease again at its revision (compare-and-set), so it lives another
     /// `max_age`. Fails with [`BusError::LeaseLost`] when it expired or was taken.
+    ///
+    /// Cancellation-safe: a refresh dropped (a caller's timeout) or failed after the hub
+    /// committed its write leaves the key a revision ahead of ours. A later refresh that
+    /// finds the key moved re-reads it, and when the latest value is still ours (the same
+    /// record, token included, which no other lease writes) takes that revision and
+    /// writes again; only a value that is not ours, or none, is a lost lease.
     pub async fn refresh(&mut self) -> Result<()> {
-        match self
-            .store
-            .update(&self.name, self.value.clone(), self.revision)
-            .await
-        {
-            Ok(revision) => {
-                self.revision = revision;
-                Ok(())
+        let mut adopted = false;
+        loop {
+            match self
+                .store
+                .update(&self.name, self.value.clone(), self.revision)
+                .await
+            {
+                Ok(revision) => {
+                    self.revision = revision;
+                    return Ok(());
+                }
+                Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision && !adopted => {
+                    // Our own write whose answer we never saw: keep the lease.
+                    self.revision = self
+                        .own_later_revision()
+                        .await?
+                        .ok_or_else(|| self.lost())?;
+                    adopted = true;
+                }
+                Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision => {
+                    return Err(self.lost());
+                }
+                Err(e) => return Err(nats(&format!("refreshing lease {}", self.name), e)),
             }
-            Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision => {
-                Err(BusError::LeaseLost {
-                    name: self.name.clone(),
-                })
-            }
-            Err(e) => Err(nats(&format!("refreshing lease {}", self.name), e)),
         }
     }
 
-    /// Delete the lease if it is still at our revision. `false`: it was no longer ours
-    /// (it expired, and perhaps another holder took it), so nothing was deleted.
-    pub async fn release(self) -> Result<bool> {
-        match self
-            .store
-            .purge_expect_revision(&self.name, Some(self.revision))
-            .await
-        {
-            Ok(()) => Ok(true),
-            Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision => Ok(false),
-            Err(e) => Err(nats(&format!("releasing lease {}", self.name), e)),
+    /// The key's latest revision when it is later than ours and still holds our record
+    /// (a write of ours whose answer we never saw).
+    async fn own_later_revision(&self) -> Result<Option<u64>> {
+        let ours = live_entry(&self.store, &self.name).await?.filter(|e| {
+            e.revision > self.revision
+                && serde_json::from_slice::<LockRecord>(&e.value).ok().as_ref()
+                    == Some(&self.record)
+        });
+        Ok(ours.map(|e| e.revision))
+    }
+
+    fn lost(&self) -> BusError {
+        BusError::LeaseLost {
+            name: self.name.clone(),
         }
     }
+
+    /// Delete the lease if it is still ours. `false`: it was no longer ours (it expired,
+    /// and perhaps another holder took it), so nothing was deleted. Like
+    /// [`Lease::refresh`], it takes the later revision of a write of ours whose answer it
+    /// never saw, once.
+    pub async fn release(self) -> Result<bool> {
+        let mut revision = self.revision;
+        let mut adopted = false;
+        loop {
+            match self
+                .store
+                .purge_expect_revision(&self.name, Some(revision))
+                .await
+            {
+                Ok(()) => return Ok(true),
+                Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision && !adopted => {
+                    match self.own_later_revision().await? {
+                        Some(r) => revision = r,
+                        None => return Ok(false),
+                    }
+                    adopted = true;
+                }
+                Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision => return Ok(false),
+                Err(e) => return Err(nats(&format!("releasing lease {}", self.name), e)),
+            }
+        }
+    }
+}
+
+/// A fresh lease token: 32 hex digits, unique per acquisition. From the standard
+/// library's randomly keyed hasher (seeded by the OS once per process) over the clock,
+/// the process and a counter, so it needs no random device of its own.
+fn lease_token() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, Ordering::Relaxed);
+    let t = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let half = |salt: u64| {
+        let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+        h.write_u64(salt);
+        h.write_u64(n);
+        h.write_u128(t);
+        h.write_u32(std::process::id());
+        h.finish()
+    };
+    format!("{:016x}{:016x}", half(0), half(1))
 }
 
 /// The latest value of `key`, unless it was deleted.

@@ -315,6 +315,59 @@ pub struct Opts {
     /// than the landing lock's lease from the merge; else [`crate::merge::POLL_LIMIT`]
     /// from the merge ([`crate::merge::until`]).
     pub merge_until: Option<tokio::time::Instant>,
+    /// The steps the landing does after a merge: what a `PARTIAL` right after it names.
+    pub after: AfterSteps,
+}
+
+/// Which of the optional steps after a merge a landing does (`landed.log` and `main` are
+/// always done).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AfterSteps {
+    /// The `landed` notes.
+    pub notes: bool,
+    /// Their GitHub comment.
+    pub comment: bool,
+    /// The wrapper's pins (`gh land` of a repository they follow).
+    pub pins: bool,
+}
+
+impl Default for AfterSteps {
+    fn default() -> Self {
+        AfterSteps {
+            notes: true,
+            comment: true,
+            pins: false,
+        }
+    }
+}
+
+/// The steps after the merge in `steps` that `p` does not show done, as a phrase ("main
+/// and the comment are"); with every step done, only the record is left to delete.
+pub(crate) fn left_of(p: Option<&Progress>, steps: AfterSteps, wrapper: &str) -> String {
+    let mut all = vec![
+        (progress::LANDED_LOG, state::KEY_LANDED.to_string()),
+        (progress::MAIN, state::KEY_MAIN.to_string()),
+    ];
+    if steps.notes {
+        all.push((progress::NOTES, "the landed notes".into()));
+    }
+    if steps.comment {
+        all.push((progress::COMMENT, "the comment".into()));
+    }
+    if steps.pins {
+        all.push((progress::PINS, format!("the {wrapper} pins")));
+    }
+    let left: Vec<String> = all
+        .into_iter()
+        .filter(|(step, _)| !p.is_some_and(|p| p.has(step)))
+        .map(|(_, name)| name)
+        .collect();
+    match left.as_slice() {
+        [] => "its record is".to_string(),
+        [one] if steps.pins && one.ends_with(" pins") => format!("{one} are"),
+        [one] => format!("{one} is"),
+        [init @ .., last] => format!("{} and {last} are", init.join(", ")),
+    }
 }
 
 /// The last word of a gate line.
@@ -389,6 +442,35 @@ impl Outcome {
             head: head.to_string(),
         }
     }
+    /// A step after the merge failed with `e`: `PARTIAL` (exit 3), naming the merge, what is
+    /// left (`left`, a phrase: "main and the landed notes are") and the error; the same
+    /// command finishes it. An unreachable hub stays the error (exit 10).
+    pub(crate) fn partial(
+        repo: &str,
+        number: u64,
+        head: &str,
+        merge: Option<&str>,
+        left: &str,
+        e: Error,
+    ) -> Result<Outcome> {
+        if matches!(e, Error::Bus(hgl_ai_bus::BusError::Unreachable { .. })) {
+            return Err(e);
+        }
+        let at = merge
+            .filter(|m| !m.is_empty())
+            .map(|m| format!(" at {}", short(m)))
+            .unwrap_or_default();
+        let mut o = Outcome::new(
+            Kind::Partial,
+            format!(
+                "{repo} #{number} is merged{at}, but {left} not done ({e}); run the same command again to finish PARTIAL"
+            ),
+            false,
+            head,
+        );
+        o.merge_commit = merge.filter(|m| !m.is_empty()).map(String::from);
+        Ok(o)
+    }
     pub fn to_json(&self) -> Value {
         serde_json::json!({
             "outcome": self.kind.word(),
@@ -426,11 +508,14 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         |kind: Kind, line: String, retry: bool| Step::Done(Outcome::new(kind, line, retry, head));
     let prefix = format!("{repo} #{} {}", pr.number, pr.branch);
     if pr.merged {
-        return done(
+        let mut o = Outcome::new(
             Kind::AlreadyMerged,
             format!("{repo} #{} already MERGED", pr.number),
             false,
+            head,
         );
+        o.merge_commit = pr.merge_commit.clone().filter(|m| !m.is_empty());
+        return Step::Done(o);
     }
     if pr.state != "open" {
         return done(
@@ -1132,12 +1217,23 @@ pub async fn evaluate<G: Gh>(
                     merge::POLL_EVERY,
                 )
                 .await?;
-                let after = read_back(gh, s, repo, number, res == Merge::Merged).await?;
+                let after = match read_back(gh, s, repo, number, res == Merge::Merged).await {
+                    Ok(pr) => pr,
+                    // GitHub reported it merged: the read after is a step after the merge.
+                    Err(e) if res == Merge::Merged => {
+                        let left = left_of(None, opts.after, &s.wrapper);
+                        return Outcome::partial(repo, number, &f.pr.head, None, &left, e);
+                    }
+                    Err(e) => return Err(e),
+                };
                 if after.merged {
                     let m = after.merge_commit.clone().unwrap_or_default();
                     if let Some(b) = bus {
                         let p = Progress::new(&f.pr.head, Some(m.clone()));
-                        progress::write(b, repo, number, &p).await?;
+                        if let Err(e) = progress::write(b, repo, number, &p).await {
+                            let left = left_of(None, opts.after, &s.wrapper);
+                            return Outcome::partial(repo, number, &f.pr.head, Some(&m), &left, e);
+                        }
                     }
                     let mut o = Outcome::new(
                         Kind::Merged,
@@ -1340,6 +1436,10 @@ mod tests {
             (o.kind, o.line.as_str()),
             (Kind::AlreadyMerged, "alpha #7 already MERGED")
         );
+        // hgl-ai#133: with the merge commit, so a `PARTIAL` after it names it.
+        f.pr.merge_commit = Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed".into());
+        let o = outcome(&f, &rules(), &Opts::default());
+        assert_eq!(o.merge_commit, f.pr.merge_commit);
         let mut f = allowed();
         f.pr.state = "closed".into();
         blocked(&f, "closed");
