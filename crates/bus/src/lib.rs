@@ -1476,22 +1476,47 @@ impl Lease {
 
     /// Write the lease again at its revision (compare-and-set), so it lives another
     /// `max_age`. Fails with [`BusError::LeaseLost`] when it expired or was taken.
+    ///
+    /// Cancellation-safe: a refresh dropped (a caller's timeout) or failed after the hub
+    /// committed its write leaves the key a revision ahead of ours. A later refresh that
+    /// finds the key moved re-reads it, and when the latest value is still ours (the same
+    /// holder and `acquired_at`, which no other lease writes) takes that revision and
+    /// writes again; only a value that is not ours, or none, is a lost lease.
     pub async fn refresh(&mut self) -> Result<()> {
-        match self
-            .store
-            .update(&self.name, self.value.clone(), self.revision)
-            .await
-        {
-            Ok(revision) => {
-                self.revision = revision;
-                Ok(())
+        let mut adopted = false;
+        loop {
+            match self
+                .store
+                .update(&self.name, self.value.clone(), self.revision)
+                .await
+            {
+                Ok(revision) => {
+                    self.revision = revision;
+                    return Ok(());
+                }
+                Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision && !adopted => {
+                    match live_entry(&self.store, &self.name).await? {
+                        Some(entry)
+                            if entry.value == self.value && entry.revision > self.revision =>
+                        {
+                            // Our own write whose answer we never saw: keep the lease.
+                            self.revision = entry.revision;
+                            adopted = true;
+                        }
+                        _ => return Err(self.lost()),
+                    }
+                }
+                Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision => {
+                    return Err(self.lost());
+                }
+                Err(e) => return Err(nats(&format!("refreshing lease {}", self.name), e)),
             }
-            Err(e) if e.kind() == kv::UpdateErrorKind::WrongLastRevision => {
-                Err(BusError::LeaseLost {
-                    name: self.name.clone(),
-                })
-            }
-            Err(e) => Err(nats(&format!("refreshing lease {}", self.name), e)),
+        }
+    }
+
+    fn lost(&self) -> BusError {
+        BusError::LeaseLost {
+            name: self.name.clone(),
         }
     }
 
