@@ -256,8 +256,9 @@ unlisted paths in sensitive crates as tier 3 until an exact path is cleared
 through `tier3_new_exceptions`. A `risk-high` label on the PR, its branch's
 task issue or a GitHub closing issue raises the minimum to tier 3.
 
-Docs and standalone test files qualify for tier 1. CI, recipes, `AGENTS.md`,
-`skill/`, `docs/roles.md` and `docs/protocol.md` require at least tier 2.
+Docs and standalone test files qualify for tier 1. GitHub workflows, recipes,
+`AGENTS.md` files at any depth, `skill/`, `docs/roles.md` and
+`docs/protocol.md` require at least tier 2.
 A source fix can qualify for tier 1 with a `bug` label on its task issue,
 at most three changed files and 40 added plus deleted lines outside tests,
 and no changed Cargo manifest, lockfile, or higher-risk policy path. For a

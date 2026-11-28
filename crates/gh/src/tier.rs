@@ -73,10 +73,10 @@ fn test_only(path: &str) -> bool {
 }
 
 fn review_rules(path: &str) -> bool {
-    matches!(
-        path,
-        ".github/workflows/ci.yml" | "docs/roles.md" | "docs/protocol.md" | "AGENTS.md"
-    ) || path.starts_with("recipes/")
+    matches!(path, "docs/roles.md" | "docs/protocol.md")
+        || path.rsplit('/').next() == Some("AGENTS.md")
+        || path.starts_with(".github/workflows/")
+        || path.starts_with("recipes/")
         || path.starts_with("skill/")
 }
 
@@ -321,13 +321,20 @@ mod tests {
         );
         for path in [
             ".github/workflows/ci.yml",
+            ".github/workflows/test.yml",
             "docs/protocol.md",
             "docs/roles.md",
+            "docs/AGENTS.md",
             "recipes/n.toml",
             "skill/SKILL.md",
             "AGENTS.md",
         ] {
-            assert_eq!(classify(&rules, &[file(path, 1)]), (2, path.into()));
+            for bug in [false, true] {
+                assert_eq!(
+                    super::classify("hgl-ai", &rules, &[file(path, 1)], false, bug),
+                    (2, BTreeSet::from([path]))
+                );
+            }
         }
         let mut rename = file("docs/old-gate.md", 0);
         rename.previous_filename = Some("crates/gh/src/gate.rs".into());
