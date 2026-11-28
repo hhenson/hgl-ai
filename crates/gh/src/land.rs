@@ -266,14 +266,15 @@ async fn land_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<(Landing, String)> {
-    if let Some(outcome) = owned_elsewhere(gh, s, bus, repo, number, head, o, lock).await? {
+    let deadline = Instant::now() + o.timeout;
+    let hold = Some(deadline);
+    if let Some(outcome) = owned_elsewhere(gh, s, bus, repo, number, head, o, lock, hold).await? {
         let after = Vec::new();
         return Ok((Landing { outcome, after }, String::new()));
     }
     if let Some(done) = resume_recorded(gh, s, bus, repo, number, o, lock).await? {
         return Ok(done);
     }
-    let deadline = Instant::now() + o.timeout;
     let gate_opts = with_deadline(s, repo, o, deadline);
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
     {
@@ -353,6 +354,7 @@ async fn owned_elsewhere<G: Gh>(
     head: &str,
     o: &LandOpts,
     lock: &LandLock,
+    hold: Option<Instant>,
 ) -> Result<Option<Outcome>> {
     let Some(p) = progress::read(bus, repo, number).await? else {
         return Ok(None);
@@ -361,6 +363,22 @@ async fn owned_elsewhere<G: Gh>(
         return Ok(None);
     }
     if p.merge.is_none() {
+        // The read and the retirement wait while `hold` holds (ROLE-19): `gh land` waits
+        // until its deadline, `gh merge-if-clean` (one attempt) stops.
+        let until = match hold {
+            Some(deadline) => wait_for_hold(bus, deadline).await?,
+            None => bus
+                .state_get(state::KEY_HOLD)
+                .await?
+                .map(|h| h.value.trim().to_string())
+                .filter(|v| hold_active(v, chrono::Utc::now())),
+        };
+        if let Some(until) = until {
+            let line = format!(
+                "{repo} #{number}: hold until {until}; another's landing intent is not read HOLD"
+            );
+            return Ok(Some(Outcome::new(Kind::Hold, line, true, head)));
+        }
         let pr = gate::fetch_pr(gh, s, repo, number).await?;
         if gate::intent_obsolete(&p, &pr) {
             lock.confirm("retiring a stale landing intent").await?;
@@ -567,17 +585,18 @@ async fn settle_merged<G: Gh>(
     // `main`, and as this landing's only when the record's intent is the head merged.
     let pr = gate::fetch_pr(gh, s, repo, number).await?;
     if pr.base != "main" {
-        let after = vec![format!(
-            "{repo} #{number} was merged into {}, not main; left",
-            pr.base
-        )];
-        return Ok((
-            Landing {
-                outcome: outcome.clone(),
-                after,
-            },
-            String::new(),
-        ));
+        // Not a landing on `main`: unsatisfied, never AlreadyMerged.
+        let outcome = Outcome::new(
+            Kind::Blocked,
+            format!(
+                "{repo} #{number} was merged into {}, not main BLOCKED",
+                pr.base
+            ),
+            false,
+            &pr.head,
+        );
+        let after = Vec::new();
+        return Ok((Landing { outcome, after }, String::new()));
     }
     let p = p.filter(|p| p.merge.is_some() || p.head.eq_ignore_ascii_case(&pr.head));
     if p.is_none() && !o.adopt_merged {
@@ -648,7 +667,7 @@ pub(crate) async fn merge_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<Landing> {
-    if let Some(outcome) = owned_elsewhere(gh, s, bus, repo, number, head, o, lock).await? {
+    if let Some(outcome) = owned_elsewhere(gh, s, bus, repo, number, head, o, lock, None).await? {
         let after = Vec::new();
         return Ok(Landing { outcome, after });
     }

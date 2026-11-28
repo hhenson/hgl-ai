@@ -353,7 +353,12 @@ A merge is journaled (`merge` in the record) and announced only as the landing
 intended it: GitHub shows the pull request merged at the intent's head into
 `main`. A merge request refused and read back merged otherwise (another head,
 another base) is not this landing's; its intent is deleted. A pull request found
-merged into a base other than `main` has no landing to finish. Only the comments of
+merged into a base other than `main` has no landing to finish, and is never a
+success (`BLOCKED`, not `MERGED`): the pins do not take it for landed. A merge
+request GitHub refuses outright (refused credentials, the rate limit) deletes its
+intent; one that may have been accepted (a poll failing, a run with no answer) keeps
+it. The local build verdicts are judged under one recipe revision, read again right
+before the merge call: a recipe published since stops the merge. Only the comments of
 `[github] note_authors` (and `owner`) are note comments: Ready, its signer and
 the `landed` comment are read from them alone. Refused credentials and the rate
 limit, on any read or on the merge poll, go to the caller; they never read as one
@@ -367,7 +372,10 @@ merged at the intent's head into `main`. Absence from the round's read is not
 taken as closed. An intent that no longer stands (closed, open at another head, or
 merged otherwise) is retired under the lock, unannounced, after GitHub is read again
 there; `gh land` and `gh merge-if-clean` retire another's such intent the same way
-rather than stop on it. Then it takes each Ready candidate (docs/work.md
+rather than stop on it, once no `hold` holds (`gh land` waits for it; neither reads
+GitHub about the intent before). Its own records are finished in every repository:
+with `coordinator_lands` turned off it still finishes a confirmed merge, retires an
+intent whose pull request is open, and starts no new merge. Then it takes each Ready candidate (docs/work.md
 WORK-6), oldest first, unless its row shows a failed check, an unresolved thread,
 bot findings or the bot's limit. A landing record is finished only by whoever it
 is written for (`by`): the coordinator leaves the controller's, and `gh land` and

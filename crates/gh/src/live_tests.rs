@@ -2825,19 +2825,32 @@ async fn an_intent_merged_into_another_base_is_not_recovered() {
     {
         r.1.stdout = elsewhere.clone();
     }
-    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
-        .await
-        .unwrap();
-    assert_eq!(
-        l.outcome.kind,
-        crate::gate::Kind::AlreadyMerged,
-        "{}",
-        l.outcome.line
-    );
+    // r6 at f75a442f, P1: unsatisfied, never AlreadyMerged (the pins took that for landed),
+    // and the controller's record of it is kept.
+    put_record(&b, &crate::progress::Progress::new(HEAD, None)).await;
+    for l in [
+        land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+            .await
+            .unwrap(),
+        land::land(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+            .await
+            .unwrap(),
+    ] {
+        assert_eq!(
+            l.outcome.kind,
+            crate::gate::Kind::Blocked,
+            "{}",
+            l.outcome.line
+        );
+        assert!(!l.outcome.kind.satisfied() && !l.outcome.kind.landed());
+        assert!(l.outcome.line.contains("not main"), "{}", l.outcome.line);
+    }
     assert!(
-        l.after.iter().any(|a| a.contains("not main")),
-        "{:?}",
-        l.after
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_some(),
+        "kept"
     );
     assert!(b.state_get(state::KEY_LANDED).await.unwrap().is_none());
     assert!(landed_notes(&b).await.is_empty());
@@ -3278,6 +3291,250 @@ async fn a_rate_limit_after_the_merge_is_reported_and_stops_the_round() {
         .unwrap()
         .unwrap();
     assert!(!rec.has(crate::progress::COMMENT), "{rec:?}");
+}
+
+/// r6 at f75a442f, P1 (probe hgl-project #60): a pin pull request merged into another
+/// base is not a landed pin. The sync does not take it for updated, and its landing
+/// record is kept rather than deleted.
+#[tokio::test]
+async fn a_pin_pull_request_merged_into_another_base_is_not_landed() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let head = "d".repeat(40);
+    let stale = format!("{{\"type\":\"submodule\",\"sha\":\"{}\"}}", "b".repeat(40));
+    let open = format!("[{{\"number\":60,\"head\":{{\"sha\":\"{head}\"}}}}]");
+    let gh = FakeGh::default()
+        .on("pulls?state=open", &open)
+        .on("hgl-project/contents/hgl-compiler?ref=main", &stale);
+    let more = pins_current_gh(60, pin_merge);
+    let r = std::mem::take(&mut *more.rules.lock().unwrap());
+    gh.rules.lock().unwrap().extend(r);
+    for r in gh
+        .rules
+        .lock()
+        .unwrap()
+        .iter_mut()
+        .filter(|r| r.0 == "hgl-project/pulls/60")
+    {
+        assert!(
+            r.1.stdout.contains("\"ref\": \"main\""),
+            "the fixture's form"
+        );
+        r.1.stdout =
+            r.1.stdout
+                .replace("\"ref\": \"main\"", "\"ref\": \"release\"");
+    }
+    let intent = crate::progress::Progress::new(&head, None);
+    store::put_latest(
+        &b,
+        &crate::progress::key("hgl-project", 60),
+        &serde_json::to_string(&intent).unwrap(),
+    )
+    .await
+    .unwrap();
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(!r.ok(), "{r:?}");
+    assert!(
+        matches!(&r, crate::pins::Synced::NotLanded(o) if o.line.contains("not main")),
+        "{r:?}"
+    );
+    assert!(
+        crate::progress::read(&b, "hgl-project", 60)
+            .await
+            .unwrap()
+            .is_some(),
+        "the record is kept"
+    );
+    assert!(b.state_get(state::KEY_LANDED).await.unwrap().is_none());
+}
+
+/// `gh` that, at the first call matching `trigger`, publishes a new revision of `alpha`'s
+/// recipe (another step), as an owner may while a gate runs.
+struct RecipeRace {
+    gh: FakeGh,
+    bus: Bus,
+    trigger: &'static str,
+    raced: std::sync::atomic::AtomicBool,
+}
+
+impl crate::exec::Gh for RecipeRace {
+    async fn exec(
+        &self,
+        args: Vec<String>,
+        stdin: Option<Vec<u8>>,
+    ) -> crate::Result<crate::exec::Output> {
+        if args.join(" ").contains(self.trigger)
+            && !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let more = format!(
+                "{}[[step]]\nname = \"more\"\nrun = \"true\"\nmemcap_gb = 1\ntime = \"1m\"\n",
+                GATE_RECIPE.replace("demo", "alpha")
+            );
+            hgl_ai_build::store::recipe_put(&self.bus, &more, None)
+                .await
+                .unwrap();
+        }
+        self.gh.exec(args, stdin).await
+    }
+}
+
+/// r6 at f75a442f, P1 (BUILD-15): a recipe published while the gate reads the checks binds
+/// new verdicts. The verdict judged is for the old revision: no merge, tried again.
+#[tokio::test]
+async fn a_recipe_published_during_the_gate_stops_the_merge() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    coord_hub(&b, true).await;
+    let (s, infos) = ready_round();
+    let gh = RecipeRace {
+        gh: coord_gh(&[], |g| g),
+        bus: bus(&h).await,
+        trigger: "check-runs",
+        raced: Default::default(),
+    };
+    let mut a = crate::autoland::AutoLand::new(&s);
+    a.round(&gh, &s, &b, &infos).await.unwrap();
+    assert!(
+        gh.raced.load(std::sync::atomic::Ordering::SeqCst),
+        "the race ran"
+    );
+    assert_eq!(posts(&gh.gh, "pulls/7/merge-async"), 0, "not merged");
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(coord_reports(&b).await, (vec![], vec![]));
+}
+
+/// r6 at f75a442f, P2: the merge request refused outright (HTTP 401): nothing can merge
+/// from it, so its intent goes, and a controller with working credentials is not stopped
+/// by it.
+#[tokio::test]
+async fn a_merge_request_refused_outright_leaves_no_intent() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    coord_hub(&b, true).await;
+    let (s, infos) = ready_round();
+    let gh = coord_gh(&[], |g| g);
+    first_rule(
+        &gh,
+        FakeGh::default().fail(
+            "pulls/7/merge-async --input",
+            "gh: Bad credentials (HTTP 401)",
+        ),
+    );
+    let mut a = crate::autoland::AutoLand::new(&s);
+    let e = a.round(&gh, &s, &b, &infos).await.unwrap_err();
+    assert!(matches!(e, Error::Auth(_)), "{e}");
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none(),
+        "no intent"
+    );
+    let gh = coord_gh(&[], |g| g);
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Merged,
+        "{}",
+        l.outcome.line
+    );
+}
+
+/// r6 at f75a442f, P2: with `coordinator_lands` turned off, the coordinator still finishes
+/// a confirmed landing of its own (its reports, the record), and retires an intent whose
+/// pull request is still open there: no new merge.
+#[tokio::test]
+async fn opting_out_leaves_no_landing_without_an_owner() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    coord_hub(&b, true).await;
+    let (s, infos) = ready_round();
+    let off = crate::testutil::with_coordinator_lands(s, &["alpha"], false);
+    put_record(&b, &landed_record()).await;
+    let gh = coord_gh(&[], |g| g);
+    let mut a = crate::autoland::AutoLand::new(&off);
+    a.round(&gh, &off, &b, &[]).await.unwrap();
+    let (sent, decisions) = coord_reports(&b).await;
+    assert_eq!(
+        (sent.len(), decisions.len()),
+        (1, 1),
+        "{sent:?} {decisions:?}"
+    );
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none()
+    );
+
+    put_record(&b, &coord_record(None)).await;
+    let gh = FakeGh::default().on("pulls/7", &fixture("pr-open.json"));
+    let mut a = crate::autoland::AutoLand::new(&off);
+    a.round(&gh, &off, &b, &infos).await.unwrap();
+    assert_eq!(posts(&gh, "merge-async"), 0, "no new merge");
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none(),
+        "retired"
+    );
+}
+
+/// r6 at f75a442f, P2: while `hold` holds, `gh land` and `gh merge-if-clean` neither read
+/// GitHub about another's intent nor retire it.
+#[tokio::test]
+async fn a_hold_defers_reading_another_intent() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    coord_hub(&b, true).await;
+    let (s, _) = ready_round();
+    put_record(&b, &coord_record(None)).await;
+    store::put_latest(&b, state::KEY_HOLD, "2100-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let moved = fixture("pr-open.json").replace(HEAD, &"e".repeat(40));
+    let gh = FakeGh::default().on("pulls/7", &moved);
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &land::LandOpts::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Hold,
+        "{}",
+        l.outcome.line
+    );
+    let o = land::LandOpts {
+        timeout: Duration::from_millis(50),
+        ..land::LandOpts::default()
+    };
+    let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Hold,
+        "{}",
+        l.outcome.line
+    );
+    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_some(),
+        "kept"
+    );
 }
 
 /// `tasks` with no task is never written empty (an empty create fails every round), and

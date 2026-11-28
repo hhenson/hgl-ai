@@ -416,14 +416,40 @@ pub async fn verdict_state(
     head: &str,
     main: &str,
 ) -> Result<VerdictState> {
+    let Some(b) = bus else {
+        return Ok(VerdictState::Missing(None));
+    };
+    let recipe = recipe_revision(b, repo).await?;
+    verdict_state_at(bus, builds, repo, pr, name, head, main, recipe).await
+}
+
+/// The revision of `repo`'s recipe on the hub, if it has one: the one a verdict is for
+/// (BUILD-15).
+pub async fn recipe_revision(bus: &Bus, repo: &str) -> Result<Option<u64>> {
+    Ok(hgl_ai_build::store::recipe_get(bus, repo, None)
+        .await
+        .map_err(store_err)?
+        .map(|r| r.revision))
+}
+
+/// [`verdict_state`] under the recipe revision `recipe` read once by the caller, so every
+/// verdict of one gate is for the same revision ([`recipe_revision`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn verdict_state_at(
+    bus: Option<&Bus>,
+    builds: Option<&GateBuilds>,
+    repo: &str,
+    pr: u64,
+    name: &str,
+    head: &str,
+    main: &str,
+    recipe: Option<u64>,
+) -> Result<VerdictState> {
     let Some(bus) = bus else {
         return Ok(VerdictState::Missing(None));
     };
     // The gate needs the current recipe's verdict: an update asks again (BUILD-15).
-    let Some(recipe) = hgl_ai_build::store::recipe_get(bus, repo, None)
-        .await
-        .map_err(store_err)?
-    else {
+    let Some(recipe) = recipe else {
         return Ok(VerdictState::Missing(Some(format!(
             "no recipe for {repo} on the hub"
         ))));
@@ -434,7 +460,7 @@ pub async fn verdict_state(
         name,
         head,
         main,
-        recipe: recipe.revision,
+        recipe,
     };
     let key = w.key();
     let (raw, value) = read(bus, &key).await?;

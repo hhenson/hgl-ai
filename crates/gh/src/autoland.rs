@@ -135,14 +135,16 @@ impl AutoLand {
         bus: &Bus,
         infos: &[PrInfo],
     ) -> Result<()> {
-        if !s.repos.iter().any(|r| s.coordinator_lands(r)) {
-            return Ok(());
-        }
         if let Some(h) = hold_now(bus).await? {
             tracing::info!("hold until {}: no landing", h.trim());
             return Ok(());
         }
+        // Its own records are finished in every repository, opted in or not any more: a
+        // confirmed merge always has its owner. New merges only where it opts in.
         let mut tries = self.records(gh, s, bus, infos).await?;
+        if !s.repos.iter().any(|r| s.coordinator_lands(r)) {
+            return self.attempts(gh, s, bus, tries).await;
+        }
         let notes = if needs_notes(s, infos) {
             candidates::read_ready_notes(bus, s).await?
         } else {
@@ -157,6 +159,17 @@ impl AutoLand {
                 tries.push(t);
             }
         }
+        self.attempts(gh, s, bus, tries).await
+    }
+
+    /// Each of `tries` in turn, while no hold holds.
+    async fn attempts<G: Gh>(
+        &mut self,
+        gh: &G,
+        s: &Settings,
+        bus: &Bus,
+        tries: Vec<Try>,
+    ) -> Result<()> {
         for t in tries {
             if let Some(h) = hold_now(bus).await? {
                 tracing::info!("hold until {}: no more landings this round", h.trim());
@@ -268,11 +281,12 @@ impl AutoLand {
         progress::write(bus, &t.repo, t.number, &p).await
     }
 
-    /// The landing records of its own to finish in opted-in repositories: each whose
-    /// merge is confirmed, by the record or by GitHub. A record of a pull request among the
-    /// open ones with no merge recorded is the candidates' to decide; absence from this
-    /// round's read is not taken as closed (it reads at most 50 per repository, and a
-    /// repository may give no answer), so GitHub is asked. Closed without a merge: retired.
+    /// The landing records of its own to finish, in any repository: each whose merge is
+    /// confirmed, by the record or by GitHub. A record of a pull request among the open
+    /// ones with no merge recorded is the candidates' to decide where it opts in, and
+    /// retired where it does not (no new merge there); absence from this round's read is
+    /// not taken as closed (it reads at most 50 per repository, and a repository may give
+    /// no answer), so GitHub is asked. An intent that no longer stands: retired.
     async fn records<G: Gh>(
         &mut self,
         gh: &G,
@@ -285,9 +299,7 @@ impl AutoLand {
             let Some((repo, number)) = parse_record_key(&key) else {
                 continue;
             };
-            if !s.coordinator_lands(&repo) {
-                continue;
-            }
+            let lands = s.coordinator_lands(&repo);
             let Some(p) = progress::read(bus, &repo, number).await? else {
                 continue;
             };
@@ -311,7 +323,7 @@ impl AutoLand {
                         && i.row.number == t.number
                         && i.row.head.eq_ignore_ascii_case(&t.head)
                 });
-                if current {
+                if current && lands {
                     continue;
                 }
                 let pr = match gate::fetch_pr(gh, s, &t.repo, t.number).await {
@@ -325,8 +337,8 @@ impl AutoLand {
                 // Merged other than as intended (another head, another base): not this
                 // landing's merge.
                 if !gate::merged_as_intended(&pr, &t.head) {
-                    if gate::intent_obsolete(&p, &pr) {
-                        self.retire(gh, s, bus, &t).await?;
+                    if gate::intent_obsolete(&p, &pr) || !lands {
+                        self.retire(gh, s, bus, &t, !lands).await?;
                     }
                     continue;
                 }
@@ -339,7 +351,16 @@ impl AutoLand {
     /// Delete an intent of its own whose pull request GitHub shows closed without a
     /// merge, under the landing lock and only if the record is still that intent; and the
     /// gate builds asked for it.
-    async fn retire<G: Gh>(&self, gh: &G, s: &Settings, bus: &Bus, t: &Try) -> Result<()> {
+    /// With `off` (the repository no longer opts in) an intent not merged as intended is
+    /// retired too: no new merge comes from it.
+    async fn retire<G: Gh>(
+        &self,
+        gh: &G,
+        s: &Settings,
+        bus: &Bus,
+        t: &Try,
+        off: bool,
+    ) -> Result<()> {
         let who = holder(s, &format!("coordinator {}#{}", t.repo, t.number));
         let lock = match LandLock::acquire(bus, &t.repo, &who, Duration::ZERO).await {
             Ok(l) => l,
@@ -358,7 +379,13 @@ impl AutoLand {
             else {
                 return Ok(());
             };
-            if !gate::intent_obsolete(&p, &gate::fetch_pr(gh, s, &t.repo, t.number).await?) {
+            let pr = gate::fetch_pr(gh, s, &t.repo, t.number).await?;
+            let stands = if off {
+                gate::merged_as_intended(&pr, &p.head)
+            } else {
+                !gate::intent_obsolete(&p, &pr)
+            };
+            if stands {
                 return Ok(());
             }
             lock.confirm("retiring a landing record").await?;

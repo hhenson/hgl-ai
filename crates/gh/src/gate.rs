@@ -267,6 +267,8 @@ pub struct Facts {
     /// Parents of the pull request's head.
     pub parents: Option<Vec<String>>,
     pub verdicts: Option<Vec<VerdictResult>>,
+    /// The recipe revision the verdicts are for, read once with them (BUILD-15).
+    pub recipe: Option<u64>,
     pub checks: Option<Vec<CheckRun>>,
     /// The pull request's files since the merge base, and `main`'s.
     pub mine: Option<FileList>,
@@ -559,6 +561,15 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     let done =
         |kind: Kind, line: String, retry: bool| Step::Done(Outcome::new(kind, line, retry, head));
     let prefix = format!("{repo} #{} {}", pr.number, pr.branch);
+    // Merged into another branch: not a landing on `main`, and never a success (the pins
+    // or a recovery would take it for one).
+    if pr.merged && pr.base != "main" {
+        return done(
+            Kind::Blocked,
+            format!("{prefix} merged into {}, not main BLOCKED", pr.base),
+            false,
+        );
+    }
     if pr.merged {
         let mut o = Outcome::new(
             Kind::AlreadyMerged,
@@ -1137,13 +1148,21 @@ async fn fill<G: Gh>(
         }
         Need::Verdicts => {
             let main = f.main.clone().unwrap_or_default();
+            // One revision for every verdict, checked again right before the merge call.
+            let recipe = match bus {
+                Some(b) => crate::builds::recipe_revision(b, repo).await?,
+                None => None,
+            };
             let mut out = Vec::new();
             for name in &s.gate_rules(repo).verdicts {
-                let st =
-                    crate::builds::verdict_state(bus, builds, repo, n, name, &head, &main).await?;
+                let st = crate::builds::verdict_state_at(
+                    bus, builds, repo, n, name, &head, &main, recipe,
+                )
+                .await?;
                 out.push((name.clone(), st));
             }
             f.verdicts = Some(out);
+            f.recipe = recipe;
         }
         Need::Checks => {
             let pages = exec::get_pages(
@@ -1232,6 +1251,7 @@ async fn before_merge<G: Gh>(
     asked: &str,
     head: &str,
     main: Option<&str>,
+    recipe: Option<u64>,
     line: &str,
     opts: &Opts,
 ) -> Result<Option<Outcome>> {
@@ -1286,6 +1306,21 @@ async fn before_merge<G: Gh>(
         let comments = crate::bot::by_note_authors(&comments, &s.note_authors);
         if let Err(why) = ready_standing(&comments, asked) {
             return Ok(stop(Kind::Blocked, format!("at the merge: {why}"), false));
+        }
+    }
+    // The verdicts judged are for one recipe revision: a recipe published since (a step
+    // added, say) needs its own verdicts.
+    if let Some(judged) = recipe {
+        let now = match bus {
+            Some(b) => crate::builds::recipe_revision(b, repo).await?,
+            None => None,
+        };
+        if now != Some(judged) {
+            let why = format!(
+                "at the merge: the recipe is at revision {}, not r{judged} as judged",
+                now.map_or("none".to_string(), |r| format!("r{r}"))
+            );
+            return Ok(stop(Kind::Wait, why, true));
         }
     }
     if opts.hold_at_merge {
@@ -1380,6 +1415,9 @@ pub async fn evaluate<G: Gh>(
                     asked,
                     &f.pr.head,
                     f.main.as_deref(),
+                    // The revision the verdicts were judged under, where any were.
+                    f.recipe
+                        .filter(|_| f.verdicts.as_ref().is_some_and(|v| !v.is_empty())),
                     &line,
                     opts,
                 )
@@ -1401,7 +1439,7 @@ pub async fn evaluate<G: Gh>(
                     _ => None,
                 };
                 let until = merge::until(tokio::time::Instant::now(), opts.merge_until, lease);
-                let res = merge::merge(
+                let res = match merge::merge_tracked(
                     gh,
                     &s.full(repo),
                     number,
@@ -1409,7 +1447,25 @@ pub async fn evaluate<G: Gh>(
                     until,
                     merge::POLL_EVERY,
                 )
-                .await?;
+                .await
+                {
+                    Ok(res) => res,
+                    // GitHub refused the request itself (credentials, rate limit): nothing
+                    // can merge from it, so its intent goes and blocks no other lander.
+                    Err(merge::Failed {
+                        error,
+                        maybe_accepted: false,
+                    }) => {
+                        if let Some(b) = bus
+                            && let Err(e) = progress::delete(b, repo, number).await
+                        {
+                            eprintln!("{repo} #{number}: removing the landing record: {e}");
+                        }
+                        return Err(error);
+                    }
+                    // Accepted, or not known: the intent stays for a later attempt.
+                    Err(f) => return Err(f.error),
+                };
                 let after = match read_back(gh, s, repo, number, res == Merge::Merged).await {
                     Ok(pr) => pr,
                     // GitHub reported it merged: the read after is a step after the merge.
@@ -1526,6 +1582,7 @@ mod tests {
             bot_reviews: None,
             parents: Some(vec!["p".repeat(40)]),
             verdicts: None,
+            recipe: None,
             checks: Some(vec![]),
             mine: None,
             theirs: None,
