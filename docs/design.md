@@ -23,7 +23,7 @@ no GitHub or git library.
 | `owner` | Owner channel: thread records, events, the console's fold, status reports, `decisions.log`. | `proto`, `bus` |
 | `notify` | Owner notifications: ntfy, Slack webhook, SMTP; first channel that accepts. | `config` |
 | `usage` | The usage collector: the claude, codex and agy sources, account fingerprints, the `usage show` table (PROTO-23). | `proto` |
-| `console` | The owner's web console: pages, telemetry, passkey and OAuth sign-in, the fold, ticks. | `proto`, `config`, `bus`, `owner`, `gh`, `notify` |
+| `console` | The owner's web console: pages, the telemetry page (`web/`), its API, passkey and OAuth sign-in, the fold, ticks. | `proto`, `config`, `bus`, `owner`, `gh`, `notify` |
 | `build` | Recipes, output parsers, bounded summaries, executors (this host under `cap`; a remote over one owned ssh connection), the build driver, the builder service (`docs/build.md`). | `proto`, `config`, `bus`, `cap`, `tree` |
 | `hgl-ai` | The `clap` command line; thin over the crates. | all |
 
@@ -32,6 +32,17 @@ Async runtime `tokio`; NATS client `async-nats`; errors `anyhow` at the edge,
 (TLS), `webauthn-rs` (passkeys), `reqwest` (GitHub, Apple and Google sign-in,
 notifications), `ring` (`id_token` signatures), `lettre` (SMTP).
 TLS is `rustls` with `ring` only. Rust 1.89 or later.
+
+The console's telemetry page (`crates/console/web`) is a React 18 single-page app in
+TypeScript (strict), built by Vite: AG Grid React (Community) for the tables, Tailwind
+and Radix for tabs and the light and dark theme, TanStack Query for the console's
+JSON API, and `@nats-io/nats-core` with `@nats-io/kv` to watch the hub's buckets over
+WebSocket (docs/owner.md §3). Versions are exact, with a lockfile. Its build output,
+`web/dist`, is checked in and embedded (`include_dir`), so building the binary needs no
+Node; changing the page means `npm ci && npm run build` in `web/` and committing
+`dist` with the sources. CI and the `web` step of `recipes/hgl-ai.toml` (Node 22) run
+the types, the vitest tests and the build, and fail when `dist` is not what the
+sources build to.
 
 ## 2. Command line
 

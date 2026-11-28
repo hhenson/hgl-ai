@@ -94,29 +94,33 @@ live telemetry. GitHub stays the record (PROTO-1).
 
 ## 3. Telemetry
 
-One page, live (server-sent events), from the hub and the coordinator, read every
-10 s as the console's hub user. A tab per area; the selected tab is the URL fragment
-(`/telemetry#prs`). Each table is an AG Grid (sort, filter, resize):
+`/telemetry`, a page of its own (React, TypeScript, AG Grid; docs/design.md §1) that
+reads the hub itself: it watches the telemetry buckets over the hub's WebSocket
+listener, at `<console url>/nats` on the console's own origin, as the hub user
+`viewer`. `viewer` reads those six buckets and nothing else, and writes nothing
+(docs/install.md). The console hands its credential to a signed-in page
+(`GET /api/viewer`), which keeps it in memory only. A tab per area; the selected tab
+is the URL fragment (`/telemetry#prs`):
 
 | Tab | Shows | Source |
 | --- | --- | --- |
 | Hosts and seats | live hosts: seat, role, runtime, model, memory cap, free disk | `HGL_HOSTS` |
-| Tasks | seat, issue, implement or review, stage (assigned, working, ready, review, sendback), last note, host, age, stale | `HGL_TREES`, the notes stream |
+| Tasks | seat, issue, implement or review, stage (assigned, working, ready, review, sendback, approved, blocked), last note, host, age, stale | `HGL_TREES`, `HGL_STATE/tasks` |
 | Pull requests | head, state, bot, threads, checks; when read | `HGL_STATE/prs` |
 | Queue | claimable issues in order, priority first | `HGL_STATE/backlog` |
-| Backlog | open issues by label and repository; open, opened, closed and net per day (burndown) | `HGL_STATE/backlog`, `HGL_METRICS` |
-| Landings | the newest 50 landings | `HGL_STATE/landed.log` |
-| Fleet | `mode`, `hold`, stale trees, open questions by priority | `HGL_STATE`, `HGL_TREES`, threads |
-| Builds | the newest 40 runs: repository, head, builder, platform, status, wall time, errors, tests; live builders: platform, executor, state, reachable, slots and busy, free disk, toolchains | `HGL_BUILD/run.*`, `HGL_HOSTS/builder.*` |
+| Backlog | open issues by label and repository; open, opened, closed and net per day (burndown, 14 days) | `HGL_STATE/backlog`, `HGL_METRICS` |
+| Landings | the newest 50 | `HGL_STATE/landed.log` |
+| Fleet | `mode`, `hold`, stale trees, open questions by priority | `HGL_STATE`, `HGL_TREES`, `GET /api/session` |
+| Builds | the newest 40 runs; live builders: platform, executor, state, reachable, slots and busy, free disk, toolchains | `HGL_BUILD/run.*`, `HGL_HOSTS/builder.*` |
 | Usage | per login and limit: runtime, host, plan, scope, window, percent used, reset, observed | `HGL_USAGE` |
 
-Live updates change rows, never the page: the feed (`/telemetry/events`) sends `reset`
-with every table's rows, first on each connection, then a `diff` per reading that
-changed something, `{"meta", "tables": {"<table>": {"add", "update", "remove"}}}`. A row
-carries an `id` that is stable while it lives (`alpha#12`, `<host>/<seat>`); the page
-applies each table's change as one grid transaction by that id, so sort, filter, column
-widths, scroll and the selected tab stay, and a changed value is briefly highlighted.
-`/telemetry.json` is the whole reading.
+A put or delete in a bucket changes rows, never the page: per table, the rows it
+changes are one grid transaction by row id (the KV key where a key is a row; else a
+stable id from the value, `alpha#12`). Sort, filter, column widths, scroll and the
+selected tab stay, and a changed value is briefly highlighted. The page shows the
+connection's state and reconnects by itself; a watch that ends starts again and its
+bucket is read afresh. Open questions are the one count the page cannot read (threads
+are the console's); `GET /api/session` gives them, with the user and the CSRF token.
 
 The coordinator service adds two writes to its round: `backlog` (open issues by
 label, the ordered claimable queue) every 15 min, and one `HGL_METRICS` sample per
@@ -129,7 +133,9 @@ repository per day.
 - `HGL_METRICS/<repo>.<YYYYMMDD>`: `{repo, date, open, opened, closed, labels,
   taken_at}`, rewritten each backlog round; the day's last write is its sample.
 - A task's stage is its last note's kind: `assign` assigned, `ready` ready, `review` or
-  `receipt` review, `sendback` sendback, `approved`, `blocked`, else working.
+  `receipt` review, `sendback` sendback, `approved`, `blocked`, else working; a
+  reviewer's tree is in review. The coordinator keeps each task's last note in
+  `HGL_STATE/tasks` (docs/protocol.md §8), so the page reads no notes.
 
 ## 4. Storage
 
@@ -199,10 +205,8 @@ hgl-ai decision tail [N]
 
 The owner answers only in the console. Pages: status reports (newest first), questions
 (open first, by priority; accept, option, reject or other, with a note), conversations
-(start, reply, close; search by description, issue, state, date), telemetry. The
-console's one script and one stylesheet (light and dark, readable at phone width) are
-embedded in the binary, and so is AG Grid Community, the telemetry page's grid: MIT, a
-pinned version, recorded in `crates/console/assets/vendor/VENDOR.md`, served from
-`/assets/ag-grid/<version>/`. No CDN; the Content-Security-Policy allows only the
-console itself. Every page works without the script except for passkeys and live
-updates; telemetry then shows plain tables, all tabs in turn, as read when loaded.
+(start, reply, close; search by description, issue, state, date), telemetry. Status, questions and conversations are rendered on the server with one
+small embedded script (passkeys, the answer form); telemetry is the page above, built
+by Vite and embedded in the binary. No CDN: every file comes from the console, and the
+Content-Security-Policy allows only the console itself (and the hub at `/nats`, which
+is the same origin). The pages need JavaScript; there is no fallback without it.
