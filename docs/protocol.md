@@ -294,11 +294,11 @@ before hub users takes one shared token until it moves.
 | --- | --- | --- |
 | `main` | controller | `updated <UTC>`, then `<repo> main <sha>` lines and the wrapper's pins. Rewritten after each merge. |
 | `prs` | coordinator service | `# read <UTC>`, `# cost <n> remaining <n> resetAt <ISO>`, then rows `REPO NUMBER HEAD draft\|open BOT UNRESOLVED CHECKS UPDATED`, each followed by `# pr REPO NUMBER PASSED TOTAL TITLE` (checks passed and in all, `-` without a rollup). At most every 5 min; stale after 15 min. |
-| `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha> [<title>]` per merge; the title is the one `prs` held. |
+| `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha> [<title>]` per merge; the merged pull request's title, redacted (docs/owner.md §3). Newest 2000 lines and at most 512 KiB, kept in the append's one compare-and-set write. |
 | `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
 | `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
-| `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted; then `# title REPO ISSUE TITLE` per task whose issue title is known (read from GitHub once per task). Read from the notes stream every 10 s; written when it changes. |
+| `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted; then `# tree HOST SEAT REPO ISSUE implement\|review CREATED KIND SENDER RECIPIENT AT` per worktree (no path; the newest note about the task that the seat sent or got, or that went to `all`; `-` with none); then `# title REPO ISSUE TITLE` per task with a tree whose title is known (read from GitHub once per task, in a loop of its own; redacted). Read from the notes stream every 10 s; written when it changes. |
 | `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |

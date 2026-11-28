@@ -106,13 +106,21 @@ async fn compare_and_set_writers() {
     );
     assert!(b.state_get("hold").await.unwrap().is_none());
     for i in 0..5 {
-        store::append_bounded(&b, "landed.log", &format!("line {i}"), 3)
+        store::append_bounded(&b, "landed.log", &format!("line {i}"), 3, 1000)
             .await
             .unwrap();
     }
     assert_eq!(
         b.state_get("landed.log").await.unwrap().unwrap().value,
         "line 2\nline 3\nline 4\n"
+    );
+    // The byte bound holds in the one write: never a value over it, even for a moment.
+    store::append_bounded(&b, "landed.log", "line 5", 3, 14)
+        .await
+        .unwrap();
+    assert_eq!(
+        b.state_get("landed.log").await.unwrap().unwrap().value,
+        "line 4\nline 5\n"
     );
 }
 
@@ -532,7 +540,8 @@ async fn a_lost_landing_lock_stops_the_landing() {
     }
     assert!(a.state_get(state::KEY_LANDED).await.unwrap().is_none());
     assert!(a.state_get(state::KEY_MAIN).await.unwrap().is_none());
-    assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+    // Only the merged pull request read (its title): no write to GitHub.
+    assert_eq!(gh.calls(), ["api repos/hhenson/alpha/pulls/7"]);
     held.release().await;
     // The release of a lost lock leaves the new holder's lease alone.
     locked(LandLock::acquire(&a, "alpha", "build-1", Duration::ZERO).await);
@@ -1076,8 +1085,10 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "not merged again");
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "{log}");
+    // With the merged pull request's own title.
     assert!(
-        log.trim_end().ends_with(&format!("alpha #7 {MERGE}")),
+        log.trim_end()
+            .ends_with(&format!("alpha #7 {MERGE} Format patterns through helpers")),
         "{log}"
     );
     let main = b.state_get(state::KEY_MAIN).await.unwrap().unwrap().value;

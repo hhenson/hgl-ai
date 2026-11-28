@@ -56,27 +56,66 @@ pub fn newest_lines(text: &str, keep: usize) -> Option<String> {
     Some(s)
 }
 
-/// Append a line (the bus's own compare-and-set loop), then trim the key to its newest
-/// `keep` lines. GitHub holds the full record.
-pub async fn append_bounded(bus: &Bus, key: &str, line: &str, keep: usize) -> Result<()> {
-    bus.append_line(key, line).await?;
+/// `text` with `line` appended, then cut to its newest `keep` lines and to at most
+/// `max_bytes` (whole lines, newest kept; a line longer than that alone is cut to it).
+pub fn appended(text: &str, line: &str, keep: usize, max_bytes: usize) -> String {
+    let line = line.trim_end_matches('\n');
+    let mut lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    lines.push(line);
+    let mut out: Vec<&str> = Vec::new();
+    let mut bytes = 0;
+    for l in lines.iter().rev().take(keep) {
+        if bytes + l.len() + 1 > max_bytes {
+            if out.is_empty() {
+                // One line over the bound alone: its first bytes, on a char boundary.
+                let mut end = max_bytes.saturating_sub(1).min(l.len());
+                while !l.is_char_boundary(end) {
+                    end -= 1;
+                }
+                out.push(&l[..end]);
+            }
+            break;
+        }
+        bytes += l.len() + 1;
+        out.push(l);
+    }
+    out.reverse();
+    let mut s = out.join("\n");
+    s.push('\n');
+    s
+}
+
+/// Append a line, keeping the key to its newest `keep` lines and at most `max_bytes`, in
+/// one compare-and-set write: the value never goes over the bound, not even between an
+/// append and a trim. GitHub holds the full record.
+pub async fn append_bounded(
+    bus: &Bus,
+    key: &str,
+    line: &str,
+    keep: usize,
+    max_bytes: usize,
+) -> Result<()> {
+    let mut last = None;
     for attempt in 0..ATTEMPTS {
-        let Some(e) = bus.state_get(key).await? else {
-            return Ok(());
+        let (text, rev) = match bus.state_get(key).await? {
+            Some(e) => (e.value, e.revision),
+            None => (String::new(), 0),
         };
-        let Some(trimmed) = newest_lines(&e.value, keep) else {
-            return Ok(());
-        };
-        match bus.state_update(key, &trimmed, e.revision).await {
-            Err(BusError::Conflict { .. }) => tokio::time::sleep(backoff(attempt)).await,
+        match bus
+            .state_update(key, &appended(&text, line, keep, max_bytes), rev)
+            .await
+        {
+            Err(e @ BusError::Conflict { .. }) => {
+                last = Some(e);
+                tokio::time::sleep(backoff(attempt)).await;
+            }
             other => {
                 other?;
                 return Ok(());
             }
         }
     }
-    // Another writer keeps winning; it trims too.
-    Ok(())
+    Err(last.expect("at least one attempt").into())
 }
 
 #[cfg(test)]
@@ -88,5 +127,27 @@ mod tests {
         assert_eq!(newest_lines("a\nb\n", 2), None);
         assert_eq!(newest_lines("a\nb\nc\n", 2).as_deref(), Some("b\nc\n"));
         assert_eq!(newest_lines("a\n\nb\nc", 1).as_deref(), Some("c\n"));
+    }
+
+    #[test]
+    fn appending_within_lines_and_bytes() {
+        assert_eq!(appended("", "a", 3, 100), "a\n");
+        assert_eq!(appended("a\nb\nc\n", "d", 3, 100), "b\nc\nd\n");
+        // Bytes bind before lines: "ccc\nddd\n" is 8.
+        assert_eq!(appended("aaa\nbbb\nccc\n", "ddd", 10, 8), "ccc\nddd\n");
+        assert_eq!(appended("aaa\nbbb\nccc\n", "ddd", 10, 9), "ccc\nddd\n");
+        assert_eq!(
+            appended("a\n", "ééé", 10, 6),
+            "éé\n",
+            "cut on a char boundary"
+        );
+        // 2,000 lines of 200 four-byte characters stay under the bus's limit.
+        let long = "\u{1F600}".repeat(200);
+        let mut t = String::new();
+        for _ in 0..2100 {
+            t = appended(&t, &long, 2000, crate::state::LANDED_MAX_BYTES);
+        }
+        assert!(t.len() <= crate::state::LANDED_MAX_BYTES);
+        assert!(t.len() < hgl_ai_bus::MAX_VALUE_BYTES);
     }
 }

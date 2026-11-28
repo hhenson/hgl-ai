@@ -477,6 +477,8 @@ pub(crate) async fn after_merge<G: Gh>(
     let merged = format!("{repo} #{number} is merged at {}", short(&merge));
     let mut after = Vec::new();
     let mut recorded = false;
+    // The merged pull request: its title for `landed.log`, its branch for the notes.
+    let pr = gate::fetch_pr(gh, s, repo, number).await?;
     if !p.has(progress::LANDED_LOG) {
         lock.confirm(&format!(
             "writing {}: {merged}; {}, {} and the landed notes are not written",
@@ -485,7 +487,7 @@ pub(crate) async fn after_merge<G: Gh>(
             state::KEY_MAIN
         ))
         .await?;
-        append_landed(bus, repo, number, &merge).await?;
+        append_landed(bus, repo, number, &merge, &pr.title).await?;
         p.mark(progress::LANDED_LOG);
         progress::write(bus, repo, number, &p).await?;
         recorded = true;
@@ -512,7 +514,6 @@ pub(crate) async fn after_merge<G: Gh>(
             state::KEY_MAIN
         ));
     }
-    let pr = gate::fetch_pr(gh, s, repo, number).await?;
     let what = o.what.clone().unwrap_or_else(|| pr.title.clone());
     let issue = o
         .closes
@@ -601,29 +602,21 @@ async fn commented<G: Gh>(
         .any(|c| c.body.lines().next().map(str::trim) == Some(first.trim())))
 }
 
-/// Append the landing to `landed.log`, unless the line is there already (a resumed landing).
-/// The title is the one `prs` holds, if any: a hub read, not a GitHub call.
-async fn append_landed(bus: &Bus, repo: &str, number: u64, merge: &str) -> Result<()> {
+/// Append the landing to `landed.log`, unless the line is there already (a resumed landing),
+/// with the merged pull request's title.
+async fn append_landed(bus: &Bus, repo: &str, number: u64, merge: &str, title: &str) -> Result<()> {
     if progress::landed(bus, repo, number, Some(merge)).await? {
         return Ok(());
     }
-    let title = match bus.state_get(state::KEY_PRS).await {
-        Ok(e) => e
-            .and_then(|e| {
-                table::Table::parse(&e.value)
-                    .rows
-                    .into_iter()
-                    .find(|r| r.repo == repo && r.number == number)
-            })
-            .map(|r| r.detail.title)
-            .unwrap_or_default(),
-        Err(e) => {
-            tracing::warn!("{}: {e}; the landing's line has no title", state::KEY_PRS);
-            String::new()
-        }
-    };
-    let line = state::landed_line(&utc_now_stamp(), repo, number, merge, &title);
-    store::append_bounded(bus, state::KEY_LANDED, &line, state::LANDED_KEEP).await
+    let line = state::landed_line(&utc_now_stamp(), repo, number, merge, title);
+    store::append_bounded(
+        bus,
+        state::KEY_LANDED,
+        &line,
+        state::LANDED_KEEP,
+        state::LANDED_MAX_BYTES,
+    )
+    .await
 }
 
 /// What `land` would do now, without changing anything: the gate's dry run and the steps
@@ -728,7 +721,15 @@ pub async fn record<G: Gh>(
         ))
         .await?;
     }
-    append_landed(bus, repo, number, merge).await?;
+    // The title is worth a line, not the record: without it the line has none.
+    let title = match gate::fetch_pr(gh, s, repo, number).await {
+        Ok(pr) => pr.title,
+        Err(e) => {
+            tracing::warn!("{repo} #{number}: {e}; its landed.log line has no title");
+            String::new()
+        }
+    };
+    append_landed(bus, repo, number, merge, &title).await?;
     let text = main_text(gh, s).await?;
     if let Some(l) = lock {
         l.confirm(&format!(

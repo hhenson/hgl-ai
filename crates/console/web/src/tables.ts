@@ -3,9 +3,10 @@
 // and a stable id from the value otherwise (`alpha#12` in `prs`).
 
 import type { Row } from "./diff";
-import { age, parseBacklog, parseLanded, parsePrs, parseTasks, parseTitles, relative, span, stage, stampMs, when } from "./parse";
+import { age, parseBacklog, parseLanded, parsePrs, parseTitles, parseTrees, relative, span, stage, stampMs, when } from "./parse";
 
-export const BUCKETS = ["HGL_HOSTS", "HGL_TREES", "HGL_STATE", "HGL_METRICS", "HGL_BUILD", "HGL_USAGE"] as const;
+/** Not `HGL_TREES`: its records hold paths; the trees come in `HGL_STATE/tasks`. */
+export const BUCKETS = ["HGL_HOSTS", "HGL_STATE", "HGL_METRICS", "HGL_BUILD", "HGL_USAGE"] as const;
 export type Bucket = (typeof BUCKETS)[number];
 /** The `HGL_STATE` keys the page reads, each watched on its own: the hub's `viewer` user
  *  may read no other (`VIEWER_STATE_KEYS` in crates/proto). */
@@ -238,8 +239,9 @@ export function windowMinutes(w: string): number | null {
 }
 
 export interface Risk {
-  /** `ok`, `watch` (on pace for 80 % or more by the reset), `out` (runs out before it). */
-  level: "ok" | "watch" | "out" | "unknown";
+  /** `ok`, `watch` (on pace for 80 % or more by the reset), `out` (runs out before it),
+   *  `unknown` (no forecast), `reset` (the window has reset since the reading). */
+  level: "ok" | "watch" | "out" | "unknown" | "reset";
   /** Percent used by the reset at the window's rate so far. */
   projected: number | null;
   /** When it reaches 100 % at that rate, if before the reset (ms). */
@@ -254,6 +256,9 @@ export interface Risk {
  */
 export function runOut(usedPct: number, resetsMs: number | null, window: string, observedMs: number | null, now: number): Risk {
   const len = windowMinutes(window);
+  // A reading from a window that has ended says nothing of the one now.
+  if (resetsMs !== null && resetsMs <= now)
+    return { level: "reset", projected: null, outAt: null, text: "the window has reset since this reading" };
   if (usedPct >= 100) return { level: "out", projected: usedPct, outAt: observedMs, text: "limit reached" };
   if (resetsMs === null || len === null || observedMs === null)
     return { level: "unknown", projected: null, outAt: null, text: "no reset time to judge by" };
@@ -273,6 +278,17 @@ export function runOut(usedPct: number, resetsMs: number | null, window: string,
     };
   }
   return { level: projected >= 80 ? "watch" : "ok", projected, outAt: null, text: `on pace for ${projected}% by the reset` };
+}
+
+/** How a limit reads, from its unrounded percent used and its risk: `none` is no forecast
+ *  (and not near the limit), never "on track". */
+export type Severity = "ok" | "warn" | "crit" | "none" | "reset";
+
+export function severity(usedPct: number, level: Risk["level"]): Severity {
+  if (level === "reset") return "reset";
+  if (usedPct >= 90 || level === "out") return "crit";
+  if (usedPct >= 70 || level === "watch") return "warn";
+  return level === "unknown" ? "none" : "ok";
 }
 
 /** What the rows depend on besides the buckets. */
@@ -320,7 +336,6 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
   const state = (k: string) => raw.HGL_STATE.get(k) ?? "";
 
   const gh = github(ctx.githubOwner);
-  const last = parseTasks(state("tasks"));
   const titles = parseTitles(state("tasks"));
   const queueTitles = new Map(parseBacklog(state("backlog")).queue.map((q) => [`${q.repo}#${q.number}`, q.title]));
   const titleOf = (task: string) => titles.get(task) ?? queueTitles.get(task) ?? null;
@@ -384,20 +399,18 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
 
   out.tasks = [];
   let stale = 0;
-  for (const key of sortedKeys(raw.HGL_TREES)) {
-    const t = json(raw.HGL_TREES.get(key)!);
-    if (!t?.task) continue;
-    const task = `${t.task.repo}#${t.task.issue}`;
-    const l = last.get(task);
-    const created = stampMs(t.created_at ?? "");
+  for (const t of parseTrees(state("tasks"))) {
+    const task = `${t.repo}#${t.issue}`;
+    const l = t.last;
+    const created = stampMs(t.created);
     const old = created !== null && ctx.now - created > ctx.staleAfterMs;
     stale += old ? 1 : 0;
     const turn = turns.get(`${t.host}/${t.seat}`);
-    const here = turn?.task && turn.task.repo === t.task.repo && turn.task.issue === t.task.issue && !!turn.review === !!t.review;
+    const here = turn?.task && turn.task.repo === t.repo && turn.task.issue === t.issue && !!turn.review === t.review;
     out.tasks.push({
-      id: key,
+      id: t.id,
       task,
-      task_url: gh.issue(t.task.repo, t.task.issue),
+      task_url: gh.issue(t.repo, t.issue),
       title: titleOf(task),
       seat: t.seat,
       work: t.review ? "review" : "implement",
@@ -539,7 +552,7 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
       limit: opt(u.limit_reached),
     };
     const buckets = (u.buckets ?? []) as Json[];
-    const none = { scope: null, window: null, used_pct: null, resets: null, risk: null, level: null, projected: null };
+    const none = { scope: null, window: null, used_pct: null, resets: null, risk: null, level: null, severity: null, projected: null };
     if (!buckets.length) out.usage.push({ id: key, ...base, ...none });
     for (const b of buckets) {
       const r = runOut(b.used_pct, stampMs(b.resets_at ?? ""), b.window, stampMs(u.observed_at ?? ""), ctx.now);
@@ -548,11 +561,15 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
         ...base,
         scope: b.scope,
         window: b.window,
+        // Classified on the reading as it came; rounded only to show.
         used_pct: Math.round(b.used_pct * 10) / 10,
         resets: opt(b.resets_at),
         risk: r.text,
         level: r.level,
+        severity: severity(b.used_pct, r.level),
         projected: r.projected,
+        // The limit the source said was reached is of a window that has since reset.
+        ...(r.level === "reset" ? { limit: null } : {}),
       });
     }
   }

@@ -18,10 +18,12 @@ pub const KEY_BACKLOG: &str = "backlog";
 pub const KEY_TASKS: &str = "tasks";
 /// Lines of `landed.log` kept: far below the bus's 1 MiB value limit; GitHub holds the rest.
 pub const LANDED_KEEP: usize = 2000;
+/// Bytes of `landed.log` kept: half the bus's 1 MiB value limit, whatever the lines hold.
+pub const LANDED_MAX_BYTES: usize = 512 << 10;
 
 /// `<UTC> <repo> #<pr> <merge sha>`, then ` <title>` when there is one (one line).
 pub fn landed_line(stamp: &str, repo: &str, pr: u64, merge: &str, title: &str) -> String {
-    let title = crate::backlog::clean_title(title);
+    let title = crate::backlog::page_title(title);
     let title = title.trim();
     if title.is_empty() {
         format!("{stamp} {repo} #{pr} {merge}")

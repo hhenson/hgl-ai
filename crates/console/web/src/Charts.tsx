@@ -6,17 +6,10 @@
 import { useSyncExternalStore } from "react";
 import { relative, stampMs } from "./parse";
 import type { Store } from "./store";
-import { github } from "./tables";
+import { github, type Severity } from "./tables";
 
-/** How a limit reads: by its percent used and its run-out risk. */
-export function severity(used: number, level: string): "ok" | "warn" | "crit" {
-  if (used >= 90 || level === "out") return "crit";
-  if (used >= 70 || level === "watch") return "warn";
-  return "ok";
-}
-
-const WORD = { ok: "On track", warn: "Watch", crit: "At risk" } as const;
-const ICON = { ok: "✓", warn: "⚠", crit: "✗" } as const;
+const WORD = { ok: "On track", warn: "Watch", crit: "At risk", none: "No forecast", reset: "Window reset" } as const;
+const ICON = { ok: "✓", warn: "⚠", crit: "✗", none: "?", reset: "↺" } as const;
 
 export function UsageMeters({ store }: { store: Store }) {
   useSyncExternalStore(store.onMeta, store.getMeta);
@@ -31,10 +24,12 @@ export function UsageMeters({ store }: { store: Store }) {
       <ul className="meters">
         {rows.map((r) => {
           const used = Number(r.used_pct);
-          const level = String(r.level ?? "unknown");
-          const sev = severity(used, level);
+          const sev = (r.severity ?? "none") as Severity;
           const projected = r.projected == null ? null : Math.min(100, Number(r.projected));
           const resets = stampMs(String(r.resets ?? ""));
+          // A reading from before the window reset: what it said, not what is used now.
+          const reset = sev === "reset";
+          const usedText = reset ? `${used}% at the last reading` : `${used}% used`;
           return (
             <li key={r.id} className={`meter sev-${sev}`}>
               <div className="flex flex-wrap items-baseline justify-between gap-x-3">
@@ -43,8 +38,8 @@ export function UsageMeters({ store }: { store: Store }) {
                   {String(r.runtime)} · {String(r.scope)} · {String(r.window)} window
                 </span>
               </div>
-              <svg className="meter-bar" width="100%" height="14" role="img" aria-label={`${used}% used`}>
-                <title>{`${used}% used${projected === null ? "" : `; on pace for ${r.projected}% by the reset`}`}</title>
+              <svg className="meter-bar" width="100%" height="14" role="img" aria-label={usedText}>
+                <title>{`${usedText}${projected === null ? "" : `; on pace for ${r.projected}% by the reset`}`}</title>
                 <rect className="track" x="0" y="1" width="100%" height="12" rx="4" />
                 {used > 0 ? <rect className="fill" x="0" y="1" width={`${Math.min(100, used)}%`} height="12" rx="4" /> : null}
                 {projected !== null && projected > used ? (
@@ -52,8 +47,8 @@ export function UsageMeters({ store }: { store: Store }) {
                 ) : null}
               </svg>
               <p className="m-0 text-sm">
-                <span className="font-semibold">{used}% used</span>
-                {resets !== null ? <> · resets {relative(resets, now)}</> : null}
+                <span className="font-semibold">{usedText}</span>
+                {resets !== null ? <> · {reset ? "reset" : "resets"} {relative(resets, now)}</> : null}
                 {" · "}
                 <span className={`status sev-${sev}`}>
                   <span aria-hidden="true">{ICON[sev]}</span> {WORD[sev]}

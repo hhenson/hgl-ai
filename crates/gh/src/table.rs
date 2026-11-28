@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
-use crate::backlog::clean_title;
+use crate::backlog::page_title;
 use crate::bot::{BotState, BotView, Comment, NoteState, Review, note_state};
 use crate::{Error, Result, short};
 
@@ -128,7 +128,7 @@ impl Table {
                     "# pr\t{}\t{}\t{p}\t{n}\t{}\n",
                     r.repo,
                     r.number,
-                    clean_title(&d.title)
+                    page_title(&d.title)
                 ));
             }
         }

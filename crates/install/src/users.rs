@@ -275,9 +275,9 @@ fn pull_from(stream: &str) -> [String; 2] {
     ]
 }
 
-/// The buckets the viewer reads: the telemetry (docs/owner.md §3).
-pub const VIEWER_BUCKETS: [&str; 6] =
-    [KV_HOSTS, KV_TREES, KV_STATE, KV_METRICS, KV_BUILD, KV_USAGE];
+/// The buckets the viewer reads: the telemetry (docs/owner.md §3). Not `HGL_TREES`: its
+/// records hold the trees' paths; the page reads the trees from `HGL_STATE/tasks`.
+pub const VIEWER_BUCKETS: [&str; 5] = [KV_HOSTS, KV_STATE, KV_METRICS, KV_BUILD, KV_USAGE];
 
 /// The viewer's publishes: what reading and watching [`VIEWER_BUCKETS`] needs, on those
 /// buckets' streams only, and of `HGL_STATE` only [`VIEWER_STATE_KEYS`]: bucket status,
@@ -1065,6 +1065,13 @@ mod tests {
             tables.contains(&format!("STATE_KEYS = [{}] as const", keys.join(", "))),
             "tables.ts"
         );
+        // And the same buckets: none it may not read, `HGL_TREES` (paths) not among them.
+        let buckets: Vec<String> = VIEWER_BUCKETS.iter().map(|b| format!("\"{b}\"")).collect();
+        assert!(
+            tables.contains(&format!("BUCKETS = [{}] as const", buckets.join(", "))),
+            "tables.ts"
+        );
+        assert!(!VIEWER_BUCKETS.contains(&KV_TREES));
     }
 
     #[test]

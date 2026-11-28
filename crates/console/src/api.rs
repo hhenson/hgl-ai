@@ -30,7 +30,7 @@ fn session(app: &App, h: &HeaderMap) -> Result<crate::Session, Response> {
 
 #[derive(Serialize)]
 pub struct SessionOut {
-    /// The user as the pages show them: `Handle (email)`.
+    /// The user's handle, never the email.
     pub user: String,
     /// For the page's POSTs (sign-out, and later answers).
     pub csrf: String,
@@ -69,7 +69,7 @@ pub async fn session_info(State(app): AppState, h: HeaderMap) -> Response {
         None => None,
     };
     Json(SessionOut {
-        user: app.auth.display(&s.user),
+        user: app.auth.handle_only(&s.user),
         csrf: s.csrf,
         open_questions,
         stale_after_secs: app.cfg.stale_after().as_secs(),

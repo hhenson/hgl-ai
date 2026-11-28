@@ -141,7 +141,8 @@ async fn the_page_and_its_files_are_the_consoles_own() {
     let r = b.get("/api/session").await;
     assert_eq!(header(&r, "cache-control"), "no-store");
     let s: Value = r.json().await.unwrap();
-    assert_eq!(s["user"], "This Dude (owner@example.com)");
+    assert_eq!(s["user"], "This Dude", "the handle, never the email");
+    assert!(!s.to_string().contains('@'), "{s}");
     assert_eq!(s["csrf"].as_str().unwrap().len(), 64, "{s}");
     assert!(s["open_questions"].is_null(), "no hub, no count");
     assert_eq!(s["stale_after_secs"], 3 * 86_400, "[limits] stale_after");

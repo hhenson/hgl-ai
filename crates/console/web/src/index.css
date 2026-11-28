@@ -109,6 +109,7 @@
   .meter.sev-ok { --sev: var(--accent); }
   .meter.sev-warn { --sev: var(--caution); }
   .meter.sev-crit { --sev: var(--critical); }
+  .meter.sev-none, .meter.sev-reset { --sev: var(--muted); }
   .meter-bar { display: block; overflow: visible; }
   .meter-bar .track { fill: var(--sev); opacity: .18; }
   .meter-bar .fill { fill: var(--sev); }
@@ -116,6 +117,7 @@
   .status.sev-ok { color: var(--ok); }
   .status.sev-warn { color: var(--pending); }
   .status.sev-crit { color: var(--warn); }
+  .status.sev-none, .status.sev-reset { color: var(--muted); }
 
   /* Backlog: open issues per label, one group per repository, one scale for all. */
   .bars { display: grid; gap: 1rem; margin-bottom: 1rem;

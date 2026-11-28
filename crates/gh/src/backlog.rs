@@ -25,11 +25,13 @@
 //! it, so the day's last round is the day's sample.
 
 use std::collections::BTreeMap;
+use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use hgl_ai_bus::Bus;
 use hgl_ai_proto::{KV_METRICS, MetricsSample, utc_stamp};
+use regex::Regex;
 use serde_json::Value;
 
 use crate::exec::{self, Gh};
@@ -95,6 +97,53 @@ pub fn clean_title(t: &str) -> String {
     one_line(t).chars().take(TITLE_MAX).collect()
 }
 
+/// Token shapes: GitHub, OpenAI-style and Slack tokens, NATS seeds.
+static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|S[UOANCAX][A-Z2-7]{50,})\b",
+    )
+    .unwrap()
+});
+/// `NAME=value` or `NAME:value` where the name says it is secret.
+static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|private[_-]?key|credentials?|seed|auth))(?:\s*=\s*|:)("[^"]*"|'[^']*'|\S+)"#,
+    )
+    .unwrap()
+});
+/// `NAME: value`, a colon and a space, for the names that are nothing but a secret.
+static SECRET_COLON: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)\b((?:password|passwd|secret|token|api[_ -]?key|access[_ -]?key|private[_ -]?key)):\s+("[^"]*"|'[^']*'|\S+)"#,
+    )
+    .unwrap()
+});
+static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}").unwrap()
+});
+/// An absolute path: `~/…`, `/a/b…` (two parts or more; `/telemetry` alone stays), or a
+/// Windows drive path; at the start or after a space or opening punctuation (so not the
+/// path of a URL).
+static PATH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(^|[\s(\[{'"`=,])(?:~/[^\s'"`)\]},]*|/[^\s/'"`)\]},]+/[^\s'"`)\]},]*|[A-Za-z]:\\[^\s'"`)\]},]*)"#,
+    )
+    .unwrap()
+});
+
+/// A title the console's page may show (anything a viewer-readable key holds): an email,
+/// an absolute path, a secret's assignment or a token shape replaced, then as
+/// [`clean_title`] keeps it.
+pub fn page_title(t: &str) -> String {
+    let t = one_line(t);
+    let t = TOKEN.replace_all(&t, "[token]");
+    let t = ASSIGNMENT.replace_all(&t, "${1}=[redacted]");
+    let t = SECRET_COLON.replace_all(&t, "${1}: [redacted]");
+    let t = EMAIL.replace_all(&t, "[email]");
+    let t = PATH.replace_all(&t, "${1}[path]");
+    clean_title(&t)
+}
+
 impl Backlog {
     pub fn render(&self) -> String {
         let mut s = format!("# read {}\n", self.read);
@@ -114,7 +163,7 @@ impl Backlog {
                 r.number,
                 r.class(),
                 r.created,
-                clean_title(&r.title)
+                page_title(&r.title)
             ));
         }
         s
@@ -698,6 +747,58 @@ mod tests {
         assert_eq!(t.chars().count(), TITLE_MAX);
         assert_eq!(t.len(), 2 * TITLE_MAX);
         assert_eq!(clean_title("short"), "short");
+    }
+
+    /// What the page may not show is replaced; what it may is kept.
+    #[test]
+    fn page_titles_redact() {
+        let cases = [
+            ("Mail owner@example.com about it", "Mail [email] about it"),
+            (
+                "Logs in /home/alice/hgl-ai/work fill up",
+                "Logs in [path] fill up",
+            ),
+            ("Config at ~/.config/hgl-ai/config.toml", "Config at [path]"),
+            (
+                "Path (/var/lib/x) and C:\\Users\\bob\\x",
+                "Path ([path]) and [path]",
+            ),
+            (
+                "Leaked GH_TOKEN=abc123 in logs",
+                "Leaked GH_TOKEN=[redacted] in logs",
+            ),
+            (
+                "password: hunter2 vs password:hunter2",
+                "password: [redacted] vs password=[redacted]",
+            ),
+            (
+                "Rotate the API key: sk_live_x",
+                "Rotate the API key: [redacted]",
+            ),
+            ("api_key = 'x y' gone", "api_key=[redacted] gone"),
+            (
+                &format!("Token ghp_{} seen", "a".repeat(36)),
+                "Token [token] seen",
+            ),
+            (
+                &format!("Seed SU{} seen", "A".repeat(56)),
+                "Seed [token] seen",
+            ),
+            // Kept: a single-part path, a relative path, a URL, prose.
+            (
+                "The /telemetry page and docs/work.md",
+                "The /telemetry page and docs/work.md",
+            ),
+            (
+                "See https://github.com/o/r/pull/1",
+                "See https://github.com/o/r/pull/1",
+            ),
+            ("Auth: sign-in fails", "Auth: sign-in fails"),
+        ];
+        for (t, want) in cases {
+            assert_eq!(page_title(t), want, "{t}");
+        }
+        assert_eq!(page_title("a\tb"), "a b");
     }
 
     #[test]

@@ -127,8 +127,11 @@ honour Slack's rate limits.
 `/telemetry`, a page of its own (React, TypeScript, AG Grid; docs/design.md §1) that
 reads the hub itself: it watches the telemetry buckets over the hub's WebSocket
 listener, at `<console url>/nats` on the console's own origin, as the hub user
-`viewer`. `viewer` reads those six buckets (of `HGL_STATE`, only the keys the page
-shows) and nothing else, and sees no other client's replies. Its subject permissions
+`viewer`. `viewer` reads five buckets, `HGL_HOSTS`, `HGL_STATE` (only the keys the page
+shows), `HGL_METRICS`, `HGL_BUILD` and `HGL_USAGE`, and nothing else (not `HGL_TREES`:
+its records hold paths), and sees no other client's replies. Titles in those keys come
+redacted (an email, an absolute path, a secret's assignment or a token shape replaced),
+and the header names the user by handle only. Its subject permissions
 are read-only, but replies are not enforced until hgl-ai#141 (docs/install.md,
 docs/design.md §9). The console hands its credential to a signed-in page
 (`GET /api/viewer`), which keeps it in memory only. A tab per area; the selected tab
@@ -137,14 +140,14 @@ is the URL fragment (`/telemetry#prs`):
 | Tab | Shows | Source |
 | --- | --- | --- |
 | Hosts and seats | live hosts: seat, what it does now (idle, or the task and title of its running turn), role, runtime, model, memory cap, free disk | `HGL_HOSTS`, `HGL_STATE/tasks` |
-| Tasks | issue and title, seat, implement or review, stage (assigned, in progress, ready, in review, sent back, approved, blocked, done), whether a turn runs now, last note and when, host, tree age, stale | `HGL_TREES`, `HGL_HOSTS`, `HGL_STATE/tasks` |
+| Tasks | issue and title, seat, implement or review, stage (assigned, in progress, ready, in review, sent back, approved, blocked, done), whether a turn runs now, the seat's last note and when, tree age, stale | `HGL_STATE/tasks`, `HGL_HOSTS` |
 | Pull requests | number and title, draft, review bot, unresolved threads, checks passed of all; when read | `HGL_STATE/prs` |
 | Queue | claimable issues in the order work is handed out (`codex-priority`, then `queue_priority`, then oldest), with titles | `HGL_STATE/backlog` |
 | Backlog | open issues per repository and label as bars; open, opened, closed and net per day (burndown, 14 days) | `HGL_STATE/backlog`, `HGL_METRICS` |
 | Landings | the newest 50, with titles; the merge commit on a row's detail | `HGL_STATE/landed.log` |
-| Fleet | `mode`, `hold`, stale trees, open questions by priority | `HGL_STATE`, `HGL_TREES`, `GET /api/session` |
+| Fleet | `mode`, `hold`, stale trees, open questions by priority | `HGL_STATE`, `GET /api/session` |
 | Builds | the newest 40 runs; live builders: platform, executor, state, reachable, slots and busy, free disk, toolchains | `HGL_BUILD/run.*`, `HGL_HOSTS/builder.*` |
-| Usage | per login and limit: a bar of percent used, reset, and run-out risk (the window's burn rate so far against the time to reset); runtime, host, plan, observed | `HGL_USAGE` |
+| Usage | per login and limit: a bar of percent used, reset, and run-out risk (the window's burn rate so far against the time to reset; "no forecast" early in a window; a reading from a window that has since reset says so); runtime, host, plan, observed | `HGL_USAGE` |
 
 A put or delete in a bucket changes rows, never the page: per table, the rows it
 changes are one grid transaction by row id (the KV key where a key is a row; else a
@@ -164,10 +167,11 @@ repository per day.
   Each class is its own connection, read to its last page.
 - `HGL_METRICS/<repo>.<YYYYMMDD>`: `{repo, date, open, opened, closed, labels,
   taken_at}`, rewritten each backlog round; the day's last write is its sample.
-- A task's stage is its last note's kind: `assign` assigned, `ready` ready, `review` or
-  `receipt` in review, `sendback` sent back, `approved`, `blocked`, `done`, `landed` or
-  `closed` done, else in progress; a reviewer's tree is in review. Whether a turn runs
-  is the seat's `turn` in `HGL_HOSTS` (docs/protocol.md §9), not the tree. The coordinator keeps each task's last note in
+- A tree's stage is the kind of its seat's last note about the task (sent, got, or to
+  `all`): `done`, `landed` or `closed` done (a review tree too), else a reviewer's tree
+  is in review; `assign` assigned, `ready` ready, `review` or `receipt` in review,
+  `sendback` sent back, `approved`, `blocked`, else in progress. Whether a turn runs is
+  the seat's `turn` in `HGL_HOSTS` (docs/protocol.md §9), not the tree. The coordinator keeps each task's last note in
   `HGL_STATE/tasks` (docs/protocol.md §8), so the page reads no notes.
 
 ## 4. Storage

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { age, parseBacklog, parseLanded, parsePrs, parseTasks, parseTitles, relative, span, stage, when } from "./parse";
-import { runOut, windowMinutes } from "./tables";
+import { age, parseBacklog, parseLanded, parsePrs, parseTasks, parseTitles, parseTrees, relative, span, stage, when } from "./parse";
+import { runOut, severity, windowMinutes } from "./tables";
 
 describe("parsers", () => {
   it("reads the prs table", () => {
@@ -45,13 +45,25 @@ describe("parsers", () => {
     expect(t.get("alpha#7")).toEqual({ kind: "sendback", sender: "controller", recipient: "w1", at: "20261128T000000Z" });
     expect(t.size).toBe(1);
     expect([...parseTitles(text)]).toEqual([["alpha#7", "Fix it"]]);
+    const trees = parseTrees(
+      "# tree\tlab1\tr1\talpha\t7\treview\t20261128T000000Z\treview\tcontroller\tr1\t20261128T010000Z\n" +
+        "# tree\tlab1\tw1\talpha\t7\timplement\t20261128T000000Z\t-\t-\t-\t-\n# tree\tshort\n",
+    );
+    expect(trees).toEqual([
+      { id: "lab1.r1.alpha-7-review", host: "lab1", seat: "r1", repo: "alpha", issue: 7, review: true, created: "20261128T000000Z",
+        last: { kind: "review", sender: "controller", recipient: "r1", at: "20261128T010000Z" } },
+      { id: "lab1.w1.alpha-7", host: "lab1", seat: "w1", repo: "alpha", issue: 7, review: false, created: "20261128T000000Z", last: undefined },
+    ]);
   });
 
   it("names stages and ages as the console does", () => {
     expect(stage({ kind: "assign", sender: "c", recipient: "w1", at: "" }, false)).toBe("assigned");
     expect(stage({ kind: "receipt", sender: "r", recipient: "c", at: "" }, false)).toBe("in review");
     expect(stage({ kind: "sendback", sender: "c", recipient: "w1", at: "" }, false)).toBe("sent back");
-    for (const kind of ["done", "landed", "closed"]) expect(stage({ kind, sender: "c", recipient: "w1", at: "" }, false)).toBe("done");
+    for (const kind of ["done", "landed", "closed"]) {
+      expect(stage({ kind, sender: "c", recipient: "w1", at: "" }, false)).toBe("done");
+      expect(stage({ kind, sender: "c", recipient: "all", at: "" }, true), "a review tree kept after the end").toBe("done");
+    }
     expect(stage(undefined, true)).toBe("in review");
     expect(stage(undefined, false)).toBe("in progress");
     const now = Date.UTC(2026, 10, 28, 12, 0, 0);
@@ -81,6 +93,16 @@ describe("parsers", () => {
     // The record's own time counts, not the page's: observed an hour ago.
     expect(runOut(30, now + 3 * H, "5h", now - H, now).outAt).toBe(now - H + (70 / 30) * H);
     expect(runOut(100, now + H, "5h", now, now).level).toBe("out");
+    // A full window that has since reset: no longer "limit reached".
+    expect(runOut(100, now - H, "5h", now - 2 * H, now)).toMatchObject({ level: "reset", projected: null });
+    expect(severity(100, "reset")).toBe("reset");
+    // Classified before rounding: 89.96 is not 90.
+    expect(severity(89.96, "ok")).toBe("warn");
+    expect(severity(90, "ok")).toBe("crit");
+    // No forecast is its own word, not "on track"; near the limit it is still a risk.
+    expect(severity(10, "unknown")).toBe("none");
+    expect(severity(95, "unknown")).toBe("crit");
+    expect(severity(10, "ok")).toBe("ok");
     expect(runOut(5, now + 299 * 60_000, "5h", now, now).level).toBe("unknown");
     expect(runOut(5, null, "5h", now, now).level).toBe("unknown");
   });

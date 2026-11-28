@@ -1187,17 +1187,17 @@ async fn a_lasting_consumer_the_viewer_makes_is_found() {
     assert!(!r.contains("\"error\""), "{r}");
     // Nor an inactive threshold: one of a day outlives the page as a durable would.
     let mut body = consumer_body(
-        "KV_HGL_TREES",
+        "KV_HGL_METRICS",
         Some("idle"),
         None,
         &format!("{deliver}.i"),
-        Some("$KV.HGL_TREES.>"),
+        Some("$KV.HGL_METRICS.>"),
         &[],
     );
     body["config"]["inactive_threshold"] = 86_400_000_000_000u64.into();
     let r = ask(
         &raw,
-        "$JS.API.CONSUMER.CREATE.KV_HGL_TREES.idle.$KV.HGL_TREES.>",
+        "$JS.API.CONSUMER.CREATE.KV_HGL_METRICS.idle.$KV.HGL_METRICS.>",
         body,
     )
     .await
@@ -1207,7 +1207,7 @@ async fn a_lasting_consumer_the_viewer_makes_is_found() {
         hgl_ai_install::hub::lasting_consumers(&js).await.unwrap(),
         vec![
             "KV_HGL_HOSTS/kept".to_string(),
-            "KV_HGL_TREES/idle".to_string()
+            "KV_HGL_METRICS/idle".to_string()
         ]
     );
 }

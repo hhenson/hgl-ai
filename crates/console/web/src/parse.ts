@@ -169,6 +169,42 @@ export function parseTasks(text: string): Map<string, LastNote> {
   return out;
 }
 
+export interface Tree {
+  /** As the `HGL_TREES` key: `host.seat.repo-issue[-review]`. */
+  id: string;
+  host: string;
+  seat: string;
+  repo: string;
+  issue: number;
+  review: boolean;
+  created: string;
+  /** The newest note about the task that this tree's seat sent or got. */
+  last: LastNote | undefined;
+}
+
+/** `HGL_STATE/tasks`' `# tree HOST SEAT REPO ISSUE implement|review CREATED KIND SENDER
+ *  RECIPIENT AT` lines: the worktrees, without their paths. */
+export function parseTrees(text: string): Tree[] {
+  const out: Tree[] = [];
+  for (const line of text.split("\n")) {
+    if (!line.startsWith("# tree\t")) continue;
+    const f = line.slice(7).split("\t");
+    if (f.length < 10 || !/^\d+$/.test(f[3])) continue;
+    const review = f[4] === "review";
+    out.push({
+      id: `${f[0]}.${f[1]}.${f[2]}-${f[3]}${review ? "-review" : ""}`,
+      host: f[0],
+      seat: f[1],
+      repo: f[2],
+      issue: +f[3],
+      review,
+      created: f[5],
+      last: f[6] === "-" ? undefined : { kind: f[6], sender: f[7], recipient: f[8], at: f[9] },
+    });
+  }
+  return out;
+}
+
 /** `HGL_STATE/tasks`' `# title REPO ISSUE TITLE` lines, by `repo#issue`. */
 export function parseTitles(text: string): Map<string, string> {
   const out = new Map<string, string>();
@@ -182,6 +218,8 @@ export function parseTitles(text: string): Map<string, string> {
 
 /** A task's stage from its last note (docs/owner.md §3). */
 export function stage(last: LastNote | undefined, review: boolean): string {
+  // An ended task is done, in a review tree too.
+  if (last && ["done", "landed", "closed"].includes(last.kind)) return "done";
   if (review) return "in review";
   switch (last?.kind) {
     case "assign":
@@ -197,10 +235,6 @@ export function stage(last: LastNote | undefined, review: boolean): string {
       return "approved";
     case "blocked":
       return "blocked";
-    case "done":
-    case "landed":
-    case "closed":
-      return "done";
     default:
       return "in progress";
   }
