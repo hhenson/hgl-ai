@@ -57,11 +57,11 @@ pub async fn lasting_consumers(js: &async_nats::jetstream::Context) -> Result<Ve
     Ok(out)
 }
 
-/// The hub's JetStream as `cfg`'s credential, plainly (no bus, which would create), with
-/// the user's own inbox prefix (hgl-ai#111).
+/// The hub's JetStream as `cfg`'s credential, plainly (no bus, which would create).
 async fn jetstream_of(cfg: &Config) -> Result<async_nats::jetstream::Context, String> {
     let path = cfg.token_file().map_err(|e| e.to_string())?;
     let cred = hgl_ai_bus::read_credential(&path).map_err(|e| e.to_string())?;
+    // A hub user may subscribe to its own inbox prefix only (hgl-ai#111).
     let inbox = cred.as_ref().and_then(hgl_ai_bus::Credential::inbox_prefix);
     let mut opts = match cred {
         Some(hgl_ai_bus::Credential::Token(t)) => async_nats::ConnectOptions::with_token(t),

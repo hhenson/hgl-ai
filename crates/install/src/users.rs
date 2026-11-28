@@ -241,15 +241,17 @@ pub struct Permissions {
     pub publish_deny: Vec<String>,
 }
 
-/// What the user of `role` with public key `nkey` may subscribe to: its own inbox prefix
-/// ([`hgl_ai_proto::user_inbox`]; the viewer's is [`VIEWER_INBOX`], which the page uses),
-/// never `_INBOX.>`, where every client's JetStream and KV replies would be (the console's
-/// sessions, threads, notes; hgl-ai#111).
+/// What the user with public key `nkey` may subscribe to: its own inbox prefix
+/// ([`hgl_ai_proto::user_inbox`]; the viewer's is [`VIEWER_INBOX`], which the console's
+/// page uses), never `_INBOX.>`, where every client's JetStream and KV replies would be
+/// (the console's sessions, threads, notes; hgl-ai#111).
 pub fn subscribe_allow(role: Role, nkey: &str) -> Vec<String> {
-    match role {
-        Role::Viewer => vec![format!("{VIEWER_INBOX}.>")],
-        _ => vec![format!("{}.>", hgl_ai_proto::user_inbox(nkey))],
-    }
+    let inbox = if role == Role::Viewer {
+        VIEWER_INBOX.to_string()
+    } else {
+        hgl_ai_proto::user_inbox(nkey)
+    };
+    vec![format!("{inbox}.>")]
 }
 
 fn kv(bucket: &str) -> String {

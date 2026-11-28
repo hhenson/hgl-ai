@@ -152,9 +152,12 @@ The `viewer` reads only the telemetry, as above.
 
 Each user's replies go to its own inbox, `_INBOX.<public key>`, and that is all it may
 subscribe to: no user reads another's JetStream or KV replies (the console's sessions,
-threads, notes). The `viewer`'s is `_INBOX_VIEWER`, which the page uses. A client before this used the shared `_INBOX.>`, which the hub then
-refuses. Upgrade the clients first (their inbox works on an older hub too), then rerun
-`hgl-ai server install`; until then `doctor` on the hub warns `hub inboxes`.
+threads, notes); the `viewer`'s is `_INBOX_VIEWER`. A client before this used the shared
+`_INBOX.>`, which the hub then refuses. Upgrade the clients first (their inbox works on an
+older hub too), then rerun `hgl-ai server install`; until then `doctor` on the hub warns
+`hub inboxes`. Upgrading a client includes restarting its running bridge and builder
+services (rerun `hgl-ai client install`, which restarts them): a running process keeps
+the shared inbox until it restarts.
 
 ```sh
 hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred
