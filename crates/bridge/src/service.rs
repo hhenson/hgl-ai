@@ -152,8 +152,10 @@ impl<B: BusApi> Bridge<B> {
             Ok(Err(e)) => return tracing::warn!("listing trees: {e}"),
             Err(e) => return tracing::warn!("listing trees: {e}"),
         };
+        // A merge, not a put: a turn may have registered a fresher record since the
+        // listing (hgl-ai#51).
         for t in list.iter().filter(|t| t.file.is_some()) {
-            if let Err(e) = self.bus.tree_put(&t.record).await {
+            if let Err(e) = self.bus.tree_merge(&t.record).await {
                 tracing::warn!(key = %t.record.key(), "registering: {e}");
             }
         }
