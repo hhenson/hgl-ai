@@ -69,6 +69,8 @@ findings, and a `done` note.
   `[github.gate.<repo>] coordinator_lands` opts in (explicit configuration only), the
   coordinator takes them as landing candidates in this order; it is never on for `hgl_spec`
   or `hgl_core`.
+  On hgl-ai a clean reviewer receipt carries through conflict-free merges of `main`
+  once the checks and review bot pass at the new head (ROLE-10, ROLE-11).
 - **WORK-7 — One conflict once.** Two tasks that turn out to touch the same code: finish
   one, then merge it into the other.
 
