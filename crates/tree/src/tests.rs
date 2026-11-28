@@ -814,7 +814,7 @@ fn clone_lock_child() {
 fn removal_without_clone_does_not_touch_enclosing_repository() {
     let e = env();
     e.git.run(&e.seed, ["branch", "keep-me"]).unwrap();
-    let root = e.seed.join("nested-work");
+    let root = e.seed.join("nested:work");
     let trees = Trees::with(
         Layout::new(&root).unwrap(),
         "host",
@@ -836,7 +836,8 @@ fn removal_without_clone_does_not_touch_enclosing_repository() {
     std::fs::write(dir.join(TASK_FILE), r#"{"seat":"w1","repo":"demo","issue":12,"branch":"keep-me","base":"main","start":"x","created_at":"now"}"#).unwrap();
     let clone = trees.layout.clone_dir("demo").unwrap();
     std::fs::create_dir_all(&clone).unwrap();
-    assert!(!e.git.check(&clone, ["rev-parse", "--git-dir"]).unwrap());
+    assert!(e.git.check(&clone, ["rev-parse", "--git-dir"]).unwrap());
+    assert!(!trees.git.check(&clone, ["rev-parse", "--git-dir"]).unwrap());
     let before = e
         .git
         .run(&e.seed, ["worktree", "list", "--porcelain"])

@@ -62,15 +62,14 @@ impl Git {
         S: AsRef<OsStr>,
     {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let cwd_real = cwd.canonicalize().map_err(|e| TreeError::io(cwd, e))?;
-        let ceiling = cwd_real.parent().unwrap_or(&cwd_real);
         let out = Command::new(&self.program)
             .args(&args)
             .current_dir(cwd)
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_COMMON_DIR")
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .envs(env.iter().map(|(k, v)| (k, v)))
-            .env_remove("GIT_DIR")
-            .env("GIT_CEILING_DIRECTORIES", ceiling)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
@@ -118,6 +117,115 @@ impl Git {
 
     /// `true` when the command exits 0.
     pub fn check<I, S>(&self, cwd: &Path, args: I) -> Result<bool>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Ok(self.output(cwd, args)?.ok)
+    }
+}
+
+/// Git operations owned by Trees must name their repository explicitly.
+#[derive(Debug)]
+pub(crate) struct TreeGit {
+    pub(crate) git: Git,
+    pub(crate) clones: PathBuf,
+}
+
+type GitInvocation = (Vec<OsString>, Vec<(String, OsString)>);
+
+impl TreeGit {
+    fn args_env<I, S>(&self, cwd: &Path, args: I, env: &[(&str, &OsStr)]) -> Result<GitInvocation>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let bare = cwd.parent() == Some(self.clones.as_path());
+        let git_dir = if bare {
+            cwd.to_path_buf()
+        } else {
+            let dotgit = cwd.join(".git");
+            let dir = if dotgit.is_dir() {
+                dotgit
+            } else {
+                crate::git_dir(cwd).ok_or_else(|| {
+                    TreeError::Invalid(format!("invalid checkout {}", cwd.display()))
+                })?
+            };
+            let dir = dir.canonicalize().map_err(|e| TreeError::io(&dir, e))?;
+            if !dir.join("HEAD").is_file() {
+                return Err(TreeError::Invalid(format!(
+                    "invalid git directory {}",
+                    dir.display()
+                )));
+            }
+            dir
+        };
+        let mut argv = vec![OsString::from("--git-dir"), git_dir.into_os_string()];
+        argv.extend(args.into_iter().map(|a| a.as_ref().to_owned()));
+        let mut vars: Vec<_> = env
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_owned()))
+            .collect();
+        if !bare {
+            vars.push((
+                "GIT_WORK_TREE".into(),
+                cwd.canonicalize()
+                    .map_err(|e| TreeError::io(cwd, e))?
+                    .into_os_string(),
+            ));
+        }
+        Ok((argv, vars))
+    }
+
+    pub(crate) fn output<I, S>(&self, cwd: &Path, args: I) -> Result<Out>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.output_env(cwd, args, &[])
+    }
+
+    fn output_env<I, S>(&self, cwd: &Path, args: I, env: &[(&str, &OsStr)]) -> Result<Out>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let (args, vars) = self.args_env(cwd, args, env)?;
+        let vars: Vec<_> = vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_os_str()))
+            .collect();
+        self.git.output_env(cwd, args, &vars)
+    }
+
+    pub(crate) fn run<I, S>(&self, cwd: &Path, args: I) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        self.run_env(cwd, args, &[])
+    }
+
+    pub(crate) fn run_env<I, S>(
+        &self,
+        cwd: &Path,
+        args: I,
+        env: &[(&str, &OsStr)],
+    ) -> Result<String>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let (args, vars) = self.args_env(cwd, args, env)?;
+        let vars: Vec<_> = vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_os_str()))
+            .collect();
+        self.git.run_env(cwd, args, &vars)
+    }
+
+    pub(crate) fn check<I, S>(&self, cwd: &Path, args: I) -> Result<bool>
     where
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,

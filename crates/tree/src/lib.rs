@@ -238,7 +238,7 @@ pub struct Trees {
     layout: Layout,
     host: String,
     github: Github,
-    git: Git,
+    git: git::TreeGit,
 }
 
 impl Trees {
@@ -252,11 +252,12 @@ impl Trees {
     }
 
     pub fn with(layout: Layout, host: &str, github: &Github, git: Git) -> Self {
+        let clones = layout.root().join("clones");
         Trees {
             layout,
             host: host.to_string(),
             github: github.clone(),
-            git,
+            git: git::TreeGit { git, clones },
         }
     }
 
@@ -269,7 +270,7 @@ impl Trees {
     }
 
     pub fn git(&self) -> &Git {
-        &self.git
+        &self.git.git
     }
 
     /// The task directory, if it holds a tree.
