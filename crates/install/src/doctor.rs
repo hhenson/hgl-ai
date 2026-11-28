@@ -780,7 +780,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             || su.as_ref().is_some_and(|user| user.slack);
         if reached && slack {
             let log = service::system_log_hint(env.os, Service::Slack);
-            out.push(match hub.slack_startup(c).await {
+            out.push(match hub.slack_startup(&health_cfg).await {
                 Ok(Some(error)) if error != "ok" => Check::warn(
                     "Slack startup", error,
                     format!("logs: {log}; for missing_scope, use groups:history, chat:write and app_mentions:read; the app token needs connections:write; remove channels:history, im:history and mpim:history, then reinstall the app. If the channel was made private, check its scopes and app membership; for not_in_channel invite the app; for channel_not_found check the channel ID"),
@@ -1499,7 +1499,7 @@ mod tests {
             name: "server".into(),
             home: f.env.home.join("server").display().to_string(),
             console_url: None,
-            slack: false,
+            slack: true,
             client_user: None,
         });
         crate::save_config(&f, &f.env, &cfg).unwrap();
@@ -1518,10 +1518,17 @@ mod tests {
             cs.iter()
                 .any(|c| c.name == "telemetry consumers" && c.level == Level::Ok)
         );
-        assert_eq!(*hub.calls.borrow(), ["health", "shared_inbox", "durables"]);
+        assert!(
+            cs.iter()
+                .any(|c| c.name == "Slack startup" && c.level == Level::Ok)
+        );
+        assert_eq!(
+            *hub.calls.borrow(),
+            ["health", "slack_startup", "shared_inbox", "durables"]
+        );
         assert_eq!(
             *hub.creds.borrow(),
-            vec![f.env.home.join("builder.cred").display().to_string(); 3]
+            vec![f.env.home.join("builder.cred").display().to_string(); 4]
         );
     }
 
