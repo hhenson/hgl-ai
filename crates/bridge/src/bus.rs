@@ -13,6 +13,9 @@ pub trait BusApi: Registry + Send + Sync + 'static {
     type Delivery: DeliveryApi;
     type Lease: LeaseApi;
 
+    #[cfg(test)]
+    fn seat_lease_stop(&self, _seat: &Seat, _finished: bool) {}
+
     fn inbox(&self, seat: &Seat) -> impl Future<Output = Result<Self::Inbox>> + Send;
     fn send(&self, note: &Note) -> impl Future<Output = Result<()>> + Send;
     fn state_get(&self, key: &str) -> impl Future<Output = Result<Option<String>>> + Send;
