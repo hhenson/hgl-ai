@@ -235,6 +235,19 @@ mod tests {
         ));
     }
     #[tokio::test]
+    async fn stale_table_cannot_request_a_draft() {
+        let (s, _) = setup("[]", "[]");
+        let draft = fixture("pr-open.json").replace("\"draft\": false", "\"draft\": true");
+        let gh = FakeGh::default()
+            .on("issues/7/comments", "[]")
+            .on("pulls/7", &draft);
+        assert!(matches!(
+            check(&gh, &s, "alpha", 7, HEAD).await.unwrap(),
+            Request::Refused(_)
+        ));
+    }
+
+    #[tokio::test]
     async fn bot_review_and_running_stop_requests() {
         let receipt = serde_json::json!([{"user":{"login":"chatgpt-codex-connector[bot]"}, "body":"Didn't find any major issues. **Reviewed commit:** `1f461fa77b`"}]).to_string();
         let (s, gh) = setup(&receipt, "[]");
