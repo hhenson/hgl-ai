@@ -290,11 +290,11 @@ pub fn specs(sys: &dyn System, o: &SystemOpts) -> Vec<Spec> {
     let data = layout.data();
     let (exe, _) = server_exe(sys);
     let path = server_path(sys);
-    let mut out = vec![Spec::hub(
-        &nats_for(sys, &layout),
-        &data.join("nats.conf"),
-        &data,
-    )];
+    let os = sys.env().os;
+    let mut out = vec![Spec {
+        log: service::system_log_path(os, Service::Hub),
+        ..Spec::hub(&nats_for(sys, &layout), &data.join("nats.conf"), &data)
+    }];
     let host = &o.host;
     let svc = |s: Service, args: &[&str], cred: PathBuf| Spec {
         service: s,
@@ -311,7 +311,7 @@ pub fn specs(sys: &dyn System, o: &SystemOpts) -> Vec<Spec> {
                 cred.display().to_string(),
             ),
         ],
-        log: service::log_path(&data, s),
+        log: service::system_log_path(os, s),
     };
     if o.coord {
         out.push(svc(
@@ -457,6 +457,22 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
         Os::Linux => user.to_string(),
         Os::MacOs => "staff".into(),
     };
+    if os == Os::MacOs {
+        // launchd opens the logs as root: in a directory only root writes (hgl-ai#63).
+        root.step(
+            &format!("the services' logs, {}, root's", service::DAEMON_LOG_DIR),
+            Cmd::new("install").args([
+                "-d",
+                "-o",
+                "root",
+                "-g",
+                "wheel",
+                "-m",
+                "0755",
+                service::DAEMON_LOG_DIR,
+            ]),
+        )?;
+    }
     let mut names = Vec::new();
     for spec in specs(sys, o) {
         let (text, name) = match os {
@@ -498,6 +514,13 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
             }
             Os::MacOs => {
                 let plist = service::system_unit_path(os, s).display().to_string();
+                // A loaded daemon keeps its old plist, and `bootstrap` refuses it.
+                if service::system_state(sys, s) != service::State::NotInstalled {
+                    root.step(
+                        &format!("unload {} to load its new plist", s.label()),
+                        Cmd::new("launchctl").args(["bootout", &format!("system/{}", s.label())]),
+                    )?;
+                }
                 root.step(
                     &format!("load {}", s.label()),
                     Cmd::new("launchctl").args(["bootstrap", "system", &plist]),
@@ -528,7 +551,7 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
             "the hub did not answer on {host}:{} within {} s; see {}",
             o.port,
             o.wait.as_secs(),
-            service::log_path(&layout.data(), Service::Hub).display()
+            service::system_log_hint(os, Service::Hub)
         )));
     }
     let admin = layout.creds().join(format!("{}-admin.cred", o.host));
@@ -619,6 +642,10 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
     Ok(None)
 }
 
+/// What to do about a unit from before hgl-ai#63, whose log root opens in the server
+/// user's home (docs/install.md, Upgrading).
+pub const LOG_UPGRADE: &str = "rerun `hgl-ai server install`: its root steps reinstall the units";
+
 /// The server side's services, read without privilege; `true` when all run and the
 /// port answers.
 pub fn status(
@@ -636,7 +663,21 @@ pub fn status(
         };
         up &= st == service::State::Running
             || (s != Service::Hub && st == service::State::NotInstalled);
-        sys.say(&format!("{} (system, as {}): {text}", s.short(), su.name));
+        if st == service::State::NotInstalled {
+            sys.say(&format!("{} (system, as {}): {text}", s.short(), su.name));
+        } else {
+            sys.say(&format!(
+                "{} (system, as {}): {text}; logs: {}",
+                s.short(),
+                su.name,
+                service::system_log_hint(sys.env().os, s)
+            ));
+        }
+        if let Some(why) = service::system_log_unsafe(sys, s) {
+            sys.say(&format!(
+                "  {why}: root opens this log in the server user's home (hgl-ai#63); {LOG_UPGRADE}"
+            ));
+        }
     }
     if let Some((host, port)) = listen_port {
         let open = sys.port_open(&host, port);
@@ -840,6 +881,47 @@ mod tests {
         assert!(
             hub.contains("-c /var/lib/hgl-ai/.local/share/hgl-ai/nats.conf"),
             "{hub}"
+        );
+        // The journal, not a file root opens in the server user's home (hgl-ai#63).
+        for u in [&unit, &hub] {
+            assert!(u.contains("StandardOutput=journal\n"), "{u}");
+            assert!(!u.contains("append:"), "{u}");
+        }
+        assert!(
+            !script.contains("Logs"),
+            "no log directory on Linux: {script}"
+        );
+    }
+
+    /// `server status` names where the logs are, and a unit from before hgl-ai#63.
+    #[test]
+    fn status_names_the_logs() {
+        let d = tempfile::tempdir().unwrap();
+        let f = Fake::new(d.path(), Os::Linux);
+        f.on(|c| {
+            if c.args.iter().any(|a| a.starts_with("StandardOutput")) {
+                Output::success("StandardOutput=append\nStandardError=append\n")
+            } else {
+                Output::success("LoadState=loaded\nActiveState=active\n")
+            }
+        });
+        let su = hgl_ai_config::ServerUser {
+            name: "hgl-ai".into(),
+            home: "/var/lib/hgl-ai".into(),
+            console_url: None,
+            client_user: None,
+        };
+        assert!(status(&f, &su, None));
+        let out = f.output();
+        assert!(
+            out.contains(
+                "hub (system, as hgl-ai): running; logs: `journalctl -u hgl-ai-hub.service`"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("  StandardOutput=append: root opens this log in the server user's home (hgl-ai#63); rerun `hgl-ai server install`"),
+            "{out}"
         );
     }
 
@@ -1350,5 +1432,48 @@ mod tests {
             plist.contains("<key>HOME</key>\n    <string>/Library/hgl-ai</string>"),
             "{plist}"
         );
+        // launchd opens the logs as root: in a directory root owns, made before the
+        // daemons (hgl-ai#63).
+        assert!(
+            plist.contains(
+                "<key>StandardOutPath</key>\n  <string>/Library/Logs/hgl-ai/coord.log</string>"
+            ),
+            "{plist}"
+        );
+        assert!(!plist.contains("/Library/hgl-ai/.local"), "{plist}");
+        let dir = script
+            .find("sudo install -d -o root -g wheel -m 0755 /Library/Logs/hgl-ai\n")
+            .expect(&script);
+        assert!(dir < script.find("LaunchDaemons").unwrap(), "{script}");
+    }
+
+    /// A reinstall over loaded daemons (the upgrade from hgl-ai#63) unloads each before
+    /// loading its new plist; a first install has nothing to unload.
+    #[test]
+    fn macos_reinstall_unloads_the_loaded_daemons() {
+        let d = tempfile::tempdir().unwrap();
+        let mut o = opts(true);
+        o.user = "_hgl-ai".into();
+        o.home = PathBuf::from("/Library/hgl-ai");
+        for loaded in [true, false] {
+            let f = fake(d.path(), Os::MacOs, true);
+            if !loaded {
+                f.on(|c| match c.args.first().map(String::as_str) {
+                    Some("print") => Output::failure(113, "Could not find service"),
+                    Some("-un") => Output::success("owner\n"),
+                    _ => Output::success(""),
+                });
+            }
+            let script = install(&f, &o).unwrap().unwrap();
+            let out = "sudo launchctl bootout system/io.github.hhenson.hgl-ai.hub\n";
+            let load = "sudo launchctl bootstrap system /Library/LaunchDaemons/io.github.hhenson.hgl-ai.hub.plist";
+            match script.find(out) {
+                Some(i) => {
+                    assert!(loaded, "{script}");
+                    assert!(i < script.find(load).unwrap(), "{script}");
+                }
+                None => assert!(!loaded, "{script}"),
+            }
+        }
     }
 }
