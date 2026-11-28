@@ -82,15 +82,28 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
     if let Some(c) = c.controller {
         let _ = writeln!(s, "The controller is seat `{c}`.");
     }
-    if c.role == Role::Controller {
-        s.push_str(
+    match c.role {
+        Role::Controller => s.push_str(
             "You are the headless controller (OWN-7): this turn handles the notes below, \
              then ends; never run `hgl-ai note wait`. Start from `hgl-ai decision tail`, \
              `hgl-ai thread list --open` and `hgl-ai state get main` (OWN-8).\n",
-        );
+        ),
+        Role::Implementor => s.push_str(
+            "Run local builds in the foreground. When resolving merge conflicts, \
+             keep the merge commit separate from other fixes.\n",
+        ),
+        Role::Reviewer => s.push_str(
+            "Post each receipt's findings as a PR review comment at the exact head \
+             and send the receipt note. For a focused re-review (hgl-ai#118), check \
+             the findings and the diff since the last reviewed head.\n",
+        ),
+        _ => {}
     }
     s.push_str(
         "The `hgl-ai` skill describes the commands. Reply with `hgl-ai note send`.\n\
+         Skip `@codex review` from the fleet account. If the bot round is pending, \
+         send `ready` when your checks are complete and say the round is pending.\n\
+         Report failures that match known open issues as validation limits and continue.\n\
          Do not remove worktrees; the bridge does that. Keep all scratch inside $HGL_AI_TASK_DIR \
          (TMPDIR and CARGO_TARGET_DIR point there), never /tmp.\n",
     );
@@ -254,6 +267,11 @@ mod tests {
             "Task: hgl-compiler#980 on branch `codex/q980-fix` from origin/main",
             "The controller is seat `boss`.",
             "`hgl-ai note send`",
+            "Run local builds in the foreground",
+            "keep the merge commit separate from other fixes",
+            "Skip `@codex review` from the fleet account",
+            "send `ready` when your checks are complete and say the round is pending",
+            "Report failures that match known open issues as validation limits",
             "Do not remove worktrees",
             "$HGL_AI_TASK_DIR",
             "State hold: 20261127T050000Z (GitHub",
@@ -313,13 +331,19 @@ mod tests {
         let s = seat("r1");
         let t = task(true);
         let n = Note::new(seat("claude"), seat("r1"), Kind::Note, "x");
-        let p = build(&ctx(Some(&t), &s), &[(1, 1, &n)]);
+        let mut c = ctx(Some(&t), &s);
+        c.role = Role::Reviewer;
+        let p = build(&c, &[(1, 1, &n)]);
         assert!(p.contains(&format!(
             "review of hgl-compiler#980 at {}, merged onto origin/main ({})",
             "a".repeat(40),
             "b".repeat(40)
         )));
         assert!(p.contains("does NOT merge onto main (conflicts: src/x.rs)"));
+        assert!(p.contains("PR review comment at the exact head and send the receipt note"));
+        assert!(p.contains("check the findings and the diff since the last reviewed head"));
+        assert!(p.contains("Skip `@codex review` from the fleet account"));
+        assert!(!p.contains("Run local builds in the foreground"));
     }
 
     #[test]

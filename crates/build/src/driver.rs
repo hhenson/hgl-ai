@@ -93,18 +93,15 @@ pub struct Driven {
 }
 
 /// The variables every step sees: `HGL_AI_BUILD_ID`, `HGL_AI_SRC`, `HGL_AI_BUILD_DIR`,
-/// and for a job's own checkout `CARGO_TARGET_DIR` and `TMPDIR` inside it.
+/// plus `CARGO_TARGET_DIR` and `TMPDIR` inside its build workspace.
 pub fn build_env(id: &str, ws: &Workspace) -> Vec<(String, String)> {
-    let mut env = vec![
+    vec![
         ("HGL_AI_BUILD_ID".to_string(), id.to_string()),
         ("HGL_AI_SRC".into(), ws.src.clone()),
         ("HGL_AI_BUILD_DIR".into(), ws.build.clone()),
-    ];
-    if ws.job.is_some() {
-        env.push(("CARGO_TARGET_DIR".into(), format!("{}/target", ws.build)));
-        env.push(("TMPDIR".into(), ws.tmp.clone()));
-    }
-    env
+        ("CARGO_TARGET_DIR".into(), format!("{}/target", ws.build)),
+        ("TMPDIR".into(), ws.tmp.clone()),
+    ]
 }
 
 fn read_log(p: &Path) -> Vec<u8> {

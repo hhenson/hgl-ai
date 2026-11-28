@@ -13,7 +13,6 @@ pub mod stale;
 use std::collections::BTreeMap;
 use std::future::Future;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 use hgl_ai_config::{Config, Github};
 use hgl_ai_proto::{Seat, TaskKey, TreeRecord};
@@ -239,9 +238,7 @@ pub struct Trees {
     layout: Layout,
     host: String,
     github: Github,
-    git: Git,
-    /// Serialises git work on the shared clones within this process.
-    lock: Mutex<()>,
+    git: git::TreeGit,
 }
 
 impl Trees {
@@ -255,12 +252,12 @@ impl Trees {
     }
 
     pub fn with(layout: Layout, host: &str, github: &Github, git: Git) -> Self {
+        let clones = layout.root().join("clones");
         Trees {
             layout,
             host: host.to_string(),
             github: github.clone(),
-            git,
-            lock: Mutex::new(()),
+            git: git::TreeGit { git, clones },
         }
     }
 
@@ -273,7 +270,7 @@ impl Trees {
     }
 
     pub fn git(&self) -> &Git {
-        &self.git
+        &self.git.git
     }
 
     /// The task directory, if it holds a tree.
@@ -322,6 +319,7 @@ impl Trees {
     ) -> Result<Created> {
         let review = matches!(what, Create::Review { .. });
         let dir = self.layout.task_dir(seat, task, review)?;
+        let _guard = self.lock_clone(&task.repo)?;
         if dir.join(TASK_FILE).is_file() {
             if review {
                 return Err(TreeError::Exists(dir));
@@ -337,7 +335,6 @@ impl Trees {
                 reused: true,
             });
         }
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let clone = self.ensure_clone(&task.repo)?;
         if std::fs::symlink_metadata(&dir).is_ok() {
             // A partial tree from an interrupted create.
@@ -625,6 +622,11 @@ impl Trees {
         if std::fs::symlink_metadata(&dir).is_err() {
             return Ok(None);
         }
+        self.layout.confine_existing(&dir)?;
+        let _guard = self.lock_clone(&task.repo)?;
+        if std::fs::symlink_metadata(&dir).is_err() {
+            return Ok(None);
+        }
         let dir = self.layout.confine_existing(&dir)?;
         let file = read_task(&dir).ok();
         let freed_bytes = dir_size(&dir);
@@ -633,14 +635,17 @@ impl Trees {
             .layout
             .clone_dir(&task.repo)
             .ok()
-            .filter(|c| c.is_dir());
-        let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            .filter(|c| c.join("HEAD").is_file());
         let mut salvage = None;
         if src.join(".git").exists() {
             // A git killed with the turn may have left its lock; salvage reads through an
             // index of its own either way.
-            clear_stale_index_lock(&src);
-            salvage = self.salvage(&src, seat, task, file.as_ref(), &dir)?;
+            if self.git.checkout_git_dir(&src)?.is_some() {
+                clear_stale_index_lock(&src);
+                salvage = self.salvage(&src, seat, task, file.as_ref(), &dir)?;
+            } else {
+                tracing::warn!(src = %src.display(), "worktree metadata unavailable; nothing salvaged");
+            }
             if let Some(clone) = &clone {
                 let args: [&std::ffi::OsStr; 4] = [
                     "worktree".as_ref(),
@@ -830,12 +835,12 @@ impl Trees {
         let Some(branch) = f.branch.as_deref().filter(|_| !f.review) else {
             return Ok(Refresh::Current);
         };
+        let _guard = self.lock_clone(&f.repo)?;
         let src = dir.join("src");
         // A git killed in an earlier turn may have left its lock behind.
         clear_stale_index_lock(&src);
         let tracking = format!("refs/remotes/origin/{branch}");
         let fetched = {
-            let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
             let clone = self.ensure_clone(&f.repo)?;
             self.git.output(
                 &clone,
@@ -898,6 +903,31 @@ impl Trees {
         self.git
             .run(&src, ["merge", "--ff-only", "--quiet", &pushed])?;
         Ok(Refresh::Forwarded(pushed))
+    }
+
+    /// Lock a clone before inspecting or changing it, including its initialization.
+    fn lock_clone(&self, repo: &str) -> Result<CloneLock> {
+        let clone = self.layout.clone_dir(repo)?;
+        let locks = self.layout.root().join("clones").join(".locks");
+        mkdir(&locks)?;
+        let path = locks.join(format!(
+            "{}.lock",
+            clone.file_name().unwrap().to_string_lossy()
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&path)
+            .map_err(|e| TreeError::io(&path, e))?;
+        loop {
+            match file.lock() {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(TreeError::io(&path, e)),
+            }
+        }
+        Ok(CloneLock(file))
     }
 
     /// `<work_root>/clones/<repo>`: a bare repository with `origin`, fetched now.
@@ -998,6 +1028,17 @@ impl Trees {
             Err(_) => return Ok(()),
         }
         std::fs::remove_dir_all(&dir).map_err(|e| TreeError::io(&dir, e))
+    }
+}
+
+/// Explicit unlock also releases the lock when a child inherited the open file description.
+struct CloneLock(std::fs::File);
+
+impl Drop for CloneLock {
+    fn drop(&mut self) {
+        if let Err(e) = self.0.unlock() {
+            tracing::warn!("unlocking clone: {e}");
+        }
     }
 }
 
