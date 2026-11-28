@@ -130,6 +130,17 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
+    /// The registry lock of the tree `key` (hgl-ai#58). Locks no one holds or waits for are
+    /// dropped here.
+    pub(crate) async fn registry_lock(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let m = {
+            let mut reg = lock(&self.registry);
+            reg.retain(|_, m| Arc::strong_count(m) > 1);
+            reg.entry(key.to_string()).or_default().clone()
+        };
+        m.lock_owned().await
+    }
+
     /// Measure the trees, refresh their records, and post the stale ones and disk use.
     pub(crate) async fn report(&self) {
         let hold = self.bus.state_get("hold").await.ok().flatten();
@@ -153,8 +164,15 @@ impl<B: BusApi> Bridge<B> {
             Err(e) => return tracing::warn!("listing trees: {e}"),
         };
         // A merge, not a put: a turn may have registered a fresher record since the
-        // listing (hgl-ai#51).
+        // listing (hgl-ai#51). Only while the listed tree is still there, checked and
+        // written under its registry lock: a removal since the listing has deregistered
+        // it, or does after this write (hgl-ai#58).
         for t in list.iter().filter(|t| t.file.is_some()) {
+            let _reg = self.registry_lock(&t.record.key()).await;
+            if !still_there(t) {
+                tracing::info!(key = %t.record.key(), "removed since the listing; not registered");
+                continue;
+            }
             if let Err(e) = self.bus.tree_merge(&t.record).await {
                 tracing::warn!(key = %t.record.key(), "registering: {e}");
             }
@@ -194,6 +212,14 @@ impl<B: BusApi> Bridge<B> {
         }
         self.tell(&self.host_seat(), Kind::Note, None, body).await;
     }
+}
+
+/// Whether the listed tree is still the one on disk: its `task.json` is there and names
+/// the same tree (`seq`, `created_at`), not one made anew at its path since.
+fn still_there(t: &hgl_ai_tree::LocalTree) -> bool {
+    let Some(listed) = &t.file else { return false };
+    hgl_ai_tree::read_task(&t.dir)
+        .is_ok_and(|f| (f.seq, &f.created_at) == (listed.seq, &listed.created_at))
 }
 
 /// The `done` cleanup receipt (PROTO-14).
