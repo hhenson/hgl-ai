@@ -93,8 +93,7 @@ pub fn previous(sys: &dyn System) -> Previous {
                 p.parse::<u16>().ok(),
             )
         });
-    let slack = su.slack
-        || service::system_account(sys, Service::Slack).is_some_and(|(user, _)| user == su.name);
+    let slack = slack_enabled(sys, &su);
     Previous {
         host: Some(cfg.host),
         listen: addr.as_ref().map(|(h, _)| h.clone()),
@@ -105,6 +104,12 @@ pub fn previous(sys: &dyn System) -> Previous {
         slack,
         client_user: su.client_user,
     }
+}
+
+/// Older client configs do not record Slack, so check the installed service too.
+pub(crate) fn slack_enabled(sys: &dyn System, user: &hgl_ai_config::ServerUser) -> bool {
+    user.slack
+        || service::system_account(sys, Service::Slack).is_some_and(|(name, _)| name == user.name)
 }
 
 /// Where the server user keeps things, by its home.

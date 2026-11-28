@@ -34,9 +34,10 @@ live telemetry. Slack also carries questions and conversations. GitHub stays the
 ## 2. Owner words
 
 - **OWN-5 — Owner words.** The console publishes owner notes and its own thread
-  events. Slack has a separate hub credential and subject for owner actions in
-  existing threads. The hub denies seats and the coordinator writes to
-  `hgl.owner.>`, `hgl.notes.owner.>` and `HGL_THREADS` (docs/install.md, Hub users).
+  events. Slack supports the same owner thread actions as the console, including
+  starting a conversation. It uses a separate hub credential and subject. The hub
+  denies seats and the coordinator write access to `hgl.owner.>`,
+  `hgl.notes.owner.>` and `HGL_THREADS` (docs/install.md, Hub users).
   - NATS stores a message under the subject it was published on, so a receiver checks
     the subject, never a header or the payload: the bridge accepts sender `owner` only on
     `hgl.notes.owner.<recipient>` and nothing else there; the console folds owner events
@@ -217,8 +218,9 @@ hgl-ai decision add LINE           a controller judgement (OWN-8)
 hgl-ai decision tail [N]
 ```
 
-The owner answers only in the console. Pages: status reports (newest first), questions
-(open first, by priority; accept, option, reject or other, with a note), conversations
+The owner can answer in the console or in Slack, as agreed in §2. Console pages
+include status reports (newest first), questions (open first, by priority; accept,
+option, reject or other, with a note), conversations
 (start, reply, close; search by description, issue, state, date), telemetry. One
 embedded script and stylesheet, no CDN; works without the script except for passkeys
 and live updates.
