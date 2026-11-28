@@ -30,7 +30,7 @@
 
 mod carry;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use hgl_ai_bus::Bus;
 use hgl_ai_proto::{Family, Kind as NoteKind, ReviewReceipt, Verdict};
@@ -492,17 +492,21 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         "{prefix} {ms} head {} unresolved {unresolved} behind {behind} reviewed {reviewed}",
         short(head)
     );
-    if reviewed == "no" {
+    let bot_pending = |line: &str| {
         if bot.limited() {
-            return done(
+            return Some(done(
                 Kind::BotLimit,
                 format!("{line} review bot out of quota BOTLIMIT"),
                 false,
-            );
+            ));
         }
-        if bot.running_on(head) {
-            return done(Kind::Wait, format!("{line} review-running WAIT"), true);
-        }
+        bot.running_on(head)
+            .then(|| done(Kind::Wait, format!("{line} review-running WAIT"), true))
+    };
+    if reviewed == "no"
+        && let Some(step) = bot_pending(&line)
+    {
+        return step;
     }
     if pr.base != "main" || unresolved != 0 || reviewed == "no" {
         let mut why = Vec::new();
@@ -545,13 +549,26 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
                 r.receipt.reviewer, r.receipt.family
             )),
             Err((why, retry)) => {
-                if repo != RECEIPT_CARRY_REPO
-                    || carry_candidates(f).is_empty()
+                if repo != RECEIPT_CARRY_REPO {
+                    return done(Kind::Blocked, format!("{line} {why} BLOCKED"), retry);
+                }
+                let verdicts = carry_verdicts(f);
+                if verdicts.get(head) == Some(&Verdict::Findings) {
+                    return done(
+                        Kind::Blocked,
+                        format!("{line} ROLE-11: the receipts at the head have findings BLOCKED"),
+                        false,
+                    );
+                }
+                if !verdicts.values().any(|v| *v == Verdict::Clean)
                     || need!(f.parents, Need::Parents).len() != 2
                 {
                     return done(Kind::Blocked, format!("{line} {why} BLOCKED"), retry);
                 }
                 if reviewed != "head" {
+                    if let Some(step) = bot_pending(&line) {
+                        return step;
+                    }
                     return done(
                         Kind::Blocked,
                         format!(
@@ -801,16 +818,27 @@ fn independent_clean(r: &SeenReceipt, authors: &[Family]) -> bool {
         && !authors.contains(&r.receipt.family)
 }
 
-fn carry_candidates(f: &Facts) -> BTreeSet<&str> {
+/// An independent clean receipt clears findings at the same commit.
+fn carry_verdicts(f: &Facts) -> BTreeMap<&str, Verdict> {
+    let mut verdicts = BTreeMap::new();
     let (Some(Ok(authors)), Some(Ok(receipts))) = (&f.authors, &f.receipts) else {
-        return BTreeSet::new();
+        return verdicts;
     };
-    receipts
-        .iter()
-        .filter(|r| !authors.is_empty() && independent_clean(r, authors))
-        .map(|r| r.receipt.head.as_str())
-        .filter(|&sha| sha != f.pr.head && hgl_ai_proto::check_head(sha).is_ok())
-        .collect()
+    if authors.is_empty() {
+        return verdicts;
+    }
+    for r in receipts {
+        let head = r.receipt.head.as_str();
+        if r.receipt.reviewer.as_str() != r.sender || hgl_ai_proto::check_head(head).is_err() {
+            continue;
+        }
+        if independent_clean(r, authors) {
+            verdicts.insert(head, Verdict::Clean);
+        } else if r.receipt.verdict == Verdict::Findings {
+            verdicts.entry(head).or_insert(Verdict::Findings);
+        }
+    }
+    verdicts
 }
 
 /// ROLE-11 over what was read: a clean receipt for the given head, sent by the reviewer it
@@ -1097,7 +1125,7 @@ async fn fill<G: Gh>(
                 .as_deref()
                 .ok_or_else(|| resp("receipt carry", "no main"))?;
             f.receipt_carry = Some(
-                carry::from_remote(&s.receipt_carry_url, &head, main, &carry_candidates(f)).await,
+                carry::from_remote(&s.receipt_carry_url, &head, main, &carry_verdicts(f)).await,
             );
         }
     }
@@ -1614,6 +1642,26 @@ mod tests {
             Step::Done(o) if o.kind == Kind::Blocked && o.retry
                 && o.line.contains("receipt carry needs a clean bot review at the head")
         ));
+        for (file, kind, retry) in [
+            ("comments-limit.json", Kind::BotLimit, false),
+            ("comments-running.json", Kind::Wait, true),
+        ] {
+            let body = fixture(file).replace("9a8b7c6d5e4f30211203f4e5d6c7b8a9a0b1c2d3", &head);
+            let mut comments: Vec<Value> = serde_json::from_str(&body).unwrap();
+            comments.extend(
+                json("comments-clean.json")
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .cloned(),
+            );
+            let comments: Vec<Comment> = comments.iter().map(Comment::from_rest).collect();
+            f.bot = Some(BotView::of("chatgpt-codex-connector", &comments, &[]));
+            assert!(matches!(
+                step(&f, HEAD, &normal),
+                Step::Done(o) if o.kind == kind && o.retry == retry && o.line.contains("reviewed parent")
+            ));
+        }
         f.bot = Some(BotView::default());
         f.bot_reviews = Some(vec![Review {
             author: "b".into(),

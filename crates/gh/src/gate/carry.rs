@@ -1,9 +1,11 @@
 //! Prove a receipt can carry using the exact commits read from GitHub.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::process::{Output, Stdio};
 use std::time::Duration;
+
+use hgl_ai_proto::Verdict;
 
 type Proof<T> = Result<T, String>;
 
@@ -11,7 +13,7 @@ pub(super) async fn from_remote(
     url: &str,
     head: &str,
     main: &str,
-    candidates: &BTreeSet<&str>,
+    verdicts: &BTreeMap<&str, Verdict>,
 ) -> Proof<Option<String>> {
     for sha in [head, main] {
         hgl_ai_proto::check_head(sha).map_err(|e| e.to_string())?;
@@ -71,10 +73,11 @@ pub(super) async fn from_remote(
         if stdout("merge-tree", automatic)?.trim() != *tree {
             return Ok(None);
         }
-        if candidates.contains(parent) {
-            return Ok(Some((*parent).to_string()));
+        match verdicts.get(parent) {
+            Some(Verdict::Clean) => return Ok(Some((*parent).to_string())),
+            Some(Verdict::Findings) => return Ok(None),
+            None => commit = (*parent).to_string(),
         }
-        commit = (*parent).to_string();
     }
 }
 
@@ -94,7 +97,6 @@ async fn run(git: &Path, args: &[&str]) -> Proof<Output> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.current_dir(git)
         .arg("--git-dir=.")
-        .args(args)
         .env_remove("GIT_COMMON_DIR")
         .env_remove("GIT_OBJECT_DIRECTORY")
         .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
@@ -108,14 +110,15 @@ async fn run(git: &Path, args: &[&str]) -> Proof<Output> {
         .kill_on_drop(true);
     if args[0] != "fetch" {
         // Fetch uses the host's Git authentication. The remerge uses Git's default drivers.
-        cmd.env_remove("GIT_CONFIG_PARAMETERS")
+        cmd.args(["-c", "core.attributesFile=/dev/null"])
+            .env_remove("GIT_CONFIG_PARAMETERS")
             .env_remove("GIT_CONFIG_COUNT")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", git.join("unused-global-config"))
             .env("GIT_ATTR_NOSYSTEM", "1");
     }
     let command = args[0];
-    tokio::time::timeout(Duration::from_secs(60), cmd.output())
+    tokio::time::timeout(Duration::from_secs(60), cmd.args(args).output())
         .await
         .map_err(|_| format!("git {command} timed out"))?
         .map_err(|e| format!("could not run git {command}: {e}"))
@@ -182,7 +185,10 @@ mod tests {
                 self.0.path().to_str().unwrap(),
                 &self.git(&["rev-parse", "HEAD"]),
                 &self.git(&["rev-parse", "main"]),
-                &candidates.iter().copied().collect(),
+                &candidates
+                    .iter()
+                    .map(|&head| (head, Verdict::Clean))
+                    .collect(),
             )
             .await
             .unwrap()
@@ -248,5 +254,23 @@ mod tests {
         std::fs::write(repo.0.path().join("common"), "edited in merge").unwrap();
         repo.git(&["commit", "-a", "--amend", "--no-edit"]);
         assert_eq!(repo.carry(&[&resolved]).await, None);
+    }
+
+    #[tokio::test]
+    async fn rejects_a_merge_resolved_by_user_attributes() {
+        let repo = History::new();
+        let reviewed = repo.commit("common", "pr version\n");
+        repo.advance_main("common", "main version\n");
+        let attributes = repo.0.path().join("merge-attributes");
+        std::fs::write(&attributes, "* merge=union\n").unwrap();
+        repo.git(&[
+            "-c",
+            &format!("core.attributesFile={}", attributes.display()),
+            "merge",
+            "--no-ff",
+            "--no-edit",
+            "main",
+        ]);
+        assert_eq!(repo.carry(&[&reviewed]).await, None);
     }
 }

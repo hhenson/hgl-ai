@@ -851,19 +851,16 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
 
 const MERGE: &str = "01e99ea5e46457bac035ca8a2699b6b6575b32ed";
 
-/// The hub as a landing of `alpha#7` (issue 980) finds it: the author's tree with its
-/// family, and a clean review receipt from another family among the controller's notes
-/// (with notes that are not one for it around it).
-async fn authored_and_reviewed(b: &Bus) {
+async fn register_pr_author(b: &Bus, repo: &str) {
     let tree = hgl_ai_proto::TreeRecord {
         host: "build-1".into(),
         seat: Seat::new("w1").unwrap(),
         task: hgl_ai_proto::TaskKey {
-            repo: "alpha".into(),
+            repo: repo.into(),
             issue: 980,
         },
         review: false,
-        path: "/w/w1/alpha-980".into(),
+        path: format!("/w/w1/{repo}-980"),
         branch: Some("codex/980-format-patterns".into()),
         created_at: "20260101T000000Z".into(),
         size_bytes: 0,
@@ -874,6 +871,13 @@ async fn authored_and_reviewed(b: &Bus) {
         handoff_seq: None,
     };
     b.tree_put(&tree).await.unwrap();
+}
+
+/// The hub as a landing of `alpha#7` (issue 980) finds it: the author's tree with its
+/// family, and a clean review receipt from another family among the controller's notes
+/// (with notes that are not one for it around it).
+async fn authored_and_reviewed(b: &Bus) {
+    register_pr_author(b, "alpha").await;
     let controller = Seat::new("controller").unwrap();
     let note = |kind: Kind, from: &str, pr: u64, body: &str| {
         let mut n =
@@ -1190,6 +1194,139 @@ fn commit_on(seed: &std::path::Path, branch: &str, from: &str, file: &str, text:
     );
     git(seed, &["push", "--quiet", "--force", "origin", branch]);
     git(seed, &["rev-parse", "HEAD"])
+}
+
+#[tokio::test]
+async fn evaluate_carries_only_past_merges_without_unresolved_findings() {
+    use crate::gate::{Kind as GateKind, Opts, evaluate};
+    use hgl_ai_proto::{Family, Note, ReviewReceipt, Verdict};
+    use serde_json::json;
+
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let repo = "hgl-ai";
+    register_pr_author(&b, repo).await;
+
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path();
+    git(path, &["init", "--quiet", "--template=", "-b", "main"]);
+    let commit = |file: &str| {
+        std::fs::write(path.join(file), file).unwrap();
+        git(path, &["add", file]);
+        git(path, &["commit", "--quiet", "-m", file]);
+        git(path, &["rev-parse", "HEAD"])
+    };
+    commit("base");
+    git(path, &["switch", "-c", "pr"]);
+    let reviewed = commit("pr");
+    let update = |file: &str| {
+        git(path, &["switch", "main"]);
+        let main = commit(file);
+        git(path, &["switch", "pr"]);
+        git(path, &["merge", "--no-ff", "--no-edit", "main"]);
+        (main, git(path, &["rev-parse", "HEAD"]))
+    };
+    let (_, middle) = update("main-first");
+    let (main, head) = update("main-second");
+
+    let mut s = settings();
+    s.receipt_carry_url = path.to_str().unwrap().into();
+    s.gates.entry(repo.into()).or_default().checks = vec!["lint".into()];
+    let gh = FakeGh::default()
+        .on("pulls/7/files", &fixture("pr-files.json"))
+        .on("Accept: application/vnd.github.v3.diff", &fixture("pr.diff"))
+        .on("pulls/7", &fixture("pr-open.json").replace(HEAD, &head))
+        .on("git/ref/heads/main", &json!({"object": {"sha": main}}).to_string())
+        .on("compare/", r#"{"ahead_by":0}"#)
+        .on(
+            "graphql",
+            r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}"#,
+        )
+        .on(
+            "issues/7/comments",
+            &fixture("comments-clean.json").replace(HEAD, &head).replace(&HEAD[..10], &head[..10]),
+        )
+        .on(
+            &format!("git/commits/{head}"),
+            &json!({"parents": [{"sha": middle}, {"sha": main}]}).to_string(),
+        )
+        .on(
+            &format!("commits/{head}/check-runs"),
+            r#"{"check_runs":[{"id":1,"name":"lint","status":"completed","conclusion":"success"}]}"#,
+        )
+        .on(&format!("commits/{head}/status?"), r#"{"statuses":[]}"#);
+    let receipt: ReviewReceipt = serde_json::from_str(&fixture("receipt.json")).unwrap();
+    let send = async |sha: &str, family: Family, verdict: Verdict| {
+        let mut receipt = receipt.clone();
+        receipt.repo = repo.into();
+        receipt.head = sha.into();
+        receipt.main.clone_from(&main);
+        receipt.family = family;
+        receipt.verdict = verdict;
+        let mut note = Note::new(
+            receipt.reviewer.clone(),
+            s.controller.clone(),
+            Kind::Receipt,
+            serde_json::to_string(&receipt).unwrap(),
+        );
+        note.repo = Some(repo.into());
+        note.issue = 7;
+        note.head = Some(sha.into());
+        b.send(&note).await.unwrap();
+    };
+    let run = async || {
+        evaluate(
+            &gh,
+            &s,
+            Some(&b),
+            repo,
+            7,
+            &head,
+            &Opts::default(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    };
+    send(&reviewed, Family::Claude, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::WouldMerge, "{}", o.line);
+    assert!(
+        o.line.contains(&format!("receipt carried from {reviewed}")),
+        "{}",
+        o.line
+    );
+
+    send(&middle, Family::Claude, Verdict::Findings).await;
+    send(&middle, Family::Gpt, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::Blocked, "{}", o.line);
+
+    send(&middle, Family::Claude, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::WouldMerge, "{}", o.line);
+    assert!(
+        o.line.contains(&format!("receipt carried from {middle}")),
+        "{}",
+        o.line
+    );
+
+    send(&head, Family::Claude, Verdict::Findings).await;
+    send(&head, Family::Gpt, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::Blocked, "{}", o.line);
+    assert!(
+        o.line.contains("receipts at the head have findings"),
+        "{}",
+        o.line
+    );
+
+    send(&head, Family::Claude, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::WouldMerge, "{}", o.line);
+    assert!(o.line.contains("receipt r1/claude"), "{}", o.line);
 }
 
 /// Ask until the verdict is judged (pass, fail) or the gate build did not run.

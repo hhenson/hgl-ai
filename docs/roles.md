@@ -84,8 +84,10 @@ Open decisions are issues in this repository.
   `gh land` and `gh merge-if-clean` enforce it unless `[github.gate.<repo>]
   review_receipt = false`. For hgl-ai a receipt carries from a first-parent
   ancestor when every intervening commit merges a first-parent commit of `main`
-  with an empty remerge-diff and no conflicts. A conflict or intervening non-merge commit
-  requires a fresh receipt. A pull request the tool makes (the wrapper's pins) has
+  with an empty remerge-diff and no conflicts. A conflict or intervening
+  non-merge commit requires a fresh receipt. A findings receipt at any merge
+  in the chain requires a clean other-family receipt at that commit to carry.
+  A pull request the tool makes (the wrapper's pins) has
   no author and needs none. An agent never reviews work it wrote, paired on or
   coordinated. When no other family is available, nothing lands: same-family
   review is never a fallback, and failover never moves a task to a family that
