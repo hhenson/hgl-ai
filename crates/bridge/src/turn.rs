@@ -856,7 +856,10 @@ impl<B: BusApi> Bridge<B> {
         drop(held);
         let quota =
             matches!(run.ended, Ended::Exited(_)) && parsed.quota && !parsed.success(exited_ok);
-        if !matches!(run.ended, Ended::CannotStart(_) | Ended::SpawnFailed(_)) {
+        if !matches!(
+            run.ended,
+            Ended::CannotStart(_) | Ended::SpawnFailed(_) | Ended::ShutdownKilled
+        ) {
             let refusal = quota.then(|| crate::usage::RefusedTurn {
                 seat: name,
                 family: r.family,
@@ -864,9 +867,7 @@ impl<B: BusApi> Bridge<B> {
                 at: hgl_ai_proto::utc_now_stamp(),
                 id: marker,
             });
-            if seat.usage[&r.runtime].send(refusal).is_err() {
-                tracing::warn!(runtime = %r.runtime, "bridge usage worker stopped");
-            }
+            seat.usage[&r.runtime].after_turn(r.runtime, refusal);
         }
         let err = parsed.error.clone().unwrap_or_default();
         match run.ended {

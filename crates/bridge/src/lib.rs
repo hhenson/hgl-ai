@@ -87,7 +87,10 @@ pub struct Options {
     /// Also the refresh of the seat leases.
     pub heartbeat_every: Duration,
     pub report_every: Duration,
+    /// Idle time between a runtime's collections.
     pub usage_every: Duration,
+    /// Minimum wait after a runtime's collection before another can start.
+    pub usage_min_every: Duration,
     pub usage_sources: hgl_ai_usage::Sources,
     /// Retry of a seat whose seat lock or lease another process holds.
     pub seat_retry: Duration,
@@ -120,6 +123,7 @@ impl Options {
             heartbeat_every: Duration::from_secs(30),
             report_every: Duration::from_secs(86400),
             usage_every: Duration::from_secs(15 * 60),
+            usage_min_every: Duration::from_secs(60),
             usage_sources: hgl_ai_usage::Sources::from_env(),
             seat_retry: Duration::from_secs(30),
             turn_timeout: cfg.turn_timeout(),
@@ -423,7 +427,7 @@ impl<B: BusApi> Bridge<B> {
             ),
         }
         let mut set = tokio::task::JoinSet::new();
-        let (usage, mut usage_tasks) = self.start_usage();
+        let (usage, refusal_tasks) = self.start_usage(&mut set, shutdown.clone());
         for s in seats {
             let file = format!("{}.json", s.name);
             let ended = EndedTasks::load(data.join("bridge").join("ended").join(&file));
@@ -447,16 +451,7 @@ impl<B: BusApi> Bridge<B> {
         if let Err(e) = self.bus.host_del(&self.cfg.host).await {
             tracing::warn!("removing the host record: {e}");
         }
-        // Let already queued usage work finish if it can, with a bounded wait on shutdown.
-        let _ = tokio::time::timeout(Duration::from_secs(2), async {
-            while let Some(r) = usage_tasks.join_next().await {
-                if let Err(e) = r {
-                    tracing::warn!("bridge usage task failed: {e}");
-                }
-            }
-        })
-        .await;
-        drop(usage_tasks);
+        refusal_tasks.drain().await;
         tracing::info!("bridge stopped");
         Ok(())
     }

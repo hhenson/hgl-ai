@@ -382,10 +382,11 @@ A builder writes `HGL_HOSTS/builder.<label>` with the same heartbeat and TTL
 
 ## 10. Subscription usage
 
-The bridge collects usage every 15 minutes and after each runtime turn ends, for that
-turn's runtime only. Collection runs in the background and failures do not affect the
-turn. `hgl-ai usage collect` also runs it by hand. The collector reads each selected CLI
-of the host's agent user, by slash command or file, never a model prompt:
+The bridge requests background collection after a turn for its runtime, coalescing pending
+requests and waiting at least one minute after each collection. With no turn it collects
+again 15 minutes after the last run. Quota events are published independently and drained
+on shutdown. `hgl-ai usage collect` also runs it by hand. The collector reads each
+selected CLI of the host's agent user, by slash command or file, never a model prompt:
 
 | Runtime | Limits | Account id |
 | --- | --- | --- |
