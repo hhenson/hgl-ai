@@ -173,7 +173,11 @@ impl<B: BusApi> Bridge<B> {
                 tracing::info!(key = %t.record.key(), "removed since the listing; not registered");
                 continue;
             }
-            if let Err(e) = self.bus.tree_merge(&t.record).await {
+            let Ok(f) = hgl_ai_tree::read_task(&t.dir) else {
+                continue;
+            };
+            let current = self.trees.record(&t.dir, &f, t.record.size_bytes);
+            if let Err(e) = self.bus.tree_merge(&current).await {
                 tracing::warn!(key = %t.record.key(), "registering: {e}");
             }
         }

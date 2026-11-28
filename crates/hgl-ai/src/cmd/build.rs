@@ -476,7 +476,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         None => new_build_id(),
     };
     let root = log_root(a.log_dir.clone(), cfg.as_ref());
-    let run_dir = root.join(&id);
+    let run_dir = std::path::absolute(root.join(&id))?;
     // The recipe: a file, or the hub's.
     let mut bus = None;
     if let Some(c) = &cfg {
@@ -529,10 +529,12 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         .unwrap_or_else(|| data_dir(cfg.as_ref()).join("build-cache").join(&repo));
     std::fs::create_dir_all(&build)?;
     let build = std::path::absolute(&build).unwrap_or(build);
+    let tmp = run_dir.join("tmp");
+    std::fs::create_dir_all(&tmp)?;
     let ws = Workspace {
         src: src.display().to_string(),
         build: build.display().to_string(),
-        tmp: std::env::temp_dir().display().to_string(),
+        tmp: tmp.display().to_string(),
         job: None,
         clone: None,
         base_sha: None,
@@ -857,6 +859,16 @@ fn local_run(dir: &Path) -> bool {
     dir.join("pid").is_file()
 }
 
+fn local_process_gone(dir: &Path) -> bool {
+    local_run(dir)
+        && !pid_alive(
+            std::fs::read_to_string(dir.join("pid"))
+                .ok()
+                .and_then(|p| p.trim().parse().ok())
+                .unwrap_or(0),
+        )
+}
+
 fn local_status(dir: &Path) -> Option<Summary> {
     let mut s = store::read_status(dir)?;
     if !local_run(dir) {
@@ -879,6 +891,13 @@ async fn status(ctx: &Ctx, id: &str, log_dir: Option<PathBuf>) -> anyhow::Result
     if let Some(d) = find_local(id, log_dir, cfg.as_ref()) {
         match local_status(&d) {
             Some(s) => print_summary(ctx, &s),
+            None if local_process_gone(&d) => {
+                eprintln!(
+                    "build {id}: stopped before writing a summary; see {}",
+                    d.join("run.out").display()
+                );
+                return Ok(EXIT_FAIL);
+            }
             None => println!("build {id}: starting (log {})", d.display()),
         }
         return Ok(EXIT_OK);
