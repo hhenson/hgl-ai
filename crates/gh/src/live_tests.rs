@@ -1929,6 +1929,32 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
             .iter()
             .any(|r| r.receipt.head == head && r.receipt.verdict == Verdict::Clean)
     );
+
+    // An old outbox without a branch cannot rule out a branch-based handoff when
+    // GitHub omits the PR from its batch. Forward the original findings in that case.
+    let mut old = receipt(&"c".repeat(40), Verdict::Findings);
+    let seq = b.send(&old).await.unwrap().seq;
+    let cursor = serde_json::json!({
+        "after": seq - 1,
+        "digest": [],
+        "outbox": {
+            "seq": seq,
+            "action": {"Sendback": {"pr": 7, "issue": 980, "to": w1, "fallback": s.controller}},
+            "line": "alpha#7 → sendback to w1"
+        }
+    });
+    b.state_put("coord.routing", &cursor.to_string())
+        .await
+        .unwrap();
+    crate::routing::round(&no_gh, &s, &b, &[]).await.unwrap();
+    old.recipient = s.controller.clone();
+    let notes = b
+        .read_notes(&[s.controller.clone(), w1, w3], seq, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note, old);
+    assert!(no_gh.calls().is_empty());
 }
 
 #[tokio::test]

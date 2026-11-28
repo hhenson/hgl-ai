@@ -708,8 +708,8 @@ async fn execute<G: Gh>(
             branch,
             fallback,
         } => {
-            // Older outboxes know only the task issue. Use the PR batch to recover
-            // its branch when available so handoffs registered by branch count too.
+            // Older outboxes know only the task issue. Without the branch we could
+            // miss a newer handoff registered under a different issue number.
             let branch = if branch.is_empty() {
                 infos
                     .iter()
@@ -718,6 +718,9 @@ async fn execute<G: Gh>(
             } else {
                 branch
             };
+            if branch.is_empty() {
+                return deliver(bus, lease, item.seq, None, forward(fallback, item)).await;
+            }
             let current =
                 |trees: &[TreeRecord]| state::current_seats(trees, repo, branch, *issue, &[], &[]);
             let owners = current(&bus.trees().await?);
