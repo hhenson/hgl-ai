@@ -418,10 +418,13 @@ async fn a_held_landing_lock_is_refreshed() {
         .await;
 }
 
+/// `merge-async`'s answer for a merge done at once.
+const MERGED_ASYNC: &str = "{\"status\":\"merged\",\"details\":{\"message\":\"merged\"}}";
+
 /// A scripted GitHub under which the gate merges `alpha#7` at `HEAD`.
 fn mergeable() -> FakeGh {
     FakeGh::default()
-        .on("pulls/7/merge", "{\"merged\":true}")
+        .on("pulls/7/merge-async", MERGED_ASYNC)
         .on("pulls/7/files", &fixture("pr-files.json"))
         .on(
             "Accept: application/vnd.github.v3.diff",
@@ -430,6 +433,8 @@ fn mergeable() -> FakeGh {
         .on("pulls/7", &fixture("pr-open.json"))
         .on("issues/7/comments", &fixture("comments-clean.json"))
         .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+        .on("check-runs", "{\"check_runs\":[]}")
+        .on("/status?per_page", "{\"statuses\":[]}")
         .on(
             "git/ref/heads/main",
             "{\"object\":{\"sha\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"}}",
@@ -729,7 +734,7 @@ async fn authored_and_reviewed(b: &Bus) {
 fn landing_gh(after: impl FnOnce(FakeGh) -> FakeGh) -> FakeGh {
     let main = "{\"object\":{\"sha\":\"0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a\"}}";
     let gh = FakeGh::default()
-        .on("pulls/7/merge", "{\"merged\":true}")
+        .on("pulls/7/merge-async", MERGED_ASYNC)
         .on("pulls/7/files", &fixture("pr-files.json"))
         .on(
             "Accept: application/vnd.github.v3.diff",
@@ -737,6 +742,8 @@ fn landing_gh(after: impl FnOnce(FakeGh) -> FakeGh) -> FakeGh {
         )
         .on("issues/7/comments", &fixture("comments-clean.json"))
         .on("compare/", "{\"ahead_by\":0,\"files\":[]}")
+        .on("check-runs", "{\"check_runs\":[]}")
+        .on("/status?per_page", "{\"statuses\":[]}")
         .on(
             "graphql",
             "{\"data\":{\"repository\":{\"pullRequest\":{\"reviewThreads\":{\"nodes\":[]}}}}}",
@@ -771,6 +778,80 @@ fn posts(gh: &FakeGh, what: &str) -> usize {
         .count()
 }
 
+/// An accepted `merge-async` still pending at the deadline (#21): not refused, the landing
+/// record is kept and the lock released; a later run that finds the pull request merged
+/// finishes the landing.
+#[tokio::test]
+async fn a_merge_still_pending_keeps_its_record() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into()];
+    s.pins = vec![];
+    let o = land::LandOpts {
+        timeout: Duration::from_millis(50),
+        ..land::LandOpts::default()
+    };
+    let pending =
+        "{\"status\":\"pending\",\"details\":{\"uuid\":\"u-1\",\"merge_method\":\"merge\"}}";
+    let gh = mergeable()
+        .once("pulls/7/merge-async --input", pending)
+        .on("merge-async/u-1", pending);
+    // The rules above go first: `mergeable` answers the merge as done.
+    gh.rules.lock().unwrap().rotate_right(2);
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Wait,
+        "{}",
+        l.outcome.line
+    );
+    assert!(
+        l.outcome.line.contains("merge accepted, not done yet"),
+        "{}",
+        l.outcome.line
+    );
+    assert!(!l.outcome.line.contains("refused"), "{}", l.outcome.line);
+    let rec = crate::progress::read(&b, "alpha", 7)
+        .await
+        .unwrap()
+        .expect("the record is kept");
+    assert_eq!((rec.head.as_str(), rec.merge.as_deref()), (HEAD, None));
+    // The lock is free again.
+    LandLock::acquire(&b, "alpha", "other", Duration::ZERO)
+        .await
+        .unwrap()
+        .release()
+        .await;
+    // GitHub merged it meanwhile: the next run finishes the landing without merging again.
+    let gh = landing_gh(|g| g);
+    gh.rules
+        .lock()
+        .unwrap()
+        .retain(|r| r.0 != "pulls/7" || !r.2);
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Resumed,
+        "{}",
+        l.outcome.line
+    );
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 0);
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
 /// Carbon's check 4 (hgl-ai#7): the read right after the merge fails (one HTTP 502). The
 /// retry finds the pull request merged and finishes its landing (`landed.log`, `main`, the
 /// notes, the comment) instead of reporting it merged with nothing recorded; a third run
@@ -789,7 +870,7 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         .await
         .unwrap_err();
     assert!(e.to_string().contains("HTTP 502"), "{e}");
-    assert_eq!(posts(&gh, "pulls/7/merge"), 1, "merged");
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "merged");
     let rec = crate::progress::read(&b, "alpha", 7)
         .await
         .unwrap()
@@ -809,7 +890,7 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         l.outcome.line
     );
     assert!(l.outcome.kind.satisfied());
-    assert_eq!(posts(&gh, "pulls/7/merge"), 1, "not merged again");
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "not merged again");
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "{log}");
     assert!(
@@ -894,5 +975,5 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
     assert!(b.state_get(state::KEY_MAIN).await.unwrap().is_some());
     assert_eq!(landed_notes(&b).await.len(), 3);
     assert_eq!(posts(&gh, "issues/7/comments"), 1);
-    assert_eq!(posts(&gh, "pulls/7/merge"), 1);
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1);
 }

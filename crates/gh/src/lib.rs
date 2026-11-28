@@ -24,6 +24,7 @@ pub mod exec;
 pub mod gate;
 pub mod land;
 pub mod lock;
+pub mod merge;
 pub mod pins;
 pub mod progress;
 pub mod release;
@@ -97,6 +98,8 @@ pub struct GateRules {
     pub receipt: bool,
     pub global_paths: Vec<String>,
     pub verdicts: Vec<String>,
+    /// Check names that must be present and passed (ROLE-20).
+    pub required_checks: Vec<String>,
     pub relax_paths: Vec<Regex>,
     pub relax_required: Vec<String>,
     pub relax_optional: Vec<Regex>,
@@ -204,6 +207,7 @@ impl Settings {
             receipt: r.review_receipt,
             global_paths,
             verdicts: r.verdicts.clone(),
+            required_checks: r.checks.clone(),
             // Checked in `from_config`.
             relax_paths: regexes("relax_paths", &r.relax_paths).unwrap_or_default(),
             relax_required: r.relax_required.clone(),
