@@ -420,7 +420,11 @@ fn land_opts(o: &PinOpts, what: Option<String>) -> LandOpts {
 /// GitHub shows merged. An intent whose pull request is not merged is left to the sync
 /// itself; any other wrapper pull request's landing to its own command, which knows its
 /// notes and comment.
-async fn unfinished<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<Vec<(u64, String)>> {
+pub(crate) async fn unfinished<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: &Bus,
+) -> Result<Vec<(u64, String)>> {
     let prefix = progress::key(&s.wrapper, 0);
     let prefix = prefix.trim_end_matches('0');
     let mut out = Vec::new();
@@ -432,10 +436,20 @@ async fn unfinished<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<Vec<(u64, 
             continue;
         };
         let pr = gate::fetch_pr(gh, s, &s.wrapper, n).await?;
-        if !is_pin_branch(s, &pr.branch) || (p.merge.is_none() && !pr.merged) {
+        if !is_pin_branch(s, &pr.branch) {
             continue;
         }
-        out.push((n, if p.head.is_empty() { pr.head } else { p.head }));
+        // Merged as its record intended (its head into `main`, the merge recorded if any):
+        // anything else is no pin landing to finish.
+        match gate::confirm_merge(&pr, &p.head, p.merge()) {
+            gate::Confirm::AsIntended(m) => out.push((n, m.head().to_string())),
+            c if pr.merged => tracing::warn!(
+                "{}#{n}: a pin landing record, but the pull request is {}; left",
+                s.wrapper,
+                c.otherwise(&p.head)
+            ),
+            _ => {}
+        }
     }
     Ok(out)
 }

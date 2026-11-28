@@ -349,6 +349,15 @@ lease.
 `gh merge-if-clean` and `gh release watch` hold it from before the gate until
 the merge, `landed.log`, `main` and the `landed` notes are done.
 
+A merge counts only when a pull request read in the same command shows it merged as
+the landing intended (`gate::confirm_merge`): into `main`, at the head the record's
+intent named (with no record, the head asked for), with a merge commit equal to the
+one recorded in the record or `landed.log`, if any. Anything else, another head, another
+base or another merge commit, is `BLOCKED` naming what GitHub shows, never `MERGED`; a
+head other than the one asked for is not adopted, and asking with the merged head finds
+it. No step after a merge runs without that confirmation, and a record's `merge` is
+written only from it.
+
 Each step after the merge (`landed.log`, `main`, the `landed` notes, the comment;
 then, for `gh land`, the pins) is recorded in `landing.<repo>.<pr>` as it is done.
 The same command run again finds the pull request merged and does only the steps
@@ -359,11 +368,11 @@ lock) gives `PARTIAL` (exit 3): the merge commit, the steps not done, the error,
 "run the same command again to finish"; the record is kept. Without `--json` the
 lines of the steps done follow it. An unreachable hub is still exit 10. Before it
 reads the pins, `gh pins sync` (and so `gh land`) finishes the landing of any pin pull
-request (its branch the pin branch) whose record shows it merged, or that GitHub shows
-merged; it is not left behind pins that read current. One another sync finished first
+request (its branch the pin branch) that GitHub shows merged as its record intended;
+it is not left behind pins that read current. One another sync finished first
 is done, and the sync goes on to the pins. Its dry run reads the hub for them too. A pull
-request found merged with neither a record nor a `landed.log` line has every step
-done then. `main` is written only whole: a failed read is tried three times, then the
+request found merged at the head asked for with neither a record nor a `landed.log`
+line has every step done then. `main` is written only whole: a failed read is tried three times, then the
 landing fails; a repository with no `main` (HTTP 404) is left out with a warning.
 
 `HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream

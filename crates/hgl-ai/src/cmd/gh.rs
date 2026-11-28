@@ -634,13 +634,12 @@ mod tests {
     /// hgl-ai#133: a `PARTIAL` at the command line keeps the lines of the steps done.
     #[test]
     fn a_partial_keeps_its_lines() {
-        let outcome = hgl_ai_gh::gate::Outcome {
-            kind: Kind::Partial,
-            line: "alpha #7 is merged at 01e99ea5, but the comment is not done (x); run the same command again to finish PARTIAL".into(),
-            retry: false,
-            merge_commit: None,
-            head: String::new(),
-        };
+        let outcome = hgl_ai_gh::gate::Outcome::new(
+            Kind::Partial,
+            "alpha #7 is merged at 01e99ea5, but the comment is not done (x); run the same command again to finish PARTIAL".into(),
+            false,
+            "",
+        );
         let l = Landing {
             outcome,
             after: vec!["recorded alpha #7".into(), "the pins are not raised".into()],
