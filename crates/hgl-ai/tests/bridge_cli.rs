@@ -1076,3 +1076,106 @@ fn running(pid: i32) -> bool {
                 .is_some_and(|i| !s[i + 1..].trim_start().starts_with('Z'))
         })
 }
+
+#[test]
+fn pending_review_priority_orders_live_turns() {
+    let d = Scratch::new("priority");
+    let Some(hub) = Hub::start(&d.0) else { return };
+    let g = git(&d.0);
+    let (_, seed) = remote(&g, &d.0, "demo");
+    let head = g
+        .run(&seed, ["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let token = d.0.join("hub.token");
+    std::fs::write(&token, format!("{}\n", hub.token)).unwrap();
+    let (mut cfg, p) = config(&d.0, &hub.url, &token);
+    cfg.seats.push(SeatConfig {
+        name: Seat::new("r1").unwrap(),
+        role: Role::Reviewer,
+        binding: Binding {
+            runtime: Runtime::Codex,
+            family: None,
+            tier: Some(Tier::Fast),
+            model: None,
+            effort: None,
+        },
+        fallback: vec![],
+        memcap_gb: Some(4),
+        headless: false,
+    });
+    cfg.save(&p).unwrap();
+    assert!(hgl(&p, &["init"]).output().unwrap().status.success());
+    let bin = d.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = d.0.join("calls");
+    let release = d.0.join("release");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bridge/fixtures/codex-ok.jsonl");
+    let script = format!(
+        "#!/bin/sh\npwd >> '{}'\nwhile [ ! -e '{}' ]; do sleep 0.1; done\ncat '{}'\n",
+        calls.display(),
+        release.display(),
+        fixture.display()
+    );
+    std::fs::write(bin.join("codex"), script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut bridge = hgl(&p, &["bridge", "run", "--seat", "r1"]);
+    isolate(&mut bridge, &d.0);
+    let log = std::fs::File::create(d.0.join("bridge.log")).unwrap();
+    let _daemon = Daemon(
+        bridge
+            .env("PATH", path)
+            .env("HGL_AI_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let bridge_log = || std::fs::read_to_string(d.0.join("bridge.log")).unwrap_or_default();
+    until("reviewer advertised", 20, &bridge_log, || {
+        out(&hgl(&p, &["hosts"]).output().unwrap()).contains("r1 reviewer/codex")
+    });
+    let send = |issue: &str, high: bool| {
+        let mut args = vec![
+            "note", "send", "--from", "claude", "--to", "r1", "--kind", "review", "--repo", "demo",
+            "--issue", issue, "--head", &head, "--body", "review",
+        ];
+        if high {
+            args.extend(["--priority", "high"]);
+        }
+        let o = hgl(&p, &args).output().unwrap();
+        assert!(o.status.success(), "{}", err(&o));
+    };
+    send("1", false);
+    until("first turn started", 30, &bridge_log, || calls.exists());
+    send("2", false);
+    send("3", false);
+    send("4", true);
+    // Allow the bridge to receive all three while the first turn is busy.
+    std::thread::sleep(Duration::from_secs(2));
+    std::fs::write(release, "go").unwrap();
+    until("four turns", 60, &bridge_log, || {
+        std::fs::read_to_string(&calls).is_ok_and(|s| s.lines().count() == 4)
+    });
+    let got = std::fs::read_to_string(calls).unwrap();
+    let order: Vec<_> = got
+        .lines()
+        .map(|line| line.split('/').rev().nth(1).unwrap())
+        .collect();
+    assert_eq!(
+        order,
+        [
+            "demo-1-review",
+            "demo-4-review",
+            "demo-2-review",
+            "demo-3-review"
+        ]
+    );
+}

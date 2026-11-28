@@ -1809,10 +1809,9 @@ async fn landed_drops_the_queued_notes_of_its_task() {
     );
     eventually("the turn of demo#11 runs", || h.calls("codex").len() == 1).await;
     // Queued behind the running turn, then ended before it could start.
-    let a = h.bus.push(
-        "w1",
-        note(Kind::Assign, "w1", 12, "[claude] Assign: demo#12 Moot"),
-    );
+    let mut moot = note(Kind::Assign, "w1", 12, "[claude] Assign: demo#12 Moot");
+    moot.priority = hgl_ai_proto::NotePriority::High;
+    let a = h.bus.push("w1", moot);
     let s = h.bus.push(
         "w1",
         note(Kind::Sendback, "w1", 12, "[claude] Sendback: demo#12"),
@@ -3088,5 +3087,133 @@ async fn refusal_after_checkout_change_keeps_the_author() {
     eventually("fallback completed", || h.bus.events(seq) == [Ev::Ack]).await;
     let f = hgl_ai_tree::read_task(&h.work().join("w1/demo-986")).unwrap();
     assert!(f.families.contains(&Family::Gpt));
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn followup_turns_precede_high_priority_new_work() {
+    let h = harness();
+    let gate = h.calls.join("go");
+    h.script("codex", &format!("case \"$(pwd)\" in *demo-11*) while [ ! -e '{}' ]; do sleep 0.05; done;; esac\ncat '{}'", gate.display(), fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let busy = h.bus.push("w1", note(Kind::Assign, "w1", 11, "busy"));
+    eventually("busy turn", || h.calls("codex").len() == 1).await;
+    let mut high = note(Kind::Assign, "w1", 12, "new");
+    high.priority = hgl_ai_proto::NotePriority::High;
+    let new = h.bus.push("w1", high);
+    let followup = h.bus.push("w1", note(Kind::Sendback, "w1", 13, "sendback"));
+    eventually("both queued", || {
+        h.bus.progressed(new) && h.bus.progressed(followup)
+    })
+    .await;
+    std::fs::write(&gate, "go").unwrap();
+    eventually("all acked", || {
+        h.bus.events(busy) == [Ev::Ack]
+            && h.bus.events(new) == [Ev::Ack]
+            && h.bus.events(followup) == [Ev::Ack]
+    })
+    .await;
+    let calls = h.calls("codex");
+    assert!(calls[1].cwd.contains("demo-13"), "{}", calls[1].cwd);
+    assert!(calls[2].cwd.contains("demo-12"), "{}", calls[2].cwd);
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rereview_precedes_high_priority_new_review() {
+    let h = harness();
+    let head = h
+        .git
+        .run(&h.seed, ["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let gate = h.calls.join("go");
+    h.script("claude", &format!("case \"$(pwd)\" in *demo-11*) while [ ! -e '{}' ]; do sleep 0.05; done;; esac\ncat '{}'", gate.display(), fixture("claude-ok.jsonl")));
+    let (tx, j) = h.start(&["r1"]);
+    let review = |issue| {
+        let mut n = note(Kind::Review, "r1", issue, "review");
+        n.head = Some(head.clone());
+        n
+    };
+    let first = h.bus.push("r1", review(13));
+    eventually("first review", || h.bus.events(first) == [Ev::Ack]).await;
+    let busy = h.bus.push("r1", review(11));
+    eventually("busy turn", || h.calls("claude").len() == 2).await;
+    let mut high = review(12);
+    high.priority = hgl_ai_proto::NotePriority::High;
+    let new = h.bus.push("r1", high);
+    let again = h.bus.push("r1", review(13));
+    eventually("both queued", || {
+        h.bus.progressed(new) && h.bus.progressed(again)
+    })
+    .await;
+    std::fs::write(&gate, "go").unwrap();
+    eventually("all acked", || {
+        h.bus.events(busy) == [Ev::Ack]
+            && h.bus.events(new) == [Ev::Ack]
+            && h.bus.events(again) == [Ev::Ack]
+    })
+    .await;
+    let calls = h.calls("claude");
+    assert!(calls[2].cwd.contains("demo-13-review"), "{}", calls[2].cwd);
+    assert!(calls[3].cwd.contains("demo-12-review"), "{}", calls[3].cwd);
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn closed_drops_a_queued_high_priority_turn() {
+    let h = harness();
+    let gate = h.calls.join("go");
+    h.script(
+        "codex",
+        &format!(
+            "while [ ! -e '{}' ]; do sleep 0.05; done\ncat '{}'",
+            gate.display(),
+            fixture("codex-ok.jsonl")
+        ),
+    );
+    let (tx, j) = h.start(&["w1"]);
+    let busy = h.bus.push("w1", note(Kind::Assign, "w1", 11, "busy"));
+    eventually("busy turn", || h.calls("codex").len() == 1).await;
+    let mut high = note(Kind::Assign, "w1", 12, "moot");
+    high.priority = hgl_ai_proto::NotePriority::High;
+    let pending = h.bus.push("w1", high);
+    let closed = h.bus.push("w1", note(Kind::Closed, "w1", 12, "closed"));
+    eventually("closed acked", || h.bus.events(closed) == [Ev::Ack]).await;
+    assert_eq!(h.bus.events(pending), [Ev::Ack]);
+    std::fs::write(&gate, "go").unwrap();
+    eventually("busy acked", || h.bus.events(busy) == [Ev::Ack]).await;
+    assert_eq!(h.calls("codex").len(), 1);
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grouped_notes_keep_stream_order_after_late_delivery() {
+    let h = harness();
+    let gate = h.calls.join("go");
+    h.script("codex", &format!("case \"$(pwd)\" in *demo-11*) while [ ! -e '{}' ]; do sleep 0.05; done;; esac\ncat '{}'", gate.display(), fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let busy = h.bus.push("w1", note(Kind::Assign, "w1", 11, "busy"));
+    eventually("busy turn", || h.calls("codex").len() == 1).await;
+    let older = note(Kind::Assign, "w1", 12, "older-marker");
+    let a = h.bus.push("nobody", older.clone());
+    let b = h
+        .bus
+        .push("w1", note(Kind::Question, "w1", 12, "newer-marker"));
+    eventually("newer queued", || h.bus.progressed(b)).await;
+    h.bus.redeliver("w1", a, older);
+    eventually("older queued", || h.bus.progressed(a)).await;
+    std::fs::write(&gate, "go").unwrap();
+    eventually("both acked", || {
+        h.bus.events(busy) == [Ev::Ack]
+            && h.bus.events(a) == [Ev::Ack]
+            && h.bus.events(b) == [Ev::Ack]
+    })
+    .await;
+    let calls = h.calls("codex");
+    assert!(
+        calls[1].stdin.find("older-marker").unwrap() < calls[1].stdin.find("newer-marker").unwrap()
+    );
     stop(tx, j).await;
 }

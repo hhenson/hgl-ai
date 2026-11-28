@@ -189,11 +189,11 @@ pub fn check_head(h: &str) -> Result<(), ProtoError> {
 }
 
 macro_rules! string_enum {
-    ($(#[$m:meta])* $name:ident, $what:literal, { $($var:ident => $s:literal),+ $(,)? }) => {
+    ($(#[$m:meta])* $name:ident, $what:literal, { $($(#[$vm:meta])* $var:ident => $s:literal),+ $(,)? }) => {
         $(#[$m])*
         #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(rename_all = "lowercase")]
-        pub enum $name { $($var),+ }
+        pub enum $name { $($(#[$vm])* $var),+ }
         impl $name {
             pub const ALL: &'static [$name] = &[$($name::$var),+];
             pub fn as_str(self) -> &'static str { match self { $($name::$var => $s),+ } }
@@ -208,6 +208,17 @@ macro_rules! string_enum {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.write_str(self.as_str()) }
         }
     };
+}
+
+string_enum!(
+    /// Priority when choosing a seat’s next pending turn.
+    #[derive(Default)]
+    NotePriority, "note priority", { #[default] Normal => "normal", High => "high" });
+
+impl NotePriority {
+    fn is_normal(&self) -> bool {
+        *self == Self::Normal
+    }
 }
 
 string_enum!(
@@ -333,6 +344,9 @@ pub struct Note {
     #[serde(default)]
     pub issue: u64,
     pub kind: Kind,
+    /// Missing on older notes means normal priority.
+    #[serde(default, skip_serializing_if = "NotePriority::is_normal")]
+    pub priority: NotePriority,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub head: Option<String>,
     /// Base branch or commit for `assign`; merge commit for `landed`.
@@ -387,6 +401,7 @@ impl Note {
             repo: None,
             issue: 0,
             kind,
+            priority: NotePriority::Normal,
             head: None,
             base: None,
             by: None,

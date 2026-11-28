@@ -1134,8 +1134,46 @@ impl<B: BusApi> Bridge<B> {
                 *h = true;
             }
         }
-        let idx = (0..plans.len())
-            .find(|&i| !held[i] && st.busy.get(&plans[i].target).is_none_or(|u| *u <= now))?;
+        // Review trees may belong to a prior host of this seat. The hub registry
+        // supplies their identity without relying on that host's filesystem.
+        let review_trees = if st.pending.iter().any(|d| d.note().kind == Kind::Review) {
+            self.bus.trees().await.unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        // Rank whole eligible turns: sendbacks and reviews of an existing review tree
+        // precede new work, then high priority precedes normal. Ties keep stream order.
+        let mut best: Option<(usize, bool, bool, u64)> = None;
+        for i in 0..plans.len() {
+            if held[i] || st.busy.get(&plans[i].target).is_some_and(|u| *u > now) {
+                continue;
+            }
+            let mut followup = false;
+            let mut high = false;
+            let mut first = u64::MAX;
+            for j in 0..plans.len() {
+                if held[j] || plans[j].target != plans[i].target {
+                    continue;
+                }
+                let note = st.pending[j].note();
+                first = first.min(st.pending[j].seq());
+                followup |= note.kind == Kind::Sendback
+                    || (note.kind == Kind::Review
+                        && note.task().is_some_and(|task| {
+                            review_trees
+                                .iter()
+                                .any(|r| r.seat == *seat.name() && r.task == task && r.review)
+                                || self.trees.existing(seat.name(), &task, true).is_some()
+                        }));
+                high |= note.priority == hgl_ai_proto::NotePriority::High;
+            }
+            if best.is_none_or(|(_, f, h, seq)| {
+                (followup, high) > (f, h) || ((followup, high) == (f, h) && first < seq)
+            }) {
+                best = Some((i, followup, high, first));
+            }
+        }
+        let idx = best?.0;
         let target = plans[idx].target.clone();
         let mut group = Vec::new();
         let mut creates = Vec::new();
@@ -1149,6 +1187,8 @@ impl<B: BusApi> Bridge<B> {
             }
         }
         st.pending = rest;
+        // A deferred or redelivered note may have arrived after a newer one.
+        group.sort_by_key(|d| d.seq());
         if let Target::Tree { task, review } = &target {
             // A turn of the task after its end is a restart: the tree is its now, not a
             // removal still owed (older notes of the task are moot, so these are later).
