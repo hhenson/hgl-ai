@@ -146,26 +146,67 @@ pub async fn verdict_put(
     v.main = base.clone();
     let key = verdict_key(&job.repo, job.issue, name, &job.head, base, recipe);
     let text = v.render();
+    // Legacy writers arbitrate through HGL_STATE. If the new bucket already has a
+    // final value, use that value instead of introducing a contradictory legacy one.
+    let mut proposed = false;
     for _ in 0..16 {
-        let cur = bus.state_get(&key).await?;
-        let old = cur.as_ref().and_then(|e| VerdictValue::parse(&e.value));
-        if old
-            .as_ref()
-            .is_some_and(|o| o.judged() && o.is_for(&job.head, base))
-        {
-            return Ok(false);
+        let new = bus.verdict_get(&key).await?;
+        let old = bus.state_get(&key).await?;
+        let final_value = |value: &str| {
+            VerdictValue::parse(value).is_some_and(|v| v.judged() && v.is_for(&job.head, base))
+        };
+        let legacy_final = old.as_ref().is_some_and(|e| final_value(&e.value));
+        let new_final = new.as_ref().is_some_and(|e| final_value(&e.value));
+        if legacy_final && new_final {
+            // Existing conflicting final values cannot safely be rewritten.
+            return Ok(old.as_ref().is_some_and(|e| e.value == text)
+                && new.as_ref().is_some_and(|e| e.value == text));
+        }
+        let desired = if legacy_final {
+            &old.as_ref().expect("legacy final").value
+        } else if new_final {
+            &new.as_ref().expect("new final").value
+        } else if proposed {
+            match &old {
+                Some(e) => &e.value,
+                None => return Ok(false),
+            }
+        } else {
+            &text
+        };
+        if old.as_ref().is_none_or(|e| e.value != *desired) {
+            match bus
+                .state_update(&key, desired, old.as_ref().map_or(0, |e| e.revision))
+                .await
+            {
+                Ok(_) => {
+                    proposed = true;
+                    continue;
+                }
+                Err(BusError::Conflict { .. }) => continue,
+                Err(e) => return Err(e.into()),
+            }
+        }
+        if new.as_ref().is_some_and(|e| e.value == *desired) {
+            return Ok(*desired == text);
+        }
+        // Do not mirror a stale non-final value over a newer value. A concurrent
+        // mirror after this check changes the new bucket revision and fails our CAS.
+        let latest = bus.state_get(&key).await?;
+        if latest.as_ref().map(|e| e.revision) != old.as_ref().map(|e| e.revision) {
+            continue;
         }
         match bus
-            .state_update(&key, &text, cur.map(|e| e.revision).unwrap_or(0))
+            .verdict_update(&key, desired, new.as_ref().map_or(0, |e| e.revision))
             .await
         {
-            Ok(_) => return Ok(true),
+            Ok(_) => return Ok(*desired == text),
             Err(BusError::Conflict { .. }) => continue,
             Err(e) => return Err(e.into()),
         }
     }
     Err(StoreError::Other(format!(
-        "{key} kept changing; not written"
+        "{key} kept changing; not mirrored"
     )))
 }
 
@@ -208,10 +249,14 @@ pub async fn verdicts_purge(
         }
     }
     let keys = bus.state_keys(&verdict_prefix(repo, pr)).await?;
+    let new_keys = bus.verdict_keys(&verdict_prefix(repo, pr)).await?;
     for k in &keys {
         bus.state_del(k).await?;
     }
-    Ok(Some(keys.len()))
+    for k in &new_keys {
+        bus.verdict_del(k).await?;
+    }
+    Ok(Some(keys.len() + new_keys.len()))
 }
 
 /// Sweep the verdict keys: those the hub wrote more than `max_age` seconds before `now`
@@ -236,6 +281,17 @@ pub async fn verdicts_sweep(
             prs.insert(p);
         }
     }
+    for k in bus.verdict_keys("verdict.").await? {
+        let Some(e) = bus.verdict_get(&k).await? else {
+            continue;
+        };
+        if now - e.created > max_age {
+            bus.verdict_del(&k).await?;
+            n += 1;
+        } else if let Some(p) = verdict_pr(&k) {
+            prs.insert(p);
+        }
+    }
     if let Some(ended) = ended {
         for (repo, pr) in prs {
             n += verdicts_purge(bus, ended, &repo, pr).await?.unwrap_or(0);
@@ -249,6 +305,11 @@ pub async fn verdicts_sweep(
 /// probe key `verdict._probe.0.<host>`, no repository's, written and deleted.
 pub async fn may_write_verdicts(bus: &Bus, host: &str) -> Result<bool, StoreError> {
     let key = format!("verdict._probe.0.{host}");
+    match bus.verdict_put(&key, "probe").await {
+        Ok(_) => bus.verdict_del(&key).await?,
+        Err(BusError::Denied { .. }) => return Ok(false),
+        Err(e) => return Err(e.into()),
+    }
     match bus.state_put(&key, "probe").await {
         Ok(_) => {
             bus.state_del(&key).await?;

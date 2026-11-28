@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_config::Config;
-use hgl_ai_proto::build::KV_BUILD;
+use hgl_ai_proto::build::{KV_BUILD, KV_VERDICTS};
 use hgl_ai_proto::{
     KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES,
     KV_USAGE, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
@@ -94,8 +94,18 @@ impl Hub for BusHub {
             }
         }
         for b in [
-            KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
-            KV_USAGE, KV_BUILD, KV_SLACK,
+            KV_STATE,
+            KV_HOSTS,
+            KV_TREES,
+            KV_LOCKS,
+            KV_ENDED,
+            KV_THREADS,
+            KV_METRICS,
+            KV_CONSOLE,
+            KV_USAGE,
+            KV_BUILD,
+            KV_SLACK,
+            KV_VERDICTS,
         ] {
             if js.get_key_value(b).await.is_err() {
                 missing.push(b.to_string());
@@ -257,7 +267,8 @@ mod live {
                 KV_CONSOLE,
                 KV_USAGE,
                 KV_BUILD,
-                KV_SLACK
+                KV_SLACK,
+                KV_VERDICTS
             ]
         );
 
@@ -280,8 +291,18 @@ mod live {
             .unwrap();
         }
         for b in [
-            KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
-            KV_USAGE, KV_BUILD, KV_SLACK,
+            KV_STATE,
+            KV_HOSTS,
+            KV_TREES,
+            KV_LOCKS,
+            KV_ENDED,
+            KV_THREADS,
+            KV_METRICS,
+            KV_CONSOLE,
+            KV_USAGE,
+            KV_BUILD,
+            KV_SLACK,
+            KV_VERDICTS,
         ] {
             js.create_key_value(async_nats::jetstream::kv::Config {
                 bucket: b.into(),
