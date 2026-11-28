@@ -188,6 +188,7 @@ struct Posts {
     rate_limit_open: Option<u64>,
     socket_opens: usize,
     history_calls: usize,
+    history_error: Option<String>,
     next_post_skew: i64,
 }
 
@@ -369,6 +370,9 @@ async fn history(
     assert_eq!(query["include_all_metadata"], "true");
     let mut posts = state.posts.lock().unwrap();
     posts.history_calls += 1;
+    if let Some(code) = &posts.history_error {
+        return Json(json!({"ok": false, "error": code}));
+    }
     let oldest = query["oldest"]
         .split('.')
         .next()
@@ -1018,6 +1022,24 @@ async fn slack_and_console_share_owner_actions_once() {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[tokio::test]
+async fn startup_error_chain_keeps_only_safe_slack_error_codes() {
+    let fake = FakeSlack::start().await;
+    let web = Web::new(fake.base.clone(), "xapp-test".into(), "xoxb-test".into()).unwrap();
+    for (response, expected) in [
+        ("missing_scope", "missing_scope"),
+        ("xoxb-secret-token", "unknown_error"),
+    ] {
+        fake.state.posts.lock().unwrap().history_error = Some(response.into());
+        let error = web.verify_channel("CQA").await.unwrap_err();
+        let logged = format!("{error:#}");
+        assert!(logged.contains("checking the private Slack Q&A channel"));
+        assert!(logged.contains(&format!("conversations.history: {expected}")));
+        assert!(!logged.contains("xoxb-"));
+        assert!(!logged.contains("xapp-"));
     }
 }
 

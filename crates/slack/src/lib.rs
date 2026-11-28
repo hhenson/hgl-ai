@@ -215,7 +215,11 @@ pub async fn run(
         .await
         {
             Ok(adapter) => break adapter,
-            Err(e) => pause(&mut slack_retry, Some(e), "Slack adapter startup").await,
+            Err(e) => {
+                let delay = slack_retry.delay(Some(&e));
+                tracing::warn!(?delay, "Slack adapter startup: {e:#}");
+                sleep(delay).await;
+            }
         }
     };
     tokio::join!(adapter.outbound_loop(), adapter.socket_loop());

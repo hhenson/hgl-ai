@@ -865,6 +865,13 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 format!("`{}`", service::start_hint(env, s))
             };
             out.push(match st {
+                State::Running if s == Service::Slack => Check::ok(
+                    name,
+                    format!(
+                        "running (system); logs: {}; if missing_scope, check that the channel is private and the bot has groups:history (reinstall the app after changing scopes)",
+                        service::system_log_hint(env.os, s)
+                    ),
+                ),
                 State::Running => Check::ok(
                     name,
                     if system(s) {
@@ -1320,7 +1327,9 @@ mod tests {
         assert_eq!(get(&cs, "server user").level, Level::Ok);
         assert_eq!(get(&cs, "console credential").level, Level::Ok);
         assert_eq!(get(&cs, "service hub").detail, "running (system)");
-        assert_eq!(get(&cs, "service slack").detail, "running (system)");
+        let slack_service = &get(&cs, "service slack").detail;
+        assert!(slack_service.contains("missing_scope"));
+        assert!(slack_service.contains("private") && slack_service.contains("groups:history"));
         for file in SLACK_FILES {
             assert_eq!(get(&cs, &format!("Slack {file}")).level, Level::Ok);
         }
