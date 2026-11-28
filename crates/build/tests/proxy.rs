@@ -530,7 +530,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
 
     let mut cfg = hgl_ai_config::Config::new("lab1");
     cfg.paths.work_root = w.root.join("work").display().to_string();
-    cfg.paths.data_dir = w.root.join("data").display().to_string();
+    cfg.paths.data_dir = short_path(&w.root.join("data")).display().to_string();
     cfg.builder.local = false;
     cfg.builder.remote.push(
         toml::from_str(&format!(
