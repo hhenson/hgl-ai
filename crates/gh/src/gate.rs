@@ -260,7 +260,7 @@ pub struct Facts {
     /// How many commits `main` has that the head does not.
     pub behind: Option<u64>,
     pub bot: Option<BotView>,
-    /// The pull request's note comments, the fleet's ([`crate::bot::note_comments`]), read
+    /// The pull request's note comments, the fleet's ([`crate::bot::by_note_authors`]), read
     /// with the bot's ([`Need::BotComments`]).
     pub comments: Option<Vec<Comment>>,
     pub bot_reviews: Option<Vec<Review>>,
@@ -1116,7 +1116,7 @@ async fn fill<G: Gh>(
             let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
             f.bot = Some(BotView::of(&s.review_bot, &comments, &[]));
             // Ready is read from the fleet's comments only; the bot's view keeps them all.
-            f.comments = Some(crate::bot::note_comments(&comments, &s.note_authors));
+            f.comments = Some(crate::bot::by_note_authors(&comments, &s.note_authors));
         }
         Need::BotReviews => {
             let list =
@@ -1283,7 +1283,7 @@ async fn before_merge<G: Gh>(
         )
         .await?;
         let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
-        let comments = crate::bot::note_comments(&comments, &s.note_authors);
+        let comments = crate::bot::by_note_authors(&comments, &s.note_authors);
         if let Err(why) = ready_standing(&comments, asked) {
             return Ok(stop(Kind::Blocked, format!("at the merge: {why}"), false));
         }

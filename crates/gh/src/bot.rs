@@ -339,16 +339,6 @@ pub fn is_note_author(login: &str, authors: &[String]) -> bool {
     !login.is_empty() && authors.iter().any(|a| bare(a).eq_ignore_ascii_case(&login))
 }
 
-/// The comments of `authors` among `comments` ([`is_note_author`]): the only ones read as
-/// note comments (Ready, Sent back, Landed, a Ready's signer). Anyone can comment.
-pub fn note_comments(comments: &[Comment], authors: &[String]) -> Vec<Comment> {
-    comments
-        .iter()
-        .filter(|c| is_note_author(&c.author, authors))
-        .cloned()
-        .collect()
-}
-
 fn declared_head(first: &str) -> Option<&str> {
     DECLARED_HEAD
         .captures(first)
