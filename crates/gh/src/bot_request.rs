@@ -9,6 +9,8 @@ use crate::{
     lock::{LandLock, holder},
 };
 use hgl_ai_bus::Bus;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
@@ -17,6 +19,20 @@ pub enum Request {
     Recorded(String),
     Refused(String),
     Posted,
+}
+
+const INTENT_PREFIX: &str = "botreq.";
+
+#[derive(Debug, Serialize, Deserialize)]
+struct Intent {
+    repo: String,
+    pr: u64,
+    head: String,
+}
+
+fn intent_key(repo: &str, pr: u64, head: &str) -> String {
+    let digest = Sha256::digest(format!("{repo}\n{pr}\n{head}").as_bytes());
+    format!("{INTENT_PREFIX}{}", hex::encode(&digest[..16]))
 }
 
 /// An owner-authored exact-head request marker.
@@ -124,6 +140,10 @@ pub async fn request<G: Gh>(
                 if pull.merged || pull.state != "open" || pull.draft || pull.head != head {
                     return Ok(Request::Refused(format!("{repo}#{pr} is closed, merged, a draft, or its head moved")));
                 }
+                lock.confirm("bot review request intent").await?;
+                let intent = Intent { repo: repo.into(), pr, head: head.into() };
+                let encoded = serde_json::to_string(&intent).map_err(|e| invalid(format!("encoding bot request intent: {e}")))?;
+                crate::store::put_latest(bus, &intent_key(repo, pr, head), &encoded).await?;
                 lock.confirm("bot review request").await?;
                 let posted = exec::write(gh, "POST", &format!("repos/{}/issues/{pr}/comments", s.full(repo)), &[("body", &body(head))]).await?;
                 let created = posted["created_at"].as_str().filter(|s| !s.is_empty())
@@ -135,6 +155,8 @@ pub async fn request<G: Gh>(
         lock.confirm("bot request decision record").await?;
         let line = format!("{created} {}: bot review request for {repo}#{pr} at {head} (owner action)", s.controller);
         hgl_ai_owner::decision_once(bus, &line).await.map_err(|e| invalid(format!("request posted but decision log failed; retry to recover: {e}")))?;
+        lock.confirm("bot request intent removal").await?;
+        bus.state_del(&intent_key(repo, pr, head)).await?;
         Ok(outcome)
     }
     .await;
@@ -157,11 +179,38 @@ pub async fn pass<G: Gh>(
         .ok_or_else(|| invalid("no coordinator PR table; wait for a coordinator round"))?;
     let table = Table::parse(&entry.value);
     let mut outcomes = Vec::new();
+    let mut pending = std::collections::HashSet::new();
+    for key in bus.state_keys(INTENT_PREFIX).await? {
+        let Some(entry) = bus.state_get(&key).await? else {
+            continue;
+        };
+        let intent: Intent = serde_json::from_str(&entry.value)
+            .map_err(|e| invalid(format!("{key}: invalid bot request intent: {e}")))?;
+        validate(s, &intent.repo, intent.pr, &intent.head)?;
+        if key != intent_key(&intent.repo, intent.pr, &intent.head) {
+            return Err(invalid(format!(
+                "{key}: bot request intent key does not match its contents"
+            )));
+        }
+        pending.insert((intent.repo.clone(), intent.pr, intent.head.clone()));
+        let result = if dry_run {
+            match verify_owner(gh, s).await {
+                Ok(()) => check(gh, s, &intent.repo, intent.pr, &intent.head).await,
+                Err(e) => Err(e),
+            }
+        } else {
+            request(gh, s, bus, &intent.repo, intent.pr, &intent.head).await
+        };
+        outcomes.push((intent.repo, intent.pr, intent.head, result));
+    }
     for row in table
         .rows
         .into_iter()
         .filter(|r| !r.draft && r.bot == BotState::None && s.repos.contains(&r.repo))
     {
+        if pending.contains(&(row.repo.clone(), row.number, row.head.clone())) {
+            continue;
+        }
         let result = if dry_run {
             match verify_owner(gh, s).await {
                 Ok(()) => check(gh, s, &row.repo, row.number, &row.head).await,

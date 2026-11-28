@@ -1704,15 +1704,31 @@ async fn bot_request_failure_never_records_a_post_and_retry_repairs_log() {
             .is_err()
     );
     assert!(b.state_get("decisions.log").await.unwrap().is_none());
+    assert_eq!(b.state_keys("botreq.").await.unwrap().len(), 1);
+    // The POST may have succeeded despite its failed response. By the next coordinator
+    // round the bot is clean, or the PR has disappeared from the table altogether.
+    store::put_latest(
+        &b,
+        state::KEY_PRS,
+        &format!(
+            "# read 20261128T000000Z\nalpha\t7\t{head}\topen\tclean\t0\tpass\t20261128T000000Z\n"
+        ),
+    )
+    .await
+    .unwrap();
     let comment = serde_json::json!([{"user":{"login":"owner"}, "created_at":"2026-01-01T00:00:00Z", "body":bot_request::body(head)}]).to_string();
     let gh = FakeGh::default()
         .on("api user", r#"{"login":"owner"}"#)
         .on("--paginate", &comment);
-    assert_eq!(
-        bot_request::request(&gh, &s, &b, "alpha", 7, head)
+    let results = bot_request::pass(&gh, &s, &b, false).await.unwrap();
+    assert_eq!(results.len(), 1);
+    assert!(matches!(results[0].3, Ok(Request::Already)));
+    assert!(b.state_keys("botreq.").await.unwrap().is_empty());
+    assert!(
+        bot_request::pass(&gh, &s, &b, false)
             .await
-            .unwrap(),
-        Request::Already
+            .unwrap()
+            .is_empty()
     );
     assert!(!gh.calls().iter().any(|c| c.contains("-X POST")));
     assert!(
