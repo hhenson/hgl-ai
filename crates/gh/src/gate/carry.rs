@@ -66,7 +66,13 @@ pub(super) async fn from_remote(
         }
         // A successful remerge with the recorded tree has an empty remerge-diff.
         // The exit code also rules out conflicts even if their temporary tree was committed.
-        let automatic = run(git, &["merge-tree", "--write-tree", parent, merged]).await?;
+        // Read the tracked attributes Git would see when merging from the first parent.
+        let automatic = run(
+            git,
+            &["merge-tree", "--write-tree", parent, merged],
+            Some(parent),
+        )
+        .await?;
         if automatic.status.code() == Some(1) {
             return Ok(None);
         }
@@ -82,7 +88,7 @@ pub(super) async fn from_remote(
 }
 
 async fn success(git: &Path, args: &[&str]) -> Proof<String> {
-    stdout(args[0], run(git, args).await?)
+    stdout(args[0], run(git, args, None).await?)
 }
 
 fn stdout(command: &str, out: Output) -> Proof<String> {
@@ -93,7 +99,7 @@ fn stdout(command: &str, out: Output) -> Proof<String> {
     String::from_utf8(out.stdout).map_err(|_| format!("git {command} gave invalid output"))
 }
 
-async fn run(git: &Path, args: &[&str]) -> Proof<Output> {
+async fn run(git: &Path, args: &[&str], attr_source: Option<&str>) -> Proof<Output> {
     let mut cmd = tokio::process::Command::new("git");
     cmd.current_dir(git)
         .arg("--git-dir=.")
@@ -109,13 +115,17 @@ async fn run(git: &Path, args: &[&str]) -> Proof<Output> {
         .stdin(Stdio::null())
         .kill_on_drop(true);
     if args[0] != "fetch" {
-        // Fetch uses the host's Git authentication. The remerge uses Git's default drivers.
+        // Fetch uses the host's Git authentication. The remerge isolates host settings.
         cmd.args(["-c", "core.attributesFile=/dev/null"])
             .env_remove("GIT_CONFIG_PARAMETERS")
             .env_remove("GIT_CONFIG_COUNT")
+            .env_remove("GIT_ATTR_SOURCE")
             .env("GIT_CONFIG_NOSYSTEM", "1")
             .env("GIT_CONFIG_GLOBAL", git.join("unused-global-config"))
             .env("GIT_ATTR_NOSYSTEM", "1");
+    }
+    if let Some(commit) = attr_source {
+        cmd.arg(format!("--attr-source={commit}"));
     }
     let command = args[0];
     tokio::time::timeout(Duration::from_secs(60), cmd.args(args).output())
@@ -272,5 +282,25 @@ mod tests {
             "main",
         ]);
         assert_eq!(repo.carry(&[&reviewed]).await, None);
+    }
+
+    #[tokio::test]
+    async fn each_merge_uses_its_first_parents_tracked_attributes() {
+        let repo = History::new();
+        repo.advance_main(".gitattributes", "common merge=union\n");
+        repo.git(&["merge", "--ff-only", "main"]);
+        let reviewed = repo.commit("common", "pr version\n");
+        repo.advance_main("common", "main version\n");
+        // This update merges cleanly with the first parent's union driver. It changes the
+        // attributes for later merges to use the text driver.
+        repo.advance_main(".gitattributes", "common merge=text\n");
+        repo.git(&["merge", "--no-ff", "--no-edit", "main"]);
+        repo.advance_main("main", "further advance");
+        repo.git(&["merge", "--no-ff", "--no-edit", "main"]);
+
+        assert_eq!(
+            repo.carry(&[&reviewed]).await.as_deref(),
+            Some(reviewed.as_str())
+        );
     }
 }

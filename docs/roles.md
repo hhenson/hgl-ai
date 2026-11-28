@@ -87,6 +87,7 @@ Open decisions are issues in this repository.
   with an empty remerge-diff and no conflicts. A conflict or intervening
   non-merge commit requires a fresh receipt. A findings receipt at any merge
   in the chain requires a clean other-family receipt at that commit to carry.
+  The proof uses each merge's first-parent `.gitattributes` and Git 2.43 or later.
   A pull request the tool makes (the wrapper's pins) has
   no author and needs none. An agent never reviews work it wrote, paired on or
   coordinated. When no other family is available, nothing lands: same-family
