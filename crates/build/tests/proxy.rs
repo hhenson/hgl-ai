@@ -220,6 +220,10 @@ fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
     assert_eq!(r.limit, Some("time"), "{r:?}");
     assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
     let pid = std::fs::read_to_string(&pidfile).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while alive(&pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(!alive(&pid), "the remote child is gone");
 
     // A stop before the remote's pid has arrived still kills the remote tree.
