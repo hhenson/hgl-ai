@@ -44,6 +44,11 @@ pub const KV_CONSOLE: &str = "HGL_CONSOLE";
 pub fn user_inbox(nkey: &str) -> String {
     format!("_INBOX.{nkey}")
 }
+/// Where a role's account finds the hub's JetStream API on a hub with an account per role
+/// (hgl-ai#141): `$JS.API.<x>` is `JS.HUB.API.<x>`, a bucket's `$KV.<b>.<k>` is
+/// `JS.HUB.API.$KV.<b>.<k>` (a JetStream context with this API prefix writes there), and
+/// note, owner and usage subjects and acknowledgements keep their names.
+pub const HUB_API_PREFIX: &str = "JS.HUB.API";
 /// The Slack adapter's delivery state and thread mappings.
 pub const KV_SLACK: &str = "HGL_SLACK";
 /// Owner words (OWN-5).

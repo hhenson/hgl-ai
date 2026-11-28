@@ -28,6 +28,8 @@ struct Hub {
     conf: std::path::PathBuf,
     store: std::path::PathBuf,
     port: u16,
+    /// One account per role (hgl-ai#141), not one account with permissions.
+    accounts: bool,
 }
 
 impl Hub {
@@ -37,6 +39,23 @@ impl Hub {
 
     /// The hub with `edit` applied to its rendered `nats.conf`.
     fn start_with(edit: impl Fn(&Registry, String) -> String) -> Option<Hub> {
+        Hub::start_layout(false, edit)
+    }
+
+    /// The hub with one account per role (hgl-ai#141).
+    fn accounts() -> Option<Hub> {
+        Hub::start_layout(true, |_, conf| conf)
+    }
+
+    fn auth(accounts: bool, reg: &Registry) -> Auth<'_> {
+        if accounts {
+            Auth::Accounts(reg)
+        } else {
+            Auth::Users(reg)
+        }
+    }
+
+    fn start_layout(accounts: bool, edit: impl Fn(&Registry, String) -> String) -> Option<Hub> {
         let bin = std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|d| d.join("nats-server"))
             .find(|p| p.is_file());
@@ -74,7 +93,7 @@ impl Hub {
                     "127.0.0.1",
                     port,
                     &d.path().join("store"),
-                    &Auth::Users(&reg),
+                    &Hub::auth(accounts, &reg),
                 ),
             ),
         )
@@ -102,6 +121,7 @@ impl Hub {
             conf: conf_path,
             store,
             port,
+            accounts,
         })
     }
 
@@ -111,7 +131,12 @@ impl Hub {
         let reg = self.reg.lock().unwrap();
         std::fs::write(
             &self.conf,
-            render_conf("127.0.0.1", self.port, &self.store, &Auth::Users(&reg)),
+            render_conf(
+                "127.0.0.1",
+                self.port,
+                &self.store,
+                &Hub::auth(self.accounts, &reg),
+            ),
         )
         .unwrap();
         let env =
@@ -770,4 +795,511 @@ async fn own_inboxes_work_on_an_older_hub() {
             .unwrap()
             .is_some()
     );
+}
+
+// ---- One account per role (hgl-ai#141) ----------------------------------------------
+//
+// Raw JetStream requests under the hub's API prefix: `bus` uses it from hgl-ai#144.
+
+use async_nats::jetstream::{self, consumer, kv};
+use hgl_ai_install::users::{Target, access_table, local_subject};
+
+/// The user of each role with an account.
+const ROLE_USERS: [(Role, &str); 5] = [
+    (Role::Seat, "build-1"),
+    (Role::Coord, "hub-coord"),
+    (Role::Builder, "lab1-builder"),
+    (Role::Console, "console"),
+    (Role::Slack, "hub-slack"),
+];
+
+/// A NATS subject pattern matches `subject`.
+fn matches(pattern: &str, subject: &str) -> bool {
+    let (p, s): (Vec<&str>, Vec<&str>) =
+        (pattern.split('.').collect(), subject.split('.').collect());
+    for (i, t) in p.iter().enumerate() {
+        match *t {
+            ">" => return s.len() > i,
+            "*" if i < s.len() => {}
+            t if i < s.len() && s[i] == t => {}
+            _ => return false,
+        }
+    }
+    p.len() == s.len()
+}
+
+/// `pattern` with each wildcard token `token`.
+fn sample(pattern: &str, token: &str) -> String {
+    pattern
+        .split('.')
+        .map(|t| if t == "*" || t == ">" { token } else { t })
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The subject a write row publishes on in `HUB`.
+fn write_pattern(t: &Target) -> Option<String> {
+    match t {
+        Target::Keys { bucket, keys } => Some(format!("$KV.{bucket}.{keys}")),
+        Target::Subjects(s) => Some(s.clone()),
+        _ => None,
+    }
+}
+
+/// What `role` may write, as `HUB` subject patterns.
+fn writes_of(role: Role) -> Vec<String> {
+    access_table()
+        .iter()
+        .filter(|r| r.of(role).writes())
+        .filter_map(|r| write_pattern(&r.target))
+        .collect()
+}
+
+impl Hub {
+    /// `who`'s JetStream context in its own account, through the hub's API prefix.
+    async fn js_of(&self, who: &str) -> (async_nats::Client, jetstream::Context) {
+        let c = self.raw(who).await;
+        let js = jetstream::with_prefix(c.clone(), hgl_ai_proto::HUB_API_PREFIX);
+        (c, js)
+    }
+
+    /// The admin's own JetStream, in `HUB`.
+    async fn admin_js(&self) -> jetstream::Context {
+        let Credential::Nkey { seed, .. } = self.creds["hub-admin"].clone() else {
+            unreachable!()
+        };
+        let c = async_nats::ConnectOptions::with_nkey(seed)
+            .custom_inbox_prefix(self.inbox("hub-admin"))
+            .connect(&self.url)
+            .await
+            .unwrap();
+        jetstream::new(c)
+    }
+}
+
+/// The hub provisioned, with the verdict bucket (hgl-ai#145), two keys in every bucket,
+/// two messages in every stream, and the Slack adapter's link and delivery keys.
+async fn seeded(hub: &Hub) -> jetstream::Context {
+    hub.bus("hub-admin").await.provision().await.unwrap();
+    let js = hub.admin_js().await;
+    js.create_key_value(kv::Config {
+        bucket: hgl_ai_install::users::KV_VERDICTS.into(),
+        history: 5,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    let buckets: std::collections::BTreeSet<String> = access_table()
+        .into_iter()
+        .filter_map(|r| match r.target {
+            Target::Keys { bucket, .. } => Some(bucket),
+            _ => None,
+        })
+        .collect();
+    for bucket in buckets {
+        {
+            let store = js.get_key_value(&bucket).await.unwrap();
+            for k in ["seed.a", "seed.b", "links.a.b", "d.a.b.c"] {
+                store.put(k, "seed".into()).await.unwrap();
+            }
+        }
+    }
+    for s in ["hgl.notes.seed", "hgl.owner.thread.seed", "hgl.usage.seed"] {
+        for _ in 0..2 {
+            js.publish(s, "seed".into()).await.unwrap().await.unwrap();
+        }
+    }
+    js
+}
+
+/// Whether anything is stored on `subject` in `HUB`; every subject a role could write is
+/// in some stream.
+async fn stored(admin: &jetstream::Context, subject: &str) -> bool {
+    let name = admin
+        .stream_by_subject(subject)
+        .await
+        .unwrap_or_else(|e| panic!("no stream holds {subject}: {e}"));
+    let stream = admin.get_stream(&name).await.unwrap();
+    stream
+        .get_last_raw_message_by_subject(subject)
+        .await
+        .is_ok()
+}
+
+/// Up to `n` messages of one pull, within two seconds.
+async fn pull(c: &consumer::Consumer<consumer::pull::Config>, n: usize) -> Vec<jetstream::Message> {
+    let mut b = c
+        .batch()
+        .max_messages(n)
+        .expires(Duration::from_secs(2))
+        .messages()
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    while let Some(m) = b.next().await {
+        out.push(m.unwrap());
+    }
+    out
+}
+
+/// Every role reads and writes all its row gives it, across the account boundary: the
+/// hub's account info, buckets by key, by sequence and through a pull consumer, streams
+/// through a durable with acknowledgement, its feed, `HGL_OWNER` by sequence, and every
+/// write by publish and by bucket put.
+#[tokio::test]
+async fn accounts_every_role_reads_and_writes_its_rows() {
+    let Some(hub) = Hub::accounts() else { return };
+    let admin = seeded(&hub).await;
+    for (role, who) in ROLE_USERS {
+        let (_c, js) = hub.js_of(who).await;
+        for row in access_table() {
+            let a = row.of(role);
+            let what = format!("{who} ({role}) {:?} {a:?}", row.target);
+            if a.reads() {
+                match &row.target {
+                    Target::AccountInfo => {
+                        assert!(js.query_account().await.unwrap().streams > 0, "{what}");
+                    }
+                    Target::Keys { bucket, keys } => {
+                        let store = js.get_key_value(bucket).await.expect(&what);
+                        let key = if keys == ">" { "seed.a" } else { "links.a.b" };
+                        assert_eq!(
+                            store.get(key).await.expect(&what).unwrap(),
+                            "seed",
+                            "{what}"
+                        );
+                        if keys == ">" {
+                            let s = js.get_stream(format!("KV_{bucket}")).await.unwrap();
+                            let first = s.cached_info().state.first_sequence;
+                            s.direct_get(first).await.expect(&what);
+                            s.get_raw_message(first).await.expect(&what);
+                            let c = s
+                                .create_consumer(consumer::pull::Config {
+                                    ack_policy: consumer::AckPolicy::None,
+                                    filter_subject: format!("$KV.{bucket}.seed.>"),
+                                    ..Default::default()
+                                })
+                                .await
+                                .expect(&what);
+                            assert_eq!(pull(&c, 2).await.len(), 2, "a batch: {what}");
+                        } else {
+                            // Only those keys: no other key, no consumer.
+                            let r =
+                                tokio::time::timeout(Duration::from_secs(2), store.get("d.a.b.c"))
+                                    .await;
+                            assert!(!matches!(r, Ok(Ok(Some(_)))), "{what}");
+                        }
+                    }
+                    Target::Stream(name)
+                    | Target::BySequence(name)
+                    | Target::Feed { stream: name, .. } => {
+                        let s = js.get_stream(name).await.expect(&what);
+                        if !matches!(row.target, Target::Feed { .. }) {
+                            s.get_raw_message(1).await.expect(&what);
+                        }
+                        let durable = match &row.target {
+                            Target::Feed { consumer, .. } => Some(consumer.clone()),
+                            Target::Stream(_) => Some(format!("probe-{role}")),
+                            _ => None,
+                        };
+                        let Some(durable) = durable else { continue };
+                        let c = s
+                            .create_consumer(consumer::pull::Config {
+                                durable_name: Some(durable.clone()),
+                                ack_policy: consumer::AckPolicy::Explicit,
+                                ..Default::default()
+                            })
+                            .await
+                            .expect(&what);
+                        let got = pull(&c, 2).await;
+                        assert_eq!(got.len(), 2, "a batch: {what}");
+                        for m in &got {
+                            m.double_ack().await.expect(&what);
+                        }
+                        let info = admin
+                            .get_stream(name)
+                            .await
+                            .unwrap()
+                            .consumer_info(&durable)
+                            .await
+                            .unwrap();
+                        assert_eq!(info.num_ack_pending, 0, "{what}");
+                        assert_eq!(
+                            info.ack_floor.stream_sequence,
+                            got.last().unwrap().info().unwrap().stream_sequence,
+                            "{what}"
+                        );
+                    }
+                    Target::Subjects(_) => unreachable!(),
+                }
+            }
+            if a.writes() {
+                let subject = sample(&write_pattern(&row.target).unwrap(), &format!("ok-{role}"));
+                match &row.target {
+                    Target::Keys { bucket, .. } => {
+                        let key = subject.strip_prefix(&format!("$KV.{bucket}.")).unwrap();
+                        js.get_key_value(bucket)
+                            .await
+                            .expect(&what)
+                            .put(key, "ok".into())
+                            .await
+                            .expect(&what);
+                    }
+                    _ => {
+                        js.publish(subject.clone(), "ok".into())
+                            .await
+                            .expect(&what)
+                            .await
+                            .expect(&what);
+                    }
+                }
+                assert!(stored(&admin, &subject).await, "{what}");
+            }
+        }
+    }
+}
+
+/// hgl-ai#141: no role writes outside its rows, neither by publishing nor by having
+/// JetStream reply onto the subject (a request's reply, a pull's, a publish
+/// acknowledgement's), nor through a push consumer; nor does any role reach the admin's
+/// stream operations.
+#[tokio::test]
+async fn accounts_refuse_every_write_outside_a_row() {
+    let Some(hub) = Hub::accounts() else { return };
+    let admin = seeded(&hub).await;
+    let patterns: Vec<String> = access_table()
+        .iter()
+        .filter_map(|r| write_pattern(&r.target))
+        .collect();
+    for (role, who) in ROLE_USERS {
+        let (c, mut rx) = spy(&hub, who).await;
+        let js = jetstream::with_prefix(c.clone(), hgl_ai_proto::HUB_API_PREFIX);
+        let mine = writes_of(role);
+        let token = format!("probe-{role}");
+        let denied: Vec<String> = patterns
+            .iter()
+            .map(|p| sample(p, &token))
+            .filter(|s| !mine.iter().any(|m| matches(m, s)))
+            .collect();
+        assert!(!denied.is_empty(), "{who}");
+
+        // Directly, under the prefix and by the hub's own name.
+        let mut tried = std::collections::BTreeSet::new();
+        for s in &denied {
+            for subject in [local_subject(s), s.clone()] {
+                if tried.insert(subject.clone()) {
+                    c.publish(subject, "forged".into()).await.unwrap();
+                }
+            }
+        }
+        c.flush().await.unwrap();
+        let got = refusals(&mut rx, tried.len()).await;
+        for subject in &tried {
+            assert!(
+                got.iter().any(|e| e.contains(&format!("\"{subject}\""))),
+                "{who} published {subject}: {got:?}"
+            );
+        }
+
+        // By the reply route: requests the role may make, replying onto each subject.
+        let mut requests = vec![(
+            format!("{}.INFO", hgl_ai_proto::HUB_API_PREFIX),
+            String::new(),
+        )];
+        if let Some(w) = mine.first() {
+            requests.push((local_subject(&sample(w, &format!("ok-{role}"))), "x".into()));
+        }
+        let pullable = access_table().into_iter().find_map(|r| match r.target {
+            Target::Stream(s) if r.of(role).reads() => Some((s, format!("probe-{role}"))),
+            Target::Feed { stream, consumer } if r.of(role).reads() => Some((stream, consumer)),
+            _ => None,
+        });
+        let (stream, durable) = pullable.unwrap();
+        js.get_stream(&stream)
+            .await
+            .unwrap()
+            .create_consumer(consumer::pull::Config {
+                durable_name: Some(durable.clone()),
+                ack_policy: consumer::AckPolicy::Explicit,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        requests.push((
+            format!(
+                "{}.CONSUMER.MSG.NEXT.{stream}.{durable}",
+                hgl_ai_proto::HUB_API_PREFIX
+            ),
+            r#"{"batch":5,"expires":500000000}"#.into(),
+        ));
+        for (req, body) in &requests {
+            for s in &denied {
+                for reply in [s.clone(), local_subject(s)] {
+                    c.publish_with_reply(req.clone(), reply, body.clone().into())
+                        .await
+                        .unwrap();
+                }
+            }
+        }
+        // A push consumer delivering a stored value onto each subject. A consumer's
+        // create request does not say push or pull in its subject, so the hub creates it;
+        // it delivers in `HUB`, where nothing but the admin's own inbox has interest.
+        let kv_stream = access_table().into_iter().find_map(|r| match r.target {
+            Target::Keys { bucket, keys } if keys == ">" && r.of(role).reads() => Some(bucket),
+            _ => None,
+        });
+        if let Some(bucket) = kv_stream {
+            let s = js.get_stream(format!("KV_{bucket}")).await.unwrap();
+            // (Onto its own subjects the hub refuses it: "forms a cycle".)
+            let own = format!("$KV.{bucket}.");
+            for d in denied.iter().filter(|d| !d.starts_with(&own)) {
+                let r = s
+                    .create_consumer(consumer::push::Config {
+                        deliver_subject: d.clone(),
+                        filter_subject: format!("$KV.{bucket}.seed.a"),
+                        ..Default::default()
+                    })
+                    .await;
+                assert!(r.is_ok(), "{who}: {d}: {:?}", r.err());
+            }
+        }
+        c.flush().await.unwrap();
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        for s in &denied {
+            assert!(!stored(&admin, s).await, "{who} ({role}) wrote {s}");
+        }
+
+        // The admin's operations.
+        for op in [
+            "STREAM.PURGE",
+            "STREAM.DELETE",
+            "STREAM.UPDATE",
+            "STREAM.MSG.DELETE",
+        ] {
+            let local = format!("{}.{op}.HGL_NOTES", hgl_ai_proto::HUB_API_PREFIX);
+            c.publish(local.clone(), "{\"seq\":1}".into())
+                .await
+                .unwrap();
+            c.flush().await.unwrap();
+            assert!(!refusals(&mut rx, 1).await.is_empty(), "{who}: {op}");
+        }
+        assert!(js.delete_stream("HGL_NOTES").await.is_err(), "{who}");
+        assert!(
+            js.create_stream(jetstream::stream::Config {
+                name: "EVIL".into(),
+                subjects: vec!["evil.>".into()],
+                ..Default::default()
+            })
+            .await
+            .is_err(),
+            "{who}"
+        );
+    }
+    let notes = admin.get_stream("HGL_NOTES").await.unwrap();
+    assert!(notes.get_raw_message(1).await.is_ok(), "nothing purged");
+    assert!(admin.get_stream("EVIL").await.is_err());
+}
+
+/// The parts #141 left unproven: acknowledgement (ack, progress, nak, redelivery), a
+/// batch pull, and leases (`HGL_LOCKS` create and update) across accounts; and no role
+/// account has JetStream of its own.
+#[tokio::test]
+async fn accounts_ack_batch_and_leases_work_across_accounts() {
+    let Some(hub) = Hub::accounts() else { return };
+    let admin = seeded(&hub).await;
+    let (_c, js) = hub.js_of("build-1").await;
+    for i in 0..4 {
+        js.publish(format!("hgl.notes.w{i}"), "n".into())
+            .await
+            .unwrap()
+            .await
+            .unwrap();
+    }
+    let c = js
+        .get_stream("HGL_NOTES")
+        .await
+        .unwrap()
+        .create_consumer(consumer::pull::Config {
+            durable_name: Some("inbox-w9".into()),
+            filter_subjects: vec![
+                "hgl.notes.w0".into(),
+                "hgl.notes.w1".into(),
+                "hgl.notes.w2".into(),
+                "hgl.notes.w3".into(),
+            ],
+            ack_policy: consumer::AckPolicy::Explicit,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let got = pull(&c, 10).await;
+    assert_eq!(got.len(), 4, "one batch");
+    got[0].ack_with(jetstream::AckKind::Progress).await.unwrap();
+    got[0]
+        .ack_with(jetstream::AckKind::Nak(None))
+        .await
+        .unwrap();
+    for m in &got[1..] {
+        m.double_ack().await.unwrap();
+    }
+    let again = pull(&c, 10).await;
+    assert_eq!(again.len(), 1);
+    assert_eq!(again[0].info().unwrap().delivered, 2);
+    again[0].double_ack().await.unwrap();
+    let info = admin
+        .get_stream("HGL_NOTES")
+        .await
+        .unwrap()
+        .consumer_info("inbox-w9")
+        .await
+        .unwrap();
+    assert_eq!((info.num_ack_pending, info.num_redelivered), (0, 0));
+
+    // Leases: create once, update by revision, a stale update refused.
+    for (role, who) in ROLE_USERS {
+        let (_c, js) = hub.js_of(who).await;
+        let key = format!("seat.{role}");
+        if !role_writes_locks(role) {
+            // The console reads the bucket; Slack does not see it.
+            if let Ok(locks) = js.get_key_value("HGL_LOCKS").await {
+                assert_eq!(role, Role::Console);
+                assert!(locks.create(&key, "x".into()).await.is_err(), "{who}");
+            }
+            continue;
+        }
+        let locks = js.get_key_value("HGL_LOCKS").await.unwrap();
+        let rev = locks.create(&key, who.into()).await.unwrap();
+        assert!(
+            locks.create(&key, "other".into()).await.is_err(),
+            "{who}: held"
+        );
+        let rev2 = locks.update(&key, "refreshed".into(), rev).await.unwrap();
+        assert!(
+            locks.update(&key, "stale".into(), rev).await.is_err(),
+            "{who}: stale"
+        );
+        assert_eq!(locks.get(&key).await.unwrap().unwrap(), "refreshed");
+        locks
+            .delete_expect_revision(&key, Some(rev2))
+            .await
+            .unwrap();
+        assert!(locks.get(&key).await.unwrap().is_none());
+        // And a bucket put and get.
+        let state = js.get_key_value("HGL_STATE").await.unwrap();
+        state.put(format!("k.{role}"), "v".into()).await.unwrap();
+        assert_eq!(state.get(format!("k.{role}")).await.unwrap().unwrap(), "v");
+    }
+
+    // No role has JetStream of its own, and none reaches the hub's under `$JS.API`.
+    for (_, who) in ROLE_USERS {
+        let (c, mut rx) = spy(&hub, who).await;
+        let own = jetstream::new(c.clone());
+        let r = tokio::time::timeout(Duration::from_secs(3), own.query_account()).await;
+        assert!(!matches!(r, Ok(Ok(_))), "{who}: {r:?}");
+        assert!(!refusals(&mut rx, 1).await.is_empty(), "{who}");
+    }
+}
+
+fn role_writes_locks(role: Role) -> bool {
+    writes_of(role).iter().any(|w| w == "$KV.HGL_LOCKS.>")
 }

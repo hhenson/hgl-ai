@@ -19,12 +19,14 @@ fn conf_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', r"\\").replace('"', "\\\""))
 }
 
-/// How clients authenticate: one shared token (the single-token mode of older installs)
-/// or a hub user per client (OWN-5).
+/// How clients authenticate: one shared token (the single-token mode of older installs),
+/// a hub user per client (OWN-5) in one account, or the same users in one account per
+/// role (hgl-ai#141; not installed yet).
 #[derive(Debug, Clone, Copy)]
 pub enum Auth<'a> {
     Token(&'a str),
     Users(&'a crate::users::Registry),
+    Accounts(&'a crate::users::Registry),
 }
 
 /// `<data_dir>/nats.conf`: listen address, JetStream store, authorization.
@@ -32,6 +34,7 @@ pub fn render_conf(listen: &str, port: u16, store_dir: &Path, auth: &Auth) -> St
     let authorization = match auth {
         Auth::Token(t) => format!("authorization {{\n  token: {}\n}}\n", conf_str(t)),
         Auth::Users(reg) => crate::users::render_authorization(reg),
+        Auth::Accounts(reg) => crate::users::render_accounts(reg),
     };
     format!(
         "# hgl-ai hub, written by `hgl-ai server install`; reinstalling rewrites it.\n\
