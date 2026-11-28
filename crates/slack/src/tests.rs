@@ -1031,6 +1031,8 @@ async fn startup_error_chain_keeps_only_safe_slack_error_codes() {
     let web = Web::new(fake.base.clone(), "xapp-test".into(), "xoxb-test".into()).unwrap();
     for (response, expected) in [
         ("missing_scope", "missing_scope"),
+        ("not_in_channel", "not_in_channel"),
+        ("channel_not_found", "channel_not_found"),
         ("xoxb-secret-token", "unknown_error"),
         ("", "unknown_error"),
     ] {
