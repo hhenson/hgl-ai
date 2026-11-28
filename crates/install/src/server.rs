@@ -577,7 +577,7 @@ pub fn user_add(
                 && reg.get(name).is_some_and(|u| u.role != role && u.nkey == k)
             {
                 return Err(other(
-                    "screen-rules requires a new key when changing an existing user's role",
+                    "rule writer requires a new key when changing an existing user's role",
                 ));
             }
             reg.register(name, role, k, rotate)?;
