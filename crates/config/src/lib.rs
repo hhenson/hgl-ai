@@ -479,6 +479,55 @@ pub fn model_args(r: &Resolved) -> Vec<String> {
     a
 }
 
+/// The Codex permission profile a turn runs under ([`codex_profile`]).
+pub const CODEX_PROFILE: &str = "hgl_task";
+
+/// The `-c` overrides that select [`CODEX_PROFILE`]: the whole disk readable, `writable`
+/// (the task directory and the clone) writable, and the network on.
+///
+/// A named profile, not `sandbox_mode = "workspace-write"` with
+/// `sandbox_workspace_write.writable_roots`: that legacy policy makes the `.git` of every
+/// writable root read-only and, where `.git` is a `gitdir:` pointer (a worktree), its target
+/// too. A task's `src/.git` points into the clone's `worktrees/`, so `index.lock` could not
+/// be created even with the clone writable (hgl-ai#29, codex-cli 0.172.0). A profile's
+/// paths are taken as given. `exec resume` honours it too, also for a session started
+/// under the legacy policy. Shared by the bridge's turns and `doctor`'s probe of them.
+pub fn codex_profile(writable: &[PathBuf]) -> Vec<String> {
+    let mut fs = vec![format!("{}=\"read\"", toml_str(":root"))];
+    fs.extend(
+        writable
+            .iter()
+            .map(|p| format!("{}=\"write\"", toml_str(&p.to_string_lossy()))),
+    );
+    vec![
+        format!("default_permissions={}", toml_str(CODEX_PROFILE)),
+        format!(
+            "permissions.{CODEX_PROFILE}.filesystem={{{}}}",
+            fs.join(",")
+        ),
+        format!("permissions.{CODEX_PROFILE}.network.enabled=true"),
+    ]
+}
+
+/// A TOML basic string.
+fn toml_str(s: &str) -> String {
+    let mut o = String::with_capacity(s.len() + 2);
+    o.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => o.push_str("\\\""),
+            '\\' => o.push_str("\\\\"),
+            '\n' => o.push_str("\\n"),
+            '\t' => o.push_str("\\t"),
+            '\r' => o.push_str("\\r"),
+            c if c.is_control() => o.push_str(&format!("\\u{:04X}", c as u32)),
+            c => o.push(c),
+        }
+    }
+    o.push('"');
+    o
+}
+
 impl Config {
     /// A fresh configuration for `host` with defaults everywhere else.
     pub fn new(host: impl Into<String>) -> Self {

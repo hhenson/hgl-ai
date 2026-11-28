@@ -1,10 +1,10 @@
-//! `hgl-ai doctor`: one line per check, with the fix. It changes nothing and
-//! never spends a model turn.
+//! `hgl-ai doctor`: one line per check, with the fix. It changes nothing (but for
+//! a probe directory it removes again) and never spends a model turn.
 
 use std::path::Path;
 use std::time::Duration;
 
-use hgl_ai_config::Config;
+use hgl_ai_config::{CODEX_PROFILE, Config, codex_profile};
 use hgl_ai_proto::Runtime;
 use serde::Serialize;
 
@@ -119,6 +119,103 @@ fn sign_in_fix(rt: Runtime) -> &'static str {
         Runtime::Codex => "`codex login`",
         Runtime::Agy => "run `agy` once and sign in",
     }
+}
+
+/// A session id no rollout has: `exec resume` loads the configuration, then fails
+/// without a model turn.
+const NO_SESSION: &str = "00000000-0000-0000-0000-000000000000";
+
+/// The Codex CLI applies the permission profile a turn runs under (hgl-ai#59).
+/// `codex profile`: `codex sandbox -P hgl_task` with the turn's overrides, a probe
+/// directory under `work_root` writable, writes there; a CLI without profiles ignores the
+/// overrides and runs read-only. `codex config`: the configuration (`config.toml` and the
+/// overrides) loads under `--strict-config`, which every turn passes.
+fn codex_checks(sys: &dyn System, bin: &Path, work_root: &Path, used: bool) -> Vec<Check> {
+    let bad = |name: &str, detail: String, fix: &str| {
+        if used {
+            Check::fail(name, format!("{detail}; a seat uses it"), fix)
+        } else {
+            Check::warn(name, detail, fix)
+        }
+    };
+    let unknown = |name: &str, detail: String| Check::new(name, Level::Warn, detail, None);
+    let b = bin.display().to_string();
+    let dir = work_root.join(format!(".doctor-codex-{}", std::process::id()));
+    let profile = codex_profile(std::slice::from_ref(&dir));
+    let overrides: Vec<String> = profile
+        .iter()
+        .flat_map(|c| ["-c".to_string(), c.clone()])
+        .collect();
+    let mut out = Vec::new();
+
+    let name = "codex profile";
+    let probe = dir.join("probe");
+    out.push(match sys.mkdir(&dir) {
+        Err(e) => unknown(name, format!("no probe directory {}: {e}", dir.display())),
+        Ok(()) => {
+            let cmd = Cmd::new(b.clone())
+                .args(["sandbox", "-P", CODEX_PROFILE, "-C"])
+                .arg(dir.display().to_string())
+                .args(overrides.iter().cloned())
+                .args(["--", "sh", "-c", ": > \"$1\"", "sh"])
+                .arg(probe.display().to_string())
+                .timeout(PROBE);
+            let o = sys.query(&cmd);
+            let wrote = sys.exists(&probe);
+            let _ = sys.remove_dir_all(&dir);
+            match o {
+                Err(e) => unknown(name, format!("`codex sandbox`: {e}")),
+                Ok(o) if o.timed_out => unknown(name, "`codex sandbox` timed out".into()),
+                Ok(o) if o.ok() && wrote => Check::ok(
+                    name,
+                    format!("`codex sandbox -P {CODEX_PROFILE}` writes the task directory"),
+                ),
+                Ok(o) => bad(
+                    name,
+                    format!(
+                        "`codex sandbox -P {CODEX_PROFILE}` did not write ({}: {}); \
+                         turns would run read-only, without network",
+                        o.status_text(),
+                        o.detail()
+                    ),
+                    "upgrade codex to one with permission profiles (0.172.0 has them)",
+                ),
+            }
+        }
+    });
+
+    let name = "codex config";
+    let cmd = Cmd::new(b)
+        .args(["exec", "resume", "--strict-config"])
+        .args(overrides)
+        .args(["--skip-git-repo-check", NO_SESSION, "-"])
+        .timeout(PROBE);
+    out.push(match sys.query(&cmd) {
+        Err(e) => unknown(name, format!("`codex exec resume`: {e}")),
+        Ok(o) if o.timed_out => unknown(name, "`codex exec resume` timed out".into()),
+        Ok(o) => {
+            let text = format!("{}\n{}", o.stderr, o.stdout);
+            if text.contains("unknown configuration field")
+                || text.contains("Error loading config")
+                || text.contains("--strict-config")
+            {
+                let line = text
+                    .lines()
+                    .find(|l| l.contains("unknown configuration field") || l.contains("strict"))
+                    .map_or_else(|| o.detail(), |l| l.trim().to_string());
+                bad(
+                    name,
+                    format!("rejected under `--strict-config`, so every turn fails: {line}"),
+                    "remove the field from codex's `config.toml`, or upgrade codex",
+                )
+            } else if text.contains("No prompt provided") {
+                Check::ok(name, "loads under `--strict-config`")
+            } else {
+                unknown(name, format!("could not tell: {}", o.detail()))
+            }
+        }
+    });
+    out
 }
 
 fn seat_uses(cfg: Option<&Config>, rt: Runtime) -> bool {
@@ -684,6 +781,17 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 ),
             }
         });
+        if !server_side
+            && sys.exists(&wr)
+            && let Some((_, bin)) = clis.iter().find(|(r, _)| *r == Runtime::Codex)
+        {
+            out.extend(codex_checks(
+                sys,
+                bin,
+                &wr,
+                seat_uses(Some(c), Runtime::Codex),
+            ));
+        }
     }
 
     let tool = |name: &str| sys.which(name);
@@ -758,6 +866,8 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
+
     use super::*;
     use crate::hub::fake::FakeHub;
     use crate::sys::fake::Fake;
@@ -829,6 +939,7 @@ mod tests {
             let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
             match (c.program.as_str(), a.as_slice()) {
                 (_, ["auth", "status", "--json"]) => Output::success(r#"{"loggedIn": true}"#),
+                (_, ["sandbox", ..] | ["exec", "resume", ..]) => codex_ok(&a),
                 ("id", _) => Output::success("1000\n"),
                 ("loginctl", _) => Output::success("yes\n"),
                 ("systemctl", [_, "is-active", _]) => Output::success("active\n"),
@@ -837,6 +948,33 @@ mod tests {
             }
         });
         f
+    }
+
+    /// codex 0.172.0 for the two probes: `exec resume` with no prompt, and `sandbox`.
+    fn codex_ok(a: &[&str]) -> Output {
+        if a[0] == "exec" {
+            return Output::failure(1, "No prompt provided via stdin.");
+        }
+        codex_sandbox(a)
+    }
+
+    /// `codex sandbox` (0.172.0): applies `-P` from the overrides; the probe writes its
+    /// last argument when the profile makes its directory writable.
+    fn codex_sandbox(a: &[&str]) -> Output {
+        let dir = a[a.iter().position(|x| *x == "-C").unwrap() + 1];
+        let profile = codex_profile(&[PathBuf::from(dir)]);
+        let applied = profile.iter().all(|p| a.contains(&p.as_str()))
+            && a.windows(2).any(|w| w == ["-P", CODEX_PROFILE]);
+        if !applied {
+            return Output::failure(
+                1,
+                "Error: default_permissions requires a `[permissions]` table",
+            );
+        }
+        let probe = a.last().unwrap();
+        assert!(probe.starts_with(dir), "{probe} outside {dir}");
+        std::fs::write(probe, "").unwrap();
+        Output::success("")
     }
 
     fn levels(cs: &[Check]) -> Vec<(String, Level)> {
@@ -863,6 +1001,14 @@ mod tests {
                 .any(|c| c.name == "work_root" && c.detail.contains("536 GB free"))
         );
         assert!(f.runs().is_empty(), "doctor changes nothing");
+        let work = f.env.home.join("hgl-ai/work");
+        assert!(
+            std::fs::read_dir(&work).unwrap().next().is_none(),
+            "the codex probe directory is removed"
+        );
+        for n in ["codex profile", "codex config"] {
+            assert!(cs.iter().any(|c| c.name == n), "no check {n}");
+        }
         let auth = cs.iter().find(|c| c.name == "hub auth").unwrap();
         assert_eq!(auth.detail, "hub user");
         assert!(
@@ -969,6 +1115,7 @@ mod tests {
             let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
             match (c.program.as_str(), a.as_slice()) {
                 (_, ["auth", "status", "--json"]) => Output::success(r#"{"loggedIn": true}"#),
+                (_, ["sandbox", ..] | ["exec", "resume", ..]) => codex_ok(&a),
                 ("id", _) => Output::success("1000\n"),
                 ("loginctl", _) => Output::success("yes\n"),
                 ("systemctl", [_, "is-active", _]) => Output::success("active\n"),
@@ -999,6 +1146,7 @@ mod tests {
             let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
             match (c.program.as_str(), a.as_slice()) {
                 (_, ["auth", "status", "--json"]) => Output::success(r#"{"loggedIn": true}"#),
+                (_, ["sandbox", ..] | ["exec", "resume", ..]) => codex_ok(&a),
                 ("id", _) => Output::success("1000\n"),
                 ("loginctl", _) => Output::success("yes\n"),
                 ("systemctl", ["show", "-p", "StandardOutput,StandardError", u])
@@ -1134,6 +1282,11 @@ mod tests {
                     ..Output::default()
                 },
                 (_, ["login", "status"]) => Output::failure(1, "Not logged in"),
+                // A CLI without permission profiles or `--strict-config`.
+                (_, ["sandbox", ..]) => Output::failure(2, "error: unexpected argument '-P' found"),
+                (_, ["exec", "resume", ..]) => {
+                    Output::failure(2, "error: unexpected argument '--strict-config' found")
+                }
                 ("id", _) => Output::success("1000\n"),
                 ("loginctl", _) => Output::success("no\n"),
                 ("systemctl", [_, "is-active", _]) => Output::failure(3, "inactive"),
@@ -1176,7 +1329,54 @@ mod tests {
         assert_eq!(get("lingering").level, Level::Warn);
         assert_eq!(get("work_root").level, Level::Fail, "10 GB is below 200");
         assert_eq!(get("gh").level, Level::Fail);
+        assert_eq!(get("codex profile").level, Level::Fail);
+        assert!(get("codex profile").detail.contains("read-only"));
+        assert_eq!(get("codex config").level, Level::Fail);
+        assert!(get("codex config").detail.contains("'--strict-config'"));
         assert!(any_fail(&cs));
+    }
+
+    /// The CLI runs the sandbox but ignores the profile (read-only), and `config.toml`
+    /// has a field this CLI does not know: both fail for a seat's runtime, warn otherwise.
+    #[test]
+    fn codex_profile_ignored_or_config_rejected() {
+        let d = tempfile::tempdir().unwrap();
+        let f = Fake::new(d.path(), Os::Linux);
+        let work = f.env.home.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        f.on(|c| match c.args.first().map(String::as_str) {
+            Some("sandbox") => Output::success(""),
+            _ => Output::failure(
+                1,
+                "Error loading config.toml:\n/h/.codex/config.toml:2:1: unknown configuration \
+                 field `not_a_field`\n  |\n2 | not_a_field = 1",
+            ),
+        });
+        let cs = codex_checks(&f, Path::new("/usr/bin/codex"), &work, true);
+        assert_eq!(
+            levels(&cs),
+            [
+                ("codex profile".to_string(), Level::Fail),
+                ("codex config".to_string(), Level::Fail)
+            ]
+        );
+        assert!(
+            cs[0].detail.contains("did not write (exit 0"),
+            "{}",
+            cs[0].detail
+        );
+        assert!(cs[1].detail.contains("`not_a_field`"), "{}", cs[1].detail);
+        assert!(std::fs::read_dir(&work).unwrap().next().is_none());
+        let q = f.cmds.borrow();
+        let strict = &q.iter().find(|(_, c)| c.args[0] == "exec").unwrap().1.args;
+        assert!(
+            strict.contains(&"--strict-config".to_string()),
+            "{strict:?}"
+        );
+        assert_eq!(strict.last().map(String::as_str), Some("-"));
+        drop(q);
+        let cs = codex_checks(&f, Path::new("/usr/bin/codex"), &work, false);
+        assert!(cs.iter().all(|c| c.level == Level::Warn), "{cs:?}");
     }
 
     #[tokio::test]
