@@ -351,6 +351,13 @@ pub struct ReadyMark {
 
 /// The [`ReadyMark`] the note comments leave at `head`.
 pub fn ready_mark(comments: &[Comment], head: &str) -> ReadyMark {
+    ready_mark_across(comments, head, None)
+}
+
+/// [`ready_mark`] when the comments read leave an unread run before the comment created at
+/// `gap` (a long pull request read from both ends): a note there may have cleared Ready, so
+/// the gap clears it, at `gap`. A `Ready` after the gap marks it again.
+pub fn ready_mark_across(comments: &[Comment], head: &str, gap: Option<&str>) -> ReadyMark {
     let mut notes: Vec<(&str, NoteState, Option<&str>)> = comments
         .iter()
         .filter_map(|c| {
@@ -364,7 +371,16 @@ pub fn ready_mark(comments: &[Comment], head: &str) -> ReadyMark {
         .collect();
     notes.sort_by(|a, b| a.0.cmp(b.0));
     let mut mark = ReadyMark::default();
+    let mut gap = gap;
+    let mut cross = |mark: &mut ReadyMark, upto: Option<&str>| {
+        if let Some(g) = gap.filter(|g| upto.is_none_or(|u| u >= *g)) {
+            mark.at = None;
+            mark.cleared = Some(g.to_string());
+            gap = None;
+        }
+    };
     for (at, st, declared) in notes {
+        cross(&mut mark, Some(at));
         let at_head = declared.is_some_and(|d| names_head(d, head));
         let keeps = match st {
             NoteState::Ready if at_head && declared.is_some_and(|d| d.len() >= READY_HEAD_MIN) => {
@@ -379,6 +395,7 @@ pub fn ready_mark(comments: &[Comment], head: &str) -> ReadyMark {
             mark.cleared = Some(at.to_string());
         }
     }
+    cross(&mut mark, None);
     mark
 }
 
@@ -646,6 +663,42 @@ mod tests {
             ReadyMark::default()
         );
         assert_eq!(mark(&[]), ReadyMark::default());
+    }
+
+    #[test]
+    fn an_unread_gap_clears_ready() {
+        let c = |body: &str, at: &str| Comment {
+            author: "u".into(),
+            body: body.into(),
+            created_at: at.into(),
+            updated_at: at.into(),
+        };
+        let t = |h: u32| format!("2026-01-01T{h:02}:00:00Z");
+        let at = |s: &str| Some(s.to_string());
+        let early = c("[codex] Ready: o/r#7 at 1f461fa7", &t(1));
+        let approved = c("[claude] Approved.", &t(5));
+        let again = c("[codex] Ready: o/r#7 at 1f461fa7", &t(6));
+        // Ready before the gap, an Approved after it: a Sent back may be in the gap.
+        let cs = [early.clone(), approved.clone()];
+        assert_eq!(ready_mark(&cs, H1).at, at(&t(1)), "no gap");
+        assert_eq!(
+            ready_mark_across(&cs, H1, Some(&t(4))),
+            ReadyMark {
+                at: None,
+                cleared: at(&t(4))
+            }
+        );
+        // Nothing read after the gap: cleared all the same.
+        let only = std::slice::from_ref(&early);
+        assert_eq!(ready_mark_across(only, H1, Some(&t(4))).cleared, at(&t(4)));
+        // A Ready after the gap (or at its first comment) stands.
+        let cs = [early.clone(), approved.clone(), again];
+        assert_eq!(ready_mark_across(&cs, H1, Some(&t(4))).at, at(&t(6)));
+        let cs = [early.clone(), c("[codex] Ready: o/r#7 at 1f461fa7", &t(4))];
+        assert_eq!(ready_mark_across(&cs, H1, Some(&t(4))).at, at(&t(4)));
+        // A clear after the gap is the later one.
+        let cs = [early, approved, c("[claude] Sent back", &t(7))];
+        assert_eq!(ready_mark_across(&cs, H1, Some(&t(4))).cleared, at(&t(7)));
     }
 
     #[test]
