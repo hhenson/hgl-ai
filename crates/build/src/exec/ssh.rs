@@ -1296,6 +1296,7 @@ fn copy(mut r: impl Read, file: &Mutex<std::fs::File>) {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_os = "linux")]
     fn short_path(path: &Path) -> PathBuf {
         let cwd = std::env::current_dir().unwrap();
         let a: Vec<_> = cwd.components().collect();
@@ -1384,6 +1385,10 @@ mod tests {
     #[test]
     fn a_stalled_artifact_transfer_ends() {
         let tmp = tempfile::Builder::new().prefix("hbf").tempdir().unwrap();
+        let socket_tmp = tempfile::Builder::new()
+            .prefix("hbs")
+            .tempdir_in(".")
+            .unwrap();
         let state = tmp.path().join("remote");
         std::fs::create_dir_all(&state).unwrap();
         let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ssh");
@@ -1391,7 +1396,7 @@ mod tests {
             "r1",
             state.to_str().unwrap(),
             fake,
-            &short_path(&tmp.path().join("ssh")),
+            &socket_tmp.path().join("ssh"),
             Dialect::Posix,
         )
         .unwrap();

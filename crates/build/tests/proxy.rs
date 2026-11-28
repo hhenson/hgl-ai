@@ -21,21 +21,6 @@ use hgl_ai_bus::Bus;
 use hgl_ai_proto::build::{BUILD_VERSION, BuildJob, BuildStatus, Platform, reply_seat};
 use hgl_ai_proto::{Kind, Note, Seat};
 
-fn short_path(path: &Path) -> PathBuf {
-    let cwd = std::env::current_dir().unwrap();
-    let a: Vec<_> = cwd.components().collect();
-    let b: Vec<_> = path.components().collect();
-    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-    let mut relative = PathBuf::new();
-    for _ in common..a.len() {
-        relative.push("..");
-    }
-    for part in &b[common..] {
-        relative.push(part.as_os_str());
-    }
-    relative
-}
-
 fn fake_ssh() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ssh")
 }
@@ -66,6 +51,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// proxy's directories. Short paths, for the control socket.
 struct World {
     _tmp: tempfile::TempDir,
+    socket_tmp: tempfile::TempDir,
     root: PathBuf,
     origin: String,
     head: String,
@@ -95,6 +81,10 @@ impl World {
         World {
             origin: bare.display().to_string(),
             _tmp: tmp,
+            socket_tmp: tempfile::Builder::new()
+                .prefix("hbs")
+                .tempdir_in(".")
+                .unwrap(),
             root,
             head,
             state,
@@ -107,7 +97,7 @@ impl World {
             "win1",
             self.state.to_str().unwrap(),
             fake_ssh(),
-            &short_path(&self.root.join("ssh")),
+            &self.socket_tmp.path().join("ssh"),
             Dialect::Posix,
         )
         .unwrap()
@@ -530,7 +520,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
 
     let mut cfg = hgl_ai_config::Config::new("lab1");
     cfg.paths.work_root = w.root.join("work").display().to_string();
-    cfg.paths.data_dir = short_path(&w.root.join("data")).display().to_string();
+    cfg.paths.data_dir = w.socket_tmp.path().join("data").display().to_string();
     cfg.builder.local = false;
     cfg.builder.remote.push(
         toml::from_str(&format!(

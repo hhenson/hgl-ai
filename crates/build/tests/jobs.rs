@@ -14,21 +14,6 @@ use hgl_ai_bus::Bus;
 use hgl_ai_proto::build::{BUILD_VERSION, BuildJob, BuildStatus, reply_seat};
 use hgl_ai_proto::{Kind, Note, Seat};
 
-fn short_path(path: &Path) -> PathBuf {
-    let cwd = std::env::current_dir().unwrap();
-    let a: Vec<_> = cwd.components().collect();
-    let b: Vec<_> = path.components().collect();
-    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
-    let mut relative = PathBuf::new();
-    for _ in common..a.len() {
-        relative.push("..");
-    }
-    for part in &b[common..] {
-        relative.push(part.as_os_str());
-    }
-    relative
-}
-
 struct Nats(Child, #[allow(dead_code)] tempfile::TempDir, String, String);
 
 impl Drop for Nats {
@@ -97,6 +82,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 struct Rig {
     _nats: Nats,
     _tmp: tempfile::TempDir,
+    _socket_tmp: tempfile::TempDir,
     root: PathBuf,
     bus: Arc<Bus>,
     heads: [String; 2],
@@ -222,9 +208,13 @@ impl Rig {
         git(&seed, &["push", "--quiet", "origin", "main"]);
         let recipe = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"test -f f.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
         store::recipe_put(&bus, recipe, None).await.unwrap();
+        let socket_tmp = tempfile::Builder::new()
+            .prefix("hbs")
+            .tempdir_in(".")
+            .unwrap();
         let mut cfg = hgl_ai_config::Config::new("lab1");
         cfg.paths.work_root = root.join("work").display().to_string();
-        cfg.paths.data_dir = short_path(&root.join("data")).display().to_string();
+        cfg.paths.data_dir = socket_tmp.path().join("data").display().to_string();
         cfg.builder.toolchains = vec!["git".into()];
         if o.remote {
             let state = root.join("winbox");
@@ -264,6 +254,7 @@ impl Rig {
             settings,
             _nats: n,
             _tmp: tmp,
+            _socket_tmp: socket_tmp,
             root,
             bus,
             heads: [heads[0].clone(), heads[1].clone()],
