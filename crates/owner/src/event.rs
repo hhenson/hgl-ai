@@ -1,6 +1,6 @@
 //! Events of the owner channel (docs/owner.md §4) and how the console folds them into
-//! thread records. Agents publish on `hgl.console.>`; only the console's hub user may
-//! publish on `hgl.owner.>`, so an event's subject says whose words it carries (OWN-5).
+//! thread records. Agents publish on `hgl.console.>`; the console and Slack have
+//! separate owner subjects, so an event's subject says whose words it carries (OWN-5).
 //! The fold refuses an owner event on an agent subject and the reverse.
 
 use hgl_ai_proto::{CONSOLE_PREFIX, Kind, Note, OWNER_PREFIX, Seat};
@@ -28,6 +28,14 @@ pub fn owner_subject(id: &str) -> String {
     format!("{OWNER_PREFIX}.thread.{id}")
 }
 
+/// An owner message from Slack, keyed by workspace, channel and ts (without its dot).
+pub fn slack_subject(id: &str, team: &str, channel: &str, timestamp_key: &str) -> String {
+    format!(
+        "{}.slack.{team}.{channel}.{timestamp_key}",
+        owner_subject(id)
+    )
+}
+
 /// Who published an event, by its subject.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Origin {
@@ -43,10 +51,15 @@ pub fn parse_subject(subject: &str) -> Option<(Origin, &str)> {
     {
         return Some((Origin::Agent, id));
     }
-    subject
+    let tail = subject
         .strip_prefix(OWNER_PREFIX)
-        .and_then(|r| r.strip_prefix(".thread."))
-        .map(|id| (Origin::Owner, id))
+        .and_then(|r| r.strip_prefix(".thread."))?;
+    let id = match tail.split_once(".slack.") {
+        Some((id, key)) if key.split('.').count() == 3 => id,
+        Some(_) => return None,
+        None => tail,
+    };
+    Some((Origin::Owner, id))
 }
 
 /// A status report (OWN-1) on `hgl.console.status`.
@@ -264,9 +277,15 @@ pub fn fold(
     // OWN-5: owner events only from the owner's subject, agent events never from it.
     if ev.body.origin() != origin {
         return Err(refuse(format!(
-            "a {:?} event on {subject}: owner events come only from the console",
+            "a {:?} event on the wrong subject {subject}",
             ev.body.origin()
         )));
+    }
+    if origin == Origin::Owner
+        && subject != owner_subject(sid)
+        && (!sid.starts_with("q-") || !matches!(ev.body, Body::OwnerMessage { .. }))
+    {
+        return Err(refuse("Slack may only add owner messages to questions"));
     }
     match origin {
         Origin::Owner if ev.sender != hgl_ai_proto::OWNER => {
@@ -680,7 +699,7 @@ mod tests {
         );
         // A seat publishing the owner's answer on the agent subject it may use.
         let e = fold(Some(&t), &agent_subject(ID), 2, &ans, &ctl()).unwrap_err();
-        assert!(e.0.contains("only from the console"), "{e}");
+        assert!(e.0.contains("wrong subject"), "{e}");
         // An agent event on the owner's subject (only the console could put it there).
         let msg = Event {
             body: Body::Message { body: "hi".into() },

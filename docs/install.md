@@ -80,6 +80,33 @@ user (`[github] token_file`); run that step again to replace it.
 The server user's own commands run with `sudo -u hgl-ai env HOME=/var/lib/hgl-ai
 hgl-ai ...` (`server user add`, `doctor`).
 
+### Slack Q&A
+
+Use the existing Slack app with Socket Mode, `chat:write`, `groups:history` and
+the `message.groups` bot event. Install it in the workspace and invite it to the
+private `#hgl-qa` channel. In the server user's configuration add the workspace,
+channel and owner member IDs, and use the owner's console handle:
+
+```toml
+[slack]
+team = "T12345678"
+channel = "C12345678"
+user = "U12345678"
+handle = "Owner Handle"
+```
+
+In the app settings, generate an app-level token with `connections:write` under
+**Basic Information** and copy the installed bot token from **OAuth &
+Permissions**. Run `hgl-ai server install --slack --keep-token --print-root-steps`
+and review the printed script before running it. Paste the tokens at its
+no-echo prompts. The script writes `slack-app.token` and `slack-bot.token` under
+the server user's `~/.config/hgl-ai/`, both mode 0600. Enter keeps a token file
+already in place.
+
+The script provisions the Slack hub user and starts `hgl-ai-slack` as the server
+user alongside the console. The adapter opens outbound HTTPS and WebSocket
+connections. `server status` shows its service state and log location.
+
 ### Upgrading an install from before hgl-ai#63
 
 Its units append to `<data_dir>/logs/*.log` in the server user's home, opened by
@@ -104,12 +131,13 @@ hgl-ai server user ...`).
 | `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`, `HGL_BUILD/run.*`, `HGL_USAGE`, `hgl.usage.>`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, recipes (`HGL_BUILD/recipe.*`), verdicts (`HGL_STATE/verdict.*`), stream changes |
 | `coord` | a seat's, and `HGL_METRICS` |
 | `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
-| `console` | `hgl.owner.>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
+| `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
+| `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<ts>` and `HGL_SLACK` |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
-Every role reads every stream and bucket but `HGL_CONSOLE` (the console's own); seat
-and coordinator users read `HGL_OWNER` through short-lived consumers and may not
-touch the console's durable feed.
+The console keeps session state in `HGL_CONSOLE`. The Slack adapter reads its own
+delivery state and its durable `HGL_OWNER` feed. Seat, coordinator and builder users
+read `HGL_OWNER` through short-lived consumers.
 
 ```sh
 hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred

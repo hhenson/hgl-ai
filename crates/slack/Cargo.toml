@@ -1,0 +1,32 @@
+[package]
+name = "hgl-ai-slack"
+description = "Slack Socket Mode adapter for hgl-ai owner questions"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+hgl-ai-bus.workspace = true
+hgl-ai-config.workspace = true
+hgl-ai-owner.workspace = true
+hgl-ai-proto.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+futures.workspace = true
+hex.workspace = true
+libc.workspace = true
+reqwest = { workspace = true, features = ["json", "query"] }
+rustls.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+tokio-websockets = { version = "0.10.1", features = ["client", "ring", "rand", "rustls-webpki-roots", "rustls-tls12"] }
+tracing.workspace = true
+
+[dev-dependencies]
+axum = { version = "0.8.9", default-features = false, features = ["http1", "tokio", "json", "query"] }
+hgl-ai-install.workspace = true
+tempfile.workspace = true
+tokio-websockets = { version = "0.10.1", features = ["server"] }

@@ -4,8 +4,8 @@
 //! - [`model`]: the thread record of `HGL_THREADS`.
 //! - [`event`]: the events of `HGL_OWNER` and the fold the console applies to them.
 //! - The functions below are the operations the command line (agents) and the console
-//!   (the owner) use. Agents publish on `hgl.console.>`; the console alone publishes the
-//!   owner's words on `hgl.owner.>` and writes `HGL_THREADS` (OWN-5).
+//!   (the owner) use. Agents publish on `hgl.console.>`. The console folds its own and
+//!   Slack's owner events and is the only writer of `HGL_THREADS` (OWN-5).
 
 pub mod event;
 pub mod model;
@@ -215,9 +215,12 @@ async fn whole_for(bus: &Bus, rec: &Thread, ev: &Event) -> Result<Option<Thread>
 async fn refold(bus: &Bus, rec: &Thread, upto: u64) -> Result<Option<Thread>> {
     let controller = Seat::new(rec.seat.clone()).map_err(|e| invalid(e.to_string()))?;
     let msgs = bus
-        .history(
+        .history_filtered(
             STREAM_OWNER,
-            &format!("hgl.*.thread.{}", rec.id),
+            vec![
+                format!("hgl.*.thread.{}", rec.id),
+                format!("{}.slack.>", event::owner_subject(&rec.id)),
+            ],
             chrono::DateTime::UNIX_EPOCH,
             100_000,
         )
@@ -360,7 +363,11 @@ pub async fn apply(bus: &Bus, controller: &Seat, msg: &StreamMsg) -> Result<Appl
         // Every effect before the record, each one idempotent: a fold that fails part
         // way is folded again, and only the record's write makes it done.
         for n in &fx.notes {
-            bus.send(n).await?;
+            if msg.subject == ev.subject() {
+                bus.send(n).await?;
+            } else {
+                bus.send_with_id(n, &msg.subject).await?;
+            }
         }
         if let Some(line) = &fx.decision {
             decision_once(bus, line).await?;

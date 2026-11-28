@@ -37,8 +37,14 @@ pub const KV_METRICS: &str = "HGL_METRICS";
 /// The console's own state (sign-in sessions, the pending `p2` batch); only the console
 /// reads or writes it.
 pub const KV_CONSOLE: &str = "HGL_CONSOLE";
-/// Owner words: `hgl.owner.thread.<id>`. Only the console's hub user publishes here (OWN-5).
+/// The Slack adapter's delivery state and thread mappings.
+pub const KV_SLACK: &str = "HGL_SLACK";
+/// Owner words (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
+/// One owner message per Slack workspace, channel and message timestamp in a question.
+pub const SLACK_OWNER_FILTER: &str = "hgl.owner.thread.*.slack.*.*.*";
+/// The Slack adapter's durable owner feed.
+pub const SLACK_FEED: &str = "slack";
 /// Agent traffic for the owner: `hgl.console.status`, `hgl.console.thread.<id>`.
 pub const CONSOLE_PREFIX: &str = "hgl.console";
 /// Owner notes to a seat travel on `hgl.notes.owner.<seat>`, which only the console's hub

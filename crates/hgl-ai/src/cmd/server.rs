@@ -101,6 +101,9 @@ struct InstallArgs {
     /// Do not install the console service.
     #[arg(long)]
     no_console: bool,
+    /// Install the Slack Q&A system service using the server's [slack] configuration.
+    #[arg(long)]
+    slack: bool,
     /// Configure the console: its origin, https://<stable name>[:port].
     #[arg(long, value_name = "URL")]
     console_url: Option<String>,
@@ -178,6 +181,7 @@ impl InstallArgs {
             (self.no_coord, "--no-coord"),
             (self.users, "--users"),
             (self.no_console, "--no-console"),
+            (self.slack, "--slack"),
         ] {
             if on {
                 v.push(flag.into());
@@ -251,6 +255,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 port: a.port.or(prev.port).unwrap_or(4222),
                 coord: !a.no_coord,
                 console: !a.no_console && console_url.is_some(),
+                slack: a.slack,
                 console_url,
                 client_user: a.client_user.clone().or(prev.client_user),
                 keep_token: a.keep_token,
@@ -274,6 +279,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 users: a.users,
                 coord: !a.no_coord,
                 console: !a.no_console,
+                slack: a.slack,
                 console_url: a.console_url,
                 console_listen: a.console_listen,
                 console_users: a.console_users,

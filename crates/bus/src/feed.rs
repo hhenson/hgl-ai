@@ -6,10 +6,14 @@
 use std::time::Duration;
 
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
-use async_nats::jetstream::{self, AckKind, context::Publish};
+use async_nats::jetstream::{
+    self, AckKind,
+    context::{Publish, PublishErrorKind},
+};
 use futures::StreamExt;
 use hgl_ai_proto::{
-    CONSOLE_PREFIX, KV_CONSOLE, KV_METRICS, KV_THREADS, MetricsSample, OWNER_PREFIX, STREAM_OWNER,
+    CONSOLE_PREFIX, KV_CONSOLE, KV_METRICS, KV_SLACK, KV_THREADS, MetricsSample, OWNER_PREFIX,
+    STREAM_OWNER,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -116,6 +120,26 @@ impl Bus {
         payload: &[u8],
         msg_id: &str,
     ) -> Result<SendReceipt> {
+        self.publish_owner_event(subject, payload, Some(msg_id))
+            .await
+    }
+
+    /// Publish an owner event once on a subject unique to its source message.
+    /// Returns false if the subject has already been used, even after the dedup window.
+    pub async fn publish_slack_event(&self, subject: &str, payload: &[u8]) -> Result<bool> {
+        match self.publish_owner_event(subject, payload, None).await {
+            Ok(_) => Ok(true),
+            Err(BusError::Conflict { .. }) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    async fn publish_owner_event(
+        &self,
+        subject: &str,
+        payload: &[u8],
+        msg_id: Option<&str>,
+    ) -> Result<SendReceipt> {
         let ok = [OWNER_PREFIX, CONSOLE_PREFIX]
             .iter()
             .any(|p| subject.strip_prefix(p).is_some_and(|r| r.starts_with('.')));
@@ -130,9 +154,11 @@ impl Bus {
                 payload.len()
             )));
         }
-        let publish = Publish::build()
-            .payload(payload.to_vec().into())
-            .message_id(msg_id);
+        let publish = Publish::build().payload(payload.to_vec().into());
+        let publish = match msg_id {
+            Some(id) => publish.message_id(id),
+            None => publish.expected_last_subject_sequence(0),
+        };
         let ack = self
             .guarded(subject, async {
                 self.js
@@ -140,7 +166,15 @@ impl Bus {
                     .await
                     .map_err(|e| publish_error(subject, e))?
                     .await
-                    .map_err(|e| publish_error(subject, e))
+                    .map_err(|e| {
+                        if msg_id.is_none() && e.kind() == PublishErrorKind::WrongLastSequence {
+                            return BusError::Conflict {
+                                key: subject.into(),
+                                expected: 0,
+                            };
+                        }
+                        publish_error(subject, e)
+                    })
             })
             .await?;
         Ok(SendReceipt {
@@ -184,6 +218,18 @@ impl Bus {
         since: chrono::DateTime<chrono::Utc>,
         max: usize,
     ) -> Result<Vec<StreamMsg>> {
+        self.history_filtered(stream, vec![filter.into()], since, max)
+            .await
+    }
+
+    /// Read a stream's history across subject filters, in stream sequence order.
+    pub async fn history_filtered(
+        &self,
+        stream: &str,
+        filters: Vec<String>,
+        since: chrono::DateTime<chrono::Utc>,
+        max: usize,
+    ) -> Result<Vec<StreamMsg>> {
         let s = self
             .js
             .get_stream(stream)
@@ -191,15 +237,19 @@ impl Bus {
             .map_err(|e| missing(&format!("stream {stream}"), e))?;
         let start = time::OffsetDateTime::from_unix_timestamp(since.timestamp())
             .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
+        let mut config = pull::Config {
+            deliver_policy: DeliverPolicy::ByStartTime { start_time: start },
+            ack_policy: AckPolicy::None,
+            inactive_threshold: Duration::from_secs(30),
+            memory_storage: true,
+            ..Default::default()
+        };
+        match filters.as_slice() {
+            [filter] => config.filter_subject = filter.clone(),
+            _ => config.filter_subjects = filters,
+        }
         let consumer = s
-            .create_consumer(pull::Config {
-                deliver_policy: DeliverPolicy::ByStartTime { start_time: start },
-                ack_policy: AckPolicy::None,
-                filter_subject: filter.to_string(),
-                inactive_threshold: Duration::from_secs(30),
-                memory_storage: true,
-                ..Default::default()
-            })
+            .create_consumer(config)
             .await
             .map_err(|e| nats(&format!("reading {stream}"), e))?;
         let mut out: std::collections::VecDeque<StreamMsg> = std::collections::VecDeque::new();
@@ -231,14 +281,25 @@ impl Bus {
 
     /// One thread record and its revision.
     pub async fn thread_get<T: DeserializeOwned>(&self, id: &str) -> Result<Option<(T, u64)>> {
-        check_kv_key(id)?;
         let store = self.store(&self.threads, KV_THREADS).await?;
-        match live_entry(store, id).await? {
-            None => Ok(None),
-            Some(e) => serde_json::from_slice(&e.value)
-                .map(|t| Some((t, e.revision)))
-                .map_err(|err| BusError::Nats(format!("thread {id} is unreadable: {err}"))),
-        }
+        get_record(store, id).await
+    }
+
+    /// A Slack delivery record or reverse thread mapping, with its revision.
+    pub async fn slack_get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<(T, u64)>> {
+        let store = self.store(&self.slack, KV_SLACK).await?;
+        get_record(store, key).await
+    }
+
+    /// Change a Slack delivery record or create a reverse thread mapping.
+    pub async fn slack_put<T: Serialize>(
+        &self,
+        key: &str,
+        value: &T,
+        revision: u64,
+    ) -> Result<u64> {
+        let store = self.store(&self.slack, KV_SLACK).await?;
+        self.put_record(store, KV_SLACK, key, value, revision).await
     }
 
     /// Write a thread record if it is still at `expected_revision` (0: only if absent).
@@ -248,14 +309,26 @@ impl Bus {
         rec: &T,
         expected_revision: u64,
     ) -> Result<u64> {
-        check_kv_key(id)?;
         let store = self.store(&self.threads, KV_THREADS).await?;
+        self.put_record(store, KV_THREADS, id, rec, expected_revision)
+            .await
+    }
+
+    async fn put_record<T: Serialize>(
+        &self,
+        store: &jetstream::kv::Store,
+        bucket: &str,
+        id: &str,
+        rec: &T,
+        expected_revision: u64,
+    ) -> Result<u64> {
+        check_kv_key(id)?;
         let value = serde_json::to_vec(rec).map_err(|e| nats(&format!("encoding {id}"), e))?;
         let conflict = || BusError::Conflict {
             key: id.to_string(),
             expected: expected_revision,
         };
-        let subject = format!("$KV.{KV_THREADS}.{id}");
+        let subject = format!("$KV.{bucket}.{id}");
         self.guarded(&subject, async {
             if expected_revision == 0 {
                 store
@@ -356,5 +429,18 @@ impl Bus {
     pub async fn metrics(&self) -> Result<Vec<MetricsSample>> {
         let store = self.store(&self.metrics, KV_METRICS).await?;
         list_json(store).await
+    }
+}
+
+async fn get_record<T: DeserializeOwned>(
+    store: &jetstream::kv::Store,
+    key: &str,
+) -> Result<Option<(T, u64)>> {
+    check_kv_key(key)?;
+    match live_entry(store, key).await? {
+        None => Ok(None),
+        Some(entry) => serde_json::from_slice(&entry.value)
+            .map(|value| Some((value, entry.revision)))
+            .map_err(|error| BusError::Nats(format!("{key} is unreadable: {error}"))),
     }
 }

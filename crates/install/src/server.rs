@@ -31,6 +31,8 @@ pub struct ServerOpts {
     pub coord: bool,
     /// Also install the console service (`hgl-ai console run`) when `[console]` is set.
     pub console: bool,
+    /// Provision the Slack adapter's hub user for a system install.
+    pub slack: bool,
     /// Write `[console]` with this origin (`https://<stable name>`).
     pub console_url: Option<String>,
     pub console_listen: Option<String>,
@@ -67,6 +69,7 @@ impl Default for ServerOpts {
             users: false,
             coord: true,
             console: true,
+            slack: false,
             console_url: None,
             console_listen: None,
             console_users: Vec::new(),
@@ -182,6 +185,18 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
         }
         cfg.console = Some(c);
     }
+    if o.slack {
+        if srv.units != hgl_ai_config::Units::System || o.services || srv.auth != HubAuth::Users {
+            return Err(other(
+                "Slack needs system services and an NKey hub (server install --users)",
+            ));
+        }
+        if !o.console || cfg.console.is_none() || cfg.slack.is_none() {
+            return Err(other(
+                "Slack needs the console and [slack] in the server user's configuration",
+            ));
+        }
+    }
     cfg.validate()?;
 
     let data_dir = env.expand(&cfg.paths.data_dir);
@@ -260,6 +275,15 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
                     Role::Console,
                     &users::cred_path(&cdir, CONSOLE_USER),
                 )?);
+            }
+            if o.slack {
+                ensure_user(
+                    sys,
+                    &mut reg,
+                    SLACK_USER,
+                    Role::Slack,
+                    &users::cred_path(&cdir, SLACK_USER),
+                )?;
             }
             reg.save(sys, &data_dir)?;
             sys.say(&format!(
@@ -390,6 +414,7 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
 
 /// The hub user name of the console.
 pub const CONSOLE_USER: &str = "console";
+pub const SLACK_USER: &str = "slack";
 
 #[derive(Default)]
 struct ServiceCreds {

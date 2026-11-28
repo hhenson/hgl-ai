@@ -1,5 +1,5 @@
 //! Hub users (OWN-5, docs/install.md): every client has its own NKey user with the
-//! permissions of its role, so only the console's user can publish the owner's words.
+//! permissions of its role. The console and Slack publish owner words on separate subjects.
 //!
 //! The registry `<data_dir>/hub-users.toml` (mode 0600) holds names, roles and public
 //! keys only; each credential (the NKey seed) is written once, to a file of mode 0600,
@@ -14,9 +14,9 @@ use std::str::FromStr;
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS,
-    KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
-    SUBJECT_PREFIX, USAGE_PREFIX,
+    CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE,
+    KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
+    SLACK_OWNER_FILTER, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, USAGE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 
@@ -40,16 +40,19 @@ pub enum Role {
     Builder,
     /// The owner's console: the owner's subjects, `HGL_THREADS`, `tick` notes.
     Console,
+    /// Slack Q&A: inbound messages, its own feed and delivery state.
+    Slack,
     /// Everything: provisioning the stream and buckets (`hgl-ai init`, `server install`).
     Admin,
 }
 
 impl Role {
-    pub const ALL: [Role; 5] = [
+    pub const ALL: [Role; 6] = [
         Role::Seat,
         Role::Coord,
         Role::Builder,
         Role::Console,
+        Role::Slack,
         Role::Admin,
     ];
 
@@ -59,6 +62,7 @@ impl Role {
             Role::Coord => "coord",
             Role::Builder => "builder",
             Role::Console => "console",
+            Role::Slack => "slack",
             Role::Admin => "admin",
         }
     }
@@ -77,7 +81,7 @@ impl FromStr for Role {
             .into_iter()
             .find(|r| r.as_str() == s)
             .ok_or_else(|| {
-                format!("unknown hub role {s:?}: seat, coord, builder, console or admin")
+                format!("unknown hub role {s:?}: seat, coord, builder, console, slack or admin")
             })
     }
 }
@@ -252,6 +256,25 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     if role == Role::Admin {
         return None;
     }
+    let slack_bucket = kv(KV_SLACK);
+    if role == Role::Slack {
+        return Some(Permissions {
+            publish_allow: vec![
+                SLACK_OWNER_FILTER.into(),
+                format!("$KV.{KV_SLACK}.>"),
+                format!("$JS.API.STREAM.INFO.{slack_bucket}"),
+                format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
+                format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
+                format!("$JS.API.STREAM.INFO.{STREAM_OWNER}"),
+                format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}.{SLACK_FEED}"),
+                format!("$JS.API.CONSUMER.INFO.{STREAM_OWNER}.{SLACK_FEED}"),
+                format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_FEED}"),
+                format!("$JS.ACK.{STREAM_OWNER}.{SLACK_FEED}.>"),
+            ],
+            publish_deny: Vec::new(),
+            subscribe_allow: vec!["_INBOX.>".into()],
+        });
+    }
     // Reads everyone needs: stream and bucket lookups, direct gets, consumer state,
     // flow control of the ordered consumers that list a bucket's keys.
     let mut allow: Vec<String> = [
@@ -311,7 +334,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             // acknowledgement; the console's durable feed stays the console's.
             allow.push(format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}"));
             allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.*"));
-            deny = owner;
+            deny.extend(owner);
             if role != Role::Builder {
                 deny.push(verdicts);
             }
@@ -330,6 +353,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}.>"),
                 format!("$JS.API.CONSUMER.DURABLE.CREATE.{STREAM_OWNER}.*"),
                 format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.console"),
+                format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_FEED}"),
                 format!("$JS.ACK.{STREAM_OWNER}.>"),
             ]);
             // The console's own state (sessions) is not for agents to read.
@@ -346,13 +370,22 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         Role::Console => {
             // `tick` notes to the controller, the owner's notes and thread events.
             allow.push(format!("{SUBJECT_PREFIX}.*"));
-            allow.extend(owner);
+            allow.extend([
+                format!("{OWNER_PREFIX}.thread.*"),
+                format!("{OWNER_NOTES_PREFIX}.>"),
+                format!("$KV.{KV_THREADS}.>"),
+            ]);
             allow.extend(pull_from(STREAM_OWNER));
             allow.push(format!("$KV.{KV_STATE}.decisions.log"));
             allow.push(format!("$KV.{KV_CONSOLE}.>"));
         }
-        Role::Admin => unreachable!(),
+        Role::Slack | Role::Admin => unreachable!(),
     }
+    deny.extend([
+        format!("$JS.API.DIRECT.GET.{slack_bucket}"),
+        format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
+        format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
+    ]);
     Some(Permissions {
         publish_allow: allow,
         publish_deny: deny,
@@ -494,10 +527,19 @@ mod tests {
         assert!(builder.publish_deny.iter().any(|d| d == "hgl.owner.>"));
         assert!(builder.publish_allow.iter().any(|a| a == "$KV.HGL_STATE.>"));
         let console = permissions(Role::Console).unwrap();
-        for s in ["hgl.owner.>", "hgl.notes.owner.>", "$KV.HGL_THREADS.>"] {
+        for s in [
+            "hgl.owner.thread.*",
+            "hgl.notes.owner.>",
+            "$KV.HGL_THREADS.>",
+        ] {
             assert!(console.publish_allow.iter().any(|a| a == s), "{s}");
         }
-        assert!(console.publish_deny.is_empty());
+        assert!(
+            !console
+                .publish_allow
+                .iter()
+                .any(|a| a == SLACK_OWNER_FILTER)
+        );
         assert!(permissions(Role::Admin).is_none());
     }
 
