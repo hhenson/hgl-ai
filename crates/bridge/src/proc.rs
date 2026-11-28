@@ -771,6 +771,16 @@ fn read_tail(mut r: impl Read, mut log: Option<std::fs::File>) -> String {
 mod tests {
     use super::*;
 
+    /// A value of `HGL_AI_TURN` unique per process and per call, as `Bridge::next_marker`
+    /// makes: `reap` kills every process carrying a turn's marker, so a fixed one lets two
+    /// test runs on one host kill each other's children (hgl-ai#77, hgl-ai#72).
+    fn marker(name: &str) -> String {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        format!("test-{name}-{}-{n}", std::process::id())
+    }
+
     fn sh(script: &str, cwd: &std::path::Path) -> CmdSpec {
         CmdSpec {
             program: "sh".into(),
@@ -875,7 +885,7 @@ mod tests {
             limits(10_000, Method::Rlimit),
             no_stop(),
             None,
-            "t1",
+            &marker("t1"),
             None,
             |l| got.push(l.to_string()),
             None,
@@ -898,7 +908,7 @@ mod tests {
             limits(10_000, Method::Rlimit),
             no_stop(),
             None,
-            "t2",
+            &marker("t2"),
             None,
             |l| got.push(l.to_string()),
             None,
@@ -929,7 +939,7 @@ mod tests {
                 limits(400, m),
                 no_stop(),
                 Some(&lock),
-                &format!("t3-{m:?}"),
+                &marker(&format!("t3-{m:?}")),
                 None,
                 |_| {},
                 None,
@@ -961,7 +971,7 @@ mod tests {
                 limits(10_000, m),
                 no_stop(),
                 None,
-                &format!("t4-{m:?}"),
+                &marker(&format!("t4-{m:?}")),
                 None,
                 |_| {},
                 None,
@@ -986,7 +996,7 @@ mod tests {
                 limits(60_000, Method::Rlimit),
                 rx,
                 Some(&lock),
-                "t5",
+                &marker("t5"),
                 None,
                 |_| {},
                 None,
@@ -1018,7 +1028,7 @@ mod tests {
                     limits(60_000, Method::Rlimit),
                     rx,
                     None,
-                    "t6",
+                    &marker("t6"),
                     None,
                     |_| {},
                     None,
@@ -1061,7 +1071,7 @@ mod tests {
                 limits(60_000, Method::Rlimit),
                 no_stop(),
                 None,
-                "t7",
+                &marker("t7"),
                 Some(&s2),
                 |_| {},
                 None,
@@ -1091,7 +1101,7 @@ mod tests {
             limits(10_000, Method::Rlimit),
             no_stop(),
             lock,
-            "t8",
+            &marker("t8"),
             None,
             |_| {},
             None,
