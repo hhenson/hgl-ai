@@ -1,7 +1,6 @@
 //! `hgl-ai build`: recipes, runs here or on a builder of another platform, their status,
 //! summaries, logs, and a debugging shell (docs/build.md).
 
-use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -215,7 +214,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
             step,
             bytes,
             log_dir,
-        } => log(ctx, &id, step, bytes, log_dir),
+        } => log(ctx, &id, step, bytes, log_dir).await,
         Cmd::Shell(a) => shell(ctx, a).await,
         Cmd::Recipe(a) => recipe(ctx, a).await,
         Cmd::Gate {
@@ -414,7 +413,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         None => new_build_id(),
     };
     let root = log_root(a.log_dir.clone(), cfg.as_ref());
-    let run_dir = root.join(&id);
+    let run_dir = std::path::absolute(root.join(&id))?;
     // The recipe: a file, or the hub's.
     let mut bus = None;
     if let Some(c) = &cfg {
@@ -467,10 +466,12 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         .unwrap_or_else(|| data_dir(cfg.as_ref()).join("build-cache").join(&repo));
     std::fs::create_dir_all(&build)?;
     let build = std::path::absolute(&build).unwrap_or(build);
+    let tmp = run_dir.join("tmp");
+    std::fs::create_dir_all(&tmp)?;
     let ws = Workspace {
         src: src.display().to_string(),
         build: build.display().to_string(),
-        tmp: std::env::temp_dir().display().to_string(),
+        tmp: tmp.display().to_string(),
         job: None,
         clone: None,
         base_sha: None,
@@ -786,6 +787,16 @@ fn local_run(dir: &Path) -> bool {
     dir.join("pid").is_file()
 }
 
+fn local_process_gone(dir: &Path) -> bool {
+    local_run(dir)
+        && !pid_alive(
+            std::fs::read_to_string(dir.join("pid"))
+                .ok()
+                .and_then(|p| p.trim().parse().ok())
+                .unwrap_or(0),
+        )
+}
+
 fn local_status(dir: &Path) -> Option<Summary> {
     let mut s = store::read_status(dir)?;
     if !local_run(dir) {
@@ -808,6 +819,13 @@ async fn status(ctx: &Ctx, id: &str, log_dir: Option<PathBuf>) -> anyhow::Result
     if let Some(d) = find_local(id, log_dir, cfg.as_ref()) {
         match local_status(&d) {
             Some(s) => print_summary(ctx, &s),
+            None if local_process_gone(&d) => {
+                eprintln!(
+                    "build {id}: stopped before writing a summary; see {}",
+                    d.join("run.out").display()
+                );
+                return Ok(EXIT_FAIL);
+            }
             None => println!("build {id}: starting (log {})", d.display()),
         }
         return Ok(EXIT_OK);
@@ -905,7 +923,7 @@ async fn list(ctx: &Ctx, repo: Option<String>, failed: bool, limit: usize) -> an
     Ok(EXIT_OK)
 }
 
-fn log(
+async fn log(
     ctx: &Ctx,
     id: &str,
     step: Option<String>,
@@ -914,60 +932,22 @@ fn log(
 ) -> anyhow::Result<i32> {
     check_build_id(id)?;
     let cfg = ctx.load_config().ok();
-    let Some(d) = find_local(id, log_dir, cfg.as_ref()) else {
-        bail!("build {id} has no log on this host (a remote build's log stays on its builder)");
-    };
-    let s = local_status(&d);
-    let step = match step {
-        Some(s) => s,
-        None => s
-            .as_ref()
-            .and_then(|s| {
-                s.steps
-                    .iter()
-                    .find(|x| !matches!(x.status.as_str(), "pass" | "skipped"))
-                    .or(s.steps.last())
-                    .map(|x| x.name.clone())
-            })
-            .ok_or_else(|| anyhow::anyhow!("build {id} has run no step yet"))?,
-    };
-    // A step's log, or a file the summary names inside the run's directory (a report).
-    let path = if step.contains(['/', '\\']) || step.ends_with(".xml") {
-        let rel = Path::new(&step);
-        let inside = rel
-            .components()
-            .all(|c| matches!(c, std::path::Component::Normal(_)));
-        if !inside {
-            bail!("{step}: name a file inside the build's directory, as the summary does");
-        }
-        d.join(rel)
+    let data = if let Some(dir) = find_local(id, log_dir, cfg.as_ref()) {
+        let s = local_status(&dir).ok_or_else(|| anyhow::anyhow!("build {id} has no summary"))?;
+        hgl_ai_build::log::read(&dir, &s, step.as_deref(), bytes.as_deref())
+            .map_err(anyhow::Error::msg)?
     } else {
-        d.join(format!("{step}.log"))
+        let (cfg, bus) = connect(ctx).await?;
+        let s = store::run_get(&bus, id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("build {id} not found"))?;
+        hgl_ai_build::log::request(&bus, sender(&cfg)?, &s.host, id, step, bytes)
+            .await
+            .map_err(anyhow::Error::msg)?
     };
-    let real = std::fs::canonicalize(&path).with_context(|| format!("{}", path.display()))?;
-    if !real.starts_with(std::fs::canonicalize(&d)?) {
-        bail!("{step}: not inside the build's directory");
-    }
-    let mut f = std::fs::File::open(&real).with_context(|| format!("{}", path.display()))?;
-    let len = f.metadata()?.len();
-    const MAX: u64 = 64 << 10;
-    let (start, end) = match bytes {
-        Some(r) => {
-            let (a, b) = r
-                .split_once('-')
-                .ok_or_else(|| anyhow::anyhow!("--bytes START-END"))?;
-            let (a, b): (u64, u64) = (a.parse()?, b.parse()?);
-            (a.min(len), b.min(len).max(a.min(len)))
-        }
-        None => (len.saturating_sub(MAX), len),
-    };
-    let end = end.min(start + MAX);
-    f.seek(SeekFrom::Start(start))?;
-    let mut buf = Vec::new();
-    f.take(end - start).read_to_end(&mut buf)?;
     use std::io::Write;
-    std::io::stdout().write_all(&buf)?;
-    if !buf.ends_with(b"\n") {
+    std::io::stdout().write_all(&data)?;
+    if !data.ends_with(b"\n") {
         println!();
     }
     Ok(EXIT_OK)

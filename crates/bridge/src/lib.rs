@@ -663,6 +663,8 @@ impl<B: BusApi> Bridge<B> {
                     // Another bridge may serve the seat now: start nothing more, stop the
                     // running turn at once, hand every note back.
                     stopping = true;
+                    #[cfg(test)]
+                    self.bus.seat_lease_stop(seat.name(), false);
                     fetcher.abort();
                     end.lost = Some(st.running.is_some());
                     stop_turn(&st.running, Stop::Graceful(Duration::ZERO));
@@ -712,6 +714,10 @@ impl<B: BusApi> Bridge<B> {
             .chain(st.deferred.drain(..).map(|(d, _)| d));
         for d in held {
             let _ = d.nak(self.opts.nak_delay).await;
+        }
+        #[cfg(test)]
+        if end.lost.is_some() {
+            self.bus.seat_lease_stop(seat.name(), true);
         }
         end
     }
@@ -1494,24 +1500,27 @@ impl<B: BusApi> Bridge<B> {
         cur: Option<Family>,
         to: Family,
     ) -> Option<String> {
-        if Some(to) == cur {
-            return None;
-        }
         let Target::Tree { task, review } = target else {
             return None;
         };
         if *review {
+            if Some(to) == cur {
+                return None;
+            }
             return Some(format!(
                 "a review keeps its family ({}), which differs from the author's",
                 cur.map(|f| f.to_string())
                     .unwrap_or_else(|| "unknown".into())
             ));
         }
-        let mut authors: HashSet<Family> = cur.into_iter().collect();
+        let mut authors: HashSet<Family> = HashSet::new();
         if let Some(dir) = self.trees.existing(seat.name(), task, false)
             && let Ok(f) = hgl_ai_tree::read_task(&dir)
         {
             authors.extend(f.families);
+        }
+        if Some(to) == cur && authors.contains(&to) {
+            return None;
         }
         authors.insert(to);
         let reviewers: HashSet<Family> = match self.bus.hosts().await {
