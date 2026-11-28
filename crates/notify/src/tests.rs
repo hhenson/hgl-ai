@@ -95,6 +95,7 @@ impl Request {
 struct FakeHttp {
     addr: SocketAddr,
     log: Arc<Mutex<Vec<Request>>>,
+    received: Arc<tokio::sync::Notify>,
     task: JoinHandle<()>,
 }
 
@@ -103,14 +104,17 @@ impl FakeHttp {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let log = Arc::new(Mutex::new(Vec::new()));
+        let received = Arc::new(tokio::sync::Notify::new());
         let task = tokio::spawn({
             let log = log.clone();
+            let received = received.clone();
             async move {
                 while let Ok((mut s, _)) = listener.accept().await {
                     let Some(req) = read_request(&mut s).await else {
                         continue;
                     };
                     log.lock().unwrap().push(req);
+                    received.notify_one();
                     if status == 0 {
                         std::future::pending::<()>().await;
                     }
@@ -123,7 +127,12 @@ impl FakeHttp {
                 }
             }
         });
-        FakeHttp { addr, log, task }
+        FakeHttp {
+            addr,
+            log,
+            received,
+            task,
+        }
     }
 
     fn url(&self, path: &str) -> String {
@@ -579,26 +588,41 @@ async fn no_channels() {
 async fn attempt_times_out() {
     let hang = FakeHttp::start(0, "").await;
     let up = FakeHttp::start(200, "").await;
+    let timeout = Duration::from_secs(60);
     let notifier = Notifier::new(vec![ntfy(hang.url("/t"), None), ntfy(up.url("/t"), None)])
         .unwrap()
-        .with_timeout(Duration::from_millis(300));
-    assert_eq!(
-        notifier.send(&note("t", Priority::Urgent)).await.unwrap(),
-        "ntfy"
-    );
+        .with_timeout(timeout);
+    let notification = note("t", Priority::Urgent);
+    let send = notifier.send(&notification);
+    tokio::pin!(send);
+    tokio::select! {
+        result = &mut send => panic!("send finished before the request arrived: {result:?}"),
+        () = hang.received.notified() => {}
+    }
+    tokio::time::pause();
+    tokio::time::advance(timeout).await;
+    tokio::time::resume();
+    assert_eq!(send.await.unwrap(), "ntfy");
     assert_eq!(hang.requests().len(), 1);
     assert_eq!(up.requests().len(), 1);
+
+    let hang = FakeHttp::start(0, "").await;
     let notifier = Notifier::new(vec![ntfy(hang.url("/t"), None)])
         .unwrap()
-        .with_timeout(Duration::from_millis(300));
-    let f = failures(
-        notifier
-            .send(&note("t", Priority::Urgent))
-            .await
-            .unwrap_err(),
-    );
+        .with_timeout(timeout);
+    let send = notifier.send(&notification);
+    tokio::pin!(send);
+    tokio::select! {
+        result = &mut send => panic!("send finished before the request arrived: {result:?}"),
+        () = hang.received.notified() => {}
+    }
+    tokio::time::pause();
+    tokio::time::advance(timeout).await;
+    tokio::time::resume();
+    let f = failures(send.await.unwrap_err());
+    assert_eq!(hang.requests().len(), 1);
     assert!(
-        f[0].reason.contains("no answer within 300ms"),
+        f[0].reason.contains("no answer within 60s"),
         "{}",
         f[0].reason
     );
