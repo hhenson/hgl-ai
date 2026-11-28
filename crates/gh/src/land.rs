@@ -256,7 +256,7 @@ async fn land_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<(Landing, String)> {
-    if let Some(done) = resume_recorded(gh, s, bus, repo, number, head, o, lock).await? {
+    if let Some(done) = resume_recorded(gh, s, bus, repo, number, o, lock).await? {
         return Ok(done);
     }
     let deadline = Instant::now() + o.timeout;
@@ -326,19 +326,17 @@ async fn land_locked<G: Gh>(
 /// record and a `landed.log` line, the landing is finished (another attempt finished it
 /// while this one waited for the lock): `AlreadyMerged`, without the gate, whose table and
 /// bot limit no longer apply to it.
-#[allow(clippy::too_many_arguments)]
 async fn resume_recorded<G: Gh>(
     gh: &G,
     s: &Settings,
     bus: &Bus,
     repo: &str,
     number: u64,
-    head: &str,
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<Option<(Landing, String)>> {
     let Some(p) = progress::read(bus, repo, number).await? else {
-        return landed_earlier(bus, repo, number, head).await;
+        return landed_earlier(gh, s, bus, repo, number).await;
     };
     // Only the intent: whether the merge happened is GitHub's to say (the gate asks).
     let Some(merge) = p.merge.clone() else {
@@ -360,24 +358,29 @@ async fn resume_recorded<G: Gh>(
     ))
 }
 
-/// A landing with no record whose `landed.log` line is there: finished.
-async fn landed_earlier(
+/// A landing with no record whose `landed.log` line is there: finished. The head is the
+/// pull request's, the one merged: the caller's may be older (the gate updated the branch
+/// before the merge).
+async fn landed_earlier<G: Gh>(
+    gh: &G,
+    s: &Settings,
     bus: &Bus,
     repo: &str,
     number: u64,
-    head: &str,
 ) -> Result<Option<(Landing, String)>> {
     let Some(merge) = progress::landed_merge(bus, repo, number).await? else {
         return Ok(None);
     };
+    let head = gate::fetch_pr(gh, s, repo, number).await?.head;
     let mut outcome = Outcome::new(
         Kind::AlreadyMerged,
         format!(
-            "{repo} #{number} already MERGED at {} and landed",
+            "{repo} #{number} at {} landed earlier at {} already MERGED",
+            short(&head),
             short(&merge)
         ),
         false,
-        head,
+        &head,
     );
     outcome.merge_commit = Some(merge);
     let after = vec![format!(
@@ -565,7 +568,7 @@ pub(crate) async fn merge_locked<G: Gh>(
         ..o.clone()
     };
     let (Landing { outcome, mut after }, _) =
-        match resume_recorded(gh, s, bus, repo, number, head, o, lock).await? {
+        match resume_recorded(gh, s, bus, repo, number, o, lock).await? {
             Some(done) => done,
             None => {
                 let gate_opts = with_deadline(s, repo, o, Instant::now() + o.timeout);

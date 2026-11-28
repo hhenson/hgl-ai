@@ -1114,8 +1114,29 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         "done"
     );
 
-    let again = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    // Asked with an older head (the gate updated the branch before the merge): the merged
+    // head is reported, and the line ends in its status word (r6 on #133).
+    let older = "e".repeat(40);
+    let again = land::land(&gh, &s, &b, "alpha", 7, &older, &o)
+        .await
+        .unwrap();
     assert_eq!(again.outcome.kind, crate::gate::Kind::AlreadyMerged);
+    assert_eq!(again.outcome.head, HEAD);
+    assert_eq!(again.outcome.merge_commit.as_deref(), Some(MERGE));
+    assert!(
+        again.outcome.line.ends_with(" MERGED")
+            && again
+                .outcome
+                .line
+                .contains(&format!("at {}", crate::short(HEAD))),
+        "{}",
+        again.outcome.line
+    );
+    let again = land::merge_once(&gh, &s, &b, "alpha", 7, &older, &o)
+        .await
+        .unwrap();
+    assert_eq!(again.outcome.kind, crate::gate::Kind::AlreadyMerged);
+    assert_eq!(again.outcome.head, HEAD);
     assert!(
         again.after[0].starts_with("landed earlier"),
         "{:?}",
