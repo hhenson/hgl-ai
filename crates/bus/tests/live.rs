@@ -8,6 +8,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
+use futures::StreamExt;
 use hgl_ai_bus::{Bus, BusError, Credential, InboxOptions, ProvisionOptions, parse_credential};
 use hgl_ai_install::nats::{Auth, render_conf};
 use hgl_ai_install::users::{Registry, Role as HubRole};
@@ -158,6 +159,10 @@ impl Hub {
     }
 
     async fn raw(&self) -> jetstream::Context {
+        jetstream::new(self.admin_client().await)
+    }
+
+    async fn admin_client(&self) -> async_nats::Client {
         let cred = parse_credential(&self.credentials[&HubRole::Admin])
             .unwrap()
             .unwrap();
@@ -166,8 +171,7 @@ impl Hub {
             Credential::Nkey { seed, .. } => async_nats::ConnectOptions::with_nkey(seed.clone())
                 .custom_inbox_prefix(cred.inbox_prefix().unwrap()),
         };
-        let c = opts.connect(&self.url).await.expect("raw connect");
-        jetstream::new(c)
+        opts.connect(&self.url).await.expect("raw connect")
     }
 }
 
@@ -1589,7 +1593,8 @@ async fn owner_history_and_durable_feeds(layout: Layout) {
     let coord = hub.as_role(HubRole::Coord).await;
     let console = hub.as_role(HubRole::Console).await;
     let slack = hub.as_role(HubRole::Slack).await;
-    let admin = hub.raw().await;
+    let client = hub.admin_client().await;
+    let admin = jetstream::new(client.clone());
     let mut stream = admin.get_stream(STREAM_OWNER).await.unwrap();
     let epoch = chrono::DateTime::UNIX_EPOCH;
     let status = "hgl.console.status";
@@ -1610,6 +1615,16 @@ async fn owner_history_and_durable_feeds(layout: Layout) {
         .await
         .unwrap()
         .seq;
+    for n in 0..64 {
+        coord
+            .publish_event(
+                "hgl.console.thread.other",
+                b"unrelated",
+                &format!("other-{n}"),
+            )
+            .await
+            .unwrap();
+    }
     let reply = slack
         .publish_event("hgl.owner.thread.a.slack.b.c.d", b"reply", "reply")
         .await
@@ -1645,7 +1660,16 @@ async fn owner_history_and_durable_feeds(layout: Layout) {
         .collect::<Vec<_>>(),
         [last],
     );
-    let filters = vec!["hgl.*.status".into(), "hgl.owner.thread.a.slack.>".into()];
+    let filters = vec![
+        "hgl.*.status".into(),
+        "hgl.owner.thread.a.slack.>".into(),
+        status.into(),
+    ];
+    let mut requests = client
+        .subscribe(format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
     for reader in [&seat, &coord, &console, &slack] {
         assert_eq!(
             reader
@@ -1658,6 +1682,21 @@ async fn owner_history_and_durable_feeds(layout: Layout) {
             [reply, last],
         );
     }
+    client.flush().await.unwrap();
+    requests.unsubscribe().await.unwrap();
+    let mut count = 0;
+    while let Some(request) = requests.next().await {
+        let fields: serde_json::Value = serde_json::from_slice(&request.payload).unwrap();
+        let filter = fields["next_by_subj"]
+            .as_str()
+            .expect("history request has a subject filter");
+        assert!(filters.iter().any(|f| f == filter), "{filter}");
+        count += 1;
+    }
+    assert_eq!(
+        count, 24,
+        "six matching reads per role, regardless of unrelated events"
+    );
     assert_eq!(stream.info().await.unwrap().state.consumer_count, 0);
 
     let mut owner_feed = console
