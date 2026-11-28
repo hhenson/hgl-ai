@@ -2,14 +2,12 @@
 //! every five minutes) into `HGL_STATE/prs`; `hold` while the GraphQL allowance is spent
 //! (and no round while a `hold` holds, whoever wrote it); and an immediate `note` to the
 //! controller when a `ready` or `approved` pull request gains a bot finding or a failing
-//! check between rounds. The previous table (from the bus at start, then from memory) is
-//! what a round is compared with. After the pull request round, every
-//! [`backlog::BACKLOG_EVERY`], the backlog round: `HGL_STATE/backlog` and the day's
+//! check between rounds. Each round compares with the table on the hub. Every
+//! [`backlog::BACKLOG_EVERY`], a backlog round writes `HGL_STATE/backlog` and the day's
 //! `HGL_METRICS` samples, under the same `hold`.
 //!
-//! An alert is kept until its send succeeds: in memory and on the hub
-//! (`HGL_STATE/coord.alerts`, the notes not sent yet), and sent again each round, so a hub
-//! write that fails once loses no alert, nor does a restart of the service (hgl-ai#8).
+//! Alert notes are stored in `HGL_STATE/coord.alerts` before the table advances. Each round
+//! retries the queued notes, removing them only after JetStream acknowledges the send.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -28,8 +26,6 @@ use crate::{Error, Result, Settings, state, store};
 pub const MIN_INTERVAL: Duration = Duration::from_secs(300);
 /// `HGL_STATE` key of the alerts not sent yet: a JSON array of their notes.
 pub const KEY_UNSENT: &str = "coord.alerts";
-/// Most alerts kept unsent; the oldest go first.
-pub const UNSENT_KEEP: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct CoordOpts {
@@ -95,9 +91,8 @@ async fn write_hold(
     Ok(())
 }
 
-/// Add the notes of new alerts to the unsent ones (one per pull request, head and body),
-/// keeping the newest [`UNSENT_KEEP`].
-pub fn queue(unsent: &mut Vec<Note>, new: Vec<Note>) {
+/// Keep the original note when comparing the same transition again so its ID stays stable.
+fn queue(unsent: &mut Vec<Note>, new: impl IntoIterator<Item = Note>) {
     for n in new {
         let same = |u: &Note| {
             u.repo == n.repo && u.issue == n.issue && u.head == n.head && u.body == n.body
@@ -106,32 +101,34 @@ pub fn queue(unsent: &mut Vec<Note>, new: Vec<Note>) {
             unsent.push(n);
         }
     }
-    let excess = unsent.len().saturating_sub(UNSENT_KEEP);
-    unsent.drain(..excess);
 }
 
-/// The alerts left unsent by an earlier round or run.
-async fn load_unsent(b: &Bus) -> Vec<Note> {
-    match b.state_get(KEY_UNSENT).await {
-        Ok(Some(e)) => serde_json::from_str(&e.value).unwrap_or_else(|err| {
-            tracing::warn!("{KEY_UNSENT} is not readable ({err}); dropped");
-            Vec::new()
-        }),
-        Ok(None) => Vec::new(),
-        Err(e) => {
-            tracing::warn!("reading {KEY_UNSENT}: {e}");
-            Vec::new()
-        }
+/// Save new alerts alongside outstanding ones before committing the new comparison table.
+async fn stage_alerts(b: &Bus, pending: &mut Vec<Note>) -> Result<(Vec<Note>, u64)> {
+    let (mut unsent, mut revision) = match b.state_get(KEY_UNSENT).await? {
+        Some(e) => (
+            serde_json::from_str(&e.value)
+                .map_err(|err| crate::invalid(format!("reading {KEY_UNSENT}: {err}")))?,
+            e.revision,
+        ),
+        None => (Vec::new(), 0),
+    };
+    let before = unsent.len();
+    queue(&mut unsent, pending.iter().cloned());
+    if unsent.len() != before {
+        let text = serde_json::to_string(&unsent).expect("notes encode");
+        revision = b.state_update(KEY_UNSENT, &text, revision).await?;
     }
+    pending.clear();
+    Ok((unsent, revision))
 }
 
-/// Send every unsent alert; the ones whose send failed stay, and the list is written to the
-/// hub when it changed. The first failure is returned.
-async fn send_unsent(b: &Bus, unsent: &mut Vec<Note>, stored: &mut bool) -> Result<()> {
+/// Remove only acknowledged sends, using the revision read before sending.
+async fn send_unsent(b: &Bus, unsent: Vec<Note>, revision: u64) -> Result<()> {
     let mut failed = None;
     let before = unsent.len();
     let mut kept = Vec::new();
-    for n in std::mem::take(unsent) {
+    for n in unsent {
         match b.send(&n).await {
             Ok(_) => tracing::info!("alert sent: {}", n.body.lines().next().unwrap_or("")),
             Err(e) => {
@@ -141,16 +138,13 @@ async fn send_unsent(b: &Bus, unsent: &mut Vec<Note>, stored: &mut bool) -> Resu
             }
         }
     }
-    *unsent = kept;
-    if unsent.is_empty() {
-        if *stored {
-            b.state_del(KEY_UNSENT).await?;
-            *stored = false;
-        }
-    } else if unsent.len() != before || !*stored {
-        let text = serde_json::to_string(&*unsent).expect("notes encode");
-        store::put_latest(b, KEY_UNSENT, &text).await?;
-        *stored = true;
+    if kept.len() != before {
+        let text = if kept.is_empty() {
+            String::new()
+        } else {
+            serde_json::to_string(&kept).expect("notes encode")
+        };
+        b.state_update(KEY_UNSENT, &text, revision).await?;
     }
     match failed {
         Some(e) => Err(e.into()),
@@ -158,17 +152,27 @@ async fn send_unsent(b: &Bus, unsent: &mut Vec<Note>, stored: &mut bool) -> Resu
     }
 }
 
-/// Write a round to the hub: the table and `hold`. The alerts go separately
-/// ([`send_unsent`]), so one failure does not take the other with it.
+/// Commit the comparison table after its alerts are durable, then try sending the queue.
 async fn publish(
     b: &Bus,
+    s: &Settings,
     t: &Table,
-    rate: &RateLimit,
-    hold: Option<&str>,
-    change: &HoldChange,
+    infos: &[PrInfo],
+    pending: &mut Vec<Note>,
 ) -> Result<()> {
-    store::put_latest(b, state::KEY_PRS, &t.render()).await?;
-    write_hold(b, change, rate, hold).await
+    let (prev, revision) = match b.state_get(state::KEY_PRS).await? {
+        Some(e) => (Table::parse(&e.value).rows, e.revision),
+        None => (Vec::new(), 0),
+    };
+    let notes = table::alerts(&prev, infos)
+        .iter()
+        .map(|a| alert_note(s, a))
+        .collect::<Result<Vec<_>>>()?;
+    queue(pending, notes);
+    let (unsent, alert_revision) = stage_alerts(b, pending).await?;
+    b.state_update(state::KEY_PRS, &t.render(), revision)
+        .await?;
+    send_unsent(b, unsent, alert_revision).await
 }
 
 /// A refused round: `hold` until the reset time (written, or printed in a dry run).
@@ -257,15 +261,8 @@ pub async fn run<G: Gh>(
     exec::check_auth(gh).await?;
     let bus = if o.dry_run { None } else { bus };
     let mut prev: Vec<Row> = Vec::new();
-    let mut unsent: Vec<Note> = Vec::new();
-    let mut stored = false;
-    if let Some(b) = bus {
-        match b.state_get(state::KEY_PRS).await {
-            Ok(e) => prev = e.map(|e| Table::parse(&e.value).rows).unwrap_or_default(),
-            Err(e) => tracing::warn!("reading the previous table: {e}"),
-        }
-        unsent = load_unsent(b).await;
-        stored = !unsent.is_empty();
+    let mut pending = Vec::new();
+    if bus.is_some() {
         eprintln!(
             "coordinator: {} repositories of {} every {:?} into {st}/{}, every {:?} into {st}/{} and {}",
             s.repos.len(),
@@ -316,28 +313,20 @@ pub async fn run<G: Gh>(
                     rate: Some(rate.clone()),
                     rows: infos.iter().map(|i| i.row.clone()).collect(),
                 };
-                let alerts = table::alerts(&prev, &infos);
                 let change = table::hold_after(&rate, s.hold_below, hold.as_deref(), now);
                 match bus {
                     None => {
                         let _ = out.write_all(t.render().as_bytes());
-                        for a in &alerts {
+                        for a in table::alerts(&prev, &infos) {
                             let _ = write!(out, "would alert {}: {}", s.controller, a.body());
                         }
                         let _ = out.flush();
+                        prev = t.rows;
                     }
                     Some(b) => {
-                        let mut notes = Vec::with_capacity(alerts.len());
-                        for a in &alerts {
-                            notes.push(alert_note(s, a)?);
-                        }
-                        // Captured here: the transition is not looked for again, its note
-                        // is kept until a send succeeds.
-                        queue(&mut unsent, notes);
-                        let sent = send_unsent(b, &mut unsent, &mut stored).await;
-                        let res = publish(b, &t, &rate, hold.as_deref(), &change)
-                            .await
-                            .and(sent);
+                        let published = publish(b, s, &t, &infos, &mut pending).await;
+                        let held = write_hold(b, &change, &rate, hold.as_deref()).await;
+                        let res = published.and(held);
                         if let Err(e) = res {
                             if o.once {
                                 return Err(e);
@@ -353,7 +342,6 @@ pub async fn run<G: Gh>(
                         }
                     }
                 }
-                prev = t.rows;
                 last_rate = Some(rate);
                 match change {
                     HoldChange::Set(v) => hold = Some(v),

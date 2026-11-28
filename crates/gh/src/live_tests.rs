@@ -568,7 +568,7 @@ async fn a_hold_at_the_deadline_stops_the_landing() {
 
 /// A JetStream API request over the plain NATS protocol (the hub here has no auth), for a
 /// test to change the hub under the code it tests. Returns the reply's payload.
-fn js_api(url: &str, subject: &str) -> String {
+fn js_api(url: &str, subject: &str, payload: &str) -> String {
     use std::io::{BufRead, BufReader, Write};
     let addr = url.trim_start_matches("nats://");
     let stream = std::net::TcpStream::connect(addr).unwrap();
@@ -582,7 +582,8 @@ fn js_api(url: &str, subject: &str) -> String {
     assert!(line.starts_with("INFO"), "{line}");
     write!(
         w,
-        "CONNECT {{\"verbose\":false,\"pedantic\":false}}\r\nSUB _INBOX.t 1\r\nPUB {subject} _INBOX.t 0\r\n\r\nPING\r\n"
+        "CONNECT {{\"verbose\":false,\"pedantic\":false}}\r\nSUB _INBOX.t 1\r\nPUB {subject} _INBOX.t {}\r\n{payload}\r\nPING\r\n",
+        payload.len()
     )
     .unwrap();
     loop {
@@ -597,11 +598,9 @@ fn js_api(url: &str, subject: &str) -> String {
     }
 }
 
-/// Carbon's check 8b (hgl-ai#8): a round whose alerts cannot be sent (the notes stream is
-/// gone) keeps them on the hub, and the next run sends them, though the table it compares
-/// with no longer shows the change.
+/// Alerts from consecutive failed rounds survive a restart, even after the table advances.
 #[tokio::test]
-async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
+async fn alerts_from_consecutive_failed_rounds_survive_a_restart() {
     let Some(h) = hub() else { return };
     let b = bus(&h).await;
     let mut s = settings();
@@ -609,34 +608,40 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
     store::put_latest(&b, state::KEY_PRS, &fixture("coord-prev.prs"))
         .await
         .unwrap();
-    // The run's backlog round too (merged with the owner console's coordinator).
-    let gh = || {
+    let prs = fixture("coord-batch.json");
+    let gh = |prs: &str| {
         FakeGh::default()
             .on("auth status", "")
             .on("query Backlog", &fixture("backlog-batch.json"))
-            .on("graphql", &fixture("coord-batch.json"))
+            .on("graphql", prs)
     };
     let o = CoordOpts {
         once: true,
         dry_run: false,
         interval: coord::MIN_INTERVAL,
     };
-    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES");
+    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES", "");
     assert!(reply.contains("\"success\":true"), "{reply}");
-    let r = coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new()).await;
-    assert!(r.is_err(), "the sends failed");
-    // The table moved on; the alerts wait on the hub.
-    let t = Table::parse(&b.state_get(state::KEY_PRS).await.unwrap().unwrap().value);
-    assert_eq!(t.rows.len(), 6);
-    let kept = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap().value;
-    let kept: Vec<hgl_ai_proto::Note> = serde_json::from_str(&kept).unwrap();
-    assert_eq!(kept.len(), 2);
+    let first = prs.replace("\"state\": \"FAILURE\"", "\"state\": \"SUCCESS\"");
+    let mut ids = Vec::new();
+    for (snapshot, expected) in [(&first, vec![11]), (&prs, vec![11, 12])] {
+        let r = coord::run(&gh(snapshot), &s, Some(&b), &o, &mut Vec::new()).await;
+        assert!(r.is_err(), "the sends failed");
+        let t = Table::parse(&b.state_get(state::KEY_PRS).await.unwrap().unwrap().value);
+        assert_eq!(t.rows.len(), 6);
+        let kept = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap().value;
+        let kept: Vec<hgl_ai_proto::Note> = serde_json::from_str(&kept).unwrap();
+        assert_eq!(kept.iter().map(|n| n.issue).collect::<Vec<_>>(), expected);
+        let stored_ids: Vec<_> = kept.iter().map(hgl_ai_proto::Note::msg_id).collect();
+        assert!(stored_ids.starts_with(&ids), "the retry keeps the same ID");
+        ids = stored_ids;
+    }
 
     // The stream is back; a new run (a restarted service) sends them.
     b.provision().await.unwrap();
     let controller = Seat::new("controller").unwrap();
     let mut inbox = b.inbox(&controller).await.unwrap();
-    coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new())
+    coord::run(&gh(&prs), &s, Some(&b), &o, &mut Vec::new())
         .await
         .unwrap();
     let got = inbox.fetch(10, Duration::from_secs(5)).await.unwrap();
@@ -645,6 +650,7 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
         .map(|d| d.note.body.lines().next().unwrap_or("").to_string())
         .collect();
     assert_eq!(got.len(), 2, "{firsts:?}");
+    assert_eq!(got.iter().map(|d| d.note.msg_id()).collect::<Vec<_>>(), ids);
     assert!(
         firsts[0].starts_with("[coord] Alert: alpha#11"),
         "{firsts:?}"
@@ -653,8 +659,8 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
     for d in &got {
         d.ack().await.unwrap();
     }
-    // Sent once: a third round sends nothing.
-    coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new())
+    // After recovery, an unchanged round sends nothing.
+    coord::run(&gh(&prs), &s, Some(&b), &o, &mut Vec::new())
         .await
         .unwrap();
     assert!(
@@ -663,6 +669,69 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
             .await
             .unwrap()
             .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn the_table_waits_for_a_durable_alert_queue() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+    let previous = fixture("coord-prev.prs");
+    store::put_latest(&b, state::KEY_PRS, &previous)
+        .await
+        .unwrap();
+    let gh = FakeGh::default()
+        .on("auth status", "")
+        .on("query Backlog", &fixture("backlog-batch.json"))
+        .on("graphql", &fixture("coord-batch.json"));
+    let o = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+    let controller = Seat::new("controller").unwrap();
+    let mut inbox = b.inbox(&controller).await.unwrap();
+
+    // Keep the table writable while the stream refuses the alert queue subject.
+    let info = js_api(&h.url, "$JS.API.STREAM.INFO.KV_HGL_STATE", "");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    let mut config = info["config"].clone();
+    config["subjects"] = serde_json::json!(["$KV.HGL_STATE.prs", "$KV.HGL_STATE.hold"]);
+    let reply = js_api(
+        &h.url,
+        "$JS.API.STREAM.UPDATE.KV_HGL_STATE",
+        &config.to_string(),
+    );
+    assert!(!reply.contains("\"error\""), "{reply}");
+
+    let r = coord::run(&gh, &s, Some(&b), &o, &mut Vec::new()).await;
+    assert!(r.is_err(), "writing the alert queue should fail");
+    assert_eq!(
+        b.state_get(state::KEY_PRS).await.unwrap().unwrap().value,
+        previous
+    );
+    assert!(
+        inbox
+            .fetch(10, Duration::from_millis(300))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let reply = js_api(
+        &h.url,
+        "$JS.API.STREAM.UPDATE.KV_HGL_STATE",
+        &info["config"].to_string(),
+    );
+    assert!(!reply.contains("\"error\""), "{reply}");
+    coord::run(&gh, &s, Some(&b), &o, &mut Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox.fetch(10, Duration::from_secs(2)).await.unwrap().len(),
+        2
     );
 }
 
