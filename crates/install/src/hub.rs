@@ -18,6 +18,57 @@ pub trait Hub {
     fn provision(&self, cfg: &Config) -> impl Future<Output = Result<(), BusError>>;
     /// Doctor: `Err` when unreachable, else the stream and buckets that are missing.
     fn health(&self, cfg: &Config) -> impl Future<Output = Result<Vec<String>, String>>;
+    /// Doctor, on the hub's host: the consumers on the telemetry streams that outlive a
+    /// page ([`lasting_consumers`]), as `<stream>/<name>`.
+    fn durables(&self, cfg: &Config) -> impl Future<Output = Result<Vec<String>, String>>;
+}
+
+/// A consumer on the telemetry streams that lives on without its page: durable, or with an
+/// inactive threshold above this.
+pub const LASTING: Duration = Duration::from_secs(3600);
+
+/// The consumers on the streams of the buckets the console's page reads
+/// ([`crate::users::VIEWER_BUCKETS`]) that outlive a page ([`LASTING`]), as
+/// `<stream>/<name>`. No part of the fleet makes one there, but the `viewer` user can:
+/// subjects cannot stop a `durable_name` or an `inactive_threshold` in a consumer create's
+/// body (docs/design.md §9).
+pub async fn lasting_consumers(js: &async_nats::jetstream::Context) -> Result<Vec<String>, String> {
+    use futures::StreamExt;
+    let mut out = Vec::new();
+    for b in crate::users::VIEWER_BUCKETS {
+        let name = format!("KV_{b}");
+        let stream = js
+            .get_stream(&name)
+            .await
+            .map_err(|e| format!("{name}: {e}"))?;
+        let mut list = stream.consumers();
+        while let Some(c) = list.next().await {
+            let c = c.map_err(|e| format!("listing the consumers of {name}: {e}"))?;
+            if c.config.durable_name.is_some() || c.config.inactive_threshold > LASTING {
+                out.push(format!("{name}/{}", c.name));
+            }
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
+/// The hub's JetStream as `cfg`'s credential, plainly (no bus, which would create).
+async fn jetstream_of(cfg: &Config) -> Result<async_nats::jetstream::Context, String> {
+    let path = cfg.token_file().map_err(|e| e.to_string())?;
+    let opts = match hgl_ai_bus::read_credential(&path).map_err(|e| e.to_string())? {
+        Some(hgl_ai_bus::Credential::Token(t)) => async_nats::ConnectOptions::with_token(t),
+        Some(hgl_ai_bus::Credential::Nkey { seed, .. }) => {
+            async_nats::ConnectOptions::with_nkey(seed)
+        }
+        None => async_nats::ConnectOptions::new(),
+    };
+    let client = opts
+        .connection_timeout(Duration::from_secs(5))
+        .connect(cfg.hub.url.as_str())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(async_nats::jetstream::new(client))
 }
 
 /// The real hub, through `hgl-ai-bus`.
@@ -35,20 +86,7 @@ impl Hub for BusHub {
     /// Read-only: the bus API has no existence check that does not create, so
     /// this looks the streams and buckets up directly.
     async fn health(&self, cfg: &Config) -> Result<Vec<String>, String> {
-        let path = cfg.token_file().map_err(|e| e.to_string())?;
-        let opts = match hgl_ai_bus::read_credential(&path).map_err(|e| e.to_string())? {
-            Some(hgl_ai_bus::Credential::Token(t)) => async_nats::ConnectOptions::with_token(t),
-            Some(hgl_ai_bus::Credential::Nkey { seed, .. }) => {
-                async_nats::ConnectOptions::with_nkey(seed)
-            }
-            None => async_nats::ConnectOptions::new(),
-        };
-        let client = opts
-            .connection_timeout(Duration::from_secs(5))
-            .connect(cfg.hub.url.as_str())
-            .await
-            .map_err(|e| e.to_string())?;
-        let js = async_nats::jetstream::new(client);
+        let js = jetstream_of(cfg).await?;
         let mut missing = Vec::new();
         for s in [STREAM_NOTES, STREAM_OWNER, STREAM_USAGE] {
             if js.get_stream(s).await.is_err() {
@@ -65,6 +103,10 @@ impl Hub for BusHub {
         }
         Ok(missing)
     }
+
+    async fn durables(&self, cfg: &Config) -> Result<Vec<String>, String> {
+        lasting_consumers(&jetstream_of(cfg).await?).await
+    }
 }
 
 #[cfg(test)]
@@ -78,6 +120,8 @@ pub(crate) mod fake {
         pub reachable: bool,
         pub missing: Vec<String>,
         pub calls: RefCell<Vec<&'static str>>,
+        /// What `durables` finds.
+        pub durables: Vec<String>,
         /// The credential file each call connected with.
         pub creds: RefCell<Vec<String>>,
     }
@@ -87,6 +131,7 @@ pub(crate) mod fake {
             FakeHub {
                 reachable: true,
                 missing: Vec::new(),
+                durables: Vec::new(),
                 calls: RefCell::new(Vec::new()),
                 creds: RefCell::new(Vec::new()),
             }
@@ -121,6 +166,11 @@ pub(crate) mod fake {
         async fn health(&self, cfg: &Config) -> Result<Vec<String>, String> {
             self.answer("health", cfg)
                 .map(|()| self.missing.clone())
+                .map_err(|e| e.to_string())
+        }
+        async fn durables(&self, cfg: &Config) -> Result<Vec<String>, String> {
+            self.answer("durables", cfg)
+                .map(|()| self.durables.clone())
                 .map_err(|e| e.to_string())
         }
     }
