@@ -668,15 +668,20 @@ fn detach_inside_a_turn_is_refused() {
 
 #[test]
 fn turn_term_stops_a_local_build_without_a_failure_verdict() {
-    turn_term_build(false);
+    turn_term_build(false, false);
 }
 
 #[test]
 fn turn_term_preserves_an_earlier_failure() {
-    turn_term_build(true);
+    turn_term_build(true, false);
 }
 
-fn turn_term_build(earlier_failure: bool) {
+#[test]
+fn turn_sigint_then_term_stops_a_local_build() {
+    turn_term_build(false, true);
+}
+
+fn turn_term_build(earlier_failure: bool, interrupt_first: bool) {
     use std::os::unix::process::CommandExt;
 
     let dir = Scratch::new("turn-term");
@@ -737,6 +742,10 @@ fn turn_term_build(earlier_failure: bool) {
         std::thread::sleep(Duration::from_millis(20));
     }
     // Signal the whole group, as turn cleanup does.
+    if interrupt_first {
+        assert_eq!(unsafe { libc::kill(pid, libc::SIGINT) }, 0);
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert_eq!(unsafe { libc::kill(-pid, libc::SIGTERM) }, 0);
     let output = child.wait_with_output().unwrap();
     let summary: serde_json::Value =
