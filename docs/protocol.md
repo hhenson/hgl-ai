@@ -102,10 +102,11 @@ before hub users takes one shared token until it moves.
     the system's limit) is not retried: the bridge sends `term` and tells the
     controller which notes it dropped.
   - At shutdown or a lost lease, held and running notes are naked (handed back).
-- **PROTO-9 — Idempotent sends.** Each note carries a `Nats-Msg-Id` of
+- **PROTO-9 — Idempotent sends.** Notes normally carry a `Nats-Msg-Id` of
   `<sender>-<created_at>-<sha256(envelope)[0:12]>` over recipient, kind, repo,
   issue, head, base and body (and `by` and `class` when set), so a retried send is
-  dropped and no other note is.
+  dropped and no other note is. Coordinator PR alerts use the comparison
+  table revision, repository, PR, head and finding as their message ID.
 
 ## 4. Notes
 
@@ -302,7 +303,7 @@ before hub users takes one shared token until it moves.
 | `decisions.log` | controller, console, coordinator service | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean`, coordinator service | JSON `{"head","merge","done","notes_at","by","report","partial","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. `by` is `coordinator` on the coordinator's landings, which alone finish them (`coord.note`, `coord.decision`, from the `report` kept in the record before it is sent; a `PARTIAL` once, `coord.partial`); it leaves every other record to the controller. |
 | `coord.ask.<repo>.<pr>.<name>` | coordinator service | JSON of the last gate build the coordinator asked for the verdict `name` (head, `main`, recipe revision, build id, builder, asks). Written before the job is sent, with the job, its note's `created_at` and `sent`, then again once the note is published. A restart waits for that build rather than ask again; an ask not known sent is sent again as the same message (the hub drops a copy) unless its builder already took the job; the queued summary is created only if absent, so a resend never sets back the builder's. Deleted when the landing is done or retired. |
-| `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
+| `coord.alerts` | coordinator service | JSON array of pending alert notes and delivery metadata, saved before `prs` advances. Retries run during holds and GitHub read failures. The queue retains at most 100 entries within the state byte limit and reports oldest-entry drops. Five failed sends replace an alert with a dead-letter note for the controller. |
 | `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
