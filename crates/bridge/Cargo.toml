@@ -12,6 +12,7 @@ hgl-ai-config.workspace = true
 hgl-ai-bus.workspace = true
 hgl-ai-cap.workspace = true
 hgl-ai-tree.workspace = true
+hgl-ai-usage.workspace = true
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true
@@ -24,4 +25,5 @@ hex.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
 tracing-subscriber.workspace = true

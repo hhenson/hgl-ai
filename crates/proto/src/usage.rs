@@ -5,11 +5,11 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{ProtoError, Runtime};
+use crate::{Family, ProtoError, Runtime, Seat};
 
 /// The latest record per login, `HGL_USAGE/<runtime>.<account>`; labels at `label.<account>`.
 pub const KV_USAGE: &str = "HGL_USAGE";
-/// Every record that won its key, on `hgl.usage.<runtime>.<account>` (the burn-down history).
+/// Usage observations and quota refusals, on `hgl.usage.<runtime>.<account>`.
 pub const STREAM_USAGE: &str = "HGL_USAGE_LOG";
 pub const USAGE_PREFIX: &str = "hgl.usage";
 /// Hex digits of SHA-256 kept in an account fingerprint.
@@ -59,6 +59,10 @@ pub fn check_label(l: &str) -> Result<(), ProtoError> {
 
 pub fn usage_key(runtime: Runtime, account: &str) -> String {
     format!("{runtime}.{account}")
+}
+
+fn usage_subject(runtime: Runtime, account: &str) -> String {
+    format!("{USAGE_PREFIX}.{}", usage_key(runtime, account))
 }
 
 pub fn usage_label_key(account: &str) -> String {
@@ -113,7 +117,7 @@ impl UsageRecord {
     }
 
     pub fn subject(&self) -> String {
-        format!("{USAGE_PREFIX}.{}", self.key())
+        usage_subject(self.runtime, &self.account)
     }
 
     pub fn validate(&self) -> Result<(), ProtoError> {
@@ -129,6 +133,30 @@ impl UsageRecord {
             }
         }
         Ok(())
+    }
+}
+
+/// A bridge turn refused for quota (PROTO-17), published only to usage history.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename = "quota_refusal")]
+pub struct QuotaRefusal {
+    pub runtime: Runtime,
+    pub account: String,
+    pub host: String,
+    pub seat: Seat,
+    pub family: Family,
+    pub model: String,
+    pub at: String,
+}
+
+impl QuotaRefusal {
+    pub fn subject(&self) -> String {
+        usage_subject(self.runtime, &self.account)
+    }
+
+    pub fn validate(&self) -> Result<(), ProtoError> {
+        check_account(&self.account)?;
+        crate::check_stamp(&self.at)
     }
 }
 

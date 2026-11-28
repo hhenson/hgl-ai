@@ -19,6 +19,7 @@ pub mod proc;
 pub mod prompt;
 mod service;
 mod turn;
+mod usage;
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -44,6 +45,7 @@ use crate::failures::Failures;
 use crate::lock::FileLock;
 use crate::proc::{Stop, TreeSlot};
 use crate::turn::{Outcome, Target, TurnOut};
+use crate::usage::UsageQueues;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BridgeError {
@@ -85,6 +87,11 @@ pub struct Options {
     /// Also the refresh of the seat leases.
     pub heartbeat_every: Duration,
     pub report_every: Duration,
+    /// Idle time between a runtime's collections.
+    pub usage_every: Duration,
+    /// Minimum wait after a runtime's collection before another can start.
+    pub usage_min_every: Duration,
+    pub usage_sources: hgl_ai_usage::Sources,
     /// Retry of a seat whose seat lock or lease another process holds.
     pub seat_retry: Duration,
     pub turn_timeout: Duration,
@@ -115,6 +122,9 @@ impl Options {
             in_progress_every: Duration::from_secs(60),
             heartbeat_every: Duration::from_secs(30),
             report_every: Duration::from_secs(86400),
+            usage_every: Duration::from_secs(15 * 60),
+            usage_min_every: Duration::from_secs(60),
+            usage_sources: hgl_ai_usage::Sources::from_env(),
             seat_retry: Duration::from_secs(30),
             turn_timeout: cfg.turn_timeout(),
             shutdown_grace: Duration::from_secs(30),
@@ -212,6 +222,7 @@ struct HeldLease<L> {
 /// One seat at run time: its configuration and current binding.
 struct SeatRt {
     cfg: SeatConfig,
+    usage: Arc<UsageQueues>,
     /// 0 is the primary binding, `i` is `fallback[i - 1]` (PROTO-17).
     binding: Mutex<usize>,
     exhausted_told: AtomicBool,
@@ -234,11 +245,18 @@ struct SeatRt {
 }
 
 impl SeatRt {
-    fn new(cfg: SeatConfig, ended: EndedTasks, failures: Failures, cleanup: Cleanup) -> Self {
+    fn new(
+        cfg: SeatConfig,
+        ended: EndedTasks,
+        failures: Failures,
+        cleanup: Cleanup,
+        usage: Arc<UsageQueues>,
+    ) -> Self {
         SeatRt {
             lost_why: Mutex::default(),
             cleanup: Mutex::new(cleanup),
             cfg,
+            usage,
             binding: Mutex::new(0),
             exhausted_told: AtomicBool::new(false),
             busy_told: Mutex::default(),
@@ -409,16 +427,18 @@ impl<B: BusApi> Bridge<B> {
             ),
         }
         let mut set = tokio::task::JoinSet::new();
+        let (usage, refusal_tasks) = self.start_usage(&mut set, shutdown.clone());
         for s in seats {
             let file = format!("{}.json", s.name);
             let ended = EndedTasks::load(data.join("bridge").join("ended").join(&file));
             let failures = Failures::load(data.join("bridge").join("failures").join(&file));
             let cleanup = Cleanup::load(data.join("bridge").join("cleanup").join(&file));
             set.spawn(self.clone().seat_main(
-                Arc::new(SeatRt::new(s, ended, failures, cleanup)),
+                Arc::new(SeatRt::new(s, ended, failures, cleanup, usage.clone())),
                 shutdown.clone(),
             ));
         }
+        drop(usage);
         set.spawn(self.clone().heartbeat_loop(shutdown.clone()));
         set.spawn(self.clone().lease_loop(shutdown.clone()));
         set.spawn(self.clone().report_loop(shutdown.clone()));
@@ -431,6 +451,7 @@ impl<B: BusApi> Bridge<B> {
         if let Err(e) = self.bus.host_del(&self.cfg.host).await {
             tracing::warn!("removing the host record: {e}");
         }
+        refusal_tasks.drain().await;
         tracing::info!("bridge stopped");
         Ok(())
     }

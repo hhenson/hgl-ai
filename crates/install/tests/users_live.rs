@@ -334,6 +334,21 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
         seat_bus.usage().await.unwrap()[0].label.as_deref(),
         Some("team")
     );
+    seat_bus
+        .usage_quota_refusal(
+            &hgl_ai_proto::QuotaRefusal {
+                runtime: usage.runtime,
+                account: usage.account.clone(),
+                host: usage.host.clone(),
+                seat: seat("w1"),
+                family: hgl_ai_proto::Family::Gpt,
+                model: "model".into(),
+                at: usage.observed_at.clone(),
+            },
+            "turn-1",
+        )
+        .await
+        .unwrap();
     // Every role reads the usage history (PROTO-24).
     for who in ["build-1", "hub-coord", "console"] {
         let got = hub
@@ -346,7 +361,7 @@ async fn roles_hold_and_seats_cannot_speak_as_the_owner() {
                 10,
             )
             .await;
-        assert_eq!(got.map(|h| h.len()).ok(), Some(1), "{who}");
+        assert_eq!(got.map(|h| h.len()).ok(), Some(2), "{who}");
     }
     let task = hgl_ai_proto::TaskKey {
         repo: "alpha".into(),

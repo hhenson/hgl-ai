@@ -82,11 +82,7 @@ pub async fn collect(src: &Sources, runtimes: &[Runtime], host: &str) -> Vec<Col
         if !want(r) {
             return None;
         }
-        let got = match r {
-            Runtime::Claude => claude(src, host).await,
-            Runtime::Codex => codex(src, host).await,
-            Runtime::Agy => agy(src, host).await,
-        };
+        let got = collect_runtime(src, r, host).await;
         Some(got.map_or_else(
             |why| Collected::Skipped { runtime: r, why },
             |r| Collected::Record(Box::new(r)),
@@ -96,9 +92,38 @@ pub async fn collect(src: &Sources, runtimes: &[Runtime], host: &str) -> Vec<Col
     [c, x, a].into_iter().flatten().collect()
 }
 
+/// Collect one runtime, returning its skip reason if it cannot supply an observation.
+pub async fn collect_runtime(
+    src: &Sources,
+    runtime: Runtime,
+    host: &str,
+) -> Result<UsageRecord, String> {
+    match runtime {
+        Runtime::Claude => collect_claude(src, host, claude_account(src).await?).await,
+        Runtime::Codex => codex(src, host).await,
+        Runtime::Agy => agy(src, host).await,
+    }
+}
+
+/// Resolve the signed-in account even when its usage source cannot supply an observation.
+pub async fn fingerprint(src: &Sources, runtime: Runtime) -> Result<String, String> {
+    let id = match runtime {
+        Runtime::Claude => return Ok(claude_account(src).await?.account),
+        Runtime::Codex => {
+            let home = src.codex_home.clone().ok_or("no codex home")?;
+            blocking(move || codex_login(&home)).await?
+        }
+        Runtime::Agy => {
+            let home = src.agy_home.clone().ok_or("no home for agy's logs")?;
+            blocking(move || agy_login(&home)).await?
+        }
+    };
+    Ok(account_fingerprint(&id))
+}
+
 fn record(
     runtime: Runtime,
-    id: &str,
+    account: String,
     host: &str,
     plan: Option<String>,
     observed_at: DateTime<Utc>,
@@ -108,7 +133,7 @@ fn record(
     let collected_at = Utc::now().max(observed_at);
     UsageRecord {
         runtime,
-        account: account_fingerprint(id),
+        account,
         label: None,
         host: host.to_string(),
         plan,
@@ -121,13 +146,31 @@ fn record(
     }
 }
 
-async fn claude(src: &Sources, host: &str) -> Result<UsageRecord, String> {
+/// A Claude login resolved for a probe or refusal. Only the fingerprint and plan are kept.
+pub struct ClaudeAccount {
+    pub account: String,
+    plan: Option<String>,
+}
+
+pub async fn claude_account(src: &Sources) -> Result<ClaudeAccount, String> {
     let login = parse::claude_login(&run(&src.claude, &["auth", "status"], src.timeout).await?)?;
+    Ok(ClaudeAccount {
+        account: account_fingerprint(&login.id),
+        plan: login.plan,
+    })
+}
+
+/// Probe using an already resolved login, as when a Claude refusal requested the probe.
+pub async fn collect_claude(
+    src: &Sources,
+    host: &str,
+    login: ClaudeAccount,
+) -> Result<UsageRecord, String> {
     let text = run(&src.claude, &["-p", "/usage"], src.timeout).await?;
     let now = Utc::now();
     Ok(record(
         Runtime::Claude,
-        &login.id,
+        login.account,
         host,
         login.plan,
         now,
@@ -143,7 +186,7 @@ async fn agy(src: &Sources, host: &str) -> Result<UsageRecord, String> {
     let id = blocking(move || agy_login(&home)).await?;
     Ok(record(
         Runtime::Agy,
-        &id,
+        account_fingerprint(&id),
         host,
         None,
         now,
@@ -166,14 +209,11 @@ async fn codex(src: &Sources, host: &str) -> Result<UsageRecord, String> {
     let home = src.codex_home.clone().ok_or("no codex home")?;
     let host = host.to_string();
     blocking(move || {
-        let auth = home.join("auth.json");
-        let id = parse::codex_account(
-            &read_bounded(&auth).map_err(|e| format!("{}: {e}", auth.display()))?,
-        )?;
+        let id = codex_login(&home)?;
         let limits = codex_limits(&home.join("sessions"), &id)?;
         Ok(record(
             Runtime::Codex,
-            &id,
+            account_fingerprint(&id),
             &host,
             limits.plan,
             limits.observed_at,
@@ -182,6 +222,11 @@ async fn codex(src: &Sources, host: &str) -> Result<UsageRecord, String> {
         ))
     })
     .await
+}
+
+fn codex_login(home: &Path) -> Result<String, String> {
+    let auth = home.join("auth.json");
+    parse::codex_account(&read_bounded(&auth).map_err(|e| format!("{}: {e}", auth.display()))?)
 }
 
 /// The account's newest rate limits: the latest `observed_at` over the recently written

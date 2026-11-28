@@ -208,6 +208,9 @@ hgl-ai doctor
    this host's platform for the fleet (`docs/build.md`). SDK prefixes for recipes go in
    `[builder.sdk]`.
 
+After starting the upgraded bridge, retire the interim usage schedule on Linux with
+`systemctl --user disable --now hgl-usage.timer` wherever that timer was installed.
+
 `client uninstall` removes the services and the skills, keeping the
 configuration unless `--purge`. Both installers take `--dry-run`, and
 `--linger` to run `loginctl enable-linger` on Linux so services survive logout.

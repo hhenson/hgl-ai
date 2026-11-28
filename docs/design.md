@@ -17,7 +17,7 @@ no GitHub or git library.
 | `bus` | NATS connection, provisioning, send, inbox fetch, ack/nak/term/in-progress, KV, leases. | `proto`, `config` |
 | `cap` | Memory and time caps for a command tree (`systemd-run --user --scope` on Linux, `setrlimit` and a resident-memory watchdog elsewhere; macOS does not enforce `RLIMIT_AS`, so there the watchdog alone limits memory). A bridge turn gets a transient slice of its own, `app-hgl_ai_turn_<id>.slice` with the seat's `MemoryMax`, named in `HGL_AI_SLICE`; a cap inside the turn puts its scope there. The command leads a process group, which is signalled too. Tests that go over a cap on purpose run only with `HGL_AI_OOM_TESTS=1` (CI sets it). | — |
 | `tree` | Worktree layout, create, register, salvage, remove, stale listing. | `proto`, `config`, `bus` |
-| `bridge` | Seat loops, runtime adapters, prompt building, heartbeats, failover, cleanup on `landed`. | all above |
+| `bridge` | Seat loops, runtime adapters, prompt building, heartbeats, failover, usage scheduling, cleanup on `landed`. | `proto`, `config`, `bus`, `cap`, `tree`, `usage` |
 | `install` | Hub and client installers, user services, `nats-server` provisioning, skill installation, agent launch. | `config`, `bus` |
 | `gh` | Coordinator service, merge gate, landing, pin sync, release watch, tap release; `backlog` and `HGL_METRICS`. Landing and release watch hold the hub lease `HGL_LOCKS/lock.land.<repo>`, so they exclude each other across hosts. | `proto`, `config`, `bus` |
 | `owner` | Owner channel: thread records, events, the console's fold, status reports, `decisions.log`. | `proto`, `bus` |

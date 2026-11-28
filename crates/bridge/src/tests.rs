@@ -98,6 +98,13 @@ fn harness() -> H {
     opts.in_progress_every = Duration::from_millis(100);
     opts.heartbeat_every = Duration::from_millis(100);
     opts.report_every = Duration::from_secs(3600);
+    opts.usage_sources = hgl_ai_usage::Sources {
+        claude: bin.join("claude-usage"),
+        agy: bin.join("agy-usage"),
+        codex_home: Some(root.join("codex-home")),
+        agy_home: Some(root.join("agy-home")),
+        timeout: Duration::from_secs(10),
+    };
     opts.seat_retry = Duration::from_millis(100);
     opts.turn_timeout = Duration::from_secs(20);
     opts.shutdown_grace = Duration::from_millis(300);
@@ -196,6 +203,34 @@ impl H {
                 })
             })
             .collect()
+    }
+
+    fn slow_claude_usage(&mut self) {
+        self.opts.usage_sources.timeout = Duration::from_secs(60);
+        self.script(
+            "claude-usage",
+            &format!(
+                r#"case "$*" in
+  'auth status')
+    while [ -f '{dir}/hold-auth' ]; do sleep 0.05; done
+    printf '%s\n' '{{"loggedIn":true,"orgId":"test-org","email":"usage@example.test","planTier":"max"}}'
+    ;;
+  '-p /usage')
+    while [ ! -f '{dir}/release-probe' ]; do sleep 0.05; done
+    printf '%s\n' 'Current week (all models): 20% used'
+    ;;
+  *) exit 2 ;;
+esac"#,
+                dir = self.root.display()
+            ),
+        );
+    }
+
+    fn claude_usage_calls(&self, args: [&str; 2]) -> usize {
+        self.calls("claude-usage")
+            .iter()
+            .filter(|call| call.args == args)
+            .count()
     }
 
     fn work(&self) -> PathBuf {
@@ -1058,6 +1093,13 @@ async fn assign_then_sendback_resumes_then_landed_cleans_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
     let h = harness();
+    let home = h.opts.usage_sources.codex_home.as_ref().unwrap();
+    std::fs::create_dir(home).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        r#"{"tokens":{"account_id":"codex-account"}}"#,
+    )
+    .unwrap();
     h.script(
         "codex",
         &format!("cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")),
@@ -1084,6 +1126,21 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
     );
     // Held, not naked: the refusal spends no delivery (PROTO-8).
     eventually("acked once moved", || h.bus.events(a) == [Ev::Ack]).await;
+    eventually("refusal published without a usage observation", || {
+        h.bus.quota_refusals().len() == 1
+    })
+    .await;
+    let refusals = h.bus.quota_refusals();
+    let refusal = &refusals[0];
+    assert_eq!(refusal.runtime, Runtime::Codex);
+    assert_eq!(
+        refusal.account,
+        hgl_ai_proto::account_fingerprint("codex-account")
+    );
+    assert_eq!(refusal.seat, seat("w1"));
+    assert_eq!(refusal.family, Family::Gpt);
+    assert_eq!(refusal.model, "gpt-6.2-astra");
+    assert!(h.bus.usage().is_empty());
     let tf = hgl_ai_tree::read_task(&h.work().join("w1/demo-3")).unwrap();
     assert_eq!(tf.families, [Family::Claude]);
     assert_eq!(
@@ -1115,6 +1172,175 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
     })
     .await;
     stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_runs_periodically_and_only_for_the_finished_turns_runtime() {
+    let mut h = harness();
+    h.opts.usage_every = Duration::from_millis(500);
+    h.opts.usage_min_every = Duration::from_millis(100);
+    let usage_sources = &h.opts.usage_sources;
+    let agy_home = usage_sources.agy_home.as_ref().unwrap();
+    std::fs::create_dir_all(agy_home.join("log")).unwrap();
+    std::fs::write(
+        agy_home.join("log/cli-test.log"),
+        "applyAuthResult: email=example@example.test\n",
+    )
+    .unwrap();
+    let probe = &usage_sources.agy;
+    std::fs::write(probe, "#!/bin/sh\nprintf 'Gemini Models\\tFive Hour Limit Remaining\\t80%%\\t1970-01-01T00:00:00Z\\n'\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("two periodic agy probes", || h.bus.usage().len() >= 2).await;
+    stop(tx, j).await;
+
+    // With the next tick far off, a Codex turn adds only a Codex observation.
+    h.opts.usage_every = Duration::from_secs(900);
+    let home = h.opts.usage_sources.codex_home.as_ref().unwrap();
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        r#"{"tokens":{"account_id":"codex-account"}}"#,
+    )
+    .unwrap();
+    h.script(
+        "codex",
+        &format!(
+            "cat > '{}' <<'EOF'\n{{\"timestamp\":\"2026-11-27T10:00:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"rate_limits\":{{\"primary\":{{\"used_percent\":20,\"window_minutes\":300}}}}}}}}\nEOF\ncat '{}'",
+            home.join("sessions/rollout-test.jsonl").display(),
+            fixture("codex-ok.jsonl")
+        ),
+    );
+    let before = h.bus.usage().len();
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 3, "[claude] Assign: demo#3 Three"),
+    );
+    eventually("turn acknowledged", || h.bus.events(a) == [Ev::Ack]).await;
+    eventually("post-turn Codex observation", || {
+        h.bus.usage().len() > before
+    })
+    .await;
+    stop(tx, j).await;
+    let usage = h.bus.usage();
+    assert_eq!(usage.len(), before + 1);
+    assert_eq!(usage[before].runtime, Runtime::Codex);
+    assert!(h.bus.quota_refusals().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_slow_probe_cannot_hold_turns_or_refusals_and_a_claude_refusal_reuses_auth() {
+    let mut h = harness();
+    h.opts.usage_min_every = Duration::from_millis(100);
+    h.slow_claude_usage();
+    h.script(
+        "claude",
+        &format!(
+            "if [ \"$n\" -le 2 ]; then cat '{}'; else cat '{}'; exit 1; fi",
+            fixture("claude-ok.jsonl"),
+            fixture("claude-quota.synthetic.jsonl"),
+        ),
+    );
+    let (tx, j) = h.start(&["r1"]);
+    let send = |body| h.bus.push("r1", note(Kind::Note, "r1", 1, body));
+    let first = send("start a usage probe");
+    eventually("first turn settled and its probe is blocked", || {
+        h.bus.events(first) == [Ev::Ack] && h.claude_usage_calls(["-p", "/usage"]) == 1
+    })
+    .await;
+    let second = send("another turn during the probe");
+    eventually("second turn acknowledged with the probe blocked", || {
+        h.bus.events(second) == [Ev::Ack]
+    })
+    .await;
+    send("refuse the third turn during the probe");
+    eventually("refusal published with the probe blocked", || {
+        h.bus.quota_refusals().len() == 1
+    })
+    .await;
+    let refusal = h.bus.quota_refusals().pop().unwrap();
+    assert_eq!(refusal.runtime, Runtime::Claude);
+    assert_eq!(
+        refusal.account,
+        hgl_ai_proto::account_fingerprint("test-org/usage@example.test")
+    );
+    assert!(h.bus.usage().is_empty());
+    assert_eq!(h.claude_usage_calls(["-p", "/usage"]), 1);
+
+    std::fs::write(h.root.join("release-probe"), "").unwrap();
+    eventually(
+        "the blocked probe and one coalesced probe published",
+        || h.bus.usage().len() == 2,
+    )
+    .await;
+    stop(tx, j).await;
+    assert_eq!(h.claude_usage_calls(["-p", "/usage"]), 2);
+    assert_eq!(h.claude_usage_calls(["auth", "status"]), 2);
+    assert!(h.bus.usage().iter().all(|r| {
+        r.account == refusal.account && r.plan.as_deref() == Some("max") && r.buckets.len() == 1
+    }));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_cancels_a_slow_probe_and_drains_queued_refusals() {
+    let mut h = harness();
+    h.cfg.seats[0].binding = h.cfg.seats[1].binding.clone();
+    h.cfg.seats[0].fallback.clear();
+    h.slow_claude_usage();
+    h.script(
+        "claude",
+        &format!(
+            "if [ \"$n\" -eq 1 ]; then cat '{}'; else cat '{}'; exit 1; fi",
+            fixture("claude-ok.jsonl"),
+            fixture("claude-quota.synthetic.jsonl"),
+        ),
+    );
+    let (tx, mut j) = h.start(&["r1", "w1"]);
+    let first = h.bus.push("r1", note(Kind::Note, "r1", 1, "start a probe"));
+    eventually("first turn settled and its probe is blocked", || {
+        h.bus.events(first) == [Ev::Ack] && h.claude_usage_calls(["-p", "/usage"]) == 1
+    })
+    .await;
+    let hold_auth = h.root.join("hold-auth");
+    std::fs::write(&hold_auth, "").unwrap();
+    h.bus.push("r1", note(Kind::Note, "r1", 1, "first refusal"));
+    eventually(
+        "the refusal worker is waiting on auth during the probe",
+        || h.claude_usage_calls(["auth", "status"]) == 2,
+    )
+    .await;
+    h.bus
+        .push("w1", note(Kind::Note, "w1", 1, "second refusal"));
+    eventually("both seats handled their quota outcomes", || {
+        h.bus.sent_containing("has no fallback left").len() == 2
+    })
+    .await;
+
+    tx.send(true).unwrap();
+    eventually("the bridge shut down its seats", || {
+        !h.bus.deleted_hosts().is_empty()
+    })
+    .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(2200), &mut j)
+            .await
+            .is_err(),
+        "the started and queued refusals still need draining"
+    );
+    assert!(h.bus.quota_refusals().is_empty());
+    std::fs::remove_file(hold_auth).unwrap();
+    tokio::time::timeout(Duration::from_secs(5), j)
+        .await
+        .expect("draining refusals finishes while the probe is blocked")
+        .unwrap()
+        .unwrap();
+    let refused: Vec<Seat> = h.bus.quota_refusals().into_iter().map(|r| r.seat).collect();
+    assert_eq!(refused, [seat("r1"), seat("w1")]);
+    assert_eq!(h.claude_usage_calls(["-p", "/usage"]), 1);
+    assert_eq!(h.claude_usage_calls(["auth", "status"]), 3);
+    assert!(h.bus.usage().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -11,7 +11,7 @@ use sha2::{Digest, Sha256};
 
 pub mod usage;
 pub use usage::{
-    KV_USAGE, STREAM_USAGE, USAGE_PREFIX, UsageBucket, UsageLabel, UsageRecord,
+    KV_USAGE, QuotaRefusal, STREAM_USAGE, USAGE_PREFIX, UsageBucket, UsageLabel, UsageRecord,
     account_fingerprint, check_account, check_label, usage_key, usage_label_key,
 };
 

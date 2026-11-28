@@ -854,6 +854,21 @@ impl<B: BusApi> Bridge<B> {
             tracing::error!(seat = %name, "a process of the turn survived; the turn lock stays held by it");
         }
         drop(held);
+        let quota =
+            matches!(run.ended, Ended::Exited(_)) && parsed.quota && !parsed.success(exited_ok);
+        if !matches!(
+            run.ended,
+            Ended::CannotStart(_) | Ended::SpawnFailed(_) | Ended::ShutdownKilled
+        ) {
+            let refusal = quota.then(|| crate::usage::RefusedTurn {
+                seat: name,
+                family: r.family,
+                model: r.model,
+                at: hgl_ai_proto::utc_now_stamp(),
+                id: marker,
+            });
+            seat.usage[&r.runtime].after_turn(r.runtime, refusal);
+        }
         let err = parsed.error.clone().unwrap_or_default();
         match run.ended {
             Ended::Stopped => Outcome::Stopped,
@@ -866,7 +881,7 @@ impl<B: BusApi> Bridge<B> {
                 Outcome::PrepFailed(rollback_error.unwrap())
             }
             Ended::Exited(_) if parsed.success(exited_ok) => Outcome::Clean,
-            Ended::Exited(_) if parsed.quota => Outcome::Quota(if err.is_empty() {
+            Ended::Exited(_) if quota => Outcome::Quota(if err.is_empty() {
                 "quota refusal".into()
             } else {
                 err

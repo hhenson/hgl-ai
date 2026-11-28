@@ -227,7 +227,8 @@ before hub users takes one shared token until it moves.
   reviewer family that is none of its authors' (the families its turns ran on).
   It tells the controller, and returns the seat to its primary after
   `limits.failover_cooldown` (default 1 h). With no such binding, the notes stay
-  held (PROTO-8). The merge gate checks ROLE-11 again (PROTO-19).
+  held (PROTO-8). The bridge also publishes the refusal to the login's usage history
+  (§10). The merge gate checks ROLE-11 again (PROTO-19).
 
 ## 7. Receipts
 
@@ -381,8 +382,11 @@ A builder writes `HGL_HOSTS/builder.<label>` with the same heartbeat and TTL
 
 ## 10. Subscription usage
 
-`hgl-ai usage collect` reads each signed-in CLI of the host's agent user, by slash
-command or file, never a prompt (no model turn):
+The bridge requests background collection after a turn for its runtime, coalescing pending
+requests and waiting at least one minute after each collection. With no turn it collects
+again 15 minutes after the last run. Quota events are published independently and drained
+on shutdown. `hgl-ai usage collect` also runs it by hand. The collector reads each
+selected CLI of the host's agent user, by slash command or file, never a model prompt:
 
 | Runtime | Limits | Account id |
 | --- | --- | --- |
@@ -406,7 +410,9 @@ command or file, never a prompt (no model turn):
   record stays fresh while any of those hosts is up. Each record that replaces its key
   is also published to `hgl.usage.<runtime>.<account>` (message id
   `<key>.<observed_at>`), the history for burn-down; the same observation again is sent
-  to the history only when the history's last record for the key is not it. `usage show` gives each record the label
-  in force. Seat and coordinator users may publish both, and every role reads the
-  history; a host is to publish only the accounts its registration lists
-  (#36).
+  to the history only when the history's last observation for the key is not it.
+  PROTO-17 refusals are stream events on the same subject, with `kind: "quota_refusal"`,
+  `runtime`, `account`, `host`, `seat`, `family`, `model` and `at` (UTC). If the
+  signed-in account cannot be resolved, the bridge logs the failure. `usage show` gives
+  each record the label in force. Seat and coordinator users may publish both, and every
+  role reads the history. A host is to publish only the accounts its registration lists (#36).
