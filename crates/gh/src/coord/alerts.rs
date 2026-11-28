@@ -1,4 +1,4 @@
-use hgl_ai_bus::{Bus, MAX_VALUE_BYTES};
+use hgl_ai_bus::{Bus, BusError, MAX_VALUE_BYTES};
 use hgl_ai_proto::{Kind, Note, check_head};
 use serde::{Deserialize, Serialize};
 
@@ -11,6 +11,7 @@ const SEND_ATTEMPTS: u8 = 5;
 const QUEUE_BYTES: usize = MAX_VALUE_BYTES - 1024;
 // Space for the fixed-size overflow report, including its envelope.
 const REPORT_BYTES: usize = 1024;
+const ALERT_BYTES: usize = QUEUE_BYTES - REPORT_BYTES;
 
 #[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -127,14 +128,15 @@ impl Entry {
 fn append(entries: &mut Vec<Entry>, new: impl IntoIterator<Item = Entry>) {
     for entry in new {
         let finding = entry.finding();
-        // Keep the original envelope and retry count when the same finding is observed again.
+        // Keep the original envelope and retry count, and let reports coexist with alerts.
         let exists = entries.iter().any(|queued| {
-            (finding.is_some()
-                && queued.note.repo == entry.note.repo
-                && queued.note.issue == entry.note.issue
-                && queued.note.head == entry.note.head
-                && queued.finding() == finding)
-                || queued.note == entry.note
+            queued.report == entry.report
+                && ((finding.is_some()
+                    && queued.note.repo == entry.note.repo
+                    && queued.note.issue == entry.note.issue
+                    && queued.note.head == entry.note.head
+                    && queued.finding() == finding)
+                    || queued.note == entry.note)
         });
         if !exists {
             entries.push(entry);
@@ -149,7 +151,7 @@ fn bound(s: &Settings, entries: &mut Vec<Entry>) {
         .iter_mut()
         .map(|entry| {
             let mut size = serde_json::to_vec(entry).expect("alert encodes").len() + 1;
-            if size + 2 > QUEUE_BYTES {
+            if size + 2 > ALERT_BYTES {
                 *entry = entry.dead_letter(s, "the encoded alert exceeds the queue byte limit");
                 size = serde_json::to_vec(entry)
                     .expect("dead letter encodes")
@@ -164,7 +166,7 @@ fn bound(s: &Settings, entries: &mut Vec<Entry>) {
         return;
     }
     let mut dropped = 0;
-    while entries.len() - dropped >= UNSENT_KEEP || bytes > QUEUE_BYTES - REPORT_BYTES {
+    while entries.len() - dropped >= UNSENT_KEEP || bytes > ALERT_BYTES {
         bytes -= sizes[dropped];
         dropped += 1;
     }
@@ -226,8 +228,14 @@ impl Queue {
                     );
                 }
                 Err(e) if entry.report => {
-                    tracing::debug!("retrying coordinator alert report: {e}");
-                    self.entries.push(entry);
+                    if matches!(e, BusError::Proto(_)) {
+                        tracing::warn!("dropping invalid coordinator alert report: {e}");
+                        changed = true;
+                    } else {
+                        tracing::warn!("retrying coordinator alert report: {e}");
+                        self.entries.push(entry);
+                    }
+                    failed.get_or_insert(e);
                 }
                 Err(e) => {
                     changed = true;
@@ -312,6 +320,24 @@ mod tests {
     }
 
     #[test]
+    fn a_queued_dead_letter_does_not_suppress_a_new_alert() {
+        let s = settings();
+        let alert = alert();
+        let report = Entry::alert(&s, &alert, 1).dead_letter(&s, "previous send failed");
+        let new = Entry::alert(&s, &alert, 2);
+        let mut queue = vec![report.clone()];
+
+        append(&mut queue, [new.clone(), report, new.clone()]);
+
+        let [report, queued] = queue.as_slice() else {
+            panic!("expected one report and one alert");
+        };
+        assert!(report.report);
+        assert!(!queued.report);
+        assert_eq!(queued.message_id(), new.message_id());
+    }
+
+    #[test]
     fn an_alert_that_cannot_fit_leaves_a_small_report() {
         let s = settings();
         let mut alert = alert();
@@ -321,5 +347,32 @@ mod tests {
         assert!(queue[0].report);
         assert_eq!(queue[0].note.issue, alert.number);
         assert!(serde_json::to_vec(&queue).unwrap().len() < 1024);
+    }
+
+    #[test]
+    fn an_alert_that_cannot_fit_with_the_overflow_report_keeps_older_entries() {
+        let s = settings();
+        let mut older = alert();
+        older.url.push_str(&"x".repeat(REPORT_BYTES));
+        let older = Entry::alert(&s, &older, 1);
+        let mut large = alert();
+        large.number += 1;
+        let initial_size = serde_json::to_vec(&Entry::alert(&s, &large, 1))
+            .unwrap()
+            .len()
+            + 3;
+        large
+            .url
+            .push_str(&"x".repeat(ALERT_BYTES + 1 - initial_size));
+        let mut queue = vec![older.clone(), Entry::alert(&s, &large, 1)];
+
+        bound(&s, &mut queue);
+
+        let [kept, report] = queue.as_slice() else {
+            panic!("expected the older alert and a dead-letter report");
+        };
+        assert_eq!(kept.note, older.note);
+        assert!(report.report);
+        assert_eq!(report.note.issue, large.number);
     }
 }

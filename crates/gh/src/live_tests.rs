@@ -1061,6 +1061,73 @@ async fn an_invalid_alert_becomes_a_durable_dead_letter_after_five_failures() {
 }
 
 #[tokio::test]
+async fn alert_report_failures_drop_invalid_reports_and_retry_transient_failures() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let s = settings();
+    let invalid = Note::new(
+        s.coord_seat.clone(),
+        Seat::owner(),
+        Kind::Note,
+        "[coord] Invalid report recipient",
+    );
+    let valid = Note::new(
+        s.coord_seat.clone(),
+        s.controller.clone(),
+        Kind::Note,
+        "[coord] Dead letter: pending report",
+    );
+    let report = |note: &Note| {
+        let mut value = serde_json::to_value(note).unwrap();
+        value["report"] = true.into();
+        value
+    };
+    let saved = serde_json::json!([report(&invalid), report(&valid)]);
+    b.state_create(coord::KEY_UNSENT, &saved.to_string())
+        .await
+        .unwrap();
+    b.state_create(state::KEY_HOLD, "2100-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES", "");
+    assert!(reply.contains("\"success\":true"), "{reply}");
+    let gh = FakeGh::default().on("auth status", "");
+    let opts = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+
+    let result = coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new()).await;
+    assert!(matches!(
+        result,
+        Err(Error::Bus(hgl_ai_bus::BusError::Proto(_)))
+    ));
+    let kept = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap();
+    assert_eq!(
+        serde_json::from_str::<Vec<Note>>(&kept.value).unwrap(),
+        [valid.clone()]
+    );
+
+    let result = coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new()).await;
+    assert!(matches!(
+        result,
+        Err(Error::Bus(hgl_ai_bus::BusError::Nats(_)))
+    ));
+    let retried = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap();
+    assert_eq!(retried.revision, kept.revision);
+
+    b.provision().await.unwrap();
+    let mut inbox = b.inbox(&s.controller).await.unwrap();
+    coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new())
+        .await
+        .unwrap();
+    let got = inbox.fetch(10, Duration::from_secs(2)).await.unwrap();
+    assert_eq!(got.into_iter().map(|d| d.note).collect::<Vec<_>>(), [valid]);
+    assert!(b.state_get(coord::KEY_UNSENT).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn malformed_alert_state_is_replaced_before_advancing_the_table() {
     let Some(h) = hub() else { return };
     let b = bus(&h).await;
