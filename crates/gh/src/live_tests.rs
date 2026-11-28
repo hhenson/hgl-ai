@@ -574,6 +574,10 @@ async fn a_hold_at_the_deadline_stops_the_landing() {
 /// A JetStream API request over the plain NATS protocol (the hub here has no auth), for a
 /// test to change the hub under the code it tests. Returns the reply's payload.
 fn js_api(url: &str, subject: &str) -> String {
+    js_api_body(url, subject, "")
+}
+
+fn js_api_body(url: &str, subject: &str, body: &str) -> String {
     use std::io::{BufRead, BufReader, Write};
     let addr = url.trim_start_matches("nats://");
     let stream = std::net::TcpStream::connect(addr).unwrap();
@@ -587,7 +591,8 @@ fn js_api(url: &str, subject: &str) -> String {
     assert!(line.starts_with("INFO"), "{line}");
     write!(
         w,
-        "CONNECT {{\"verbose\":false,\"pedantic\":false}}\r\nSUB _INBOX.t 1\r\nPUB {subject} _INBOX.t 0\r\n\r\nPING\r\n"
+        "CONNECT {{\"verbose\":false,\"pedantic\":false}}\r\nSUB _INBOX.t 1\r\nPUB {subject} _INBOX.t {}\r\n{body}\r\nPING\r\n",
+        body.len()
     )
     .unwrap();
     loop {
@@ -1802,7 +1807,8 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
         "comments?per_page",
         &serde_json::json!([posted]).to_string(),
     );
-    crate::routing::round(&recovered, &s, &b, &read(HEAD))
+    // The accepted comment is recoverable even after the PR disappears from the batch.
+    crate::routing::round(&recovered, &s, &b, &[])
         .await
         .unwrap();
     crate::routing::round(&recovered, &s, &b, &read(HEAD))
@@ -1839,8 +1845,11 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
     b.send(&note(Kind::Review, &s.controller, &r2, 9, HEAD, "Queued"))
         .await
         .unwrap();
+    let w3 = seat("w3");
+    b.tree_del(&tree(&w2, 0).key()).await.unwrap();
+    b.tree_put(&tree(&w3, sequence + 10)).await.unwrap();
     let head = "b".repeat(40);
-    let sequence = b.send(&ready(&w2, &head)).await.unwrap().seq;
+    let sequence = b.send(&ready(&w3, &head)).await.unwrap().seq;
     crate::routing::round(&no_gh, &s, &b, &read(&head))
         .await
         .unwrap();
@@ -1850,7 +1859,7 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
         .unwrap();
     assert_eq!(notes.len(), 1);
     assert_eq!(notes[0].note.recipient, r2);
-    assert!(notes[0].note.body.contains(HEAD));
+    assert!(!notes[0].note.body.contains("Earlier reviewed head"));
 
     let mut second = receipt(&head, Verdict::Findings);
     let sequence = b.send(&second).await.unwrap().seq;
@@ -1867,6 +1876,27 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
         notes[0].note, second,
         "the controller judges repeat findings"
     );
+
+    let mut wrong_family = receipt(&head, Verdict::Clean);
+    let mut body = state::routed_receipt(&wrong_family).unwrap();
+    body.family = Family::Claude;
+    wrong_family.body = serde_json::to_string(&body).unwrap();
+    let sequence = b.send(&wrong_family).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&head))
+        .await
+        .unwrap();
+    wrong_family.recipient = s.controller.clone();
+    let notes = b
+        .read_notes(
+            std::slice::from_ref(&s.controller),
+            sequence,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note, wrong_family);
 
     let sequence = b.send(&receipt(&head, Verdict::Clean)).await.unwrap().seq;
     crate::routing::round(&no_gh, &s, &b, &read(&head))
@@ -1886,7 +1916,7 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
     let receipts = crate::gate::receipts(&b, &s, "alpha", 7).await.unwrap();
     assert_eq!(
         receipts.len(),
-        3,
+        4,
         "the router and its forwarded copy share one receipt"
     );
     assert!(
@@ -1894,4 +1924,162 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
             .iter()
             .any(|r| r.receipt.head == head && r.receipt.verdict == Verdict::Clean)
     );
+}
+
+#[tokio::test]
+async fn routing_recovers_retained_outputs_and_drains_a_disabled_pool() {
+    use hgl_ai_proto::Note;
+    use serde_json::{Value, json};
+
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let s = settings();
+    let mut config: Value =
+        serde_json::from_str(&js_api(&h.url, "$JS.API.STREAM.INFO.HGL_NOTES")).unwrap();
+    let config = &mut config["config"];
+    config["duplicate_window"] = json!(100_000_000);
+    let updated: Value = serde_json::from_str(&js_api_body(
+        &h.url,
+        "$JS.API.STREAM.UPDATE.HGL_NOTES",
+        &config.to_string(),
+    ))
+    .unwrap();
+    assert!(updated.get("error").is_none(), "{updated}");
+
+    let reviewer = Seat::new("removed").unwrap();
+    let author = Seat::new("w1").unwrap();
+    let mut ready = Note::new(author, s.coord_seat.clone(), Kind::Ready, "Ready");
+    ready.repo = Some("alpha".into());
+    ready.issue = 7;
+    ready.head = Some(HEAD.into());
+    let first = b.send(&ready).await.unwrap().seq;
+    let mut review = ready.clone();
+    review.sender = s.coord_seat.clone();
+    review.recipient = reviewer.clone();
+    review.kind = Kind::Review;
+    let routed = b
+        .send_with_id(&review, &format!("coord-routing-{first}"))
+        .await
+        .unwrap()
+        .seq;
+    let gh = FakeGh::default();
+    let checkpoint = "coord.routing";
+    b.state_put(
+        checkpoint,
+        &json!({
+            "after": first - 1,
+            "digest": [],
+            "outbox": {
+                "seq": first,
+                "action": { "Review": { "pr": 7, "to": reviewer, "earlier": null, "url": "" } },
+                "line": "alpha#7 → review by removed"
+            }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+
+    let queued = Note::new(
+        ready.sender.clone(),
+        s.coord_seat.clone(),
+        Kind::Question,
+        "Queued",
+    );
+    b.send(&queued).await.unwrap();
+    let probe = b
+        .send_with_id(&queued, "duplicate-window-probe")
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let probe_again = b
+        .send_with_id(&queued, "duplicate-window-probe")
+        .await
+        .unwrap();
+    assert!(!probe_again.duplicate && probe.seq != probe_again.seq);
+
+    crate::routing::round(&gh, &s, &b, &[]).await.unwrap();
+    let reviews = b
+        .read_notes(&[reviewer], first, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(reviews.len(), 1);
+    assert_eq!(reviews[0].seq, routed);
+    let notes = b
+        .read_notes(
+            std::slice::from_ref(&s.controller),
+            first,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 4);
+    assert_eq!(
+        notes
+            .iter()
+            .filter(|n| n.note.body.trim_end() == "Queued")
+            .count(),
+        3
+    );
+    assert!(notes[3].note.body.contains("review by removed"));
+
+    // Lose the cursor update after sending the digest.
+    b.state_put(
+        checkpoint,
+        &json!({
+            "after": probe_again.seq,
+            "digest": ["alpha#7 → review by removed"],
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    crate::routing::round(&gh, &s, &b, &[]).await.unwrap();
+
+    // Lose the cursor update after forwarding a new input.
+    let next = b.send(&queued).await.unwrap().seq;
+    let mut forwarded = queued;
+    forwarded.recipient = s.controller.clone();
+    b.send_with_id(&forwarded, &format!("coord-routing-{next}"))
+        .await
+        .unwrap();
+    b.state_put(
+        checkpoint,
+        &json!({
+            "after": probe_again.seq,
+            "digest": [],
+            "outbox": {
+                "seq": next,
+                "action": { "Forward": { "to": s.controller } },
+                "line": null
+            }
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    crate::routing::round(&gh, &s, &b, &[]).await.unwrap();
+    let recovered = b
+        .read_notes(&[s.controller], first, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(recovered.len(), 5);
+    assert_eq!(
+        recovered
+            .iter()
+            .filter(|n| n.note.body.contains("review by removed"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        recovered
+            .iter()
+            .filter(|n| n.note.body.trim_end() == "Queued")
+            .count(),
+        4
+    );
+    assert!(gh.calls().is_empty());
 }

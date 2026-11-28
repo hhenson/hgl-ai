@@ -157,15 +157,18 @@ pub fn routed_receipt(note: &Note) -> Option<ReviewReceipt> {
         return None;
     }
     let receipt = parse_receipt(&note.body)?;
-    (receipt.reviewer == note.sender
+    matches_receipt(note, &receipt).then_some(receipt)
+}
+
+pub(crate) fn matches_receipt(note: &Note, receipt: &ReviewReceipt) -> bool {
+    receipt.reviewer == note.sender
         && Some(receipt.repo.as_str()) == note.repo.as_deref()
         && receipt.pr == note.issue
         && receipt.pr != 0
         && Some(receipt.head.as_str()) == note.head.as_deref()
         && check_head(&receipt.head).is_ok()
         && check_head(&receipt.main).is_ok()
-        && !receipt.model.trim().is_empty())
-    .then_some(receipt)
+        && !receipt.model.trim().is_empty()
 }
 
 /// Body of a `landed` note (PROTO-11).

@@ -348,6 +348,15 @@ pub async fn run<G: Gh>(
             tokio::time::sleep(until.min(o.interval).max(Duration::from_secs(30))).await;
             continue;
         }
+        if let Some(b) = bus
+            && s.review_pools.is_empty()
+            && let Err(e) = routing::round(gh, s, b, &[]).await
+        {
+            if o.once {
+                return Err(e);
+            }
+            tracing::warn!("draining review notes: {e}");
+        }
         match round(gh, s).await {
             Ok((infos, rate, missing)) => {
                 for m in &missing {
@@ -406,6 +415,7 @@ pub async fn run<G: Gh>(
                     HoldChange::Keep => {}
                 }
                 if let Some(b) = bus
+                    && !s.review_pools.is_empty()
                     && !hold
                         .as_deref()
                         .is_some_and(|h| table::hold_active(h, Utc::now()))

@@ -18,8 +18,11 @@ pub struct ReviewPool {
 }
 
 impl ReviewPool {
-    pub fn automatic(&self, repo: &str) -> bool {
-        repo != "hgl_spec" && !self.manual && !self.seats.is_empty()
+    pub fn automatic(&self, repo: &str, spec_repos: &[String]) -> bool {
+        !matches!(repo, "hgl_spec" | "hgl_core")
+            && !spec_repos.iter().any(|spec| spec == repo)
+            && !self.manual
+            && !self.seats.is_empty()
     }
 }
 

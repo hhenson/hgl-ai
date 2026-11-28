@@ -143,12 +143,11 @@ wrapper = "hgl-project"
 clone_url = "https://github.com/{owner}/{repo}.git"   # default
 controller = "controller"              # default; the seat that gets the bridge's and coordinator's notes
 
+# hgl_spec and hgl_core always go to the controller. List additional spec repos here.
+# spec_repos = ["another-spec"]
+
 [github.review_pools.hgl-compiler]      # set this pool on the coordinator and sending hosts
 seats = ["r1", "r2"]
-
-[github.review_pools.hgl_spec]
-seats = ["r5"]
-manual = true                          # hgl_spec is always routed by the controller
 
 [github.gate.hgl-compiler]             # per repository; every key optional
 review_receipt = true                  # default: a clean receipt from another family (ROLE-11)

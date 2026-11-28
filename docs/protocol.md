@@ -150,6 +150,7 @@ receipts through the coordinator. The coordinator validates against the current 
 round and forwards exceptions with the original sender, kind, head and body. It sends
 the controller a digest of routine routes and clean landing candidates after each round.
 The controller handles findings following any earlier sendback so it can apply ROLE-15.
+The controller also handles `hgl_spec`, `hgl_core`, and repositories in `github.spec_repos`.
 
 - **PROTO-20 — Owner notes.** A note with sender `owner` travels on
   `hgl.notes.owner.<recipient>`, which only the console's hub user may publish. The

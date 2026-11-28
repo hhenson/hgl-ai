@@ -217,6 +217,9 @@ pub struct Github {
         skip_serializing_if = "github::is_hold_below"
     )]
     pub hold_below: u64,
+    /// Additional specification repositories handled by the controller.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub spec_repos: Vec<String>,
     /// Reviewer seats by repository. An absent or manual pool leaves routing to the controller.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub review_pools: BTreeMap<String, ReviewPool>,
@@ -280,7 +283,7 @@ impl Github {
             && self
                 .review_pools
                 .get(repo)
-                .is_some_and(|pool| pool.automatic(repo))
+                .is_some_and(|pool| pool.automatic(repo, &self.spec_repos))
     }
 
     /// The clone URL of `repo` (`clone_url` with `{owner}` and `{repo}` filled in).
@@ -311,6 +314,7 @@ impl Default for Github {
             coord_seat: github::coord_seat(),
             coord_interval: github::coord_interval(),
             hold_below: github::hold_below(),
+            spec_repos: Vec::new(),
             review_pools: BTreeMap::new(),
             global_paths: github::global_paths(),
             hygiene_files: github::hygiene_files(),
