@@ -1923,3 +1923,86 @@ async fn tasks_without_a_task_write_nothing() {
         .unwrap();
     assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
 }
+
+/// `gh` for [`a_pin_landing_finished_by_another_sync_is_done`]: at the first read of the pin
+/// pull request, another sync finishes its landing (its `landed.log` line, its record gone).
+struct Racing {
+    gh: FakeGh,
+    bus: Bus,
+    merge: String,
+    raced: std::sync::atomic::AtomicBool,
+}
+
+impl crate::exec::Gh for Racing {
+    async fn exec(
+        &self,
+        args: Vec<String>,
+        stdin: Option<Vec<u8>>,
+    ) -> crate::Result<crate::exec::Output> {
+        if args.join(" ").contains("hgl-project/pulls/50")
+            && !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let line = format!("20261128T000000Z hgl-project #50 {}", self.merge);
+            store::append_bounded(&self.bus, state::KEY_LANDED, &line, 100)
+                .await
+                .unwrap();
+            crate::progress::delete(&self.bus, "hgl-project", 50)
+                .await
+                .unwrap();
+        }
+        self.gh.exec(args, stdin).await
+    }
+}
+
+/// hgl-ai#133: two syncs pick the same unfinished pin landing, and the other finishes it
+/// first. This one finds it landed: done, not `NotLanded`, and the plan is still read.
+/// A dry run reads the hub too: it names an unfinished pin landing, rather than say the
+/// pins are current.
+#[tokio::test]
+async fn a_pin_landing_finished_by_another_sync_is_done() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let pin = crate::progress::Progress::new(&"d".repeat(40), Some(pin_merge.into()));
+    crate::progress::write(&b, "hgl-project", 50, &pin)
+        .await
+        .unwrap();
+
+    let dry = crate::exec::ReadOnly(pins_current_gh(50, pin_merge));
+    let r = crate::pins::sync(&dry, &s, Some(&b), &crate::pins::PinOpts::default(), true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&r, crate::pins::Synced::Would(l) if l == "would finish the landing of the pin pull request hgl-project#50"),
+        "{r:?}"
+    );
+    assert!(
+        crate::progress::read(&b, "hgl-project", 50)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let gh = Racing {
+        gh: pins_current_gh(50, pin_merge),
+        bus: bus(&h).await,
+        merge: pin_merge.into(),
+        raced: Default::default(),
+    };
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(r.ok(), "{r:?}");
+    assert!(
+        matches!(&r, crate::pins::Synced::Current(l) if l == "pins current at cccccccc"),
+        "{r:?}"
+    );
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "landed once: {log}");
+    assert!(
+        b.state_get(state::KEY_MAIN).await.unwrap().is_none(),
+        "not finished again"
+    );
+}

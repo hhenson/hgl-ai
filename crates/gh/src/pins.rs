@@ -14,7 +14,7 @@ use hgl_ai_config::Pin;
 use serde_json::{Value, json};
 
 use crate::exec::{self, Gh};
-use crate::gate::{self, Outcome};
+use crate::gate::{self, Kind, Outcome};
 use crate::land::{self, LandOpts};
 use crate::progress;
 use crate::{Error, Result, Settings, invalid, short};
@@ -264,10 +264,12 @@ pub async fn sync<G: Gh>(
                 &land_opts(o, None),
             ))
             .await?;
-            if !l.outcome.kind.landed() {
-                return Ok(Synced::NotLanded(l.outcome));
+            match l.outcome.kind {
+                k if k.landed() => resumed = Some(l.outcome),
+                // Finished meanwhile by another sync: done; the plan says what is left.
+                Kind::AlreadyMerged => {}
+                _ => return Ok(Synced::NotLanded(l.outcome)),
             }
-            resumed = Some(l.outcome);
         }
     }
     let p = read_plan(gh, s).await?;
@@ -437,17 +439,20 @@ async fn unfinished<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<Vec<(u64, 
     Ok(out)
 }
 
-/// Whether `branch` is a pin pull request's: `<branch_prefix><pin_branch>` with `{sha8}`
-/// as eight hex digits.
+/// Whether `branch` is a pin pull request's: `<branch_prefix><pin_branch>` with every
+/// `{sha8}` the same eight hex digits, as [`texts`] makes it.
 pub(crate) fn is_pin_branch(s: &Settings, branch: &str) -> bool {
     let template = format!("{}{}", s.branch_prefix, s.pin_branch);
-    let Some((before, after)) = template.split_once("{sha8}") else {
+    let Some((before, _)) = template.split_once("{sha8}") else {
         return branch == template;
     };
     branch
         .strip_prefix(before)
-        .and_then(|b| b.strip_suffix(after))
-        .is_some_and(|sha| sha.len() == 8 && sha.bytes().all(|c| c.is_ascii_hexdigit()))
+        .and_then(|rest| rest.get(..8))
+        .is_some_and(|sha| {
+            sha.bytes().all(|c| c.is_ascii_hexdigit())
+                && branch == format!("{}{}", s.branch_prefix, fill(&s.pin_branch, sha))
+        })
 }
 
 /// Point `refs/heads/<branch>` of `w` at `sha`: a branch left by an earlier attempt (or one
@@ -563,6 +568,24 @@ mod tests {
         ] {
             assert!(!is_pin_branch(&s, b), "{b}");
         }
+        // Every `{sha8}` is filled, with the same commit.
+        let mut s = settings();
+        s.pin_branch = "pins-{sha8}-compiler-{sha8}".into();
+        let p = the_plan('b');
+        let (branch, ..) = texts(&s, &p, &PinOpts::default()).unwrap();
+        assert_eq!(branch, "codex/pins-cccccccc-compiler-cccccccc");
+        assert!(is_pin_branch(&s, &branch));
+        for b in [
+            "codex/pins-cccccccc-compiler-dddddddd",
+            "codex/pins-cccccccc-compiler-{sha8}",
+            "codex/pins-cccccccc-compiler-",
+        ] {
+            assert!(!is_pin_branch(&s, b), "{b}");
+        }
+        // No placeholder: the name itself.
+        s.pin_branch = "pins".into();
+        assert!(is_pin_branch(&s, "codex/pins"));
+        assert!(!is_pin_branch(&s, "codex/pins-cccccccc"));
     }
 
     #[tokio::test]

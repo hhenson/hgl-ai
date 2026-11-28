@@ -279,11 +279,11 @@ enum TapCmd {
 
 /// The hub for a dry run, which only reads it (local build verdicts, review receipts, a
 /// landing's record); without one the gate says what it could not read.
-async fn dry_run_bus(cfg: &hgl_ai_config::Config) -> Option<Bus> {
+async fn dry_run_bus(cfg: &hgl_ai_config::Config, unread: &str) -> Option<Bus> {
     match Bus::connect(cfg).await {
         Ok(b) => Some(b),
         Err(e) => {
-            eprintln!("dry run without the hub ({e}): verdicts and receipts are not read");
+            eprintln!("dry run without the hub ({e}): {unread} not read");
             None
         }
     }
@@ -392,7 +392,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
             let mut o = a.opts();
             o.builds = Some(gate_builds(&cfg)?);
             let l = if a.dry_run {
-                let bus = dry_run_bus(&cfg).await;
+                let bus = dry_run_bus(&cfg, "verdicts and receipts are").await;
                 land::plan(&ReadOnly(gh), &s, bus.as_ref(), &a.repo, a.pr, &a.head, &o).await
             } else {
                 let bus = Bus::connect(&cfg).await?;
@@ -411,7 +411,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
             o.builds = Some(gate_builds(&cfg)?);
             let g = &a.gate;
             let l = if g.dry_run {
-                let bus = dry_run_bus(&cfg).await;
+                let bus = dry_run_bus(&cfg, "verdicts and receipts are").await;
                 land::plan(&ReadOnly(gh), &s, bus.as_ref(), &g.repo, g.pr, &g.head, &o).await
             } else {
                 let bus = Bus::connect(&cfg).await?;
@@ -438,7 +438,9 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 interval,
             };
             let r = if dry_run {
-                pins::sync(&ReadOnly(gh), &s, None, &o, true).await
+                // Read only: the hub for pin landings left unfinished after their merge.
+                let bus = dry_run_bus(&cfg, "unfinished pin landings are").await;
+                pins::sync(&ReadOnly(gh), &s, bus.as_ref(), &o, true).await
             } else {
                 let bus = Bus::connect(&cfg).await?;
                 pins::sync(&gh, &s, Some(&bus), &o, false).await

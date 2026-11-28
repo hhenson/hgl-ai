@@ -335,7 +335,8 @@ lock) gives `PARTIAL` (exit 3): the merge commit, the steps not done, the error,
 lines of the steps done follow it. An unreachable hub is still exit 10. Before it
 reads the pins, `gh pins sync` (and so `gh land`) finishes the landing of any pin pull
 request (its branch the pin branch) whose record shows it merged, or that GitHub shows
-merged; it is not left behind pins that read current. A pull
+merged; it is not left behind pins that read current. One another sync finished first
+is done, and the sync goes on to the pins. Its dry run reads the hub for them too. A pull
 request found merged with neither a record nor a `landed.log` line has every step
 done then. `main` is written only whole: a failed read is tried three times, then the
 landing fails; a repository with no `main` (HTTP 404) is left out with a warning.
