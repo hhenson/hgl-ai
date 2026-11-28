@@ -570,7 +570,13 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     if w.conn().is_none() {
         return;
     }
-    let recipe = "repo = \"demo\"\n[[step]]\nname = \"build\"\nrun = \"test -f main.c && sleep ${HOLD:-0}\"\ntime = \"2m\"\n";
+    let recipe = r#"
+repo = "demo"
+[[step]]
+name = "build"
+run = 'test -f main.c && mkdir -p "$CARGO_BUILD_BUILD_DIR" && echo warm > "$CARGO_BUILD_BUILD_DIR/marker"'
+time = "2m"
+"#;
     store::recipe_put(&bus, recipe, None).await.unwrap();
 
     let mut cfg = hgl_ai_config::Config::new("lab1");
@@ -602,11 +608,15 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     // startup cleanup is done.
     let jobs = w.remote.join("jobs");
     std::fs::create_dir_all(jobs.join("20261126-000000-000000/src")).unwrap();
-    let mode = |m: u32| {
+    let cache = w.remote.join("cargo-cache/windows");
+    let orphan = cache.join("cache-old-label.windows-20261126-000000-aaaaaa");
+    std::fs::create_dir_all(&orphan).unwrap();
+    let mode = |path: &Path, m: u32| {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(m)).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(m)).unwrap();
     };
-    mode(0o500);
+    mode(&jobs, 0o500);
+    mode(&cache, 0o500);
     // Unreachable from the start.
     w.down(true);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -663,8 +673,20 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
             .is_none(),
         "not taken before the startup cleanup"
     );
-    // The cleanup goes through on a later heartbeat; then the job is built.
-    mode(0o755);
+    // Checkout cleanup can succeed while the old cache's removal still fails.
+    mode(&jobs, 0o755);
+    until("checkout cleanup", 15, || async { !jobs.exists() }).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(orphan.exists());
+    assert!(
+        store::run_get(&bus, "20261127-090000-aaaaaa")
+            .await
+            .unwrap()
+            .is_none(),
+        "not taken before cache reconciliation"
+    );
+    // A later heartbeat retries cache cleanup before admitting the job.
+    mode(&cache, 0o755);
     let r = receipt(
         &bus,
         &reply,
@@ -701,9 +723,27 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         "the remote job directory is gone: {:?}",
         w.jobs()
     );
+    assert!(!orphan.exists(), "the previous proxy's cache is gone");
+    let slot = std::fs::read_dir(&cache).unwrap().next().unwrap().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(slot.path().join("marker")).unwrap(),
+        "warm\n"
+    );
 
     // A drop during the step: retried once on reconnect, not a failure.
-    let hold = "repo = \"demo\"\nenv = { HOLD = \"3\" }\n[[step]]\nname = \"build\"\nrun = \"test -f main.c && sleep ${HOLD:-0}\"\ntime = \"2m\"\n";
+    let hold = r#"
+repo = "demo"
+[[step]]
+name = "build"
+run = '''
+test -f main.c || exit 1
+if [ -n "${CARGO_BUILD_BUILD_DIR:-}" ]; then
+    test -f "$CARGO_BUILD_BUILD_DIR/marker" || exit 1
+fi
+sleep 3
+'''
+time = "2m"
+"#;
     store::recipe_put(&bus, hold, None).await.unwrap();
     let (note, reply) = job("20261127-090000-bbbbbb", &w.head);
     bus.send(&note).await.unwrap();
@@ -736,6 +776,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         "retried after the reconnect: {s:?}"
     );
     assert!(w.jobs().is_empty(), "{:?}", w.jobs());
+    assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
     // The retry checked out in a directory of its own, which no stale cleanup of the
     // first attempt can remove (Carbon's second review of #12, finding 5).
     let log = std::fs::read_to_string(w.state.join("log")).unwrap();

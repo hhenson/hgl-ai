@@ -48,7 +48,7 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   passing. A missing SDK or tool is *not run*, not a failure.
 - Steps see `HGL_AI_BUILD_ID`, `HGL_AI_SRC`, `HGL_AI_BUILD_DIR` (CMake trees go there) and,
   in a builder's checkout, `CARGO_TARGET_DIR` and `TMPDIR` inside the job directory. `env`
-  values expand `$VAR` from these.
+  values expand `$VAR` from these. Cached jobs also set `CARGO_BUILD_BUILD_DIR`.
 - `artifacts` are copied to `<log dir>/artifacts/<step>/`; `junit` and `catch2` read the
   `.xml` ones (else the log). `lines` takes `patterns = { error = [...], warning = [...] }`
   with named groups `file`, `line`, `col`, `code`, `message`.
@@ -94,7 +94,7 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
     draining or retired, busy of slots, free disk, tool versions). The sender picks a ready
     one (`--builder LABEL` to choose); an unreachable one holds the job until it is back.
   - The job is a `build` note to `builder-<label>` at the exact head (optionally `--base`
-    to merge onto). The builder checks it out in `<work_root>/builder/jobs/<id>/` from its
+    to merge onto). The builder checks it out under `<work_root>/builder/jobs/` from its
     clone in `clones/<repo>` (submodules too), runs the recipe, and removes the checkout
     (cleanup is part of done). One build at a time unless `[builder] concurrency = N`.
     One process serves a builder: it holds a `flock` on this host and the lease
@@ -111,6 +111,13 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   - `hgl-ai builder drain|retire|resume LABEL` sets `HGL_STATE/builder.<label>`;
     `mode = drain` drains every builder. A shutdown cancels running builds and returns
     their jobs to the inbox.
+  - Cargo 1.91+ reuses intermediates in `cargo-cache/<platform>/` under the executor's
+    work directory. A cache slot belongs to one repository and one job at a time.
+    It uses a stable checkout path under `jobs/`, with a fresh checkout and fresh final
+    outputs for every job. Only passing jobs that finish cleanup leave reusable slots.
+    Set `cargo_cache_gib` in `[builder]` or `[[builder.remote]]` (default 32, zero to
+    disable). The builder evicts the least recently used idle slots to that limit.
+    Active jobs can temporarily exceed it.
 - **BUILD-7 — Metrics.** Every run's summary is kept on the hub (`HGL_BUILD/run.<id>`, with
   a retention limit) so the console can chart build time, failure rate and peak memory per
   repository, step and platform. The hub keeps the first 20 errors and failures of each
@@ -188,7 +195,7 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   `<data_dir>/builder/ssh/`, mode 0700), checks it on its heartbeat and reconnects with
   backoff. A job in flight when it drops is *remote unreachable*, not a failure, and is
   retried once on reconnect; jobs wait while it is down.
-- **BUILD-13 — How it runs.** Git checks out the head in `<work_dir>/jobs/<id>/` on the
+- **BUILD-13 — How it runs.** Git checks out the head under `<work_dir>/jobs/` on the
   remote; each step runs as `powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass
   -EncodedCommand <step>` (no machine-wide policy change), its output streamed back into
   the proxy's log and parsed there. The proxy enforces the time limit: on expiry or cancel
