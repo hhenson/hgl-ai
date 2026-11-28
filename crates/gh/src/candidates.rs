@@ -279,6 +279,7 @@ mod tests {
             &crate::testutil::json("coord-batch.json"),
             &s.repos,
             &s.review_bot,
+            &s.note_authors,
             "20260105T120000Z",
         )
         .unwrap();
