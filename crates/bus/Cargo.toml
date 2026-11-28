@@ -10,6 +10,7 @@ license.workspace = true
 hgl-ai-proto.workspace = true
 hgl-ai-config.workspace = true
 async-nats.workspace = true
+nkeys = "0.4"
 tokio.workspace = true
 futures.workspace = true
 serde.workspace = true
