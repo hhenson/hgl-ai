@@ -42,7 +42,9 @@ pub enum Role {
     /// The owner's console: the owner's subjects, `HGL_THREADS`, `tick` notes.
     Console,
     /// The console's page in a browser, over WebSocket (docs/owner.md §3): reads and
-    /// watches [`VIEWER_BUCKETS`] and nothing else; no write of any kind.
+    /// watches [`VIEWER_BUCKETS`] and nothing else. Its subject permissions are read-only,
+    /// but replies are not enforced until hgl-ai#141: with one NATS account, JetStream
+    /// replies let any role write any subject.
     Viewer,
     /// Slack Q&A: owner actions, its own feed and delivery state.
     Slack,

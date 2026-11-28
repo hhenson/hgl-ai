@@ -78,7 +78,8 @@ pub async fn session_info(State(app): AppState, h: HeaderMap) -> Response {
 
 #[derive(Serialize)]
 pub struct ViewerOut {
-    /// The hub user (`viewer`), read-only on the telemetry buckets.
+    /// The hub user (`viewer`): read-only subject permissions on the telemetry buckets
+    /// (replies are not enforced until hgl-ai#141).
     pub user: String,
     /// Its NKey seed: the page keeps it in memory only.
     pub seed: String,

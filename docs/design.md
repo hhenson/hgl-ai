@@ -363,6 +363,10 @@ granted what the page's own watches need and no more (`users::permissions`):
 
 What subjects cannot stop:
 
+- Writes through replies. The subject permissions above are read-only, but replies are
+  not enforced: with one NATS account, JetStream replies let any role, `viewer`
+  included, write any subject. The account split that closes this is hgl-ai#141.
+
 - A `durable_name` in a filtered create's body makes a durable consumer, and a long
   `inactive_threshold` one that lasts as long; either outlives the page. No part of the
   fleet makes one on the telemetry streams, so `doctor` on the hub's host lists any

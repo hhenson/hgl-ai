@@ -280,7 +280,8 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
                     Role::Console,
                     &users::cred_path(&cdir, CONSOLE_USER),
                 )?);
-                // Read-only, for the console's page (docs/owner.md §3).
+                // Read-only by subject, for the console's page (docs/owner.md §3; replies:
+                // hgl-ai#141).
                 let viewer = users::cred_path(&cdir, VIEWER_USER);
                 ensure_user(sys, &mut reg, VIEWER_USER, Role::Viewer, &viewer)?;
                 if let Some(c) = cfg.console.as_mut() {

@@ -692,8 +692,9 @@ async fn consume(
 const SECRET: &str = "not-for-the-viewer";
 
 /// The console's page reads and watches the telemetry buckets as `viewer`, and can do
-/// nothing else: no write, no notes, no threads, no console state, no other stream, and
-/// of `HGL_STATE` only the page's keys.
+/// nothing else by subject: no write, no notes, no threads, no console state, no other
+/// stream, and of `HGL_STATE` only the page's keys. (Writes through replies are not
+/// enforced until hgl-ai#141.)
 #[tokio::test]
 async fn the_viewer_reads_the_telemetry_and_nothing_else() {
     let Some(hub) = Hub::start() else { return };
@@ -859,7 +860,7 @@ async fn the_viewer_reads_the_telemetry_and_nothing_else() {
     assert!(!answer.contains("\"error\""), "{answer}");
     assert_eq!(got, vec!["normal".to_string()]);
 
-    // No write of any kind.
+    // No write by subject (through replies: hgl-ai#141).
     denied(v.state_put("mode", "drain").await);
     denied(
         v.send(&Note::new(seat("w1"), seat("w2"), Kind::Note, "forged"))

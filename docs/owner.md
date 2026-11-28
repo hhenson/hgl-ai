@@ -128,8 +128,9 @@ honour Slack's rate limits.
 reads the hub itself: it watches the telemetry buckets over the hub's WebSocket
 listener, at `<console url>/nats` on the console's own origin, as the hub user
 `viewer`. `viewer` reads those six buckets (of `HGL_STATE`, only the keys the page
-shows) and nothing else, writes nothing, and sees no other client's replies
-(docs/install.md, docs/design.md §9). The console hands its credential to a signed-in page
+shows) and nothing else, and sees no other client's replies. Its subject permissions
+are read-only, but replies are not enforced until hgl-ai#141 (docs/install.md,
+docs/design.md §9). The console hands its credential to a signed-in page
 (`GET /api/viewer`), which keeps it in memory only. A tab per area; the selected tab
 is the URL fragment (`/telemetry#prs`):
 
