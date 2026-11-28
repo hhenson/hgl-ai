@@ -348,15 +348,13 @@ pub async fn run<G: Gh>(
             tokio::time::sleep(until.min(o.interval).max(Duration::from_secs(30))).await;
             continue;
         }
-        if let Some(b) = bus
+        let drained = if let Some(b) = bus
             && s.review_pools.is_empty()
-            && let Err(e) = routing::round(gh, s, b, &[]).await
         {
-            if o.once {
-                return Err(e);
-            }
-            tracing::warn!("draining review notes: {e}");
-        }
+            routing::round(gh, s, b, &[]).await
+        } else {
+            Ok(())
+        };
         match round(gh, s).await {
             Ok((infos, rate, missing)) => {
                 for m in &missing {
@@ -445,6 +443,12 @@ pub async fn run<G: Gh>(
             Err(e @ Error::Auth(_)) => return Err(e),
             Err(e) if o.once => return Err(e),
             Err(e) => tracing::warn!("round failed: {e}"),
+        }
+        if let Err(e) = drained {
+            if o.once {
+                return Err(e);
+            }
+            tracing::warn!("draining review notes: {e}");
         }
         if backlog::due(last_backlog, Instant::now(), BACKLOG_EVERY) {
             if let Some(h) = hold
