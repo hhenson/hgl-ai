@@ -18,6 +18,8 @@ pub trait Hub {
     fn provision(&self, cfg: &Config) -> impl Future<Output = Result<(), BusError>>;
     /// Doctor: `Err` when unreachable, else the stream and buckets that are missing.
     fn health(&self, cfg: &Config) -> impl Future<Output = Result<Vec<String>, String>>;
+    /// Last Slack startup error, if one is recorded.
+    fn slack_startup(&self, cfg: &Config) -> impl Future<Output = Result<Option<String>, String>>;
 }
 
 /// The real hub, through `hgl-ai-bus`.
@@ -30,6 +32,14 @@ impl Hub for BusHub {
 
     async fn provision(&self, cfg: &Config) -> Result<(), BusError> {
         Bus::connect(cfg).await?.provision().await
+    }
+
+    async fn slack_startup(&self, cfg: &Config) -> Result<Option<String>, String> {
+        let bus = Bus::connect(cfg).await.map_err(|e| e.to_string())?;
+        bus.state_get(hgl_ai_proto::SLACK_STARTUP_KEY)
+            .await
+            .map(|record| record.and_then(|entry| (entry.value != "ok").then_some(entry.value)))
+            .map_err(|e| e.to_string())
     }
 
     /// Read-only: the bus API has no existence check that does not create, so
@@ -77,6 +87,7 @@ pub(crate) mod fake {
     pub struct FakeHub {
         pub reachable: bool,
         pub missing: Vec<String>,
+        pub slack_error: Option<String>,
         pub calls: RefCell<Vec<&'static str>>,
         /// The credential file each call connected with.
         pub creds: RefCell<Vec<String>>,
@@ -87,6 +98,7 @@ pub(crate) mod fake {
             FakeHub {
                 reachable: true,
                 missing: Vec::new(),
+                slack_error: None,
                 calls: RefCell::new(Vec::new()),
                 creds: RefCell::new(Vec::new()),
             }
@@ -117,6 +129,11 @@ pub(crate) mod fake {
         }
         async fn provision(&self, cfg: &Config) -> Result<(), BusError> {
             self.answer("provision", cfg)
+        }
+        async fn slack_startup(&self, cfg: &Config) -> Result<Option<String>, String> {
+            self.answer("slack_startup", cfg)
+                .map(|()| self.slack_error.clone())
+                .map_err(|e| e.to_string())
         }
         async fn health(&self, cfg: &Config) -> Result<Vec<String>, String> {
             self.answer("health", cfg)

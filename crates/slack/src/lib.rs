@@ -214,16 +214,43 @@ pub async fn run(
         )
         .await
         {
-            Ok(adapter) => break adapter,
+            Ok(adapter) => {
+                while !record_startup(&bus, None).await {
+                    sleep(slack_retry.delay(None)).await;
+                }
+                break adapter;
+            }
             Err(e) => {
-                let delay = slack_retry.delay(Some(&e));
-                tracing::warn!(?delay, "Slack adapter startup: {e:#}");
+                let delay = startup_failure(&bus, &mut slack_retry, &e).await;
                 sleep(delay).await;
             }
         }
     };
     tokio::join!(adapter.outbound_loop(), adapter.socket_loop());
     Ok(())
+}
+
+// The API layer sanitizes its errors before they reach this point. Keep the
+// original error for Retry-After while recording the same chain that is logged.
+async fn startup_failure(bus: &Bus, retries: &mut Backoff, error: &anyhow::Error) -> Duration {
+    let delay = retries.delay(Some(error));
+    let message = format!("{error:#}");
+    tracing::warn!(?delay, "Slack adapter startup: {message}");
+    let _ = record_startup(bus, Some(message)).await;
+    delay
+}
+
+async fn record_startup(bus: &Bus, error: Option<String>) -> bool {
+    let value = error.as_deref().unwrap_or("ok");
+    if bus
+        .state_put(hgl_ai_proto::SLACK_STARTUP_KEY, value)
+        .await
+        .is_err()
+    {
+        tracing::warn!("could not write Slack startup status to the hub");
+        return false;
+    }
+    true
 }
 
 async fn pause(retries: &mut Backoff, error: Option<anyhow::Error>, operation: &str) {

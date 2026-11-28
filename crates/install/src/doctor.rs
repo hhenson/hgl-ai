@@ -845,6 +845,17 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         if slack {
             svcs.push((Service::Slack, "`hgl-ai server install --slack`".into()));
         }
+        if slack {
+            let log = service::system_log_hint(env.os, Service::Slack);
+            out.push(match hub.slack_startup(c).await {
+                Ok(Some(error)) => Check::warn(
+                    "Slack startup", error,
+                    format!("logs: {log}; for missing_scope, use groups:history, chat:write and app_mentions:read; the app token needs connections:write; remove channels:history, im:history and mpim:history, then reinstall the app. If the channel was made private, check its scopes and app membership; for not_in_channel invite the app; for channel_not_found check the channel ID"),
+                ),
+                Ok(None) => Check::ok("Slack startup", "no recorded startup error"),
+                Err(_) => Check::warn("Slack startup", "cannot read startup status", "check hub connectivity and refresh hub user permissions with `hgl-ai server install --slack --keep-token`"),
+            });
+        }
         // The client's own services (bridge, builder) are never the server user's.
         let client = |s: Service| matches!(s, Service::Bridge | Service::Builder);
         let system = |s: Service| system_units || (!client(s) && su.is_some());
@@ -865,13 +876,6 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 format!("`{}`", service::start_hint(env, s))
             };
             out.push(match st {
-                State::Running if s == Service::Slack => Check::ok(
-                    name,
-                    format!(
-                        "running (system); logs: {}; if missing_scope, check that the channel is private and the bot has groups:history (reinstall the app after changing scopes)",
-                        service::system_log_hint(env.os, s)
-                    ),
-                ),
                 State::Running => Check::ok(
                     name,
                     if system(s) {
@@ -1327,9 +1331,30 @@ mod tests {
         assert_eq!(get(&cs, "server user").level, Level::Ok);
         assert_eq!(get(&cs, "console credential").level, Level::Ok);
         assert_eq!(get(&cs, "service hub").detail, "running (system)");
-        let slack_service = &get(&cs, "service slack").detail;
-        assert!(slack_service.contains("missing_scope"));
-        assert!(slack_service.contains("private") && slack_service.contains("groups:history"));
+        let startup = get(&cs, "Slack startup");
+        assert_eq!(startup.level, Level::Ok);
+        assert!(startup.fix.is_none());
+        let mut hub = FakeHub::up();
+        hub.slack_error = Some("conversations.history: missing_scope".into());
+        let checks = run(&f, &hub).await;
+        let startup = get(&checks, "Slack startup");
+        assert_eq!(startup.level, Level::Warn);
+        assert!(startup.detail.contains("missing_scope"));
+        let hint = startup.fix.unwrap();
+        for expected in [
+            "groups:history",
+            "channels:history",
+            "im:history",
+            "mpim:history",
+            "chat:write",
+            "app_mentions:read",
+            "connections:write",
+            "not_in_channel",
+            "channel_not_found",
+            "private",
+        ] {
+            assert!(hint.contains(expected), "missing {expected}");
+        }
         for file in SLACK_FILES {
             assert_eq!(get(&cs, &format!("Slack {file}")).level, Level::Ok);
         }

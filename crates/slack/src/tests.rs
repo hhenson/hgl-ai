@@ -1032,6 +1032,7 @@ async fn startup_error_chain_keeps_only_safe_slack_error_codes() {
     for (response, expected) in [
         ("missing_scope", "missing_scope"),
         ("xoxb-secret-token", "unknown_error"),
+        ("", "unknown_error"),
     ] {
         fake.state.posts.lock().unwrap().history_error = Some(response.into());
         let error = web.verify_channel("CQA").await.unwrap_err();
@@ -1041,6 +1042,64 @@ async fn startup_error_chain_keeps_only_safe_slack_error_codes() {
         assert!(!logged.contains("xoxb-"));
         assert!(!logged.contains("xapp-"));
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn startup_retry_logs_and_persists_error_then_clears_it() {
+    if Command::new("nats-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: nats-server is unavailable");
+        return;
+    }
+    #[derive(Clone)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+    impl std::io::Write for Capture {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let hub = Hub::new();
+    let _server = hub.start().await;
+    hub.bus("admin").await.provision().await.unwrap();
+    let slack = hub.bus("slack").await;
+    let seat = hub.bus("seat").await;
+    let fake = FakeSlack::start().await;
+    let web = Web::new(fake.base.clone(), "xapp-test".into(), "xoxb-test".into()).unwrap();
+    fake.state.posts.lock().unwrap().history_error = Some("missing_scope".into());
+    let error = web.verify_channel("CQA").await.unwrap_err();
+    let output = Capture(Arc::default());
+    let writer = output.clone();
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .without_time()
+        .with_writer(move || writer.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    startup_failure(&slack, &mut Backoff::default(), &error).await;
+    let logged = String::from_utf8(output.0.lock().unwrap().clone()).unwrap();
+    assert!(logged.contains("Slack adapter startup: checking the private Slack Q&A channel: conversations.history: missing_scope"), "{logged}");
+    assert!(!logged.contains("xoxb-") && !logged.contains("xapp-"));
+    let key = hgl_ai_proto::SLACK_STARTUP_KEY;
+    let status = seat.state_get(key).await.unwrap().unwrap().value;
+    assert!(status.contains("missing_scope"));
+    slack
+        .slack_put("TQA.CQA.thread.123", &"private", 0)
+        .await
+        .unwrap();
+    assert!(
+        seat.slack_get::<String>("TQA.CQA.thread.123")
+            .await
+            .is_err()
+    );
+    assert!(record_startup(&slack, None).await);
+    assert_eq!(seat.state_get(key).await.unwrap().unwrap().value, "ok");
 }
 
 #[tokio::test]

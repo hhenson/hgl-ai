@@ -39,6 +39,8 @@ pub const KV_METRICS: &str = "HGL_METRICS";
 pub const KV_CONSOLE: &str = "HGL_CONSOLE";
 /// The Slack adapter's delivery state and thread mappings.
 pub const KV_SLACK: &str = "HGL_SLACK";
+/// Last Slack adapter startup result, readable by doctor.
+pub const SLACK_STARTUP_KEY: &str = "slack.startup";
 /// Owner words (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
 /// One owner event per Slack workspace, channel and reply or action timestamp in a thread.

@@ -158,7 +158,11 @@ impl Web {
             let code = body
                 .get("error")
                 .and_then(|v| v.as_str())
-                .filter(|s| s.len() <= 64 && s.bytes().all(|c| c.is_ascii_lowercase() || c == b'_'))
+                .filter(|s| {
+                    !s.is_empty()
+                        && s.len() <= 64
+                        && s.bytes().all(|c| c.is_ascii_lowercase() || c == b'_')
+                })
                 .unwrap_or("unknown_error");
             bail!("{method}: {code}");
         }

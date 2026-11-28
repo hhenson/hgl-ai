@@ -262,6 +262,8 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             publish_allow: vec![
                 SLACK_OWNER_FILTER.into(),
                 format!("$KV.{KV_SLACK}.>"),
+                format!("$KV.{KV_STATE}.{}", hgl_ai_proto::SLACK_STARTUP_KEY),
+                format!("$JS.API.STREAM.INFO.{}", kv(KV_STATE)),
                 format!("$JS.API.STREAM.INFO.{slack_bucket}"),
                 format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
                 format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
