@@ -60,7 +60,9 @@ pub struct Spec {
     pub program: PathBuf,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
-    pub log: PathBuf,
+    /// The file its output is appended to; `None`: the journal (systemd) or nowhere
+    /// (launchd).
+    pub log: Option<PathBuf>,
 }
 
 impl Spec {
@@ -71,7 +73,7 @@ impl Spec {
             program: nats_server.to_path_buf(),
             args: vec!["-c".into(), conf.display().to_string()],
             env: Vec::new(),
-            log: log_path(data_dir, Service::Hub),
+            log: Some(log_path(data_dir, Service::Hub)),
         }
     }
 
@@ -97,7 +99,7 @@ impl Spec {
             ],
             program: exe,
             args: args.into_iter().map(String::from).collect(),
-            log: log_path(data_dir, service),
+            log: Some(log_path(data_dir, service)),
         }
     }
 }
@@ -124,9 +126,80 @@ pub fn system_unit_path(os: Os, s: Service) -> PathBuf {
     }
 }
 
-/// A system unit that runs `spec` as `user` (and `group`) with `HOME=home`.
+/// Where a launch daemon's output goes: a directory root owns, so the server user
+/// cannot plant a symlink that root (which opens `StandardOutPath`) would follow
+/// (hgl-ai#63). Linux system units log to the journal.
+pub const DAEMON_LOG_DIR: &str = "/Library/Logs/hgl-ai";
+
+/// A system service's log file: macOS only.
+pub fn system_log_path(os: Os, s: Service) -> Option<PathBuf> {
+    match os {
+        Os::Linux => None,
+        Os::MacOs => Some(Path::new(DAEMON_LOG_DIR).join(format!("{}.log", s.short()))),
+    }
+}
+
+/// How to read a system service's log, for messages.
+pub fn system_log_hint(os: Os, s: Service) -> String {
+    match os {
+        Os::Linux => format!("`journalctl -u {}`", s.unit()),
+        Os::MacOs => format!("`sudo tail {DAEMON_LOG_DIR}/{}.log`", s.short()),
+    }
+}
+
+/// An installed system service's output setting, when it is a file root opens outside
+/// a directory only root writes (an install before hgl-ai#63): `StandardOutput=append`,
+/// `stdout path = <file>`. Read without privilege; `None` when it is safe, not
+/// installed, or unknown.
+pub fn system_log_unsafe(sys: &dyn System, s: Service) -> Option<String> {
+    match sys.env().os {
+        Os::Linux => {
+            let o = sys
+                .query(&Cmd::new("systemctl").args([
+                    "show",
+                    "-p",
+                    "StandardOutput,StandardError",
+                    &s.unit(),
+                ]))
+                .ok()
+                .filter(|o| o.ok())?;
+            o.stdout
+                .lines()
+                .filter_map(|l| l.trim().split_once('='))
+                .find(|(_, v)| matches!(*v, "append" | "file" | "truncate"))
+                .map(|(k, v)| format!("{k}={v}"))
+        }
+        Os::MacOs => {
+            let o = sys
+                .query(
+                    &Cmd::new("launchctl")
+                        .arg("print")
+                        .arg(format!("system/{}", s.label())),
+                )
+                .ok()
+                .filter(|o| o.ok())?;
+            let dir = Path::new(DAEMON_LOG_DIR);
+            o.stdout
+                .lines()
+                .map(str::trim)
+                .find(|l| match l.split_once(" = ") {
+                    Some(("stdout path" | "stderr path", p)) => Path::new(p).parent() != Some(dir),
+                    _ => false,
+                })
+                .map(str::to_string)
+        }
+    }
+}
+
+/// A system unit that runs `spec` as `user` (and `group`) with `HOME=home`. Its output
+/// goes to the journal, whatever `spec.log` says: systemd opens an `append:` file as
+/// root, and in the server user's directory that follows a symlink it plants
+/// (hgl-ai#63).
 pub fn render_systemd_system(spec: &Spec, user: &str, group: &str, home: &Path) -> String {
-    let user_unit = render_systemd(spec);
+    let user_unit = render_systemd(&Spec {
+        log: None,
+        ..spec.clone()
+    });
     let mut s = String::new();
     for line in user_unit.lines() {
         match line {
@@ -147,9 +220,12 @@ pub fn render_systemd_system(spec: &Spec, user: &str, group: &str, home: &Path) 
     s
 }
 
-/// A launch daemon that runs `spec` as `user` with `HOME=home`.
+/// A launch daemon that runs `spec` as `user` with `HOME=home`. Its output goes to
+/// [`DAEMON_LOG_DIR`], whatever `spec.log` says: launchd opens `StandardOutPath` as
+/// root (hgl-ai#63).
 pub fn render_launchd_daemon(spec: &Spec, user: &str, home: &Path) -> String {
     let mut sp = spec.clone();
+    sp.log = system_log_path(Os::MacOs, spec.service);
     sp.env
         .insert(0, ("HOME".into(), home.display().to_string()));
     let agent = render_launchd(&sp);
@@ -231,7 +307,6 @@ pub fn render_systemd(spec: &Spec) -> String {
         .chain(spec.args.iter().cloned())
         .map(|w| systemd_word(&w))
         .collect();
-    let log = spec.log.display().to_string().replace('%', "%%");
     let mut s = format!(
         "# Written by hgl-ai; reinstalling rewrites it.\n\
          [Unit]\n\
@@ -250,15 +325,17 @@ pub fn render_systemd(spec: &Spec) -> String {
             .replace('"', "\\\"");
         s.push_str(&format!("Environment=\"{k}={v}\"\n"));
     }
-    s.push_str(&format!(
-        "Restart=on-failure\n\
-         RestartSec=10\n\
-         StandardOutput=append:{log}\n\
-         StandardError=append:{log}\n\
-         \n\
-         [Install]\n\
-         WantedBy=default.target\n"
-    ));
+    s.push_str("Restart=on-failure\nRestartSec=10\n");
+    match &spec.log {
+        Some(log) => {
+            let log = log.display().to_string().replace('%', "%%");
+            s.push_str(&format!(
+                "StandardOutput=append:{log}\nStandardError=append:{log}\n"
+            ));
+        }
+        None => s.push_str("StandardOutput=journal\nStandardError=journal\n"),
+    }
+    s.push_str("\n[Install]\nWantedBy=default.target\n");
     s
 }
 
@@ -295,15 +372,19 @@ pub fn render_launchd(spec: &Spec) -> String {
         }
         s.push_str("  </dict>\n");
     }
-    let log = xml(&spec.log.display().to_string());
-    s.push_str(&format!(
+    s.push_str(
         "  <key>RunAtLoad</key>\n  <true/>\n\
          \x20 <key>KeepAlive</key>\n  <dict>\n    <key>SuccessfulExit</key>\n    <false/>\n  </dict>\n\
-         \x20 <key>ThrottleInterval</key>\n  <integer>10</integer>\n\
-         \x20 <key>StandardOutPath</key>\n  <string>{log}</string>\n\
-         \x20 <key>StandardErrorPath</key>\n  <string>{log}</string>\n\
-         </dict>\n</plist>\n"
-    ));
+         \x20 <key>ThrottleInterval</key>\n  <integer>10</integer>\n",
+    );
+    if let Some(log) = &spec.log {
+        let log = xml(&log.display().to_string());
+        s.push_str(&format!(
+            "  <key>StandardOutPath</key>\n  <string>{log}</string>\n\
+             \x20 <key>StandardErrorPath</key>\n  <string>{log}</string>\n"
+        ));
+    }
+    s.push_str("</dict>\n</plist>\n");
     s
 }
 
@@ -336,7 +417,7 @@ fn launchd_target(sys: &dyn System, s: Service) -> Result<(String, String)> {
 pub fn install(sys: &dyn System, spec: &Spec) -> Result<()> {
     let env = sys.env();
     let path = unit_path(env, spec.service);
-    if let Some(logs) = spec.log.parent() {
+    if let Some(logs) = spec.log.as_deref().and_then(Path::parent) {
         sys.mkdir(logs).map_err(io_at(logs))?;
     }
     match env.os {
@@ -558,7 +639,7 @@ mod tests {
                     "/home/u/.config/hgl-ai/config.toml".into(),
                 ),
             ],
-            log: PathBuf::from("/home/u/.local/share/hgl-ai/logs/bridge.log"),
+            log: Some(PathBuf::from("/home/u/.local/share/hgl-ai/logs/bridge.log")),
         }
     }
 
@@ -642,6 +723,88 @@ WantedBy=default.target
 </dict>
 </plist>
 "#
+        );
+    }
+
+    /// System units never append to a file in the server user's home: root opens it
+    /// and would follow a symlink planted there (hgl-ai#63). User units keep theirs.
+    #[test]
+    fn system_units_log_where_root_owns() {
+        let spec = bridge_spec();
+        let unit = render_systemd_system(&spec, "hgl-ai", "hgl-ai", Path::new("/var/lib/hgl-ai"));
+        assert!(
+            unit.contains("StandardOutput=journal\nStandardError=journal\n"),
+            "{unit}"
+        );
+        assert!(!unit.contains("append:"), "{unit}");
+        assert!(!unit.contains("/logs/"), "{unit}");
+        assert!(render_systemd(&spec).contains("StandardOutput=append:/home/u/"));
+
+        let plist = render_launchd_daemon(&spec, "_hgl-ai", Path::new("/Library/hgl-ai"));
+        for key in ["StandardOutPath", "StandardErrorPath"] {
+            assert!(
+                plist.contains(&format!(
+                    "<key>{key}</key>\n  <string>/Library/Logs/hgl-ai/bridge.log</string>"
+                )),
+                "{plist}"
+            );
+        }
+        assert!(!plist.contains("/home/u/.local"), "{plist}");
+
+        // No log file at all: the journal, or no output path.
+        let none = Spec {
+            log: None,
+            ..bridge_spec()
+        };
+        assert!(render_systemd(&none).contains("StandardOutput=journal\n"));
+        assert!(!render_launchd(&none).contains("StandardOutPath"));
+    }
+
+    /// A unit from before hgl-ai#63 is found without privilege.
+    #[test]
+    fn unsafe_system_logs_are_found() {
+        let d = tempfile::tempdir().unwrap();
+        let f = Fake::new(d.path(), Os::Linux);
+        let out = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let o = out.clone();
+        f.on(move |_| Output::success(o.borrow().clone()));
+        *out.borrow_mut() = "StandardOutput=append\nStandardError=append\n".into();
+        assert_eq!(
+            system_log_unsafe(&f, Service::Hub).as_deref(),
+            Some("StandardOutput=append")
+        );
+        *out.borrow_mut() = "StandardOutput=journal\nStandardError=inherit\n".into();
+        assert_eq!(system_log_unsafe(&f, Service::Hub), None);
+        assert_eq!(
+            f.cmds.borrow().last().unwrap().1.line(),
+            "systemctl show -p StandardOutput,StandardError hgl-ai-hub.service"
+        );
+        f.on(|_| Output::failure(1, ""));
+        assert_eq!(system_log_unsafe(&f, Service::Hub), None);
+
+        let m = Fake::new(d.path(), Os::MacOs);
+        let out = std::rc::Rc::new(std::cell::RefCell::new(String::new()));
+        let o = out.clone();
+        m.on(move |_| Output::success(o.borrow().clone()));
+        *out.borrow_mut() = "system/io.github.hhenson.hgl-ai.hub = {\n\
+             \tstdout path = /Library/hgl-ai/.local/share/hgl-ai/logs/hub.log\n\
+             \tstderr path = /Library/hgl-ai/.local/share/hgl-ai/logs/hub.log\n}\n"
+            .into();
+        assert_eq!(
+            system_log_unsafe(&m, Service::Hub).as_deref(),
+            Some("stdout path = /Library/hgl-ai/.local/share/hgl-ai/logs/hub.log")
+        );
+        *out.borrow_mut() = "\tstdout path = /Library/Logs/hgl-ai/hub.log\n\
+             \tstderr path = /Library/Logs/hgl-ai/hub.log\n"
+            .into();
+        assert_eq!(system_log_unsafe(&m, Service::Hub), None);
+        assert_eq!(
+            system_log_hint(Os::Linux, Service::Coord),
+            "`journalctl -u hgl-ai-coord.service`"
+        );
+        assert_eq!(
+            system_log_hint(Os::MacOs, Service::Coord),
+            "`sudo tail /Library/Logs/hgl-ai/coord.log`"
         );
     }
 
