@@ -133,6 +133,9 @@ struct InstallArgs {
     /// Print the steps that need root as a script, and run none of them.
     #[arg(long)]
     print_root_steps: bool,
+    /// Keep the coordinator's GitHub token in the server user's home: no prompt for it.
+    #[arg(long)]
+    keep_token: bool,
     /// Write the configuration, credentials and nats.conf only (a system install's
     /// server-user step).
     #[arg(long, hide = true)]
@@ -250,6 +253,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 console: !a.no_console && console_url.is_some(),
                 console_url,
                 client_user: a.client_user.clone().or(prev.client_user),
+                keep_token: a.keep_token,
                 wait: std::time::Duration::from_secs(install::HUB_WAIT_SECS),
             };
             if let Some(script) = install::system::install(&real, &o).map_err(lift)? {

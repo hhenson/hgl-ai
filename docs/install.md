@@ -15,9 +15,9 @@ The server side (hub, coordinator, console) runs as its own OS user, `hgl-ai`
 `/var/lib/hgl-ai` (`/Library/hgl-ai`; `--server-home`), mode 0700. The client side
 (bridge, agent CLIs, their sign-ins) stays yours, or another OS user's
 (`--client-user NAME`, kept for a reinstall). Each step that needs root is shown and
-runs through `sudo` only when you confirm it; `--print-root-steps` prints them as a
-script instead and runs none. The script is quoted for `sh` and names absolute paths
-(no `~`):
+runs through `sudo` only when you confirm it, on your terminal (`sudo` may ask for
+your password); `--print-root-steps` prints them as a script instead and runs none.
+The script is quoted for `sh` and names absolute paths (no `~`):
 
 | Step (root) | Linux | macOS |
 | --- | --- | --- |
@@ -28,7 +28,7 @@ script instead and runs none. The script is quoted for `sh` and names absolute p
 | their logs | none: the journal | `install -d -o root -g wheel -m 0755 /Library/Logs/hgl-ai` |
 | units | `install -m 0644 ... /etc/systemd/system/hgl-ai-{hub,coord,console}.service`, `systemctl daemon-reload`, `enable`, `restart` | `/Library/LaunchDaemons/io.github.hhenson.hgl-ai.*.plist`, `launchctl bootout system/...` when loaded, `bootstrap system`, `kickstart` |
 | provisioning, as the server user's admin hub user | `sudo -u hgl-ai env ... HGL_AI_HUB_CREDENTIAL=.../<hub>-admin.cred hgl-ai init` | same |
-| the coordinator's GitHub token (not `--no-coord`), before it starts | `sudo -u hgl-ai sh -c '...'`: reads it from the terminal without echo, writes `github.token` mode 0600; Enter keeps the current one | same |
+| the coordinator's GitHub token (not `--no-coord`), before it starts | `hgl-ai` (the script: its shell) reads it from your terminal without echo and pipes it to `sudo -u hgl-ai sh -c '...' sh <its home>/.config/hgl-ai/github.token`, which writes it mode 0600; nothing under `sudo` reads the terminal. Enter keeps the current one and runs nothing; `--keep-token` does not ask | same |
 | this host's client credential, for you (no root) | `sudo -u hgl-ai cat /var/lib/hgl-ai/.config/hgl-ai/hub.token \| sh -c '...' sh <your config dir>`: written by you, mode 0600 | same |
 | or, with `--client-user NAME`, for it (no root) | `sudo -u hgl-ai cat ... \| sudo -u NAME sh -c '...' sh <its home>/.config/hgl-ai`: new directories 0700, `hub.token` 0600; nothing for you | same |
 
