@@ -1040,12 +1040,15 @@ const RECEIPT_WINDOW: usize = 1000;
 /// The review receipts for `repo` #`pr` among the controller's notes on the hub (HGL_NOTES
 /// keeps 14 days): `receipt` notes whose body holds PROTO-19 JSON for this pull request.
 pub async fn receipts(bus: &Bus, s: &Settings, repo: &str, pr: u64) -> Result<Vec<SeenReceipt>> {
+    let hosts = bus.hosts().await?;
     let mut out = Vec::new();
     let mut from = 1;
+    let mut seats = vec![s.controller.clone()];
+    if s.coord_seat != s.controller && !s.coord_seat.is_reserved() {
+        seats.push(s.coord_seat.clone());
+    }
     loop {
-        let (got, last) = bus
-            .read_page(std::slice::from_ref(&s.controller), from, RECEIPT_WINDOW)
-            .await?;
+        let (got, last) = bus.read_page(&seats, from, RECEIPT_WINDOW).await?;
         // From after the last message read, a malformed one skipped included.
         let Some(last) = last else {
             return Ok(out);
@@ -1055,14 +1058,23 @@ pub async fn receipts(bus: &Bus, s: &Settings, repo: &str, pr: u64) -> Result<Ve
             if sn.note.kind != NoteKind::Receipt {
                 continue;
             }
-            if let Some(r) = state::parse_receipt(&sn.note.body)
+            let receipt = if sn.note.recipient == s.controller {
+                state::parse_receipt(&sn.note.body)
+            } else {
+                state::routed_receipt(&sn.note)
+            };
+            if let Some(r) = receipt
                 && r.repo == repo
                 && r.pr == pr
+                && state::reviewer_family_matches(&hosts, &r) != Some(false)
             {
-                out.push(SeenReceipt {
+                let seen = SeenReceipt {
                     sender: sn.note.sender.to_string(),
                     receipt: r,
-                });
+                };
+                if !out.contains(&seen) {
+                    out.push(seen);
+                }
             }
         }
     }

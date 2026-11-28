@@ -20,6 +20,7 @@ use serde_json::Value;
 
 use crate::backlog::{self, BACKLOG_EVERY};
 use crate::exec::{self, Gh};
+use crate::routing;
 use crate::table::{self, Alert, HoldChange, PrInfo, RateLimit, Row, Table};
 use crate::{Error, Result, Settings, intake, state, store};
 
@@ -297,6 +298,13 @@ pub async fn run<G: Gh>(
             tokio::time::sleep(until.min(o.interval).max(Duration::from_secs(30))).await;
             continue;
         }
+        let drained = if let Some(b) = bus
+            && s.review_pools.is_empty()
+        {
+            routing::round(gh, s, b, &[]).await
+        } else {
+            Ok(())
+        };
         let read = round(gh, s).await;
         if read.is_err()
             && let Err(e) = retry_alerts(bus, s).await
@@ -351,6 +359,27 @@ pub async fn run<G: Gh>(
                     HoldChange::Clear => hold = None,
                     HoldChange::Keep => {}
                 }
+                if let Some(b) = bus
+                    && !s.review_pools.is_empty()
+                    && !hold
+                        .as_deref()
+                        .is_some_and(|h| table::hold_active(h, Utc::now()))
+                {
+                    match routing::round(gh, s, b, &infos).await {
+                        Err(Error::RateLimited(m)) => {
+                            hold = Some(
+                                on_rate_limit(gh, bus, last_rate.as_ref(), &m, Utc::now(), out)
+                                    .await,
+                            );
+                            if o.once {
+                                return Err(Error::RateLimited(m));
+                            }
+                        }
+                        Err(e) if o.once => return Err(e),
+                        Err(e) => tracing::warn!("routing review notes: {e}"),
+                        Ok(()) => {}
+                    }
+                }
             }
             Err(Error::RateLimited(m)) => {
                 hold = Some(on_rate_limit(gh, bus, last_rate.as_ref(), &m, now, out).await);
@@ -361,6 +390,12 @@ pub async fn run<G: Gh>(
             Err(e @ Error::Auth(_)) => return Err(e),
             Err(e) if o.once => return Err(e),
             Err(e) => tracing::warn!("round failed: {e}"),
+        }
+        if let Err(e) = drained {
+            if o.once {
+                return Err(e);
+            }
+            tracing::warn!("draining review notes: {e}");
         }
         if backlog::due(last_backlog, Instant::now(), BACKLOG_EVERY) {
             if let Some(h) = hold

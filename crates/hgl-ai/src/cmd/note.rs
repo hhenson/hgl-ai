@@ -140,7 +140,7 @@ async fn send(ctx: &Ctx, a: SendArgs) -> anyhow::Result<i32> {
         }
         (None, None) => unreachable!("clap requires a body"),
     };
-    if a.from.is_reserved() {
+    if a.from.is_reserved() && !a.from.is_screen() {
         bail!(
             "--from {}: `owner` and `console` speak only through the console (docs/owner.md, OWN-5)",
             a.from
@@ -159,7 +159,9 @@ async fn send(ctx: &Ctx, a: SendArgs) -> anyhow::Result<i32> {
     note.base = a.base;
     note.class = a.class;
     note.validate()?;
-    let bus = Bus::connect(&ctx.load_config()?).await?;
+    let cfg = ctx.load_config()?;
+    hgl_ai_gh::routing::redirect(&cfg.github, &mut note)?;
+    let bus = Bus::connect(&cfg).await?;
     let r = bus.send(&note).await?;
     if ctx.json {
         println!(

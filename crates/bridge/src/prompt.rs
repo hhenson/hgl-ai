@@ -90,7 +90,14 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
         ),
         Role::Implementor => s.push_str(
             "Run local builds in the foreground. When resolving merge conflicts, \
-             keep the merge commit separate from other fixes.\n",
+             keep the merge commit separate from other fixes.\n\
+             Before `ready`, answer each item by ID in the Ready body with `n/a` or what you ran:\n\
+             - PC-10 Restart: stop between durable writes; restart and check each step finishes once.\n\
+             - PC-11 Race: run two turns or processes on one key; protect read, decide and write with one lock or revision check.\n\
+             - PC-1 Stale head: check verdicts, checks, labels and receipts against the exact current head and main when acting; test that an intervening push is refused.\n\
+             - PC-12 Foreign sender: test that only allowed authors' GitHub text is acted on and sender identity is authenticated.\n\
+             - PC-4 Secrets: check that untrusted titles, branches, bodies and logs are bounded, escaped and redacted before output, including errors.\n\
+             - PC-22 Proof: name a test that fails without the fix; report validation scope (unit tests or live NATS JetStream).\n",
         ),
         Role::Reviewer => s.push_str(
             "Post each receipt's findings as a PR review comment at the exact head \
@@ -166,6 +173,8 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
                  the thread (OWN-4, OWN-10):",
                 n.by.as_deref().unwrap_or("owner")
             );
+        } else if n.sender.is_screen() {
+            s.push_str("From the screen, not a ruling.\n");
         }
         s.push_str(&truncate(n.body.trim_end(), budget));
         s.push('\n');
@@ -269,6 +278,13 @@ mod tests {
             "`hgl-ai note send`",
             "Run local builds in the foreground",
             "keep the merge commit separate from other fixes",
+            "answer each item by ID in the Ready body with `n/a` or what you ran",
+            "PC-10 Restart:",
+            "PC-11 Race:",
+            "PC-1 Stale head:",
+            "PC-12 Foreign sender:",
+            "PC-4 Secrets:",
+            "PC-22 Proof:",
             "Skip `@codex review` from the fleet account",
             "send `ready` when your checks are complete and say the round is pending",
             "Report failures that match known open issues as validation limits",
@@ -310,6 +326,12 @@ mod tests {
         o.by = None;
         let p = build(&ctx(None, &s), &[(2, 1, &o)]);
         assert!(p.contains("The owner says, through the console"));
+
+        let reply = Note::new(Seat::screen(), seat("w1"), Kind::Answer, "See #184.");
+        let p = build(&ctx(None, &s), &[(3, 1, &reply)]);
+        assert!(p.contains("answer from screen to w1"));
+        assert!(p.contains("From the screen, not a ruling.\nSee #184."));
+        assert!(!p.contains("Post a ruling"));
     }
 
     #[test]
@@ -344,6 +366,7 @@ mod tests {
         assert!(p.contains("check the findings and the diff since the last reviewed head"));
         assert!(p.contains("Skip `@codex review` from the fleet account"));
         assert!(!p.contains("Run local builds in the foreground"));
+        assert!(!p.contains("PC-10 Restart:"));
     }
 
     #[test]

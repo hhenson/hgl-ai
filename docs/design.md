@@ -52,7 +52,7 @@ hgl-ai server install [--listen ADDR] [--port 4222] [--store DIR] [--users] [--n
                 [--console-listen ADDR] [--server-user NAME] [--server-home DIR]
                 [--print-root-steps] [--same-user]
 hgl-ai server start|stop|status|uninstall
-hgl-ai server user add NAME --role seat|coord|console|admin [--nkey PUBKEY] [--rotate]
+hgl-ai server user add NAME --role ROLE [--nkey PUBKEY] [--rotate]
 hgl-ai server user list|remove NAME
 hgl-ai client install --hub URL --token-file FILE --host LABEL [--work-root DIR] [--no-builder]
 hgl-ai client uninstall
@@ -136,12 +136,18 @@ failover_cooldown = "1h"               # back to the primary binding after a fai
 
 [github]
 owner = "hhenson"
-# token_file = "~/.config/hgl-ai/github.token"   # the coordinator's own read-only token
+# token_file = "~/.config/hgl-ai/github.token"   # coordinator token, mode 0600
 repos = ["hgl-compiler", "hgl_spec", "hgl_core", "hgl-project", "homebrew-hgraph"]
 branch_prefix = "codex/"
 wrapper = "hgl-project"
 clone_url = "https://github.com/{owner}/{repo}.git"   # default
 controller = "controller"              # default; the seat that gets the bridge's and coordinator's notes
+
+# hgl_spec and hgl_core always go to the controller. List additional spec repos here.
+# spec_repos = ["another-spec"]
+
+[github.review_pools.hgl-compiler]      # set this pool on the coordinator and sending hosts
+seats = ["r1", "r2"]
 
 [github.gate.hgl-compiler]             # per repository; every key optional
 review_receipt = true                  # default: a clean receipt from another family (ROLE-11)

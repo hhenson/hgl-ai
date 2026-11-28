@@ -77,6 +77,8 @@ The coordinator reads GitHub with its own token, not yours: make a fine-grained,
 read-only token (Metadata, Contents, Issues, Pull requests, Checks, Actions, Commit
 statuses: read) for the repositories. The token step above stores it as the server
 user (`[github] token_file`); run that step again to replace it.
+Automatic sendback comments require [Issues or Pull requests write access](https://docs.github.com/en/rest/issues/comments#create-an-issue-comment) on the routed repositories.
+With read-only access, the coordinator forwards findings to the controller for sendback.
 
 During the intake cutover, deploy and verify the coordinator's triage delivery
 before disabling the interim `hgl-intakewatch` timer.
@@ -147,11 +149,15 @@ hgl-ai server user ...`).
 | `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
 | `console` | `hgl.owner.thread.<id>`, `hgl.owner.digest.<team>.<channel>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
+| `screen` | publishes `hgl.notes.screen.<seat>` and `HGL_SCREEN/log.>`; pulls and acknowledges `inbox-screen`; reads `HGL_STATE`, `HGL_TREES` and `HGL_SCREEN/rule.>` |
+| `screen-rules` | writes `HGL_SCREEN/rule.>` and reads `HGL_SCREEN/log.>` by key |
 | `viewer` | nothing by subject (replies are not enforced until hgl-ai#141): reads and watches `HGL_HOSTS`, `HGL_TREES`, `HGL_METRICS`, `HGL_BUILD`, `HGL_USAGE`, and of `HGL_STATE` only `prs`, `backlog`, `landed.log`, `tasks`, `mode`, `hold` (the console's page, docs/owner.md §3); consumers only in the filtered create form; subscribes to `_INBOX_VIEWER.>` only; no other stream or bucket, no consumer delete (docs/design.md §9) |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
 The console keeps session state in `HGL_CONSOLE`. The Slack adapter reads its own
 delivery state, its durable `HGL_OWNER` feeds and opening events by sequence.
+The controller uses `screen-rules` for rule writes and log reads. The `SCREEN`
+and `SCREEN_RULES` accounts isolate JetStream replies on the role-account layout.
 The console can read the Slack permalink index.
 Seat, coordinator and builder users read `HGL_OWNER` through short-lived consumers.
 The `viewer` reads only the telemetry, as above.
@@ -172,6 +178,23 @@ hgl-ai server user add lab1-builder --role builder # its builder: [builder] cred
 hgl-ai server user list
 hgl-ai server user remove build-1                  # the hub refuses it from then on
 ```
+
+Generate the `screen-rules` credential in the owner's OS account on the hub host.
+Keep the seed in that account's private configuration. Only the public key goes
+to the server user. [NATS `nk` commands](https://github.com/nats-io/nkeys/blob/main/nk/README.md)
+
+```sh
+(
+    umask 077
+    set -C
+    mkdir -p ~/.config/hgl-ai/hub-users &&
+        nk -gen user > ~/.config/hgl-ai/hub-users/controller-rules.seed
+)
+nk -inkey ~/.config/hgl-ai/hub-users/controller-rules.seed -pubout
+```
+
+Register the printed public key as the hub's server user with
+`hgl-ai server user add controller-rules --role screen-rules --nkey U...`.
 
 `user add` and `remove` rewrite `nats.conf` and reload the hub (SIGHUP through
 its pid file; connections that stay valid are kept). On the client: `hgl-ai client install --token-file <the .cred>`. A
@@ -213,6 +236,15 @@ hgl-ai doctor
    the builder service (`hgl-ai builder run`; `--no-builder` skips it), which builds
    this host's platform for the fleet (`docs/build.md`). SDK prefixes for recipes go in
    `[builder.sdk]`.
+
+For a builder running as a separate OS user, pass `--builder-user NAME` to
+`client install`. It records the user and leaves installation of that user's
+builder service to the administrator. Configure that user's own `config.toml`
+with `seat = []` and a `[builder]` section, and put its builder-role credential
+in `[builder] credential`, readable only by that user. Start the builder service
+under that account. Doctor checks the system service or the named user's service
+when its service manager is accessible. Remove any old client-user builder
+service when moving it to the separate account.
 
 `client uninstall` removes the services and the skills, keeping the
 configuration unless `--purge`. Both installers take `--dry-run`, and
