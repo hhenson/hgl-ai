@@ -24,16 +24,24 @@ struct Pull {
     labels: Vec<Label>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 struct Head {
     sha: String,
     #[serde(rename = "ref")]
     branch: String,
+    repo: Option<Repository>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, PartialEq, Eq)]
 struct Base {
     sha: String,
+    repo: Repository,
+}
+
+#[derive(Deserialize, PartialEq, Eq)]
+struct Repository {
+    #[serde(alias = "nameWithOwner")]
+    full_name: String,
 }
 
 #[derive(Deserialize)]
@@ -72,9 +80,12 @@ fn test_only(path: &str) -> bool {
     name == "tests.rs" || name.ends_with("_tests.rs") || dir.split('/').any(|p| p == "tests")
 }
 
-fn review_rules(path: &str) -> bool {
+fn tier_two_floor(path: &str) -> bool {
     matches!(path, "docs/roles.md" | "docs/protocol.md")
-        || path.rsplit('/').next() == Some("AGENTS.md")
+        || matches!(
+            path.rsplit('/').next(),
+            Some("AGENTS.md" | "Cargo.toml" | "Cargo.lock")
+        )
         || path.starts_with(".github/workflows/")
         || path.starts_with("recipes/")
         || path.starts_with("skill/")
@@ -113,14 +124,11 @@ fn classify<'a>(
         return (3, high);
     }
     let ordinary: BTreeSet<_> = paths()
-        .filter(|path| review_rules(path) || !docs_or_tests(path))
+        .filter(|path| tier_two_floor(path) || !docs_or_tests(path))
         .collect();
     let small_fix = bug
         && files.len() <= 3
-        && !paths().any(|path| {
-            let name = path.rsplit('/').next().unwrap_or(path);
-            review_rules(path) || matches!(name, "Cargo.toml" | "Cargo.lock")
-        })
+        && !paths().any(tier_two_floor)
         && files
             .iter()
             .filter(|file| !file.paths().all(test_only))
@@ -155,19 +163,14 @@ const CLOSING_ISSUES: &str = "query($owner: String!, $name: String!, $endCursor:
 #[derive(Deserialize)]
 struct LinkedIssue {
     number: u64,
-    repository: IssueRepo,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct IssueRepo {
-    name_with_owner: String,
+    repository: Repository,
 }
 
 #[derive(Deserialize)]
 struct Issue {
     labels: Vec<Label>,
     pull_request: Option<Value>,
+    repository_url: String,
 }
 
 async fn issue_labels<G: exec::Gh>(
@@ -175,7 +178,7 @@ async fn issue_labels<G: exec::Gh>(
     s: &Settings,
     repo: &str,
     number: u64,
-    branch: &str,
+    pr: &Pull,
 ) -> Result<(bool, bool)> {
     let args = [("owner", s.owner.clone()), ("name", repo.to_string())];
     let query = CLOSING_ISSUES.replace("PR_NUMBER", &number.to_string());
@@ -187,13 +190,25 @@ async fn issue_labels<G: exec::Gh>(
             .cloned()
             .unwrap_or(Value::Null);
         for issue in decode::<Vec<LinkedIssue>>("linked issues", issues)? {
-            linked.insert((issue.repository.name_with_owner, issue.number));
+            linked.insert((
+                issue.repository.full_name.to_ascii_lowercase(),
+                issue.number,
+            ));
         }
     }
-    let task = state::issue_from_branch(branch, &s.branch_prefix).map(|n| (s.full(repo), n));
+    let full = pr.base.repo.full_name.to_ascii_lowercase();
+    let same_repo = pr
+        .head
+        .repo
+        .as_ref()
+        .is_some_and(|source| source.full_name.eq_ignore_ascii_case(&full));
+    let task = if same_repo {
+        state::issue_from_branch(&pr.head.branch, &s.branch_prefix).map(|n| (full.clone(), n))
+    } else {
+        None
+    };
     let mut risk_high = false;
-    let mut task_bug = None;
-    let mut linked_bug = false;
+    let mut bug = same_repo && (!linked.is_empty() || task.is_some());
     for key in linked
         .iter()
         .chain(task.iter().filter(|key| !linked.contains(*key)))
@@ -201,22 +216,27 @@ async fn issue_labels<G: exec::Gh>(
         let path = format!("repos/{}/issues/{}", key.0, key.1);
         let issue = match exec::get(gh, &path).await {
             Ok(value) => decode::<Issue>(&path, value)?,
-            Err(e) if !linked.contains(key) && exec::is_not_found(&e) => continue,
+            Err(e) if !linked.contains(key) && exec::is_not_found(&e) => {
+                bug = false;
+                continue;
+            }
             Err(e) => return Err(e),
         };
         if issue.pull_request.is_some() {
+            bug = false;
             continue;
         }
         risk_high |= has_label(&issue.labels, "risk-high");
-        let bug = has_label(&issue.labels, "bug");
-        if task.as_ref() == Some(key) {
-            task_bug = Some(bug);
-        }
-        if linked.len() == 1 && linked.contains(key) {
-            linked_bug = bug;
-        }
+        // The issue endpoint can return the target of a redirection.
+        let returned_repo = issue
+            .repository_url
+            .rsplit_once("/repos/")
+            .map(|(_, name)| name);
+        bug &= key.0 == full
+            && returned_repo.is_some_and(|name| name.eq_ignore_ascii_case(&full))
+            && has_label(&issue.labels, "bug");
     }
-    Ok((risk_high, task_bug.unwrap_or(linked_bug)))
+    Ok((risk_high, bug))
 }
 
 /// Classify GitHub's PR diff at `head` without changing labels or coordinator state.
@@ -260,11 +280,10 @@ pub async fn evaluate<G: exec::Gh>(
             "{repo} #{number} has a comparison file without a path"
         )));
     }
-    let (issue_risk, bug) = issue_labels(gh, s, repo, number, &pr.head.branch).await?;
+    let (issue_risk, bug) = issue_labels(gh, s, repo, number, &pr).await?;
     let current: Pull = decode(&path, exec::get(gh, &path).await?)?;
-    if current.head.sha != head
-        || current.base.sha != pr.base.sha
-        || current.head.branch != pr.head.branch
+    if current.head != pr.head
+        || current.base != pr.base
         || current.changed_files != pr.changed_files
     {
         return Err(moved());
@@ -372,18 +391,44 @@ mod tests {
         assert_eq!(tier(&[file("src/contests/example.rs", 60)], true), 2);
     }
 
-    fn pr(head: &str, count: usize, labels: &[Value]) -> String {
+    #[test]
+    fn cargo_files_have_tier_two_floor() {
+        let rules = settings().gate_rules("hgl-ai");
+        for path in ["tests/Cargo.toml", "docs/examples/Cargo.lock"] {
+            for bug in [false, true] {
+                assert_eq!(
+                    classify("hgl-ai", &rules, &[file(path, 1)], false, bug),
+                    (2, BTreeSet::from([path]))
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn github_gate_config_is_tier_three() {
+        let path = "crates/config/src/github.rs";
+        let rules = settings().gate_rules("hgl-ai");
+        assert_eq!(
+            classify("hgl-ai", &rules, &[file(path, 1)], false, true),
+            (3, BTreeSet::from([path]))
+        );
+    }
+
+    fn pr(head: &str, count: usize, labels: &[Value]) -> Value {
+        let full = settings().full("hgl-ai");
         json!({
-            "head": {"sha": head, "ref": "codex/q41-fix"},
-            "base": {"sha": BASE},
+            "head": {"sha": head, "ref": "codex/q41-fix", "repo": {"full_name": full}},
+            "base": {"sha": BASE, "repo": {"full_name": full}},
             "changed_files": count,
             "labels": labels,
         })
-        .to_string()
     }
 
-    fn fake() -> FakeGh {
-        let s = settings();
+    fn fake(links: &[(&str, u64)]) -> FakeGh {
+        let nodes: Vec<_> = links
+            .iter()
+            .map(|(repo, number)| json!({"number": number, "repository": {"nameWithOwner": repo}}))
+            .collect();
         FakeGh::default()
             .on(
                 &format!("compare/{BASE}...{HEAD}?per_page=1"),
@@ -392,42 +437,89 @@ mod tests {
             .on(
                 "closingIssuesReferences",
                 &json!({"data":{"repository":{"pullRequest":{"closingIssuesReferences":{
-                    "nodes":[{"number": 53, "repository": {"nameWithOwner": s.full("hgl-ai")}}]
+                    "nodes": nodes
                 }}}}}).to_string(),
             )
     }
 
+    fn issue(repo: &str, label: Option<&str>) -> String {
+        let labels: Vec<_> = label
+            .into_iter()
+            .map(|name| json!({"name": name}))
+            .collect();
+        json!({
+            "labels": labels,
+            "repository_url": format!("https://api.github.com/repos/{repo}"),
+        })
+        .to_string()
+    }
+
     #[tokio::test]
     async fn only_issue_bug_lowers_and_risk_high_raises() {
+        let s = settings();
+        let repo = s.full("hgl-ai");
+        let uppercase = repo.to_ascii_uppercase();
         let plain = pr(HEAD, 1, &[json!({"name":"tier-1"}), json!({"name":"bug"})]);
         let risk = pr(HEAD, 1, &[json!({"name":"risk-high"})]);
-        let none = r#"{"labels":[]}"#;
-        let bug = r#"{"labels":[{"name":"bug"}]}"#;
-        let high = r#"{"labels":[{"name":"risk-high"}]}"#;
+        let none = issue(&repo, None);
+        let bug = issue(&repo, Some("bug"));
+        let high = issue(&repo, Some("risk-high"));
+        let mut local = plain.clone();
+        local["head"]["repo"]["full_name"] = json!(uppercase);
         for (pr, task, linked, expected) in [
-            (&plain, bug, none, 1),
-            (&plain, none, none, 2),
-            (&plain, bug, high, 3),
-            (&risk, none, none, 3),
+            (&local, &bug, &bug, 1),
+            (&plain, &bug, &none, 2),
+            (&plain, &none, &bug, 2),
+            (&plain, &bug, &high, 3),
+            (&risk, &none, &none, 3),
         ] {
             let gh = ReadOnly(
-                fake()
-                    .on(PR_PATH, pr)
+                fake(&[(&uppercase, 53), (&repo, 54)])
+                    .on(PR_PATH, &pr.to_string())
                     .on("issues/41", task)
-                    .on("issues/53", linked),
+                    .on("issues/53", linked)
+                    .on("issues/54", &bug),
             );
-            let a = evaluate(&gh, &settings(), "hgl-ai", 7, HEAD).await.unwrap();
+            let a = evaluate(&gh, &s, "hgl-ai", 7, HEAD).await.unwrap();
             assert_eq!(a.head, HEAD);
             assert_eq!(a.tier, expected);
             assert_eq!(a.risk_high, expected == 3);
             assert_eq!(a.paths.is_empty(), expected == 3);
         }
+        let mut without_task = plain.clone();
+        without_task["head"]["ref"] = json!("topic");
+        for (linked_repo, returned_repo, label, expected) in [
+            (repo.as_str(), uppercase.as_str(), "bug", 1),
+            ("another/hgl-ai", "another/hgl-ai", "bug", 2),
+            ("another/hgl-ai", "another/hgl-ai", "risk-high", 3),
+            (repo.as_str(), "another/hgl-ai", "bug", 2),
+        ] {
+            let gh = ReadOnly(
+                fake(&[(linked_repo, 53)])
+                    .on(PR_PATH, &without_task.to_string())
+                    .on("issues/53", &issue(returned_repo, Some(label))),
+            );
+            assert_eq!(
+                evaluate(&gh, &s, "hgl-ai", 7, HEAD).await.unwrap().tier,
+                expected
+            );
+        }
+        let mut fork = plain;
+        fork["head"]["repo"]["full_name"] = json!("another/hgl-ai");
+        let gh = ReadOnly(
+            fake(&[(&repo, 53)])
+                .on(PR_PATH, &fork.to_string())
+                .on("issues/41", &bug)
+                .on("issues/53", &bug),
+        );
+        assert_eq!(evaluate(&gh, &s, "hgl-ai", 7, HEAD).await.unwrap().tier, 2);
+        assert!(gh.0.calls().iter().all(|call| !call.contains("issues/41")));
     }
 
     #[tokio::test]
     async fn rejects_stale_head_and_partial_diff() {
         let s = settings();
-        let stale = fake().on(PR_PATH, &pr(BASE, 1, &[]));
+        let stale = fake(&[]).on(PR_PATH, &pr(BASE, 1, &[]).to_string());
         assert!(
             evaluate(&stale, &s, "hgl-ai", 7, HEAD)
                 .await
@@ -436,7 +528,7 @@ mod tests {
                 .contains("moved")
         );
         assert_eq!(stale.calls().len(), 1);
-        let partial = fake().on(PR_PATH, &pr(HEAD, 2, &[]));
+        let partial = fake(&[]).on(PR_PATH, &pr(HEAD, 2, &[]).to_string());
         assert!(
             evaluate(&partial, &s, "hgl-ai", 7, HEAD)
                 .await
@@ -444,11 +536,10 @@ mod tests {
                 .to_string()
                 .contains("incomplete")
         );
-        let race = fake()
-            .once(PR_PATH, &pr(HEAD, 1, &[]))
-            .on(PR_PATH, &pr(BASE, 1, &[]))
-            .on("issues/41", r#"{"labels":[]}"#)
-            .on("issues/53", r#"{"labels":[]}"#);
+        let race = fake(&[])
+            .once(PR_PATH, &pr(HEAD, 1, &[]).to_string())
+            .on(PR_PATH, &pr(BASE, 1, &[]).to_string())
+            .on("issues/41", &issue(&s.full("hgl-ai"), None));
         assert!(
             evaluate(&race, &s, "hgl-ai", 7, HEAD)
                 .await

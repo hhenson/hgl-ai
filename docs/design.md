@@ -253,17 +253,17 @@ refuses a moved head or an incomplete file list. GitHub's comparison API
 returns at most 300 files. `tier3_paths` matches
 repository-relative prefixes on either side of a rename. hgl-ai also treats
 unlisted paths in sensitive crates as tier 3 until an exact path is cleared
-through `tier3_new_exceptions`. A `risk-high` label on the PR, its branch's
-task issue or a GitHub closing issue raises the minimum to tier 3.
+through `tier3_new_exceptions`. A `risk-high` label on the PR, a same-repository
+branch's task issue or a GitHub closing issue raises the minimum to tier 3.
 
 Docs and standalone test files qualify for tier 1. GitHub workflows, recipes,
-`AGENTS.md` files at any depth, `skill/`, `docs/roles.md` and
-`docs/protocol.md` require at least tier 2.
-A source fix can qualify for tier 1 with a `bug` label on its task issue,
-at most three changed files and 40 added plus deleted lines outside tests,
-and no changed Cargo manifest, lockfile, or higher-risk policy path. For a
-PR without a branch task issue, a single GitHub closing issue can supply
-the `bug` label. Other changes default to tier 2.
+`AGENTS.md`, `Cargo.toml` and `Cargo.lock` files at any depth, `skill/`,
+`docs/roles.md` and `docs/protocol.md` require at least tier 2.
+A source fix can qualify for tier 1 on a same-repository PR with at least
+one task or closing issue. Every associated issue must be in the PR's
+repository and labelled `bug`. The fix can touch at most three files and
+have at most 40 added plus deleted lines outside tests. Paths with a tier
+2 or tier 3 minimum keep that minimum. Other changes default to tier 2.
 
 `hub.token_file` holds the host's hub credential: its own hub user's NKey seed, or
 the shared token of an older hub. `HGL_AI_HUB_CREDENTIAL` overrides it for one

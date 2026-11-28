@@ -184,6 +184,7 @@ pub fn default_tier3_paths(repo: &str) -> Vec<String> {
         "crates/bridge/src/lock.rs",
         "crates/bridge/src/holder.rs",
         "crates/bridge/src/cleanup.rs",
+        "crates/config/src/github.rs",
         "crates/proto/",
         ".github/workflows/release.yml",
         "packaging/",
