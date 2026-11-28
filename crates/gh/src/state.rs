@@ -39,22 +39,6 @@ pub fn render_main(
     s
 }
 
-/// A verdict value `<head> <main> pass|fail [detail]` for this head on this main:
-/// `Some(true)` pass, `Some(false)` fail, `None` absent, for another pair, or not a
-/// judgement (`running`, `not-run`).
-pub fn verdict_for(value: Option<&str>, head: &str, main: &str) -> Option<(bool, String)> {
-    use hgl_ai_proto::build::{VerdictValue, VerdictWord};
-    let v = VerdictValue::parse(value?)?;
-    if !v.is_for(head, main) {
-        return None;
-    }
-    match v.word {
-        VerdictWord::Pass => Some((true, value?.trim().to_string())),
-        VerdictWord::Fail => Some((false, value?.trim().to_string())),
-        _ => None,
-    }
-}
-
 static ISSUE_IN_BRANCH: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^q?([0-9]+)(?:[-_/]|$)").unwrap());
 
@@ -215,26 +199,6 @@ mod tests {
             b = "b".repeat(40)
         );
         assert_eq!(m, want);
-    }
-
-    #[test]
-    fn verdicts() {
-        let (h, m) = ("h".repeat(40), "m".repeat(40));
-        assert_eq!(
-            verdict_for(Some(&format!("{h} {m} pass")), &h, &m).map(|v| v.0),
-            Some(true)
-        );
-        assert_eq!(
-            verdict_for(Some(&format!("{h} {m} fail tests 3")), &h, &m).map(|v| v.0),
-            Some(false)
-        );
-        assert_eq!(
-            verdict_for(Some(&format!("{h} {} pass", "o".repeat(40))), &h, &m),
-            None,
-            "another main"
-        );
-        assert_eq!(verdict_for(Some("junk"), &h, &m), None);
-        assert_eq!(verdict_for(None, &h, &m), None);
     }
 
     #[test]

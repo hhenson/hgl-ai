@@ -169,30 +169,76 @@ pub async fn verdict_put(
     )))
 }
 
-/// Delete every verdict key of `repo#pr` (it landed or closed). Returns how many went.
-pub async fn verdicts_purge(bus: &Bus, repo: &str, pr: u64) -> Result<usize, StoreError> {
+/// Whether pull request `repo#pr` is merged or closed, as GitHub says (BUILD-15): `Err`
+/// when that could not be told (GitHub unreachable, a `hold`, no such pull request).
+/// Verdict keys are purged on this fact only, never on a note's word.
+pub type PrEnded = std::sync::Arc<
+    dyn Fn(
+            String,
+            u64,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The pull request a verdict key belongs to: `verdict.<repo>.<pr>.<name>.<pair>` read from
+/// the right, since a repository's name may hold dots.
+pub fn verdict_pr(key: &str) -> Option<(String, u64)> {
+    let rest = key.strip_prefix("verdict.")?;
+    let mut w = rest.rsplitn(4, '.');
+    let (_pair, _name, pr, repo) = (w.next()?, w.next()?, w.next()?, w.next()?);
+    Some((repo.to_string(), pr.parse().ok()?))
+}
+
+/// Delete every verdict key of `repo#pr`, if GitHub says it is merged or closed. Returns
+/// how many went; `Ok(None)` when it is open or that could not be told (nothing went).
+pub async fn verdicts_purge(
+    bus: &Bus,
+    ended: &PrEnded,
+    repo: &str,
+    pr: u64,
+) -> Result<Option<usize>, StoreError> {
+    match ended(repo.to_string(), pr).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(e) => {
+            tracing::info!("{repo} #{pr}: its state not read ({e}); its verdicts kept");
+            return Ok(None);
+        }
+    }
     let keys = bus.state_keys(&verdict_prefix(repo, pr)).await?;
     for k in &keys {
         bus.state_del(k).await?;
     }
-    Ok(keys.len())
+    Ok(Some(keys.len()))
 }
 
-/// Delete the verdict keys whose build was asked before `cutoff` (`YYYYMMDD-HHMMSS`, a
-/// build id's time), or that hold no verdict: those of pull requests closed without a
-/// `landed` note. Returns how many went.
-pub async fn verdicts_expire(bus: &Bus, cutoff: &str) -> Result<usize, StoreError> {
+/// Sweep the verdict keys: those the hub wrote more than `max_age` seconds before `now`
+/// (Unix seconds, the hub's clock; never a requester's build id), and, with `ended`, those
+/// of pull requests GitHub reports merged or closed. Returns how many went.
+pub async fn verdicts_sweep(
+    bus: &Bus,
+    now: i64,
+    max_age: i64,
+    ended: Option<&PrEnded>,
+) -> Result<usize, StoreError> {
     let mut n = 0;
+    let mut prs = std::collections::BTreeSet::new();
     for k in bus.state_keys("verdict.").await? {
         let Some(e) = bus.state_get(&k).await? else {
             continue;
         };
-        let old = VerdictValue::parse(&e.value)
-            .and_then(|v| v.id)
-            .is_none_or(|id| id.get(..15).is_none_or(|t| t < cutoff));
-        if old {
+        if now - e.created > max_age {
             bus.state_del(&k).await?;
             n += 1;
+        } else if let Some(p) = verdict_pr(&k) {
+            prs.insert(p);
+        }
+    }
+    if let Some(ended) = ended {
+        for (repo, pr) in prs {
+            n += verdicts_purge(bus, ended, &repo, pr).await?.unwrap_or(0);
         }
     }
     Ok(n)

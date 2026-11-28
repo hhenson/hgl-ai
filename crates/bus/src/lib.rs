@@ -181,6 +181,8 @@ pub struct SendReceipt {
 pub struct StateEntry {
     pub value: String,
     pub revision: u64,
+    /// Unix seconds of the write, by the hub's clock.
+    pub created: i64,
 }
 
 /// Inbox consumer settings. [`Default`] is the protocol's (§3); other values
@@ -752,6 +754,7 @@ impl Bus {
                 Ok(Some(StateEntry {
                     value,
                     revision: e.revision,
+                    created: e.created.unix_timestamp(),
                 }))
             }
             None => Ok(None),

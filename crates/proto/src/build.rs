@@ -287,9 +287,10 @@ pub struct BuildJob {
     pub recipe_rev: Option<u64>,
     #[serde(default)]
     pub keep_going: bool,
-    /// A gate build: write `verdict.<repo>.<issue>.<name>` from its result (docs/build.md
-    /// BUILD-15). Needs a pull request, a `base`, every step, and a builder of the
-    /// platform the name stands for.
+    /// A gate build: write the verdict `<name>` of pull request `issue` from its result, in
+    /// the key of its head, `base` and recipe revision ([`verdict_key`], docs/build.md
+    /// BUILD-15). Needs a pull request, a `base` commit, every step of the current recipe,
+    /// and a builder of the platform the name stands for.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verdict: Option<String>,
     /// Where the `receipt` goes ([`reply_seat`]).

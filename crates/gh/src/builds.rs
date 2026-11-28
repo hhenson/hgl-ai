@@ -362,6 +362,16 @@ pub async fn verdict_state(
             Some((format!("{id} on {label} ran past its bound"), None))
         } else if !alive(&builders, &label) {
             Some((format!("builder {label} of {id} is gone"), Some(label)))
+        } else if run
+            .as_ref()
+            .is_some_and(|s| s.status == BuildStatus::Queued)
+            && !taking(&builders, &label)
+        {
+            // Stopped and queued again, with its builder now draining or unreachable.
+            Some((
+                format!("{id} is queued again with builder {label}, which takes no jobs"),
+                Some(label),
+            ))
         } else if run.as_ref().is_some_and(|s| s.status.is_final()) {
             let (raw, again) = read(bus, &key).await?;
             if let Some(j) = judged(&raw, &again, &w) {

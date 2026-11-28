@@ -26,7 +26,8 @@ const RUNNING_MARGIN: Duration = Duration::from_secs(15 * 60);
 /// Heartbeats between sweeps of the verdict keys of pull requests that closed without a
 /// `landed` note (about an hour).
 const VERDICT_SWEEP_EVERY: u32 = 120;
-/// Verdict keys older than this are swept (the notes' history and a day).
+/// Verdict keys the hub wrote longer ago than this are swept (the notes' history and a
+/// day).
 const VERDICT_KEEP_DAYS: i64 = 15;
 /// How often a lane writes its record and checks its gate.
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
@@ -182,6 +183,9 @@ pub struct Settings {
     /// This service's hub user may write the local build verdicts (a `builder` user, or
     /// a hub with one shared token); else gate builds are not run (BUILD-15).
     pub verdicts: bool,
+    /// Asks GitHub whether a pull request is merged or closed, so its verdict keys may go;
+    /// `None`: they go only by age.
+    pub pr_ended: Option<store::PrEnded>,
 }
 
 /// Run the lanes until `shutdown` turns true; then cancel running builds (their remote
@@ -409,16 +413,13 @@ async fn lane_loop(
                     }
                 }
                 if settings.verdicts && beat.is_multiple_of(VERDICT_SWEEP_EVERY) {
-                    let cutoff = (chrono::Utc::now() - chrono::Duration::days(VERDICT_KEEP_DAYS))
-                        .format("%Y%m%d-%H%M%S")
-                        .to_string();
-                    match store::verdicts_expire(&bus, &cutoff).await {
+                    let now = chrono::Utc::now().timestamp();
+                    let age = VERDICT_KEEP_DAYS * 86_400;
+                    match store::verdicts_sweep(&bus, now, age, settings.pr_ended.as_ref()).await {
                         Ok(0) => {}
-                        Ok(n) => {
-                            tracing::info!(builder = %lane.label, "{n} old verdict keys swept")
-                        }
+                        Ok(n) => tracing::info!(builder = %lane.label, "{n} verdict keys swept"),
                         Err(e) => {
-                            tracing::warn!(builder = %lane.label, "sweeping old verdict keys: {e}")
+                            tracing::warn!(builder = %lane.label, "sweeping verdict keys: {e}")
                         }
                     }
                 }
@@ -485,16 +486,17 @@ async fn lane_loop(
         };
         for d in deliveries {
             if d.note.kind != Kind::Build {
-                // A pull request landed or closed: its verdicts are done with (BUILD-15).
+                // `landed` or `closed`: a hint, never proof (notes are not authenticated,
+                // hgl-ai#16). Its verdicts go only if GitHub says the pull request ended.
                 if d.note.kind.ends_task()
                     && settings.verdicts
-                    && let Some(repo) = d.note.repo.as_deref()
+                    && let (Some(ended), Some(repo)) = (&settings.pr_ended, d.note.repo.as_deref())
                     && d.note.issue > 0
                 {
-                    match store::verdicts_purge(&bus, repo, d.note.issue).await {
-                        Ok(0) => {}
-                        Ok(n) => {
-                            tracing::info!(builder = %lane.label, "{repo} #{}: {n} verdict keys purged", d.note.issue)
+                    match store::verdicts_purge(&bus, ended, repo, d.note.issue).await {
+                        Ok(None | Some(0)) => {}
+                        Ok(Some(n)) => {
+                            tracing::info!(builder = %lane.label, "{repo} #{}: ended on GitHub; {n} verdict keys purged", d.note.issue)
                         }
                         Err(e) => {
                             tracing::warn!(builder = %lane.label, "purging the verdicts of {repo} #{}: {e}", d.note.issue)

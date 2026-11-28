@@ -144,9 +144,13 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
     from `HGL_HOSTS` or retired, a queued job's builder not taking jobs, past `until`, or
     an end without its verdict. A `running` it did not ask for is waited on unless it is
     lost the same way. One command asks a pair at most 3 times, then reports it not run.
-  - Builders purge a pull request's verdict keys on its `landed` (or `closed`) note to
-    `all`. About hourly they sweep keys whose build was asked more than 15 days ago,
-    which covers pull requests closed without a broadcast.
+  - Verdict keys go on facts, never on a note's word (notes are not authenticated,
+    hgl-ai#16). On a `landed` or `closed` note, a builder asks GitHub for the pull
+    request's state. It purges that pull request's keys only if GitHub reports it merged
+    or closed; an open one is never purged. About hourly it sweeps keys the hub wrote more
+    than 15 days ago (the hub's write time, never a requester's build id), and the keys of
+    pull requests GitHub reports merged or closed. GitHub is not asked while `hold`
+    holds. A builder where `gh` cannot read GitHub sweeps by age only.
   - `hgl-ai build gate REPO PR [--wait] [--timeout DUR]` does the same by hand. It prints
     each verdict for the head on the present `main` and asks for the missing or lost ones.
     `--wait` asks again each 30 s round, up to `--timeout` (default 2h). Exit 0 all pass,

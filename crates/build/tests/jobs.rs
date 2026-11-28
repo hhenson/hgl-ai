@@ -111,6 +111,8 @@ struct Opts {
     before: Option<Before>,
     /// The service's hub user may not write verdicts (a seat's).
     no_verdicts: bool,
+    /// The pull requests "GitHub" reports merged or closed; the rest are open.
+    ended: Option<Vec<u64>>,
 }
 
 fn fake_ssh() -> PathBuf {
@@ -231,6 +233,13 @@ impl Rig {
             toolchains: vec!["git".into()],
             heartbeat: Duration::from_millis(300),
             verdicts: !o.no_verdicts,
+            pr_ended: o.ended.clone().map(|ended| {
+                let f: store::PrEnded = Arc::new(move |_repo: String, pr: u64| {
+                    let yes = ended.contains(&pr);
+                    Box::pin(async move { Ok(yes) })
+                });
+                f
+            }),
         };
         let (stop, rx) = tokio::sync::watch::channel(false);
         let svc = tokio::spawn(service::serve(svc_bus, lanes, settings.clone(), rx));
@@ -497,45 +506,156 @@ async fn no_other_build_displaces_a_judged_verdict() {
     r.stop().await;
 }
 
-/// The controller on #56: a pull request's verdict keys go when it lands (a `landed` note
-/// to `all`); another's stay.
+/// The controller on #56 (r3's P1): verdict keys go on facts, never on a note's word. A
+/// seat's `closed` or `landed` for an open pull request leaves its `pass` and `fail`; the
+/// same note for one GitHub reports ended purges that one's keys only.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn verdicts_are_purged_when_their_pull_request_lands() {
-    let Some(r) = Rig::start().await else { return };
-    let j = gate_job(&r, "20261127-160000-aaaaaa", &r.heads[1], mine());
-    send_pr(&r, &j).await;
-    assert_eq!(r.receipt(&j.id).await.status, BuildStatus::Pass);
+async fn verdicts_are_purged_only_for_pull_requests_github_reports_ended() {
+    let Some(r) = Rig::start_with(Opts {
+        ended: Some(vec![9]),
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let open = gate_job(&r, "20261127-160000-aaaaaa", &r.heads[1], mine());
+    send_pr(&r, &open).await;
+    assert_eq!(r.receipt(&open.id).await.status, BuildStatus::Pass);
+    let (_, pass) = verdict(&r, &r.heads[1], &r.heads[0]).await;
+    let pass = pass.unwrap();
+    // A `fail` of the same pull request for another main.
+    let rev = recipe_rev(&r).await;
+    let fail_key =
+        hgl_ai_proto::build::verdict_key("demo", 7, mine(), &r.heads[1], &r.heads[1], rev);
+    let fail = format!(
+        "{} {} fail 20261127-160000-bbbbbb lab1 r{rev} step check failed",
+        r.heads[1], r.heads[1]
+    );
+    r.bus.state_put(&fail_key, &fail).await.unwrap();
+    let mut ended = gate_job(&r, "20261127-160000-cccccc", &r.heads[1], mine());
+    ended.issue = 9;
+    send_pr(&r, &ended).await;
+    assert_eq!(r.receipt(&ended.id).await.status, BuildStatus::Pass);
+    assert_eq!(r.bus.state_keys("verdict.demo.9.").await.unwrap().len(), 1);
+    // A seat's word: `closed` to the builder alone, `landed` to all, for the open one.
+    let note = |kind: Kind, to: Seat, pr: u64| {
+        let mut n = Note::new(Seat::new("w1").unwrap(), to, kind, format!("demo #{pr}"));
+        n.repo = Some("demo".into());
+        n.issue = pr;
+        n
+    };
     r.bus
-        .state_put("verdict.demo.8.linux.x", "keep")
+        .send(&note(Kind::Closed, Seat::new("builder-lab1").unwrap(), 7))
         .await
         .unwrap();
-    let mut landed = Note::new(
-        Seat::new("controller").unwrap(),
-        Seat::broadcast(),
-        Kind::Landed,
-        "demo #7 landed",
-    );
-    landed.repo = Some("demo".into());
-    landed.issue = 7;
-    r.bus.send(&landed).await.unwrap();
+    r.bus
+        .send(&note(Kind::Landed, Seat::broadcast(), 7))
+        .await
+        .unwrap();
+    // Then the ended one: purged once GitHub says so.
+    r.bus
+        .send(&note(Kind::Closed, Seat::new("builder-lab1").unwrap(), 9))
+        .await
+        .unwrap();
     let deadline = Instant::now() + Duration::from_secs(30);
     while !r
         .bus
-        .state_keys("verdict.demo.7.")
+        .state_keys("verdict.demo.9.")
         .await
         .unwrap()
         .is_empty()
     {
-        assert!(Instant::now() < deadline, "not purged");
+        assert!(
+            Instant::now() < deadline,
+            "the ended pull request's keys stayed"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    assert!(
-        r.bus
-            .state_get("verdict.demo.8.linux.x")
-            .await
-            .unwrap()
-            .is_some()
+    let (_, still) = verdict(&r, &r.heads[1], &r.heads[0]).await;
+    assert_eq!(
+        still.as_deref(),
+        Some(pass.as_str()),
+        "the open one's pass stays"
     );
+    assert_eq!(
+        r.bus.state_get(&fail_key).await.unwrap().unwrap().value,
+        fail
+    );
+    r.stop().await;
+}
+
+/// r3's P2: the sweep ages a key by the hub's write time, never by the requester's build
+/// id. A gate build stamped in the year 2000 keeps its `fail`; the same key 16 days on by
+/// the hub's clock goes; with GitHub's word, only ended pull requests' keys go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_sweep_ages_keys_by_the_hub_not_the_build_id() {
+    let Some(r) = Rig::start().await else { return };
+    let failing = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"test -f nope.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
+    store::recipe_put(&r.bus, failing, None).await.unwrap();
+    let old = gate_job(&r, "20000101-000000-aaaaaa", &r.heads[1], mine());
+    send_pr(&r, &old).await;
+    assert_eq!(r.receipt(&old.id).await.status, BuildStatus::Fail);
+    let (key, v) = verdict(&r, &r.heads[1], &r.heads[0]).await;
+    let v = v.unwrap();
+    assert!(v.contains(" fail 20000101-000000-aaaaaa "), "{v}");
+    let now = chrono::Utc::now().timestamp();
+    let day = 86_400;
+    assert_eq!(
+        store::verdicts_sweep(&r.bus, now, 15 * day, None)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        r.bus.state_get(&key).await.unwrap().unwrap().value,
+        v,
+        "kept"
+    );
+    // GitHub says #7 is open: kept; the sweep finds its pull request from the key.
+    assert_eq!(
+        store::verdict_pr(&key),
+        Some(("demo".to_string(), 7)),
+        "{key}"
+    );
+    assert_eq!(
+        store::verdict_pr("verdict.hgl.core.12.mac.0123456789abcdef01234567"),
+        Some(("hgl.core".to_string(), 12))
+    );
+    let open: store::PrEnded = std::sync::Arc::new(|_, _| Box::pin(async { Ok(false) }));
+    assert_eq!(
+        store::verdicts_sweep(&r.bus, now, 15 * day, Some(&open))
+            .await
+            .unwrap(),
+        0
+    );
+    let unknown: store::PrEnded =
+        std::sync::Arc::new(|_, _| Box::pin(async { Err("GitHub unreachable".to_string()) }));
+    assert_eq!(
+        store::verdicts_sweep(&r.bus, now, 15 * day, Some(&unknown))
+            .await
+            .unwrap(),
+        0
+    );
+    assert!(r.bus.state_get(&key).await.unwrap().is_some());
+    // Sixteen days on, by the hub's clock: swept.
+    assert_eq!(
+        store::verdicts_sweep(&r.bus, now + 16 * day, 15 * day, None)
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(r.bus.state_get(&key).await.unwrap().is_none());
+    // Within the age, a pull request GitHub reports ended: swept.
+    r.bus.state_put(&key, &v).await.unwrap();
+    let closed: store::PrEnded = std::sync::Arc::new(|_, pr| Box::pin(async move { Ok(pr == 7) }));
+    assert_eq!(
+        store::verdicts_sweep(&r.bus, now, 15 * day, Some(&closed))
+            .await
+            .unwrap(),
+        1
+    );
+    assert!(r.bus.state_get(&key).await.unwrap().is_none());
     r.stop().await;
 }
 

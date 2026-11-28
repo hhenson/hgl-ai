@@ -533,6 +533,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         toolchains: vec!["git".into()],
         heartbeat: Duration::from_millis(300),
         verdicts: true,
+        pr_ended: None,
     };
     // A leftover job directory that cannot be removed yet: no job may start before the
     // startup cleanup is done.

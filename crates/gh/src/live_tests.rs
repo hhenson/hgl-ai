@@ -1087,6 +1087,7 @@ impl GateRig {
                 toolchains: vec!["git".into()],
                 heartbeat: Duration::from_millis(300),
                 verdicts: true,
+                pr_ended: None,
             };
             let svc_bus = Arc::new(Bus::connect_url(&h.url, None).await.unwrap());
             let (tx, rx) = tokio::sync::watch::channel(false);
@@ -1271,6 +1272,8 @@ async fn a_recipe_update_asks_again() {
     r.stop().await;
 }
 
+use hgl_ai_proto::build::BuildJob;
+
 /// r3 and r1 on #56: a `running` value whose builder is gone, or that ran past its bound,
 /// never holds the gate: it is asked again of a live builder, once. While that replacement
 /// is queued the old value is not judged again and nothing more is asked; a live one's
@@ -1364,5 +1367,37 @@ async fn a_lost_running_with_a_queued_replacement_is_asked_once() {
         r.state(Some(&builds), &r.head, &r.m1).await,
         VerdictState::Building("building 20261127-120000-ffffff on parked".into())
     );
+    // r3's minor: that build, stopped and queued again, with `parked` now draining: lost,
+    // and asked of another builder (here none is live).
+    let job = BuildJob {
+        v: hgl_ai_proto::build::BUILD_VERSION,
+        id: "20261127-120000-ffffff".into(),
+        repo: "demo".into(),
+        head: r.head.clone(),
+        base: Some(r.m1.clone()),
+        issue: 7,
+        steps: None,
+        recipe_rev: None,
+        keep_going: false,
+        verdict: Some(r.name.into()),
+        reply_to: hgl_ai_proto::build::reply_seat("20261127-120000-ffffff").unwrap(),
+        notify: None,
+        requester: "controller".into(),
+    };
+    let mut draining = parked.clone();
+    draining.state = "draining".into();
+    r.b.builder_put(&draining).await.unwrap();
+    hgl_ai_build::store::run_put(&r.b, &hgl_ai_build::request::queued(&job, &draining))
+        .await
+        .unwrap();
+    match r.state(Some(&controller_builds()), &r.head, &r.m1).await {
+        VerdictState::Missing(Some(w)) => assert!(
+            w.starts_with(
+                "20261127-120000-ffffff is queued again with builder parked, which takes no jobs; no live"
+            ),
+            "{w}"
+        ),
+        other => panic!("a build queued with a draining builder held the gate: {other:?}"),
+    }
     r.stop().await;
 }
