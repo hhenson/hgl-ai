@@ -395,9 +395,11 @@ fn land_opts(o: &PinOpts, what: Option<String>) -> LandOpts {
     }
 }
 
-/// The wrapper's landings with a record that are merged and not finished, as (number,
-/// head): a record with the merge commit, or only the intent of a pull request GitHub
-/// shows merged. An intent whose pull request is not merged is left to the sync itself.
+/// The wrapper's pin pull requests with a landing record that are merged and not finished,
+/// as (number, head): a record with the merge commit, or only the intent of a pull request
+/// GitHub shows merged. An intent whose pull request is not merged is left to the sync
+/// itself; any other wrapper pull request's landing to its own command, which knows its
+/// notes and comment.
 async fn unfinished<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<Vec<(u64, String)>> {
     let prefix = progress::key(&s.wrapper, 0);
     let prefix = prefix.trim_end_matches('0');
@@ -409,18 +411,26 @@ async fn unfinished<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<Vec<(u64, 
         let Some(p) = progress::read(bus, &s.wrapper, n).await? else {
             continue;
         };
-        let head = if p.merge.is_some() && !p.head.is_empty() {
-            p.head
-        } else {
-            let pr = gate::fetch_pr(gh, s, &s.wrapper, n).await?;
-            if !pr.merged {
-                continue;
-            }
-            if p.head.is_empty() { pr.head } else { p.head }
-        };
-        out.push((n, head));
+        let pr = gate::fetch_pr(gh, s, &s.wrapper, n).await?;
+        if !is_pin_branch(s, &pr.branch) || (p.merge.is_none() && !pr.merged) {
+            continue;
+        }
+        out.push((n, if p.head.is_empty() { pr.head } else { p.head }));
     }
     Ok(out)
+}
+
+/// Whether `branch` is a pin pull request's: `<branch_prefix><pin_branch>` with `{sha8}`
+/// as eight hex digits.
+pub(crate) fn is_pin_branch(s: &Settings, branch: &str) -> bool {
+    let template = format!("{}{}", s.branch_prefix, s.pin_branch);
+    let Some((before, after)) = template.split_once("{sha8}") else {
+        return branch == template;
+    };
+    branch
+        .strip_prefix(before)
+        .and_then(|b| b.strip_suffix(after))
+        .is_some_and(|sha| sha.len() == 8 && sha.bytes().all(|c| c.is_ascii_hexdigit()))
 }
 
 /// Point `refs/heads/<branch>` of `w` at `sha`: a branch left by an earlier attempt (or one
@@ -520,6 +530,22 @@ mod tests {
             t["tree"][1],
             json!({"path": "hgl_spec", "mode": "160000", "type": "commit", "sha": sha('5')})
         );
+    }
+
+    #[test]
+    fn pin_branches() {
+        let s = settings();
+        assert!(is_pin_branch(&s, "codex/pins-compiler-cccccccc"));
+        assert!(is_pin_branch(&s, "codex/pins-compiler-01e99ea5"));
+        for b in [
+            "codex/980-format-patterns",
+            "codex/pins-compiler-",
+            "codex/pins-compiler-cccccccc0",
+            "codex/pins-compiler-zzzzzzzz",
+            "pins-compiler-cccccccc",
+        ] {
+            assert!(!is_pin_branch(&s, b), "{b}");
+        }
     }
 
     #[tokio::test]

@@ -1615,9 +1615,21 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
     crate::progress::write(&b, "hgl-project", 52, &pin)
         .await
         .unwrap();
-    let open = fixture("pr-open.json").replace("\"number\": 7", "\"number\": 52");
+    let open = fixture("pr-open.json")
+        .replace("\"number\": 7", "\"number\": 52")
+        .replace("codex/980-format-patterns", "codex/pins-compiler-cccccccc");
+    // A wrapper pull request that is not a pin one, merged, its notes and comment left:
+    // its own command finishes it, with them; the sync does not.
+    let mut other = crate::progress::Progress::new(HEAD, Some(MERGE.into()));
+    other.mark(crate::progress::LANDED_LOG);
+    other.mark(crate::progress::MAIN);
+    crate::progress::write(&b, "hgl-project", 53, &other)
+        .await
+        .unwrap();
+    let merged = fixture("pr-merged.json").replace("\"number\": 7", "\"number\": 53");
     let gh = FakeGh::default()
         .on("hgl-project/pulls/52", &open)
+        .on("hgl-project/pulls/53", &merged)
         .on("auth status", "");
     let gh = {
         let more = pins_current_gh(51, pin_merge);
@@ -1651,11 +1663,23 @@ async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
             .is_some(),
         "not merged: left"
     );
+    assert_eq!(
+        crate::progress::read(&b, "hgl-project", 53)
+            .await
+            .unwrap()
+            .map(|p| p.done),
+        Some(vec![
+            crate::progress::LANDED_LOG.to_string(),
+            crate::progress::MAIN.to_string()
+        ]),
+        "not a pin pull request: left"
+    );
+    assert!(!log.contains("hgl-project #53"), "{log}");
     assert_eq!(posts(&gh, "merge-async"), 0);
     // Current, with nothing left to finish.
-    crate::progress::delete(&b, "hgl-project", 52)
-        .await
-        .unwrap();
+    for n in [52, 53] {
+        crate::progress::delete(&b, "hgl-project", n).await.unwrap();
+    }
     let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
         .await
         .unwrap();
