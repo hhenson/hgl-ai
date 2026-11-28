@@ -41,7 +41,7 @@ pub const KV_CONSOLE: &str = "HGL_CONSOLE";
 pub const KV_SLACK: &str = "HGL_SLACK";
 /// Owner words (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
-/// One owner message per Slack workspace, channel and message timestamp in a question.
+/// One owner event per Slack workspace, channel and reply or action timestamp in a thread.
 pub const SLACK_OWNER_FILTER: &str = "hgl.owner.thread.*.slack.*.*.*";
 /// The Slack adapter's durable owner feed.
 pub const SLACK_FEED: &str = "slack";

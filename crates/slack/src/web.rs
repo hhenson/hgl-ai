@@ -3,6 +3,7 @@ use std::time::Duration;
 use anyhow::{Context as _, Result, bail, ensure};
 use reqwest::{Client, RequestBuilder};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpStream;
 use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, WebSocketStream};
@@ -36,6 +37,8 @@ struct Metadata {
 pub struct Marker {
     pub event: String,
     pub question: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_event: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -194,6 +197,7 @@ impl Web {
         parent: Option<&str>,
         marker: Marker,
         text: &str,
+        blocks: &[Value],
     ) -> Result<String> {
         #[derive(Serialize)]
         struct Post<'a> {
@@ -202,6 +206,8 @@ impl Web {
             thread_ts: Option<&'a str>,
             client_msg_id: String,
             text: &'a str,
+            #[serde(skip_serializing_if = "<[Value]>::is_empty")]
+            blocks: &'a [Value],
             mrkdwn: bool,
             parse: &'a str,
             unfurl_links: bool,
@@ -227,6 +233,7 @@ impl Web {
             thread_ts: parent,
             client_msg_id,
             text,
+            blocks,
             mrkdwn: false,
             parse: "none",
             unfurl_links: false,
@@ -251,6 +258,44 @@ impl Web {
             "{method}: unexpected channel or message timestamp"
         );
         Ok(sent.ts)
+    }
+
+    pub async fn update(
+        &self,
+        channel: &str,
+        ts: &str,
+        marker: Marker,
+        text: &str,
+        blocks: &[Value],
+    ) -> Result<()> {
+        let method = "chat.update";
+        self.call::<Value>(
+            method,
+            self.client
+                .post(format!("{}/{method}", self.base))
+                .bearer_auth(&self.bot)
+                .json(&json!({
+                    "channel": channel, "ts": ts, "text": text, "mrkdwn": false, "parse": "none",
+                "blocks": blocks,
+                    "metadata": Metadata { event_type: METADATA_TYPE.into(), event_payload: marker }
+                })),
+        )
+        .await?;
+        Ok(())
+    }
+
+    pub async fn open_modal(&self, trigger: &str, view: Value) -> Result<()> {
+        let method = "views.open";
+        self.call::<Value>(
+            method,
+            self.client
+                .post(format!("{}/{method}", self.base))
+                .bearer_auth(&self.bot)
+                .timeout(Duration::from_secs(2))
+                .json(&json!({ "trigger_id": trigger, "view": view })),
+        )
+        .await?;
+        Ok(())
     }
 
     /// Match a prior attempt by metadata from the authenticated bot in the same channel

@@ -13,7 +13,7 @@ use axum::{
 use hgl_ai_bus::{Credential, Feed};
 use hgl_ai_install::nats::{Auth, render_conf};
 use hgl_ai_install::users::{Registry, Role};
-use hgl_ai_owner::{Ask, Priority, QOption, ThreadState};
+use hgl_ai_owner::{Ask, Choice, Priority, QOption, ThreadState};
 use hgl_ai_proto::{Kind, Note, STREAM_OWNER};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
@@ -182,6 +182,8 @@ impl Hub {
 #[derive(Default)]
 struct Posts {
     items: Vec<Value>,
+    updates: usize,
+    views: Vec<Value>,
     lose_response: bool,
 }
 
@@ -246,6 +248,37 @@ impl FakeSlack {
                     },
                 ),
             )
+            .route(
+                "/chat.update",
+                post(
+                    |State(state): State<SlackState>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                        assert_eq!(headers["authorization"], "Bearer xoxb-test");
+                        assert_eq!(body["channel"], "CQA");
+                        assert_eq!(body["mrkdwn"], false);
+                        let mut posts = state.posts.lock().unwrap();
+                        let item = posts.items.iter_mut().find(|item| item["ts"] == body["ts"]).unwrap();
+                        for name in ["text", "blocks", "metadata"] {
+                            item[name] = body[name].clone();
+                        }
+                        posts.updates += 1;
+                        if std::mem::take(&mut posts.lose_response) {
+                            return StatusCode::BAD_GATEWAY.into_response();
+                        }
+                        Json(json!({ "ok":true })).into_response()
+                    },
+                ),
+            )
+            .route(
+                "/views.open",
+                post(
+                    |State(state): State<SlackState>, headers: HeaderMap, Json(body): Json<Value>| async move {
+                        assert_eq!(headers["authorization"], "Bearer xoxb-test");
+                        assert_eq!(body["trigger_id"], "trigger");
+                        state.posts.lock().unwrap().views.push(body["view"].clone());
+                        Json(json!({ "ok":true }))
+                    },
+                ),
+            )
             .route("/conversations.history", get(history))
             .route("/conversations.replies", get(history))
             .with_state(state.clone());
@@ -264,6 +297,7 @@ impl FakeSlack {
         Adapter::new(
             bus,
             settings(),
+            Seat::new("seat").unwrap(),
             Web::new(self.base.clone(), "xapp-test".into(), "xoxb-test".into()).unwrap(),
         )
         .await
@@ -436,7 +470,7 @@ async fn question_and_replies_survive_slack_and_jetstream_restart() {
         "recover the posted root instead of posting on restart"
     );
     assert_eq!(
-        adapter.question_for(&root).await.unwrap().as_deref(),
+        adapter.thread_for(&root).await.unwrap().as_deref(),
         Some(question.as_str())
     );
 
@@ -511,12 +545,6 @@ async fn question_and_replies_survive_slack_and_jetstream_restart() {
         "identical Slack replies within a second deliver distinct owner notes"
     );
     let slack_subject = event::slack_subject(&question, "TQA", "CQA", &timestamp_key(&first));
-    let forged = Body::Answer {
-        choice: Choice::Accept,
-        option: None,
-        text: String::new(),
-        note: String::new(),
-    };
     let forged = Event {
         v: event::EVENT_VERSION,
         id: question.clone(),
@@ -524,7 +552,11 @@ async fn question_and_replies_survive_slack_and_jetstream_restart() {
         user: None,
         handle: None,
         at: hgl_ai_proto::utc_now_stamp(),
-        body: forged,
+        body: Body::Start {
+            title: "Forged".into(),
+            issue: None,
+            body: "Not allowed".into(),
+        },
     };
     let encoded = serde_json::to_vec(&forged).unwrap();
     assert!(matches!(
@@ -575,6 +607,11 @@ async fn question_and_replies_survive_slack_and_jetstream_restart() {
     hgl_ai_owner::reply(&seat_bus, &asker, &question, "Follow-up from the asker")
         .await
         .unwrap();
+    for _ in 0..2 {
+        let native_reply = next(&mut feed).await;
+        adapter.deliver(&native_reply).await.unwrap();
+        native_reply.ack().await.unwrap();
+    }
     let from_console = next(&mut feed).await;
     fake.lose_next_response();
     assert!(adapter.deliver(&from_console).await.is_err());
@@ -590,4 +627,312 @@ async fn question_and_replies_survive_slack_and_jetstream_restart() {
     assert_eq!(items[1]["text"], "The Owner\nFollow-up from the console");
     assert_eq!(items[2]["thread_ts"], root);
     assert_eq!(items[2]["text"], "seat\nFollow-up from the asker");
+}
+
+fn click(envelope: &str, root: &Value, action: &str, ts: &str) -> Value {
+    let block = root["blocks"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|block| {
+            block["elements"]
+                .as_array()
+                .is_some_and(|elements| elements.iter().any(|button| button["action_id"] == action))
+        })
+        .expect("action button on the Slack root");
+    let mut button = block["elements"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|button| button["action_id"] == action)
+        .unwrap()
+        .clone();
+    button["action_ts"] = json!(ts);
+    button["block_id"] = block["block_id"].clone();
+    json!({
+        "type": "interactive", "envelope_id": envelope,
+        "payload": {
+            "type": "block_actions", "team": {"id": "TQA"},
+            "user": {"id": "UOWNER", "team_id": "TQA"},
+            "channel": {"id": "CQA"}, "trigger_id": "trigger",
+            "container": {"type": "message", "channel_id": "CQA", "message_ts": root["ts"]},
+            "message": {"ts": root["ts"], "user": "UQABOT"},
+            "actions": [button]
+        }
+    })
+}
+
+fn action_ts(root: &Value, micros: u32) -> String {
+    let (seconds, _) = root["ts"].as_str().unwrap().split_once('.').unwrap();
+    format!("{seconds}.{micros:06}")
+}
+
+fn submission(envelope: &str, form: &Value, text: &str, note: &str) -> Value {
+    json!({
+        "type": "interactive", "envelope_id": envelope, "accepts_response_payload": true,
+        "payload": {
+            "type": "view_submission", "team": {"id": "TQA"}, "user": {"id": "UOWNER"},
+            "view": {
+                "callback_id": form["callback_id"], "private_metadata": form["private_metadata"],
+                "state": {"values": {"text": {"text": {"value": text}}, "note": {"note": {"value": note}}}}
+            }
+        }
+    })
+}
+
+async fn fold_next(console: &Bus, feed: &mut Feed, controller: &Seat) -> Thread {
+    let msg = next(feed).await;
+    let hgl_ai_owner::Applied::Folded { thread, .. } =
+        hgl_ai_owner::apply(console, controller, &msg)
+            .await
+            .unwrap()
+    else {
+        panic!("refused event at {}", msg.seq);
+    };
+    msg.ack().await.unwrap();
+    *thread
+}
+
+async fn deliver_next(adapter: &Adapter<'_>, feed: &mut Feed) {
+    let msg = next(feed).await;
+    adapter.deliver(&msg).await.unwrap();
+    msg.ack().await.unwrap();
+}
+
+fn assert_terminal(root: &Value, state: &str) {
+    assert!(root["text"].as_str().unwrap().starts_with(state), "{root}");
+    assert!(
+        root["blocks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|b| b["type"] != "actions")
+    );
+    assert!(root["metadata"]["event_payload"]["state_event"].is_string());
+}
+
+#[tokio::test]
+async fn slack_and_console_share_owner_actions_once() {
+    if Command::new("nats-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: nats-server is unavailable");
+        return;
+    }
+    let hub = Hub::new();
+    let _server = hub.start().await;
+    let admin = hub.bus("admin").await;
+    admin.provision().await.unwrap();
+    let slack = hub.bus("slack").await;
+    let console = hub.bus("console").await;
+    let seat = hub.bus("seat").await;
+    let controller = Seat::new("seat").unwrap();
+    let fake = FakeSlack::start().await;
+    let adapter = fake.adapter(&slack).await;
+    let mut outbound = adapter.open_feed().await.unwrap();
+    let mut inbound = console
+        .owner_feed(
+            hgl_ai_owner::FEED,
+            vec![format!("{CONSOLE_PREFIX}.>"), format!("{OWNER_PREFIX}.>")],
+        )
+        .await
+        .unwrap();
+
+    for from_slack in [true, false] {
+        let (id, _) = hgl_ai_owner::start_conversation(
+            &console,
+            &controller,
+            "console-owner",
+            Some("The Owner"),
+            "Project",
+            None,
+            "Hello",
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            fold_next(&console, &mut inbound, &controller).await.state,
+            ThreadState::Open
+        );
+        deliver_next(&adapter, &mut outbound).await;
+        let root = fake.items().last().unwrap().clone();
+        let ts = action_ts(&root, 100_000);
+        let close = click("close", &root, "hgl_close", &ts);
+        if from_slack {
+            let invalid = vec![
+                replace(close.clone(), "/payload/user/id", json!("UOTHER")),
+                replace(close.clone(), "/payload/team/id", json!("TOTHER")),
+                replace(close.clone(), "/payload/channel/id", json!("COTHER")),
+                replace(
+                    close.clone(),
+                    "/payload/container/channel_id",
+                    json!("COTHER"),
+                ),
+            ];
+            fake.send(&adapter, invalid).await;
+            assert!(
+                inbound
+                    .next(Duration::from_millis(100))
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            fake.send(
+                &adapter,
+                vec![
+                    close.clone(),
+                    replace(close.clone(), "/envelope_id", json!("retry")),
+                ],
+            )
+            .await;
+        } else {
+            hgl_ai_owner::owner_event(
+                &console,
+                &controller,
+                &id,
+                "console-owner",
+                Some("The Owner"),
+                Body::Close,
+            )
+            .await
+            .unwrap();
+        }
+        let thread = fold_next(&console, &mut inbound, &controller).await;
+        assert_eq!(thread.id, id);
+        assert_eq!(thread.state, ThreadState::Closed);
+        assert_eq!(
+            thread
+                .messages
+                .iter()
+                .filter(|m| m.body == "closed")
+                .count(),
+            1
+        );
+        assert_eq!(
+            hgl_ai_owner::show_full(&console, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .state,
+            ThreadState::Closed
+        );
+
+        // Slack applied the edit but the receipt was lost. A new adapter reconciles
+        // the same root by its terminal event marker before acknowledging the feed.
+        let updates = fake.state.posts.lock().unwrap().updates;
+        fake.lose_next_response();
+        let msg = next(&mut outbound).await;
+        assert!(adapter.deliver(&msg).await.is_err());
+        let restarted = fake.adapter(&slack).await;
+        restarted.deliver(&msg).await.unwrap();
+        restarted.deliver(&msg).await.unwrap();
+        msg.ack().await.unwrap();
+        let edited = fake.items().last().unwrap().clone();
+        assert_eq!(edited["ts"], root["ts"]);
+        assert_terminal(&edited, "Closed");
+        assert_eq!(fake.state.posts.lock().unwrap().updates, updates + 1);
+
+        // A retry or stale click after the edit leaves the same console and Slack state.
+        fake.send(&restarted, vec![close]).await;
+        assert!(
+            inbound
+                .next(Duration::from_millis(100))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    for (choice, action) in [
+        (Choice::Option, "hgl_option_a"),
+        (Choice::Other, "hgl_answer"),
+        (Choice::Accept, "hgl_accept"),
+        (Choice::Reject, "hgl_reject"),
+    ] {
+        let id = hgl_ai_owner::ask(
+            &seat,
+            &controller,
+            Ask {
+                title: format!("Pick a colour ({choice})"),
+                priority: Priority::P3,
+                issue: None,
+                context: String::new(),
+                question: "Which colour?".into(),
+                options: vec![QOption {
+                    label: "a".into(),
+                    line: "Blue".into(),
+                }],
+                suggested: Some("a".into()),
+            },
+        )
+        .await
+        .unwrap();
+        fold_next(&console, &mut inbound, &controller).await;
+        deliver_next(&adapter, &mut outbound).await;
+        let root = fake.items().last().unwrap().clone();
+        if choice == Choice::Reject {
+            // The console's formal answer also edits the Slack root.
+            hgl_ai_owner::owner_event(
+                &console,
+                &controller,
+                &id,
+                "console-owner",
+                Some("The Owner"),
+                Body::Answer {
+                    choice,
+                    option: None,
+                    text: String::new(),
+                    note: "Thanks".into(),
+                },
+            )
+            .await
+            .unwrap();
+        } else {
+            let ts = action_ts(&root, 200_000);
+            fake.send(&adapter, vec![click("answer", &root, action, &ts)])
+                .await;
+            let form = fake
+                .state
+                .posts
+                .lock()
+                .unwrap()
+                .views
+                .last()
+                .unwrap()
+                .clone();
+            let answer = submission("submit", &form, "Green", "Thanks");
+            fake.send(
+                &adapter,
+                vec![
+                    answer.clone(),
+                    replace(answer, "/envelope_id", json!("retry-submit")),
+                ],
+            )
+            .await;
+        }
+        let answer = fold_next(&console, &mut inbound, &controller)
+            .await
+            .answer
+            .unwrap();
+        assert_eq!(answer.choice, choice);
+        assert_eq!(answer.note, "Thanks");
+        match choice {
+            Choice::Accept | Choice::Option => assert_eq!(answer.option.as_deref(), Some("a")),
+            Choice::Other => assert_eq!(answer.text, "Green"),
+            Choice::Reject => {}
+        }
+        deliver_next(&adapter, &mut outbound).await;
+        let edited = fake.items().last().unwrap().clone();
+        assert_terminal(&edited, "Answered");
+        assert!(edited["text"].as_str().unwrap().contains("Thanks"));
+        assert!(
+            inbound
+                .next(Duration::from_millis(100))
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
 }

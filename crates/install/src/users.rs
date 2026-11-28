@@ -40,7 +40,7 @@ pub enum Role {
     Builder,
     /// The owner's console: the owner's subjects, `HGL_THREADS`, `tick` notes.
     Console,
-    /// Slack Q&A: inbound messages, its own feed and delivery state.
+    /// Slack Q&A: owner actions, its own feed and delivery state.
     Slack,
     /// Everything: provisioning the stream and buckets (`hgl-ai init`, `server install`).
     Admin,
@@ -266,6 +266,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
                 format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
                 format!("$JS.API.STREAM.INFO.{STREAM_OWNER}"),
+                format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"),
                 format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}.{SLACK_FEED}"),
                 format!("$JS.API.CONSUMER.INFO.{STREAM_OWNER}.{SLACK_FEED}"),
                 format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_FEED}"),

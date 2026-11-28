@@ -111,6 +111,34 @@ impl Feed {
 }
 
 impl Bus {
+    /// Read an immutable owner event by its stream sequence.
+    pub async fn owner_event_at(&self, seq: u64) -> Result<StreamMsg> {
+        let stream = self
+            .js
+            .get_stream_no_info(STREAM_OWNER)
+            .await
+            .map_err(|e| nats("opening the owner stream", e))?;
+        let message = self
+            .guarded(&format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"), async {
+                stream
+                    .get_raw_message(seq)
+                    .await
+                    .map_err(|e| nats("reading an owner event", e))
+            })
+            .await?;
+        Ok(StreamMsg {
+            seq,
+            subject: message.subject.to_string(),
+            time: chrono::DateTime::from_timestamp(
+                message.time.unix_timestamp(),
+                message.time.nanosecond(),
+            )
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH),
+            payload: message.payload.to_vec(),
+            handle: None,
+        })
+    }
+
     /// Publish one owner-channel event to `subject` (under `hgl.owner.` or `hgl.console.`)
     /// with a message id, so a retry is dropped. The hub refuses a subject the
     /// connection's hub user may not publish (OWN-5).
@@ -124,7 +152,7 @@ impl Bus {
             .await
     }
 
-    /// Publish an owner event once on a subject unique to its source message.
+    /// Publish an owner event once on a subject unique to its source reply or action.
     /// Returns false if the subject has already been used, even after the dedup window.
     pub async fn publish_slack_event(&self, subject: &str, payload: &[u8]) -> Result<bool> {
         match self.publish_owner_event(subject, payload, None).await {

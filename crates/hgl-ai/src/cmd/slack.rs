@@ -20,6 +20,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     match args.cmd {
         Sub::Run => {
             let cfg = ctx.load_config()?;
+            let controller = cfg.controller()?;
             let path = cfg.token_file()?;
             let slack = cfg
                 .slack
@@ -35,7 +36,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 "Slack needs its own hub user"
             );
             let bus = Bus::connect_with(&cfg.hub.url, Some(credential)).await?;
-            hgl_ai_slack::run(&bus, slack, &expand("~/.config/hgl-ai")?).await?;
+            hgl_ai_slack::run(&bus, slack, controller, &expand("~/.config/hgl-ai")?).await?;
         }
     }
     Ok(super::EXIT_OK)

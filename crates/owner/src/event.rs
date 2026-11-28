@@ -28,12 +28,9 @@ pub fn owner_subject(id: &str) -> String {
     format!("{OWNER_PREFIX}.thread.{id}")
 }
 
-/// An owner message from Slack, keyed by workspace, channel and ts (without its dot).
-pub fn slack_subject(id: &str, team: &str, channel: &str, timestamp_key: &str) -> String {
-    format!(
-        "{}.slack.{team}.{channel}.{timestamp_key}",
-        owner_subject(id)
-    )
+/// An owner event from Slack, keyed by workspace, channel and reply or action ts.
+pub fn slack_subject(id: &str, team: &str, channel: &str, source_key: &str) -> String {
+    format!("{}.slack.{team}.{channel}.{source_key}", owner_subject(id))
 }
 
 /// Who published an event, by its subject.
@@ -283,9 +280,12 @@ pub fn fold(
     }
     if origin == Origin::Owner
         && subject != owner_subject(sid)
-        && (!sid.starts_with("q-") || !matches!(ev.body, Body::OwnerMessage { .. }))
+        && !matches!(
+            ev.body,
+            Body::OwnerMessage { .. } | Body::Answer { .. } | Body::Close
+        )
     {
-        return Err(refuse("Slack may only add owner messages to questions"));
+        return Err(refuse("Slack actions require an existing thread"));
     }
     match origin {
         Origin::Owner if ev.sender != hgl_ai_proto::OWNER => {

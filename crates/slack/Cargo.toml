@@ -1,6 +1,6 @@
 [package]
 name = "hgl-ai-slack"
-description = "Slack Socket Mode adapter for hgl-ai owner questions"
+description = "Slack Socket Mode adapter for hgl-ai owner threads"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -83,7 +83,9 @@ hgl-ai ...` (`server user add`, `doctor`).
 ### Slack Q&A
 
 Use the existing Slack app with Socket Mode, `chat:write`, `groups:history` and
-the `message.groups` bot event. Install it in the workspace and invite it to the
+the `message.groups` bot event. Enable `settings.interactivity.is_enabled` in the
+app manifest for the answer and Close buttons. Socket Mode delivers their callbacks
+over the outbound connection. Install it in the workspace and invite it to the
 private `#hgl-qa` channel. In the server user's configuration add the workspace,
 channel and owner member IDs, and use the owner's console handle:
 
@@ -132,12 +134,12 @@ hgl-ai server user ...`).
 | `coord` | a seat's, and `HGL_METRICS` |
 | `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
 | `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
-| `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<ts>` and `HGL_SLACK` |
+| `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
 The console keeps session state in `HGL_CONSOLE`. The Slack adapter reads its own
-delivery state and its durable `HGL_OWNER` feed. Seat, coordinator and builder users
-read `HGL_OWNER` through short-lived consumers.
+delivery state, its durable `HGL_OWNER` feed and opening events by sequence.
+Seat, coordinator and builder users read `HGL_OWNER` through short-lived consumers.
 
 ```sh
 hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred

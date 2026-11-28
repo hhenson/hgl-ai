@@ -2,7 +2,7 @@
 
 The controller runs headless, like every other seat. The owner talks to it through a
 web console served beside the hub: status reports, questions, conversations, and
-live telemetry. Slack also carries question threads. GitHub stays the record (PROTO-1).
+live telemetry. Slack also carries questions and conversations. GitHub stays the record (PROTO-1).
 
 ## 1. Interactions
 
@@ -32,14 +32,14 @@ live telemetry. Slack also carries question threads. GitHub stays the record (PR
 ## 2. Owner words
 
 - **OWN-5 — Owner words.** The console publishes owner notes and its own thread
-  events. Slack has a separate hub credential and subject for owner messages in
-  question threads. The hub denies seats and the coordinator writes to
+  events. Slack has a separate hub credential and subject for owner actions in
+  existing threads. The hub denies seats and the coordinator writes to
   `hgl.owner.>`, `hgl.notes.owner.>` and `HGL_THREADS` (docs/install.md, Hub users).
   - NATS stores a message under the subject it was published on, so a receiver checks
     the subject, never a header or the payload: the bridge accepts sender `owner` only on
     `hgl.notes.owner.<recipient>` and nothing else there; the console folds owner events
     from the owner thread subjects in §4 and agent events from `hgl.console.thread.<id>`.
-    The Slack subject carries only `owner_message` in a question.
+    The Slack subject carries `owner_message`, a question's `answer`, or a conversation's `close`.
   - The hub, coordinator, console and Slack adapter run as a dedicated OS user.
     The client user cannot read their credentials.
 - **OWN-6 — Sign-in.** The console listens on a configured address (loopback or a
@@ -87,24 +87,27 @@ live telemetry. Slack also carries question threads. GitHub stays the record (PR
 
 ### Slack Q&A (#42)
 
-The adapter posts each question in the private `#hgl-qa` channel. Console
-messages, formal answers and the asker's follow-ups appear in its Slack thread.
-First activation includes questions already in `HGL_OWNER`. Slack shows the
-question ID and clips long posts at its size limit.
+HPH, 2026-11-28: "Slack is a first class communication channel, so if I close a conversation in the slack channel it is the same as if i close it in the web ui."
 
-Socket Mode accepts ordinary thread replies from the configured workspace,
-private channel and owner account. Each accepted reply is signed with the
-configured owner handle and stored in `HGL_OWNER` before Slack is acknowledged.
-The owner event's subject keys it by Slack message timestamp. Bot messages and
-replies outside mapped question threads are ignored.
+The adapter posts each question and conversation in the private `#hgl-qa` channel,
+including threads already in `HGL_OWNER` on first activation. Console messages and
+agent follow-ups appear in the Slack thread. The root shows the thread ID and
+clips long posts at Slack's limits.
 
-**Proposed (#42).** A Slack reply adds an owner message. The owner answers the
-question in the console. Whether a Slack reply may close it remains open.
+The owner replies by typing in the thread, answers a question with its Block Kit
+buttons and answer form, or closes a conversation with its Close button. The
+same `HGL_OWNER` events drive both surfaces. Answering, closing or withdrawing
+edits the Slack root with the new state and removes its buttons.
 
-`HGL_SLACK` keeps the thread mappings and delivery state across restarts.
-Outgoing posts carry the source event ID. After a lost response the adapter
-checks Slack for its own matching post before retrying. Recovery depends on that
-post still being visible in Slack's history.
+Socket Mode accepts actions only from the configured owner account, workspace
+and private channel. It stores the event with the configured owner handle before
+acknowledging Slack. The subject keys each event by its Slack message or action
+timestamp. Native Slack replies stay in their original thread.
+
+`HGL_SLACK` keeps mappings and delivery receipts across restarts. Posts and state
+edits carry the source event ID. After a lost response the adapter checks Slack
+for its own matching message before retrying. Recovery uses Slack's visible
+message history.
 
 ## 3. Telemetry
 
@@ -142,14 +145,14 @@ repository per day.
 | KV | `HGL_THREADS` | one record per thread: id, kind, title, issue, priority, state, times, options, suggested, answer, messages |
 | KV | `HGL_METRICS` | daily samples per repository |
 | KV | `HGL_CONSOLE` | the console's sessions, pending `p2` batch and undelivered `p1`s; the console's user only |
-| KV | `HGL_SLACK` | Slack delivery receipts and question thread mappings |
+| KV | `HGL_SLACK` | Slack delivery receipts and thread mappings |
 
 | Subject | Publisher | Event |
 | --- | --- | --- |
 | `hgl.console.status` | controller | a status report |
 | `hgl.console.thread.<id>` | agents | `ask`, `message`, `withdraw` |
 | `hgl.owner.thread.<id>` | console | `answer`, `owner_message`, `start`, `close`, with the signed-in user |
-| `hgl.owner.thread.<id>.slack.<team>.<channel>.<ts>` | Slack | `owner_message`, with the allowlisted user and configured handle |
+| `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` | Slack | `owner_message`, `answer`, `close`, with the allowlisted user and configured handle |
 | `hgl.notes.owner.<seat>` | console | the `answer` or `note` a folded owner event sends |
 
 - Thread ids are `q-` (question) or `c-` (conversation) and 8 hex digits.

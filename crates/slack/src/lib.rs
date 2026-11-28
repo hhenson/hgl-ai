@@ -1,6 +1,7 @@
 //! Stage 1 of the Slack adapter (docs/owner.md). The hub keeps the event log,
-//! delivery state, and thread mappings. Slack is a Q&A surface.
+//! delivery state, and thread mappings for questions and conversations.
 
+mod interaction;
 mod web;
 
 use std::io::Read;
@@ -13,9 +14,12 @@ use chrono::{DateTime, Utc};
 use futures::{SinkExt as _, StreamExt as _};
 use hgl_ai_bus::{Bus, BusError, StreamMsg};
 use hgl_ai_config::slack::{APP_TOKEN_FILE, BOT_TOKEN_FILE, Slack};
-use hgl_ai_owner::{Body, Choice, Event, Origin, event};
-use hgl_ai_proto::{CONSOLE_PREFIX, OWNER, OWNER_PREFIX, SLACK_FEED, Seat, utc_stamp};
+use hgl_ai_owner::{Body, Event, Origin, Thread, ThreadState, event, fold};
+use hgl_ai_proto::{
+    CONSOLE_PREFIX, OWNER, OWNER_PREFIX, SLACK_FEED, SLACK_OWNER_FILTER, Seat, utc_stamp,
+};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::time::{sleep, timeout};
 use tokio_websockets::Message;
 
@@ -31,7 +35,10 @@ struct Envelope {
     #[serde(rename = "type")]
     kind: String,
     envelope_id: Option<String>,
-    payload: Option<Callback>,
+    #[serde(default)]
+    payload: Value,
+    #[serde(default)]
+    accepts_response_payload: bool,
 }
 
 #[derive(Deserialize)]
@@ -63,16 +70,16 @@ struct Incoming {
     text: Option<String>,
 }
 
-struct Reply<'a> {
-    parent: &'a str,
-    ts: &'a str,
+struct Reply {
+    parent: String,
+    ts: String,
     at: DateTime<Utc>,
-    text: &'a str,
+    text: String,
 }
 
-fn owner_reply<'a>(env: &'a Envelope, cfg: &Slack, bot: &Bot) -> Option<Reply<'a>> {
-    let payload = env.payload.as_ref()?;
-    let msg = payload.event.as_ref()?;
+fn owner_reply(env: &Envelope, cfg: &Slack, bot: &Bot) -> Option<Reply> {
+    let payload = Callback::deserialize(&env.payload).ok()?;
+    let msg = payload.event?;
     if env.kind != "events_api"
         || payload.kind != "event_callback"
         || payload.team_id.as_deref() != Some(cfg.team.as_str())
@@ -93,11 +100,11 @@ fn owner_reply<'a>(env: &'a Envelope, cfg: &Slack, bot: &Bot) -> Option<Reply<'a
     {
         return None;
     }
-    let parent = msg.thread_ts.as_deref()?;
-    let root = slack_timestamp(parent)?;
-    let ts = msg.ts.as_deref()?;
-    let at = slack_timestamp(ts)?;
-    let text = msg.text.as_deref()?;
+    let parent = msg.thread_ts?;
+    let root = slack_timestamp(&parent)?;
+    let ts = msg.ts?;
+    let at = slack_timestamp(&ts)?;
+    let text = msg.text?;
     (at > root && !text.trim().is_empty() && text.chars().count() <= SLACK_TEXT_LIMIT).then_some(
         Reply {
             parent,
@@ -158,12 +165,13 @@ fn secret(dir: &Path, name: &str, prefix: &str) -> Result<String> {
 }
 
 /// Run the Slack service. Tokens are read once and a service restart reloads them.
-pub async fn run(bus: &Bus, cfg: Slack, secret_dir: &Path) -> Result<()> {
+pub async fn run(bus: &Bus, cfg: Slack, controller: Seat, secret_dir: &Path) -> Result<()> {
     let app = secret(secret_dir, APP_TOKEN_FILE, "xapp-")?;
     let bot = secret(secret_dir, BOT_TOKEN_FILE, "xoxb-")?;
     let adapter = Adapter::new(
         bus,
         cfg,
+        controller,
         Web::new("https://slack.com/api".into(), app, bot)?,
     )
     .await?;
@@ -174,6 +182,7 @@ pub async fn run(bus: &Bus, cfg: Slack, secret_dir: &Path) -> Result<()> {
 struct Adapter<'a> {
     bus: &'a Bus,
     cfg: Slack,
+    controller: Seat,
     bot: Bot,
     web: Web,
 }
@@ -184,10 +193,25 @@ struct Delivery {
     started: i64,
     attempted: i64,
     ts: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    opening_seq: Option<u64>,
+}
+
+impl Delivery {
+    fn pending(event: &str, opening_seq: Option<u64>) -> Self {
+        let now = Utc::now().timestamp();
+        Self {
+            event: event.into(),
+            started: now,
+            attempted: now,
+            ts: None,
+            opening_seq,
+        }
+    }
 }
 
 impl<'a> Adapter<'a> {
-    async fn new(bus: &'a Bus, cfg: Slack, web: Web) -> Result<Self> {
+    async fn new(bus: &'a Bus, cfg: Slack, controller: Seat, web: Web) -> Result<Self> {
         cfg.validate().map_err(anyhow::Error::msg)?;
         let bot = web.identify().await?;
         ensure!(
@@ -199,14 +223,20 @@ impl<'a> Adapter<'a> {
             "the Slack owner must be a human account"
         );
         web.verify_channel(&cfg.channel).await?;
-        Ok(Self { bus, cfg, bot, web })
+        Ok(Self {
+            bus,
+            cfg,
+            controller,
+            bot,
+            web,
+        })
     }
 
     fn key(&self, kind: &str, id: &str) -> String {
         format!("{}.{}.{kind}.{id}", self.cfg.team, self.cfg.channel)
     }
 
-    async fn question_for(&self, parent: &str) -> Result<Option<String>> {
+    async fn thread_for(&self, parent: &str) -> Result<Option<String>> {
         let key = self.key("thread", &timestamp_key(parent));
         if let Some((id, _)) = self.bus.slack_get::<String>(&key).await? {
             return Ok(Some(id));
@@ -218,12 +248,12 @@ impl<'a> Adapter<'a> {
         let Some(marker) = post.marker(&self.bot) else {
             return Ok(None);
         };
-        if !marker.question.starts_with("q-") || hgl_ai_owner::check_id(&marker.question).is_err() {
+        if hgl_ai_owner::check_id(&marker.question).is_err() {
             return Ok(None);
         }
         let delivery = self
             .bus
-            .slack_get::<Delivery>(&self.key("question", &marker.question))
+            .slack_get::<Delivery>(&self.root_key(&marker.question))
             .await?;
         Ok(delivery
             .filter(|(record, _)| {
@@ -232,34 +262,70 @@ impl<'a> Adapter<'a> {
             .map(|_| marker.question))
     }
 
-    async fn ingest(&self, envelope: &Envelope) -> Result<()> {
+    async fn ingest_reply(&self, envelope: &Envelope) -> Result<()> {
         let Some(reply) = owner_reply(envelope, &self.cfg, &self.bot) else {
             return Ok(());
         };
-        let Some(id) = self.question_for(reply.parent).await? else {
+        let Some(id) = self.thread_for(&reply.parent).await? else {
             return Ok(());
         };
-        let subject = event::slack_subject(
+        self.publish_action(
             &id,
-            &self.cfg.team,
-            &self.cfg.channel,
-            &timestamp_key(reply.ts),
-        );
+            &timestamp_key(&reply.ts),
+            reply.at,
+            Body::OwnerMessage { body: reply.text },
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn publish_action(
+        &self,
+        id: &str,
+        key: &str,
+        at: DateTime<Utc>,
+        body: Body,
+    ) -> Result<bool> {
+        let subject = event::slack_subject(id, &self.cfg.team, &self.cfg.channel, key);
         let event = Event {
             v: event::EVENT_VERSION,
-            id,
+            id: id.into(),
             sender: OWNER.into(),
             user: Some(format!("slack:{}:{}", self.cfg.team, self.cfg.user)),
             handle: Some(self.cfg.handle.clone()),
-            at: utc_stamp(reply.at),
-            body: Body::OwnerMessage {
-                body: reply.text.into(),
-            },
+            at: utc_stamp(at),
+            body,
         };
+        if !matches!(event.body, Body::OwnerMessage { .. }) {
+            let Some((root, _)) = self.bus.slack_get::<Delivery>(&self.root_key(id)).await? else {
+                return Ok(false);
+            };
+            let opening = self.opening(&root).await?;
+            let Ok((_, effects)) = fold(
+                Some(&opening),
+                &subject,
+                opening.seq + 1,
+                &event,
+                &self.controller,
+            ) else {
+                return Ok(false);
+            };
+            if effects.oversize.is_some() {
+                return Ok(false);
+            }
+            if self
+                .bus
+                .slack_get::<Delivery>(&self.key("state", id))
+                .await?
+                .is_some_and(|(edit, _)| edit.event != delivery_id(&event, &subject))
+            {
+                return Ok(false);
+            }
+        }
         self.bus
             .publish_slack_event(&subject, &serde_json::to_vec(&event)?)
             .await?;
-        Ok(())
+        Ok(true)
     }
 
     async fn socket_loop(&self) {
@@ -297,12 +363,25 @@ impl<'a> Adapter<'a> {
             let Some(id) = &envelope.envelope_id else {
                 continue;
             };
-            if let Err(e) = self.ingest(&envelope).await {
-                // Slack retries an unacknowledged envelope.
-                tracing::warn!("saving Slack owner message: {e}");
-                continue;
+            let handled = match envelope.kind.as_str() {
+                "events_api" => self.ingest_reply(&envelope).await.map(|()| None),
+                "interactive" => self.ingest_interaction(&envelope.payload).await,
+                _ => Ok(None),
+            };
+            let payload = match handled {
+                Ok(payload) => payload,
+                Err(e) => {
+                    // Slack retries an unacknowledged envelope.
+                    tracing::warn!("saving Slack owner action: {e}");
+                    continue;
+                }
+            };
+            let mut ack = serde_json::json!({ "envelope_id": id });
+            if envelope.accepts_response_payload
+                && let Some(payload) = payload
+            {
+                ack["payload"] = payload;
             }
-            let ack = serde_json::json!({ "envelope_id": id });
             socket
                 .send(Message::text(ack.to_string()))
                 .await
@@ -347,6 +426,7 @@ impl<'a> Adapter<'a> {
                 vec![
                     format!("{CONSOLE_PREFIX}.thread.*"),
                     format!("{OWNER_PREFIX}.thread.*"),
+                    SLACK_OWNER_FILTER.into(),
                 ],
             )
             .await?)
@@ -356,9 +436,8 @@ impl<'a> Adapter<'a> {
         let Ok(ev) = serde_json::from_slice::<Event>(&message.payload) else {
             return Ok(());
         };
-        if !ev.id.starts_with("q-")
-            || hgl_ai_owner::check_id(&ev.id).is_err()
-            || message.subject != ev.subject()
+        if hgl_ai_owner::check_id(&ev.id).is_err()
+            || event::parse_subject(&message.subject) != Some((ev.body.origin(), &ev.id))
             || ev.v != event::EVENT_VERSION
             || hgl_ai_proto::parse_stamp(&ev.at).is_none()
         {
@@ -371,35 +450,134 @@ impl<'a> Adapter<'a> {
         if !origin_ok {
             return Ok(());
         }
-        let root_key = self.key("question", &ev.id);
-        let event_id = ev.msg_id();
+        let root_key = self.root_key(&ev.id);
+        let event_id = delivery_id(&ev, &message.subject);
+        let from_slack = ev.subject() != message.subject;
+        let marker = Marker {
+            event: event_id.clone(),
+            question: ev.id.clone(),
+            state_event: None,
+        };
         match &ev.body {
-            Body::Ask(ask) if ask.validate().is_ok() => {
-                let text = question_text(&ev.id, ask);
-                let marker = Marker {
-                    event: event_id,
-                    question: ev.id.clone(),
+            Body::Ask(_) | Body::Start { .. } => {
+                let Ok((thread, _)) =
+                    fold(None, &message.subject, message.seq, &ev, &self.controller)
+                else {
+                    return Ok(());
                 };
-                let ts = self.post_once(&root_key, None, marker, &text).await?;
+                let text = root_text(&thread);
+                let blocks = interaction::root_blocks(&thread, &text);
+                let ts = self
+                    .post_once(&root_key, None, marker, &text, &blocks, Some(message.seq))
+                    .await?;
                 self.map_thread(&ev.id, &ts).await?;
             }
-            Body::Message { .. } | Body::OwnerMessage { .. } | Body::Answer { .. } => {
+            Body::Message { body } | Body::OwnerMessage { body }
+                if !from_slack && !body.trim().is_empty() =>
+            {
                 let Some((root, _)) = self.bus.slack_get::<Delivery>(&root_key).await? else {
                     return Ok(());
                 };
-                let parent = root.ts.context("the Slack question is still pending")?;
-                let Some(text) = reply_text(&ev) else {
-                    return Ok(());
-                };
+                let parent = root.ts.context("the Slack thread is still pending")?;
+                let who = ev.handle.as_deref().unwrap_or(&ev.sender);
+                let text = format!("{who}\n{body}");
                 let key = self.key("out", &event_id);
-                let marker = Marker {
-                    event: event_id,
-                    question: ev.id,
-                };
-                self.post_once(&key, Some(&parent), marker, &text).await?;
+                self.post_once(&key, Some(&parent), marker, &text, &[], None)
+                    .await?;
+            }
+            Body::Answer { .. } | Body::Close | Body::Withdraw { .. } => {
+                self.edit_state(message, &ev, &event_id).await?;
             }
             _ => {}
         }
+        Ok(())
+    }
+
+    fn root_key(&self, id: &str) -> String {
+        self.key("question", id)
+    }
+
+    async fn opening(&self, root: &Delivery) -> Result<Thread> {
+        let seq = root
+            .opening_seq
+            .context("the Slack thread has no opening event")?;
+        let message = self.bus.owner_event_at(seq).await?;
+        let ev: Event = serde_json::from_slice(&message.payload)?;
+        ensure!(
+            ev.msg_id() == root.event,
+            "the Slack thread points to the wrong opening event"
+        );
+        Ok(fold(None, &message.subject, seq, &ev, &self.controller)?.0)
+    }
+
+    async fn edit_state(&self, message: &StreamMsg, ev: &Event, event_id: &str) -> Result<()> {
+        let key = self.key("state", &ev.id);
+        let prior = self.bus.slack_get::<Delivery>(&key).await?;
+        if prior
+            .as_ref()
+            .is_some_and(|(edit, _)| edit.ts.is_some() || edit.event != event_id)
+        {
+            return Ok(());
+        }
+        let Some((root, _)) = self
+            .bus
+            .slack_get::<Delivery>(&self.root_key(&ev.id))
+            .await?
+        else {
+            return Ok(());
+        };
+        let parent = root
+            .ts
+            .as_deref()
+            .context("the Slack thread is still pending")?;
+        let opening = self.opening(&root).await?;
+        let Ok((thread, _)) = fold(
+            Some(&opening),
+            &message.subject,
+            message.seq,
+            ev,
+            &self.controller,
+        ) else {
+            return Ok(());
+        };
+        let (mut edit, revision) = if let Some((edit, revision)) = prior {
+            let posted = self.web.root_at(&self.cfg.channel, parent).await?;
+            if posted
+                .and_then(|post| post.marker(&self.bot))
+                .is_some_and(|marker| {
+                    marker.event == root.event && marker.state_event.as_deref() == Some(event_id)
+                })
+            {
+                self.record_post(&key, revision, edit, parent.into())
+                    .await?;
+                return Ok(());
+            }
+            ensure!(
+                Utc::now().timestamp() >= edit.attempted + RETRY_AFTER,
+                "waiting to reconcile a Slack edit"
+            );
+            (edit, revision)
+        } else {
+            (Delivery::pending(event_id, None), 0)
+        };
+        edit.attempted = Utc::now().timestamp();
+        let claim = self.bus.slack_put(&key, &edit, revision).await?;
+        let marker = Marker {
+            event: root.event,
+            question: ev.id.clone(),
+            state_event: Some(event_id.into()),
+        };
+        let text = terminal_text(&opening, &thread);
+        self.web
+            .update(
+                &self.cfg.channel,
+                parent,
+                marker,
+                &escaped_text(&text, 4_000),
+                &interaction::text_blocks(&text),
+            )
+            .await?;
+        self.record_post(&key, claim, edit, parent.into()).await?;
         Ok(())
     }
 
@@ -425,6 +603,8 @@ impl<'a> Adapter<'a> {
         parent: Option<&str>,
         marker: Marker,
         text: &str,
+        blocks: &[Value],
+        opening_seq: Option<u64>,
     ) -> Result<String> {
         let now = Utc::now().timestamp();
         let (mut delivery, revision) = match self.bus.slack_get::<Delivery>(key).await? {
@@ -434,7 +614,7 @@ impl<'a> Adapter<'a> {
                 }
                 ensure!(
                     delivery.event == marker.event,
-                    "the original Slack question is still pending"
+                    "the original Slack post is still pending"
                 );
                 let oldest = (delivery.started - 5).to_string();
                 if let Some(ts) = self
@@ -449,21 +629,19 @@ impl<'a> Adapter<'a> {
                 }
                 (delivery, revision)
             }
-            None => (
-                Delivery {
-                    event: marker.event.clone(),
-                    started: now,
-                    attempted: now,
-                    ts: None,
-                },
-                0,
-            ),
+            None => (Delivery::pending(&marker.event, opening_seq), 0),
         };
         delivery.attempted = Utc::now().timestamp();
         let claim = self.bus.slack_put(key, &delivery, revision).await?;
         let ts = self
             .web
-            .post(&self.cfg.channel, parent, marker, &slack_text(text))
+            .post(
+                &self.cfg.channel,
+                parent,
+                marker,
+                &escaped_text(text, SLACK_TEXT_LIMIT),
+                blocks,
+            )
             .await?;
         self.record_post(key, claim, delivery, ts).await
     }
@@ -481,52 +659,71 @@ impl<'a> Adapter<'a> {
     }
 }
 
-fn question_text(id: &str, ask: &hgl_ai_owner::Ask) -> String {
-    let mut text = format!("{id} · {} · {}", ask.priority, ask.title);
-    if let Some(issue) = &ask.issue {
+fn root_text(thread: &Thread) -> String {
+    let mut text = thread.id.clone();
+    if let Some(priority) = thread.priority {
+        text.push_str(&format!(" · {priority}"));
+    }
+    text.push_str(&format!(" · {}", thread.title));
+    if let Some(issue) = &thread.issue {
         text.push_str(&format!(" ({issue})"));
     }
-    text.push_str(&format!("\n\n{}", ask.question));
-    for option in &ask.options {
-        let suggested = if ask.suggested.as_deref() == Some(&option.label) {
+    if let Some(message) = thread.messages.first() {
+        let who = message
+            .handle
+            .as_deref()
+            .or(message.user.as_deref())
+            .unwrap_or(&message.sender);
+        text.push_str(&format!("\n\n{who}\n{}", message.body));
+    } else {
+        text.push_str(&format!("\n\n{}", thread.question));
+    }
+    for option in &thread.options {
+        let suggested = if thread.suggested.as_deref() == Some(&option.label) {
             " (suggested)"
         } else {
             ""
         };
         text.push_str(&format!("\n{}{}  {}", option.label, suggested, option.line));
     }
-    if !ask.context.trim().is_empty() {
-        text.push_str(&format!("\n\n{}", ask.context));
+    if !thread.context.trim().is_empty() {
+        text.push_str(&format!("\n\n{}", thread.context));
     }
     text
 }
 
-fn reply_text(ev: &Event) -> Option<String> {
-    let who = ev.handle.as_deref().unwrap_or(&ev.sender);
-    match &ev.body {
-        Body::Message { body } | Body::OwnerMessage { body } if !body.trim().is_empty() => {
-            Some(format!("{who}\n{body}"))
-        }
-        Body::Answer {
-            choice,
-            option,
-            text,
-            note,
-        } => {
-            let answer = match choice {
-                Choice::Accept => "Accepted the suggested option".into(),
-                Choice::Option => format!("Chose option {}", option.as_deref()?),
-                Choice::Reject => "Rejected".into(),
-                Choice::Other if !text.trim().is_empty() => text.clone(),
-                Choice::Other => return None,
-            };
-            Some(format!("{who}\nAnswer: {answer}\n{note}").trim_end().into())
-        }
-        _ => None,
+fn terminal_text(opening: &Thread, thread: &Thread) -> String {
+    let state = match thread.state {
+        ThreadState::Answered => "Answered",
+        ThreadState::Closed => "Closed",
+        ThreadState::Withdrawn => "Withdrawn",
+        ThreadState::Open => "Open",
+    };
+    let detail = thread
+        .answer
+        .as_ref()
+        .map(|answer| thread.answer_text(answer));
+    let detail = detail
+        .as_deref()
+        .or_else(|| thread.messages.last().map(|m| m.body.as_str()));
+    let mut text = root_text(opening);
+    if let Some(detail) = detail.filter(|detail| !detail.eq_ignore_ascii_case(state)) {
+        text = format!("{detail}\n\n{text}");
+    }
+    format!("{state}\n\n{text}")
+}
+
+fn delivery_id(ev: &Event, subject: &str) -> String {
+    let id = ev.msg_id();
+    if ev.subject() == subject {
+        id
+    } else {
+        let source = subject.rsplit('.').next().unwrap_or_default();
+        format!("{id}-{source}")
     }
 }
 
-fn slack_text(text: &str) -> String {
+fn escaped_text(text: &str, limit: usize) -> String {
     const CLIPPED: &str = "\n… (full text in hgl-ai)";
     let mut escaped = String::new();
     for ch in text.chars() {
@@ -536,7 +733,7 @@ fn slack_text(text: &str) -> String {
             '>' => "&gt;",
             _ => "",
         };
-        if escaped.len() + ch.len_utf8().max(extra.len()) > SLACK_TEXT_LIMIT - CLIPPED.len() {
+        if escaped.len() + ch.len_utf8().max(extra.len()) > limit - CLIPPED.len() {
             escaped.push_str(CLIPPED);
             break;
         }
