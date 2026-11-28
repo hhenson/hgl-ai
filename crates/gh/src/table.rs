@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
-use crate::backlog::page_title;
+use crate::backlog::{clean_title, public_title};
 use crate::bot::{BotState, BotView, Comment, NoteState, Review, note_state};
 use crate::{Error, Result, short};
 
@@ -128,7 +128,7 @@ impl Table {
                     "# pr\t{}\t{}\t{p}\t{n}\t{}\n",
                     r.repo,
                     r.number,
-                    page_title(&d.title)
+                    clean_title(&d.title)
                 ));
             }
         }
@@ -216,6 +216,7 @@ pub fn batch_query(n_repos: usize) -> String {
 {repos}}}
 fragment R on Repository {{
   name
+  isPrivate
   pullRequests(states: OPEN, first: 50, orderBy: {{field: CREATED_AT, direction: ASC}}) {{
     totalCount
     nodes {{
@@ -273,9 +274,10 @@ pub fn parse_batch(
             missing.push(repo.clone());
             continue;
         };
+        let private = r.get("isPrivate").and_then(Value::as_bool);
         let mut infos: Vec<PrInfo> = nodes(r, &["pullRequests"])
             .iter()
-            .filter_map(|p| pr_info(repo, p, bot, read))
+            .filter_map(|p| pr_info(repo, p, bot, read, private))
             .collect();
         infos.sort_by_key(|i| i.row.number);
         out.extend(infos);
@@ -300,7 +302,9 @@ pub fn parse_rate(data: &Value) -> Result<RateLimit> {
     })
 }
 
-fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
+/// `private`: the repository's `isPrivate`, `None` when the response did not say; a title
+/// is kept for a public repository only ([`public_title`]).
+fn pr_info(repo: &str, p: &Value, bot: &str, read: &str, private: Option<bool>) -> Option<PrInfo> {
     let number = p.get("number")?.as_u64()?;
     let head = p.get("headRefOid")?.as_str()?.to_string();
     let unresolved = nodes(p, &["reviewThreads"])
@@ -340,7 +344,10 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
             head: head.clone(),
             detail: PrDetail {
                 counts: rollup.and_then(check_counts),
-                title: p.get("title").and_then(Value::as_str).unwrap_or("").into(),
+                title: public_title(
+                    private,
+                    p.get("title").and_then(Value::as_str).unwrap_or(""),
+                ),
             },
         },
         note: note_state(&comments),

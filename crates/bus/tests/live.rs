@@ -602,6 +602,45 @@ async fn state_put_get_delete_with_revisions() {
     ));
 }
 
+/// A rollup replaces the value and drops every older revision in the one write, only at
+/// the expected revision: what the history held is gone for anyone who replays it.
+#[tokio::test]
+async fn state_rollup_drops_the_history() {
+    use futures::StreamExt;
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    bus.state_put("backlog", "old SECRET-ONE").await.unwrap();
+    bus.state_put("backlog", "old SECRET-TWO").await.unwrap();
+    bus.state_put("prs", "another key").await.unwrap();
+    let rev = bus.state_get("backlog").await.unwrap().unwrap().revision;
+    assert!(matches!(
+        bus.state_rollup("backlog", "new", rev - 1).await,
+        Err(BusError::Conflict { .. })
+    ));
+    let r = bus.state_rollup("backlog", "new", rev).await.unwrap();
+    let e = bus.state_get("backlog").await.unwrap().unwrap();
+    assert_eq!((e.value.as_str(), e.revision), ("new", r));
+    let kv = hub.raw().await.get_key_value("HGL_STATE").await.unwrap();
+    let history: Vec<String> = kv
+        .history("backlog")
+        .await
+        .unwrap()
+        .map(|e| String::from_utf8_lossy(&e.unwrap().value).into_owned())
+        .collect()
+        .await;
+    assert_eq!(history, ["new"]);
+    assert_eq!(bus.state_history("backlog").await.unwrap(), ["new"]);
+    assert_eq!(bus.state_history("prs").await.unwrap(), ["another key"]);
+    assert!(bus.state_history("never").await.unwrap().is_empty());
+    assert_eq!(
+        bus.state_get("prs").await.unwrap().unwrap().value,
+        "another key",
+        "other keys untouched"
+    );
+    // A compare-and-set after it works on its revision.
+    bus.state_update("backlog", "next", r).await.unwrap();
+}
+
 #[tokio::test]
 async fn hosts_and_trees_round_trip() {
     let Some(hub) = Hub::start() else { return };

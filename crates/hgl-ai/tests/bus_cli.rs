@@ -215,6 +215,57 @@ fn init_retires_the_viewers_tree_consumers() {
     assert_eq!(there(&js), ["fleet"]);
 }
 
+/// A row from before the upgrade (r5 on #181): `init` strips every stored title once, in
+/// every revision the bucket keeps. A hub from before the upgrade has no marker yet.
+#[test]
+fn init_strips_stored_titles_once() {
+    let Some(hub) = Hub::start("titles") else {
+        return;
+    };
+    ok(&hub.run(&["init"]));
+    // As before the upgrade: no marker, titles in two revisions.
+    ok(&hub.run(&["state", "del", "migrated.public-titles"]));
+    let row = "demo\t1\tcodex\t20260101T000000Z\tDEPLOY_TOKEN: Bluebird\n";
+    ok(&hub.run_stdin(
+        &["state", "put", "backlog", "-"],
+        &format!("{row}# read old\n"),
+    ));
+    ok(&hub.run_stdin(&["state", "put", "backlog", "-"], row));
+    let o = hub.run(&["init"]);
+    ok(&o);
+    assert!(
+        err(&o).contains("stripped stored titles from backlog"),
+        "{}",
+        err(&o)
+    );
+    let saved = ok(&hub.run(&["state", "get", "backlog"]));
+    assert!(!saved.contains("Bluebird"), "{saved}");
+    assert!(saved.contains("demo\t1\tcodex"), "the row stays: {saved}");
+    // No older revision keeps it.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let history = rt.block_on(async {
+        let mut cfg = hgl_ai_config::Config::new("t");
+        cfg.hub.url = hub.url.clone();
+        let tf = hub.dir.0.join("hub.token");
+        cfg.hub.token_file = tf.display().to_string();
+        hgl_ai_bus::Bus::connect(&cfg)
+            .await
+            .unwrap()
+            .state_history("backlog")
+            .await
+            .unwrap()
+    });
+    assert!(
+        history.iter().all(|v| !v.contains("Bluebird")),
+        "{history:?}"
+    );
+    // Once: a later `init` leaves what was written since.
+    let public = "demo\t1\tcodex\t20260101T000000Z\tA public title\n";
+    ok(&hub.run_stdin(&["state", "put", "backlog", "-"], public));
+    ok(&hub.run(&["init"]));
+    assert_eq!(ok(&hub.run(&["state", "get", "backlog"])), public);
+}
+
 #[test]
 fn notes_send_wait_peek() {
     let Some(hub) = Hub::start("notes") else {

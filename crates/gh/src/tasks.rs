@@ -15,7 +15,7 @@ use chrono::{DateTime, Utc};
 use hgl_ai_bus::Bus;
 use hgl_ai_proto::{Kind, Note, STREAM_NOTES, Seat, TreeRecord};
 
-use crate::backlog::page_title;
+use crate::backlog::{clean_title, public_title};
 use crate::exec::{self, Gh};
 use crate::{Settings, state, store, table};
 
@@ -179,7 +179,7 @@ impl Titles {
 
     pub fn insert(&mut self, repo: &str, issue: u64, title: &str) {
         self.known
-            .insert((repo.to_string(), issue), page_title(title).trim().into());
+            .insert((repo.to_string(), issue), clean_title(title).trim().into());
     }
 
     /// The tasks of `trees` in a configured repository with no title yet, not tried in
@@ -239,19 +239,25 @@ fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// The title of issue or pull request `repo#issue`.
-async fn title<G: Gh>(gh: &G, s: &Settings, repo: &str, issue: u64) -> crate::Result<String> {
+pub(crate) async fn title<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    repo: &str,
+    issue: u64,
+) -> crate::Result<String> {
     let q = format!(
         "query($owner: String!, $name: String!) {{ repository(owner: $owner, name: $name) {{ \
-         issueOrPullRequest(number: {issue}) {{ ... on Issue {{ title }} ... on PullRequest {{ title }} }} }} }}"
+         isPrivate issueOrPullRequest(number: {issue}) {{ ... on Issue {{ title }} ... on PullRequest {{ title }} }} }} }}"
     );
     let vars = [("owner", s.owner.clone()), ("name", repo.to_string())];
     let pages = exec::graphql(gh, &q, &vars, false).await?;
-    Ok(pages
-        .first()
-        .and_then(|p| p.pointer("/data/repository/issueOrPullRequest/title"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("")
-        .to_string())
+    let at = |path: &str| pages.first().and_then(|p| p.pointer(path)).cloned();
+    let private = at("/data/repository/isPrivate").and_then(|v| v.as_bool());
+    let title = at("/data/repository/issueOrPullRequest/title");
+    Ok(public_title(
+        private,
+        title.as_ref().and_then(|v| v.as_str()).unwrap_or(""),
+    ))
 }
 
 /// Keep `tasks` current, every [`TASKS_EVERY`], until the process ends; titles from
@@ -407,7 +413,7 @@ mod tests {
         let s = crate::testutil::settings();
         let gh = crate::exec::fake::FakeGh::default().on(
             "issueOrPullRequest(number: 12)",
-            r#"{"data":{"repository":{"issueOrPullRequest":{"title":"Twelve"}}}}"#,
+            r#"{"data":{"repository":{"isPrivate":false,"issueOrPullRequest":{"title":"Twelve"}}}}"#,
         );
         assert_eq!(title(&gh, &s, "alpha", 12).await.unwrap(), "Twelve");
         assert!(gh.calls()[0].contains("name=alpha"), "{:?}", gh.calls());
@@ -466,7 +472,7 @@ mod tests {
         let text = render(&idx, &trees, &titles);
         assert!(
             text.ends_with(
-                "\n# title\talpha\t7\tFix the parser\n# title\talpha\t9\tNo note, by [email]\n"
+                "\n# title\talpha\t7\tFix the parser\n# title\talpha\t9\tNo note, by owner@example.com\n"
             ),
             "{text}"
         );

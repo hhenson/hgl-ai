@@ -55,6 +55,8 @@ pub struct Pr {
     pub base: String,
     pub draft: bool,
     pub title: String,
+    /// The repository's `private` (`base.repo.private`); `None` when GitHub did not say.
+    pub private: Option<bool>,
     pub merge_commit: Option<String>,
     pub url: String,
 }
@@ -91,6 +93,7 @@ impl Pr {
             base: s(&["base", "ref"]).unwrap_or_default(),
             draft: v.get("draft").and_then(Value::as_bool).unwrap_or(false),
             title: s(&["title"]).unwrap_or_default(),
+            private: v.pointer("/base/repo/private").and_then(Value::as_bool),
             merge_commit: s(&["merge_commit_sha"]),
             url: s(&["html_url"]).unwrap_or_default(),
         })

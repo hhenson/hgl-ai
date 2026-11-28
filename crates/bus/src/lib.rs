@@ -905,6 +905,77 @@ impl Bus {
         })
     }
 
+    /// Replace `key`'s value and drop every older revision of it in the same write (a
+    /// JetStream subject rollup), if it is still at `expected_revision`; a reader sees a
+    /// put. For rewriting what earlier revisions must no longer hold (a value's history is
+    /// readable by anyone who may watch the key). Fails with [`BusError::Conflict`] when
+    /// the key moved on.
+    pub async fn state_rollup(
+        &self,
+        key: &str,
+        value: &str,
+        expected_revision: u64,
+    ) -> Result<u64> {
+        check_state_key(key)?;
+        if value.is_empty() {
+            return Err(BusError::Nats(format!(
+                "state {key}: an empty value deletes; nothing to roll up"
+            )));
+        }
+        check_value_size(key, value.len())?;
+        let subject = format!("$KV.{KV_STATE}.{key}");
+        let publish = Publish::build()
+            .payload(value.as_bytes().to_vec().into())
+            .header("Nats-Rollup", "sub")
+            .expected_last_subject_sequence(expected_revision);
+        let ack = self
+            .guarded(&subject, async {
+                let wrong = |e: jetstream::context::PublishError| {
+                    if e.kind() == jetstream::context::PublishErrorKind::WrongLastSequence {
+                        BusError::Conflict {
+                            key: key.to_string(),
+                            expected: expected_revision,
+                        }
+                    } else {
+                        publish_error(&subject, e)
+                    }
+                };
+                self.js
+                    .send_publish(subject.clone(), publish)
+                    .await
+                    .map_err(wrong)?
+                    .await
+                    .map_err(wrong)
+            })
+            .await?;
+        Ok(ack.sequence)
+    }
+
+    /// Every revision of `key` the bucket still keeps, oldest first, as stored (a delete or
+    /// purge marker as an empty value): what a reader replaying the key's history sees.
+    pub async fn state_history(&self, key: &str) -> Result<Vec<String>> {
+        check_state_key(key)?;
+        let store = self.store(&self.state, KV_STATE).await?;
+        // A key never written has no history to replay (a replay of nothing would wait).
+        let last = store
+            .entry(key)
+            .await
+            .map_err(|e| nats(&format!("the history of state {key}"), e))?;
+        if last.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut h = store
+            .history(key)
+            .await
+            .map_err(|e| nats(&format!("the history of state {key}"), e))?;
+        let mut out = Vec::new();
+        while let Some(e) = h.next().await {
+            let e = e.map_err(|e| nats(&format!("the history of state {key}"), e))?;
+            out.push(String::from_utf8_lossy(&e.value).into_owned());
+        }
+        Ok(out)
+    }
+
     /// Delete a key and its history. Deleting a missing key succeeds.
     pub async fn state_del(&self, key: &str) -> Result<()> {
         check_state_key(key)?;

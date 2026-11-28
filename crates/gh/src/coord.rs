@@ -307,6 +307,11 @@ pub async fn run<G: Gh>(
             Ok(e) => prev = e.map(|e| Table::parse(&e.value).rows).unwrap_or_default(),
             Err(e) => tracing::warn!("reading the previous table: {e}"),
         }
+        // Public repositories only (hgl-ai#181): no title of another, in any revision.
+        match crate::migrate::at_start(gh, s, b).await {
+            Ok(keys) => tracing::info!("titles of non-public repositories stripped from {keys:?}"),
+            Err(e) => tracing::warn!("stripping the titles of non-public repositories: {e}"),
+        }
         unsent = load_unsent(b).await;
         stored = !unsent.is_empty();
         eprintln!(

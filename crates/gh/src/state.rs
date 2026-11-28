@@ -23,7 +23,7 @@ pub const LANDED_MAX_BYTES: usize = 512 << 10;
 
 /// `<UTC> <repo> #<pr> <merge sha>`, then ` <title>` when there is one (one line).
 pub fn landed_line(stamp: &str, repo: &str, pr: u64, merge: &str, title: &str) -> String {
-    let title = crate::backlog::page_title(title);
+    let title = crate::backlog::clean_title(title);
     let title = title.trim();
     if title.is_empty() {
         format!("{stamp} {repo} #{pr} {merge}")

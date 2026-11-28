@@ -665,7 +665,7 @@ pub(crate) async fn after_merge<G: Gh>(
             state::KEY_MAIN
         ))
         .await?;
-        append_landed(bus, repo, number, &merge, &pr.title).await?;
+        append_landed(bus, repo, number, &merge, &landed_title(&pr)).await?;
         p.mark(progress::LANDED_LOG);
         progress::write(bus, repo, number, p).await?;
         recorded = true;
@@ -778,6 +778,12 @@ async fn commented<G: Gh>(
         .iter()
         .map(Comment::from_rest)
         .any(|c| c.body.lines().next().map(str::trim) == Some(first.trim())))
+}
+
+/// The title a `landed.log` line carries: the merged pull request's, for a public
+/// repository only ([`public_title`](crate::backlog::public_title)).
+pub fn landed_title(pr: &gate::Pr) -> String {
+    crate::backlog::public_title(pr.private, &pr.title)
 }
 
 /// Append the landing to `landed.log`, unless the line is there already (a resumed landing),
@@ -901,7 +907,7 @@ pub async fn record<G: Gh>(
     }
     // The title is worth a line, not the record: without it the line has none.
     let title = match gate::fetch_pr(gh, s, repo, number).await {
-        Ok(pr) => pr.title,
+        Ok(pr) => landed_title(&pr),
         Err(e) => {
             tracing::warn!("{repo} #{number}: {e}; its landed.log line has no title");
             String::new()

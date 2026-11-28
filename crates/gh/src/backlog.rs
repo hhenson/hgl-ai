@@ -25,13 +25,11 @@
 //! it, so the day's last round is the day's sample.
 
 use std::collections::BTreeMap;
-use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use hgl_ai_bus::Bus;
 use hgl_ai_proto::{KV_METRICS, MetricsSample, utc_stamp};
-use regex::Regex;
 use serde_json::Value;
 
 use crate::exec::{self, Gh};
@@ -97,78 +95,23 @@ pub fn clean_title(t: &str) -> String {
     one_line(t).chars().take(TITLE_MAX).collect()
 }
 
-/// A key word after which anything may be a secret: the title is cut there. Any case, any
-/// separator, inside a longer word too (`GH_TOKEN`, `apiKey`, `X-Auth`); the longest word
-/// first, so the one kept is whole (`Authorization`, not `Auth`).
-static SENSITIVE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"(?i)authorization|credentials?|password|passwd|session|cookie|secret|bearer|apikey|token|basic|auth|seed|pwd|key",
-    )
-    .unwrap()
-});
-/// Token shapes that may stand alone, with no key word before them: GitHub, GitLab, npm,
-/// OpenAI-style, Slack and AWS keys, JWTs, NATS seeds.
-static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|A[KS]IA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|S[UOANCAX][A-Z2-7]{50,})\b",
-    )
-    .unwrap()
-});
-/// A word long enough to be a key, whatever its shape.
-static LONG_WORD: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"[A-Za-z0-9_+=.-]{32,}").unwrap());
-static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}").unwrap()
-});
-
-/// Whether a word may be part of a path: it holds `/`, `\`, `~` or `file:`.
-fn pathlike(w: &str) -> bool {
-    w.contains(['/', '\\', '~']) || w.to_ascii_lowercase().contains("file:")
-}
-
-/// Every word that may be part of a path as `[path]`, and with it the rest of a quote the
-/// word opens (`"C:\Program Files\x"`, `{"p":"/a b/c"}`), through the word that closes it
-/// or the end of the title. Fails closed: a URL or `docs/work.md` goes too.
-fn redact_paths(t: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    // The quote a path word left open, if any.
-    let mut open: Option<char> = None;
-    for w in t.split(' ') {
-        if let Some(q) = open {
-            if w.contains(q) {
-                open = None;
-            }
-            continue;
-        }
-        if !pathlike(w) {
-            out.push(w);
-            continue;
-        }
-        out.push("[path]");
-        open = ['"', '\'', '`']
-            .into_iter()
-            .find(|q| w.matches(*q).count() % 2 == 1);
+/// What a viewer-readable key holds as an item's title (the owner's ruling on hgl-ai#181:
+/// public repositories only): a public repository's title as GitHub has it, as
+/// [`clean_title`] keeps it; nothing for a private repository, or one whose visibility was
+/// not read (`private`: GitHub's `isPrivate`, `None` when unknown), so the page shows
+/// `repo #N` and its link alone.
+pub fn public_title(private: Option<bool>, t: &str) -> String {
+    match private {
+        Some(false) => clean_title(t),
+        _ => String::new(),
     }
-    out.join(" ")
 }
 
-/// A title the console's page may show (anything a viewer-readable key holds), failing
-/// closed: emails out; token shapes and any word long enough to be a key out; everything
-/// after a sensitive key word out (the word kept, the rest `[redacted]`); every word that
-/// may be part of a path out, with the rest of a quote it opens. All of it over the
-/// whole title, and only then cut as [`clean_title`] cuts it, so nothing crosses the cut
-/// half-redacted. Over-redaction is the price: `docs/work.md`, a URL, `Keyboard` go too.
-pub fn page_title(t: &str) -> String {
-    let t = one_line(t);
-    let t = EMAIL.replace_all(&t, "[email]");
-    // Whole tokens first, so a key word inside one cannot leave half of it before the cut;
-    // their mark holds no key word.
-    let t = TOKEN.replace_all(&t, "[redacted]");
-    let t = LONG_WORD.replace_all(&t, "[redacted]");
-    let t = match SENSITIVE.find(&t) {
-        Some(m) => format!("{} [redacted]", &t[..m.end()]),
-        None => t.into_owned(),
-    };
-    clean_title(&redact_paths(&t))
+/// Each queue row's title as [`public_title`] has it, by its repository's visibility.
+fn hide_private(queue: &mut [QueueRow], private: &BTreeMap<String, bool>) {
+    for q in queue {
+        q.title = public_title(private.get(&q.repo).copied(), &q.title);
+    }
 }
 
 impl Backlog {
@@ -190,7 +133,7 @@ impl Backlog {
                 r.number,
                 r.class(),
                 r.created,
-                page_title(&r.title)
+                clean_title(&r.title)
             ));
         }
         s
@@ -256,6 +199,9 @@ pub struct Reading {
     pub missing: Vec<String>,
     /// Queue classes with more than one page: repository, label, the cursor after page one.
     pub more: Vec<(String, &'static str, String)>,
+    /// Each repository's `isPrivate`, as this read gave it; a repository absent is of
+    /// unknown visibility (private, for titles).
+    pub private: BTreeMap<String, bool>,
 }
 
 impl Reading {
@@ -296,6 +242,7 @@ pub fn batch_query(n_repos: usize) -> String {
   rateLimit {{ cost remaining resetAt limit }}
 {fields}}}
 fragment B on Repository {{
+  isPrivate
   open: issues(states: OPEN) {{ totalCount }}
   labels(first: 100) {{ nodes {{ name issues(states: OPEN) {{ totalCount }} }} }}
   priority: issues(states: OPEN, labels: [\"{PRIORITY}\"], first: 100, orderBy: {{field: CREATED_AT, direction: ASC}}) {{ ...Q }}
@@ -364,7 +311,7 @@ fn candidate(n: &Value) -> Option<(u64, bool, DateTime<Utc>, String)> {
     }
     let created = table::parse_time(n.get("createdAt")?.as_str()?)?;
     let title = n.get("title").and_then(Value::as_str).unwrap_or("");
-    // The whole title: `render` redacts it, then cuts it (`page_title`).
+    // The whole title: the read keeps it for a public repository only (`hide_private`).
     Some((number, priority, created, one_line(title)))
 }
 
@@ -392,6 +339,7 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
     let mut missing = Vec::new();
     let mut more = Vec::new();
     let mut queue = Vec::new();
+    let mut private = BTreeMap::new();
     for (i, repo) in repos.iter().enumerate() {
         let r = data.get(format!("r{i}")).filter(|r| !r.is_null());
         let got = r.and_then(|r| {
@@ -406,6 +354,9 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
             missing.push(repo.clone());
             continue;
         };
+        if let Some(p) = r.get("isPrivate").and_then(Value::as_bool) {
+            private.insert(repo.clone(), p);
+        }
         let mut labels = BTreeMap::new();
         for l in nodes(r, &["labels"]) {
             if let (Some(name), Some(n)) = (
@@ -450,12 +401,14 @@ pub fn parse_batch(v: &Value, repos: &[String], now: DateTime<Utc>) -> Result<Re
         return Err(resp("no repository answered"));
     }
     b.queue = order(queue, repos);
+    hide_private(&mut b.queue, &private);
     Ok(Reading {
         backlog: b,
         samples,
         rate,
         missing,
         more,
+        private,
     })
 }
 
@@ -514,6 +467,7 @@ pub fn add_pages(r: &mut Reading, repos: &[String], pages: &[(String, Vec<Value>
         }
     }
     r.backlog.queue = order(queue, repos);
+    hide_private(&mut r.backlog.queue, &r.private);
 }
 
 /// Read the backlog of every configured repository from GitHub, as at `now`.
@@ -777,230 +731,125 @@ mod tests {
         assert_eq!(clean_title("short"), "short");
     }
 
-    /// A title through every writer of a viewer-readable title: the backlog's queue (from a
-    /// GraphQL node, as a round reads it), `prs`' `# pr` lines, `tasks`' `# title` lines and
-    /// `landed.log`.
-    fn every_writer(title: &str) -> [(&'static str, String); 4] {
-        let node = serde_json::json!({
-            "number": 1, "title": title, "createdAt": "2026-01-01T00:00:00Z",
-            "labels": {"nodes": [{"name": CLAIMABLE}]}
-        });
-        let (number, priority, created, t) = candidate(&node).unwrap();
-        let b = Backlog {
-            queue: vec![QueueRow {
-                repo: "alpha".into(),
-                number,
-                priority,
-                created: utc_stamp(created),
-                title: t,
-            }],
-            ..Backlog::default()
+    /// A title of repository `alpha`, whose `isPrivate` is `private` (`None`: the response
+    /// does not say), through every writer of a viewer-readable title, each from its own
+    /// GitHub response as a round reads it: the backlog's batch, the pull request batch,
+    /// the task title query and the merged pull request (`landed.log`).
+    async fn every_writer(title: &str, private: Option<bool>) -> [(&'static str, String); 4] {
+        use serde_json::json;
+        let with = |mut repo: Value| {
+            if let Some(p) = private {
+                repo["isPrivate"] = p.into();
+            }
+            repo
         };
-        let mut pr = table::Table::parse("alpha\t1\th\topen\tnone\t0\tnone\tT\n");
-        pr.rows[0].detail.title = title.to_string();
+        let batch = json!({"data": {
+            "rateLimit": {"cost": 1, "remaining": 100, "resetAt": "2026-01-01T00:00:00Z"},
+            "opened0": {"issueCount": 0}, "closed0": {"issueCount": 0},
+            "r0": with(json!({
+                "open": {"totalCount": 1}, "labels": {"nodes": []},
+                "priority": {"nodes": [], "pageInfo": {"hasNextPage": false}},
+                "claimable": {"nodes": [{"number": 1, "title": title,
+                    "createdAt": "2026-01-01T00:00:00Z",
+                    "labels": {"nodes": [{"name": CLAIMABLE}]}}],
+                    "pageInfo": {"hasNextPage": false}}
+            }))
+        }});
+        let repos = vec!["alpha".to_string()];
+        let backlog = parse_batch(&batch, &repos, now()).unwrap().backlog.render();
+        let prs = json!({"data": {
+            "rateLimit": {"cost": 1, "remaining": 100, "resetAt": "x"},
+            "r0": with(json!({"name": "alpha", "pullRequests": {"nodes": [
+                {"number": 1, "title": title, "headRefOid": "h", "isDraft": false}
+            ]}}))
+        }});
+        let (infos, _, _) = table::parse_batch(&prs, &repos, "bot", "T").unwrap();
+        let prs = table::Table {
+            read: "T".into(),
+            rate: None,
+            rows: infos.into_iter().map(|i| i.row).collect(),
+        }
+        .render();
+        let s = crate::testutil::settings();
+        let answer = json!({"data": {"repository":
+            with(json!({"issueOrPullRequest": {"title": title}}))}});
+        let gh = crate::exec::fake::FakeGh::default().on("issueOrPullRequest", &answer.to_string());
         let mut titles = crate::tasks::Titles::default();
-        titles.insert("alpha", 1, title);
-        let tree: hgl_ai_proto::TreeRecord = serde_json::from_value(serde_json::json!({
+        titles.insert(
+            "alpha",
+            1,
+            &crate::tasks::title(&gh, &s, "alpha", 1).await.unwrap(),
+        );
+        let tree: hgl_ai_proto::TreeRecord = serde_json::from_value(json!({
             "host": "h", "seat": "w1", "task": {"repo": "alpha", "issue": 1},
             "path": "/fixture/tree", "created_at": "20260101T000000Z",
         }))
         .unwrap();
         let tasks = crate::tasks::render(&crate::tasks::NotesIndex::default(), &[tree], &titles);
+        let mut merged = json!({"number": 1, "title": title, "head": {"sha": "h"},
+            "base": {"ref": "main", "repo": {}}});
+        if let Some(p) = private {
+            merged["base"]["repo"]["private"] = p.into();
+        }
+        let pr = crate::gate::Pr::from_rest(&merged).unwrap();
+        let landed =
+            crate::state::landed_line("S", "alpha", 1, "m", &crate::land::landed_title(&pr));
         [
-            ("backlog", b.render()),
-            ("prs", pr.render()),
+            ("backlog", backlog),
+            ("prs", prs),
             ("tasks", tasks),
-            (
-                "landed.log",
-                crate::state::landed_line("S", "alpha", 1, "m", title),
-            ),
+            ("landed.log", landed),
         ]
     }
 
-    /// r5's probe on #181 (sixteen shapes, each with its marker) and the leaks of the earlier
-    /// rounds as regressions, alone and behind five prefix lengths that put them across the
-    /// 200-character cut, through all four writers: no marker comes out, whole or cut.
-    #[test]
-    fn every_writer_redacts_then_cuts() {
-        let seed = format!("SU{}", "Q".repeat(54));
-        let ghp = format!("ghp_{}", "Q".repeat(36));
-        let shapes: Vec<(&str, String, &str)> = vec![
-            // r5's sixteen.
-            ("YAML known", "GH_TOKEN: CANARY".into(), "CANARY"),
-            (
-                "quoted Windows",
-                r#"run "C:\Program Files\CANARY\bin""#.into(),
-                "CANARY",
-            ),
-            ("drive slash", "read C:/Users/CANARY/log".into(), "CANARY"),
-            ("UNC", r"read \\CANARY\share".into(), "CANARY"),
-            (
-                "email crossing the cut",
-                "CANARY@example.invalid".into(),
-                "CAN",
-            ),
-            (
-                "quoted POSIX",
-                r#"read "/Users/CANARY/My File""#.into(),
-                "CANARY",
-            ),
-            (
-                "JSON quoted",
-                r#"{"apiKey":"CANARY words"}"#.into(),
-                "CANARY",
-            ),
-            (
-                "YAML plain scalar",
-                "password: yellow CANARY".into(),
-                "CANARY",
-            ),
-            (
-                "JSON escaped quote",
-                r#"{"password":"yellow\"CANARY"}"#.into(),
-                "CANARY",
-            ),
-            (
-                "shell escaped space",
-                r"export PASSWORD=yellow\ CANARY".into(),
-                "CANARY",
-            ),
-            (
-                "quoted root with a space",
-                r#"read "/Shared Items/CANARY/report""#.into(),
-                "CANARY",
-            ),
-            (
-                "file URI",
-                "read file:///Users/CANARY/report".into(),
-                "CANARY",
-            ),
-            (
-                "Basic credential",
-                "Authorization: Basic Q0FOQVJZ".into(),
-                "Q0FO",
-            ),
-            ("NATS seed", seed.clone(), "QQQQ"),
-            (
-                "AWS temporary key id",
-                "ASIACANARYAAAAAAAAAA".into(),
-                "CANARY",
-            ),
-            (
-                "token after a flag",
-                "retry --token CANARY".into(),
-                "CANARY",
-            ),
-            // Earlier rounds'.
-            ("shell export", "export GH_TOKEN=CANARY".into(), "CANARY"),
-            ("YAML quoted", "password: \"CANARY words\"".into(), "CANARY"),
-            ("dotted name", "db.password='CANARY'".into(), "CANARY"),
-            (
-                "AWS secret",
-                "AWS_SECRET_ACCESS_KEY = CANARY".into(),
-                "CANARY",
-            ),
-            ("client secret", "client secret: CANARY".into(), "CANARY"),
-            (
-                "seed and auth",
-                "seed=CANARY and auth:CANARY".into(),
-                "CANARY",
-            ),
-            (
-                "bearer",
-                "Authorization: Bearer CANARYCANARY".into(),
-                "CANARY",
-            ),
-            ("cookie", "Cookie: sid=CANARY".into(), "CANARY"),
-            ("session", "session id CANARY".into(), "CANARY"),
-            ("GitHub token", format!("leaked {ghp}"), "QQQQ"),
-            (
-                "JWT",
-                "jwt eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.SflKxwRJCANARY".into(),
-                "CANARY",
-            ),
-            (
-                "long key",
-                format!("value {}", "CANARY9".repeat(6)),
-                "CANARY",
-            ),
-            ("email", "mail alice.b+x@mail.example.co.uk".into(), "alice"),
-            (
-                "quoted drive slash",
-                "'C:/Users/CANARY/My Docs/x'".into(),
-                "CANARY",
-            ),
-            ("drive backslash", r"Drive D:\work\CANARY".into(), "CANARY"),
-            (
-                "unquoted space",
-                r"Unquoted C:\Program Files\CANARY".into(),
-                "CANARY",
-            ),
-            ("POSIX", "Logs /home/CANARY/x".into(), "CANARY"),
-            ("home", "Key ~/.ssh/id_CANARY".into(), "CANARY"),
-            ("parenthesised", "(path:/var/lib/CANARY)".into(), "CANARY"),
-            ("flag path", "--config=/etc/CANARY/x".into(), "CANARY"),
-            (
-                "escaped space path",
-                r"open /home/a\ CANARY/x".into(),
-                "CANARY",
-            ),
-            (
-                "path in JSON with a space",
-                r#"{"p":"/srv/a b CANARY/x"}"#.into(),
-                "CANARY",
-            ),
+    /// Public repositories only (hgl-ai#181): a private repository's title, or one of a
+    /// repository whose visibility the response does not give, reaches none of the four
+    /// writers at any length, cut or whole; a public repository's passes as GitHub has it
+    /// (cut to [`TITLE_MAX`]).
+    #[tokio::test]
+    async fn only_public_titles_reach_the_writers() {
+        let shapes = [
+            "GH_TOKEN: Bluebird",
+            "DEPLOY_TOKEN: Bluebird",
+            r#"run "C:\Program Files\Bluebird\bin""#,
+            "read file:///Users/Bluebird/report",
+            "Bluebird@example.invalid",
+            "A plain Bluebird title",
         ];
-        let mut problems = Vec::new();
-        for (label, shape, marker) in &shapes {
-            for pad in [0, 160, 180, 190, 196] {
+        for shape in shapes {
+            for pad in [0, 160, 180, 190, 196, 260] {
                 let title = if pad == 0 {
-                    shape.clone()
+                    shape.to_string()
                 } else {
                     format!("{} {shape}", "é".repeat(pad))
                 };
-                for (writer, out) in every_writer(&title) {
-                    if out.contains(marker) {
-                        problems.push(format!("{label} at {pad} through {writer}: {out}"));
+                for private in [Some(true), None] {
+                    for (writer, out) in every_writer(&title, private).await {
+                        for frag in ["Bluebird", "éé", "Blue"] {
+                            assert!(
+                                !out.contains(frag),
+                                "{writer}, private {private:?}, pad {pad}: {out}"
+                            );
+                        }
                     }
+                }
+                for (writer, out) in every_writer(&title, Some(false)).await {
+                    let shown = clean_title(&title);
+                    assert!(out.contains(&shown), "{writer}, public, pad {pad}: {out}");
                 }
             }
         }
-        assert!(problems.is_empty(), "{}", problems.join("\n"));
-    }
-
-    /// The rule, exactly: what goes and what stays.
-    #[test]
-    fn page_titles_redact() {
-        let cases = [
-            ("Mail owner@example.com about it", "Mail [email] about it"),
-            (
-                "Logs in /home/alice/hgl-ai/work fill up",
-                "Logs in [path] fill up",
-            ),
-            ("CI: GH_TOKEN: CANARY", "CI: GH_TOKEN [redacted]"),
-            ("Authorization: Basic Q0FO", "Authorization [redacted]"),
-            ("Fix the parser for tabs", "Fix the parser for tabs"),
-            (r#"Run "C:\Program Files\x y" now"#, "Run [path] now"),
-            (r#"Read "/a b/c" and "x y""#, r#"Read [path] and "x y""#),
-            ("read file:///Users/x/report today", "read [path] today"),
-            // Failing closed: over-redaction, as the rule takes it.
-            ("Hub accounts 1/6", "Hub accounts [path]"),
-            ("See docs/work.md", "See [path]"),
-            ("Keyboard order", "Key [redacted]"),
-            (
-                &format!("Token ghp_{} seen", "a".repeat(36)),
-                "Token [redacted]",
-            ),
-            (&format!("Seen {}", "Q".repeat(40)), "Seen [redacted]"),
-        ];
-        for (t, want) in cases {
-            assert_eq!(page_title(t), want, "{t}");
-        }
-        assert_eq!(page_title("a\tb"), "a b");
-        // Redacted, then cut: the cut falls on the redacted text.
-        let long = format!("{} alice@example.com", "x".repeat(195));
-        assert!(!page_title(&long).contains("alice"));
-        assert_eq!(page_title(&"é".repeat(300)).chars().count(), TITLE_MAX);
+        // As GitHub has it: nothing replaced, only one line and the cut.
+        assert_eq!(
+            public_title(Some(false), "Fix\tdocs/work.md: GH_TOKEN"),
+            "Fix docs/work.md: GH_TOKEN"
+        );
+        assert_eq!(
+            public_title(Some(false), &"é".repeat(300)).chars().count(),
+            TITLE_MAX
+        );
+        assert_eq!(public_title(Some(true), "x"), "");
+        assert_eq!(public_title(None, "x"), "");
     }
 
     #[test]

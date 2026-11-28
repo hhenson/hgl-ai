@@ -293,16 +293,20 @@ before hub users takes one shared token until it moves.
 | --- | --- | --- |
 | `main` | controller | `updated <UTC>`, then `<repo> main <sha>` lines and the wrapper's pins. Rewritten after each merge. |
 | `prs` | coordinator service | `# read <UTC>`, `# cost <n> remaining <n> resetAt <ISO>`, then rows `REPO NUMBER HEAD draft\|open BOT UNRESOLVED CHECKS UPDATED`, each followed by `# pr REPO NUMBER PASSED TOTAL TITLE` (checks passed and in all, `-` without a rollup). At most every 5 min; stale after 15 min. |
-| `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha> [<title>]` per merge; the merged pull request's title, redacted (docs/owner.md §3). Newest 2000 lines and at most 512 KiB, kept in the append's one compare-and-set write. |
+| `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha> [<title>]` per merge; the merged pull request's title, of a public repository only (docs/owner.md §3). Newest 2000 lines and at most 512 KiB, kept in the append's one compare-and-set write. |
 | `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
 | `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
-| `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted; then `# tree HOST SEAT REPO ISSUE implement\|review CREATED KIND SENDER RECIPIENT AT` per worktree (no path; the newest note about the task that the seat sent or got, or that went to `all`; `-` with none); then `# title REPO ISSUE TITLE` per task with a tree whose title is known (read from GitHub once per task, in a loop of its own; redacted). Read from the notes stream every 10 s; written when it changes. |
+| `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted; then `# tree HOST SEAT REPO ISSUE implement\|review CREATED KIND SENDER RECIPIENT AT` per worktree (no path; the newest note about the task that the seat sent or got, or that went to `all`; `-` with none); then `# title REPO ISSUE TITLE` per task with a tree whose title is known (read from GitHub once per task, in a loop of its own; of a public repository only). Read from the notes stream every 10 s; written when it changes. |
 | `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
 | `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
+
+Titles in `backlog`, `prs`, `tasks` and `landed.log` are of public repositories only; a
+private one's row has an empty title or none (docs/owner.md §3). `migrated.public-titles`
+records that `hgl-ai init` stripped the titles stored before.
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`. A `#` line a reader does not know is skipped,

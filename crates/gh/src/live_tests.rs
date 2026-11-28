@@ -2113,3 +2113,89 @@ async fn an_open_pin_pull_request_landed_by_another_sync_is_done() {
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "landed once: {log}");
 }
+
+/// Public repositories only (hgl-ai#181): rows written before, in every key that carries
+/// titles and in every revision the bucket keeps, are rewritten. `init`'s pass strips every
+/// title once; the coordinator's, at its start, what GitHub does not call public.
+#[tokio::test]
+async fn stored_titles_of_private_repositories_are_migrated() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let plant = |v: &[(&str, &str)]| {
+        v.iter()
+            .map(|(k, x)| (k.to_string(), x.to_string()))
+            .collect::<Vec<_>>()
+    };
+    let old = plant(&[
+        (
+            state::KEY_BACKLOG,
+            "# read R\npriv\t1\tcodex\t20260101T000000Z\tDEPLOY_TOKEN: Bluebird\n",
+        ),
+        (
+            state::KEY_PRS,
+            "# read R\npriv\t2\th\topen\tnone\t0\tnone\tT\n# pr\tpriv\t2\t-\t-\tBluebird pr\n",
+        ),
+        (
+            state::KEY_TASKS,
+            "priv\t3\tassign\tc\tw1\tA\n# title\tpriv\t3\tBluebird task\n",
+        ),
+        (state::KEY_LANDED, "S priv #4 m Bluebird landing\n"),
+    ]);
+    // Two revisions each, both holding a title.
+    for (k, v) in &old {
+        b.state_put(k, &format!("{v}# read older Bluebird\n"))
+            .await
+            .unwrap();
+        b.state_put(k, v).await.unwrap();
+    }
+    let keys = crate::migrate::strip_once(&b).await.unwrap().unwrap();
+    assert_eq!(keys.len(), 4, "{keys:?}");
+    for (k, _) in &old {
+        let history = b.state_history(k).await.unwrap();
+        assert!(
+            history.iter().all(|v| !v.contains("Bluebird")),
+            "{k}: {history:?}"
+        );
+        assert!(
+            history.len() <= 1,
+            "{k}: older revisions dropped: {history:?}"
+        );
+    }
+    assert_eq!(
+        b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value,
+        "S priv #4 m\n"
+    );
+    // Once per hub: a second `init` leaves what the coordinator wrote since.
+    b.state_put(state::KEY_LANDED, "S pub #5 m Public landing\n")
+        .await
+        .unwrap();
+    assert!(crate::migrate::strip_once(&b).await.unwrap().is_none());
+    assert!(
+        b.state_get(state::KEY_LANDED)
+            .await
+            .unwrap()
+            .unwrap()
+            .value
+            .contains("Public landing")
+    );
+
+    // The coordinator's start: `pub` is public, `priv` private, `other` unknown.
+    let mut s = settings();
+    s.repos = ["pub", "priv", "other"].map(String::from).to_vec();
+    let gh = FakeGh::default().on(
+        "query Visibility",
+        r#"{"data":{"r0":{"isPrivate":false},"r1":{"isPrivate":true},"r2":null}}"#,
+    );
+    b.state_put(
+        state::KEY_LANDED,
+        "S pub #5 m Public landing\nS priv #6 m Bluebird\nS other #7 m Bluebird\n",
+    )
+    .await
+    .unwrap();
+    crate::migrate::at_start(&gh, &s, &b).await.unwrap();
+    let history = b.state_history(state::KEY_LANDED).await.unwrap();
+    assert_eq!(
+        history,
+        ["S pub #5 m Public landing\nS priv #6 m\nS other #7 m\n"]
+    );
+}

@@ -16,7 +16,10 @@
  },
  "base": {
   "sha": "0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a",
-  "ref": "main"
+  "ref": "main",
+  "repo": {
+   "private": false
+  }
  },
  "merge_commit_sha": "01e99ea5e46457bac035ca8a2699b6b6575b32ed"
 }

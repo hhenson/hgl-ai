@@ -13,6 +13,7 @@
 //! | [`gate`] | `gh merge-if-clean`: the merge gate |
 //! | [`builds`] | the gate builds that write the local build verdicts (BUILD-15) |
 //! | [`land`] | `gh land`: the gate in a loop, then `main`, `landed.log`, `landed` notes, pins |
+//! | [`migrate`] | `init` and `gh coord run`: no stored title of a non-public repository |
 //! | [`progress`] | `HGL_STATE/landing.<repo>.<pr>`: what a landing has done, so a retry resumes |
 //! | [`pins`] | `gh pins sync`: the wrapper's submodule pins |
 //! | [`release`] | `gh release watch`: every workflow run on a commit |
@@ -29,6 +30,7 @@ mod intake;
 pub mod land;
 pub mod lock;
 pub mod merge;
+pub mod migrate;
 pub mod pins;
 pub mod progress;
 pub mod release;

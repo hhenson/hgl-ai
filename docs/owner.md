@@ -129,13 +129,13 @@ reads the hub itself: it watches the telemetry buckets over the hub's WebSocket
 listener, at `<console url>/nats` on the console's own origin, as the hub user
 `viewer`. `viewer` reads five buckets, `HGL_HOSTS`, `HGL_STATE` (only the keys the page
 shows), `HGL_METRICS`, `HGL_BUILD` and `HGL_USAGE`, and nothing else (not `HGL_TREES`:
-its records hold paths), and sees no other client's replies. Titles in those keys come
-redacted, failing closed (over-redaction rather than a leak; `backlog::page_title`):
-emails, token shapes and any word of 32 key characters or more go; after a sensitive key
-word (password, secret, token, key, auth, bearer, basic, credential, cookie, session,
-seed; any case, inside a longer word too) the rest of the title goes; every word with
-`/`, `\`, `~` or `file:` goes, with the rest of a quote it opens. All of it over the
-whole title, before it is cut to 200 characters. The header names the user by handle
+its records hold paths), and sees no other client's replies. Titles are of public repositories only (HPH, 2026-11-28, on
+hgl-ai#181: "Public repos only"): a public repository's as GitHub has it, cut to 200
+characters; none of a private repository's, or of one whose visibility GitHub did not give,
+so the page shows `repo#N` and its link alone. Each writer takes the visibility from the
+same response as the title. `hgl-ai init` strips every stored title once per hub, and the
+coordinator at each start those of repositories not public, in every revision kept
+(`gh::migrate`). The header names the user by handle
 only. Its subject permissions are read-only, but replies are not enforced until hgl-ai#141 (docs/install.md,
 docs/design.md §9). The console hands its credential to a signed-in page
 (`GET /api/viewer`), which keeps it in memory only. A tab per area; the selected tab

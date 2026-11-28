@@ -455,7 +455,7 @@ export function derive(raw: Raw, ctx: Context): Record<string, Row[]> {
       issue_url: gh.issue(q.repo, q.number),
       class: q.class === "codex-priority" ? "priority" : q.class === "codex" ? "ready" : q.class,
       opened: q.created,
-      title: q.title,
+      title: q.title || null,
     };
   });
   out.labels = backlog.labels.map((l) => ({ id: `${l.repo}/${l.label}`, repo: l.repo, label: l.label, open: l.open }));

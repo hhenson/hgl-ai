@@ -139,6 +139,14 @@ pub async fn init(ctx: &Ctx) -> anyhow::Result<i32> {
     if !gone.is_empty() {
         eprintln!("retired the viewer's consumers: {}", gone.join(", "));
     }
+    // Public repositories only (hgl-ai#181): once per hub, every stored title goes, in
+    // every revision; the coordinator writes the public ones again.
+    if let Some(keys) = hgl_ai_gh::migrate::strip_once(&bus)
+        .await
+        .map_err(|e| anyhow::anyhow!("stripping stored titles: {e}"))?
+    {
+        eprintln!("stripped stored titles from {}", keys.join(", "));
+    }
     let names = [
         STREAM_NOTES,
         STREAM_OWNER,

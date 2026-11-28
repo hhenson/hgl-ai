@@ -320,7 +320,8 @@
       }
      }
     ]
-   }
+   },
+   "isPrivate": false
   },
   "r1": {
    "name": "beta",
@@ -454,7 +455,8 @@
       }
      }
     ]
-   }
+   },
+   "isPrivate": false
   },
   "r2": null
  }
