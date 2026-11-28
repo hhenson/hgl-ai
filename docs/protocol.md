@@ -259,7 +259,7 @@ before hub users takes one shared token until it moves.
   the note. The authors' families are those the bridges record in the task's
   implementor trees (`families` in `task.json` and `HGL_TREES`).
 
-- **PROTO-21 — Build receipt.** A builder answers a `build` job with a `receipt` from
+- **PROTO-22 — Build receipt.** A builder answers a `build` job with a `receipt` from
   `builder-<label>` at the job's `head`, to the job's `reply_to` (`r-<id>`, an address no
   inbox serves; the sender reads the last note on `hgl.notes.r-<id>`) and to its `notify`
   seat. The body is the build summary as JSON (`docs/build.md` BUILD-4):
