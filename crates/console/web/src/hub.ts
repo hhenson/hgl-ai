@@ -1,6 +1,6 @@
 // Reading the hub over WebSocket as the `viewer` user (docs/owner.md §3): one watch per
-// telemetry bucket, fed into the store. The connection reconnects by itself; a watch
-// that ends is started again and its bucket resynchronised.
+// telemetry bucket, fed into the store. A first connection that fails is tried again; a made one
+// reconnects by itself; a watch that ends is started again and its bucket resynchronised.
 
 import { Kvm } from "@nats-io/kv";
 import { type NatsConnection, nkeyAuthenticator, wsconnect } from "@nats-io/nats-core";
@@ -42,37 +42,63 @@ async function watch(nc: NatsConnection, store: Store, bucket: Bucket, stopped: 
   }
 }
 
-/** Connect and watch every bucket; returns a function that closes it all. */
-export async function start(viewer: Viewer, store: Store): Promise<() => Promise<void>> {
-  let stop = false;
-  store.setConnection("connecting");
-  let nc: NatsConnection;
-  try {
-    nc = await wsconnect({
-      servers: hubUrl(window.location, viewer.path),
-      authenticator: nkeyAuthenticator(new TextEncoder().encode(viewer.seed)),
-      name: "hgl-ai console page",
-      maxReconnectAttempts: -1,
-      reconnectTimeWait: 2000,
-    });
-  } catch (err) {
-    store.setConnection("failed", String(err));
-    throw err;
-  }
-  store.setConnection("connected");
-  void (async () => {
-    for await (const s of nc.status()) {
-      if (s.type === "disconnect") store.setConnection("reconnecting");
-      else if (s.type === "reconnecting") store.setConnection("reconnecting");
-      else if (s.type === "reconnect") store.setConnection("connected");
+/**
+ * `connect` until it succeeds, waiting `RETRY_MS` after each failure; null once `stopped()`.
+ * The client retries only a connection it has made: a first attempt that fails is final.
+ */
+export async function connectRetrying<T>(
+  connect: () => Promise<T>,
+  failed: (err: unknown) => void,
+  stopped: () => boolean,
+  wait: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
+): Promise<T | null> {
+  while (!stopped()) {
+    try {
+      return await connect();
+    } catch (err) {
+      failed(err);
     }
+    await wait(RETRY_MS);
+  }
+  return null;
+}
+
+/** Connect and watch every bucket; returns a function that closes it all, retries included. */
+export function start(viewer: Viewer, store: Store): () => Promise<void> {
+  let stop = false;
+  let nc: NatsConnection | null = null;
+  store.setConnection("connecting");
+  void (async () => {
+    const c = await connectRetrying(
+      () =>
+        wsconnect({
+          servers: hubUrl(window.location, viewer.path),
+          authenticator: nkeyAuthenticator(new TextEncoder().encode(viewer.seed)),
+          name: "hgl-ai console page",
+          maxReconnectAttempts: -1,
+          reconnectTimeWait: 2000,
+        }),
+      (err) => store.setConnection("failed", String(err)),
+      () => stop,
+    );
+    if (!c) return;
+    if (stop) return void c.close();
+    nc = c;
+    store.setConnection("connected");
+    void (async () => {
+      for await (const s of c.status()) {
+        if (s.type === "disconnect") store.setConnection("reconnecting");
+        else if (s.type === "reconnecting") store.setConnection("reconnecting");
+        else if (s.type === "reconnect") store.setConnection("connected");
+      }
+    })();
+    void c.closed().then((err) => {
+      if (!stop) store.setConnection("disconnected", err ? String(err) : "");
+    });
+    for (const b of BUCKETS) void watch(c, store, b, () => stop);
   })();
-  void nc.closed().then((err) => {
-    if (!stop) store.setConnection("disconnected", err ? String(err) : "");
-  });
-  for (const b of BUCKETS) void watch(nc, store, b, () => stop);
   return async () => {
     stop = true;
-    await nc.close();
+    await nc?.close();
   };
 }

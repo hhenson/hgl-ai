@@ -15,7 +15,7 @@ const LABEL: Record<Connection, string> = {
   connected: "Live",
   reconnecting: "Reconnecting…",
   disconnected: "Disconnected",
-  failed: "Cannot reach the hub",
+  failed: "Cannot reach the hub; retrying",
 };
 
 function tabFromHash(): string {
@@ -43,16 +43,8 @@ export function App({ store }: { store: Store }) {
   }, [store, session.data]);
   useEffect(() => {
     if (!viewer.data) return;
-    let close: (() => Promise<void>) | null = null;
-    let gone = false;
-    start(viewer.data, store).then(
-      (c) => (gone ? void c() : (close = c)),
-      () => {},
-    );
-    return () => {
-      gone = true;
-      void close?.();
-    };
+    const close = start(viewer.data, store);
+    return () => void close();
   }, [store, viewer.data]);
   // On a narrow screen the tab strip scrolls sideways: keep the selected tab in view.
   useEffect(() => {
