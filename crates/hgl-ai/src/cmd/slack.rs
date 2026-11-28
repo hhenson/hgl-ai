@@ -1,5 +1,5 @@
 use anyhow::{Context as _, ensure};
-use hgl_ai_bus::{Bus, read_credential};
+use hgl_ai_bus::read_credential;
 use hgl_ai_config::{HubAuth, Units, expand};
 
 use super::Ctx;
@@ -22,6 +22,10 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
             let cfg = ctx.load_config()?;
             let controller = cfg.controller()?;
             let path = cfg.token_file()?;
+            let console = cfg
+                .console
+                .as_ref()
+                .context("Slack needs the owner console")?;
             let slack = cfg
                 .slack
                 .context("missing [slack] in the server configuration")?;
@@ -35,8 +39,15 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 credential.role() == Some("slack"),
                 "Slack needs its own hub user"
             );
-            let bus = Bus::connect_with(&cfg.hub.url, Some(credential)).await?;
-            hgl_ai_slack::run(&bus, slack, controller, &expand("~/.config/hgl-ai")?).await?;
+            hgl_ai_slack::run(
+                &cfg.hub.url,
+                credential,
+                slack,
+                controller,
+                console.origin(),
+                &expand("~/.config/hgl-ai")?,
+            )
+            .await?;
         }
     }
     Ok(super::EXIT_OK)

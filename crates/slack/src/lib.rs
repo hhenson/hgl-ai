@@ -2,6 +2,7 @@
 //! delivery state, and thread mappings for questions and conversations.
 
 mod interaction;
+mod retry;
 mod web;
 
 use std::io::Read;
@@ -9,10 +10,10 @@ use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::Path;
 use std::time::Duration;
 
-use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use anyhow::{Context as _, Result, anyhow, ensure};
 use chrono::{DateTime, Utc};
 use futures::{SinkExt as _, StreamExt as _};
-use hgl_ai_bus::{Bus, BusError, StreamMsg};
+use hgl_ai_bus::{Bus, BusError, Credential, StreamMsg};
 use hgl_ai_config::slack::{APP_TOKEN_FILE, BOT_TOKEN_FILE, Slack};
 use hgl_ai_owner::{Body, Event, Origin, Thread, ThreadState, event, fold};
 use hgl_ai_proto::{
@@ -20,14 +21,17 @@ use hgl_ai_proto::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::time::{sleep, timeout};
+use tokio::time::{Instant, sleep, timeout};
 use tokio_websockets::Message;
 
+use retry::{Backoff, RetryAfter};
 use web::{Bot, Marker, Web};
 
-const RECONNECT: Duration = Duration::from_secs(5);
+const FEED_POLL: Duration = Duration::from_secs(5);
+const HEALTHY: Duration = Duration::from_secs(60);
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(45);
 const RETRY_AFTER: i64 = 30;
+const CLOCK_SKEW: i64 = 5 * 60;
 const SLACK_TEXT_LIMIT: usize = 40_000;
 
 #[derive(Deserialize)]
@@ -78,13 +82,33 @@ struct Reply {
 }
 
 fn owner_reply(env: &Envelope, cfg: &Slack, bot: &Bot) -> Option<Reply> {
+    let msg = owner_message(env, cfg, bot)?;
+    if msg.kind != "message" || msg.channel_type.as_deref() != Some("group") {
+        return None;
+    }
+    let parent = msg.thread_ts?;
+    let root = slack_timestamp(&parent)?;
+    let ts = msg.ts?;
+    let at = slack_timestamp(&ts)?;
+    let text = msg.text?;
+    (at > root && valid_text(&text)).then_some(Reply {
+        parent,
+        ts,
+        at,
+        text,
+    })
+}
+
+fn valid_text(text: &str) -> bool {
+    !text.trim().is_empty() && text.chars().count() <= SLACK_TEXT_LIMIT
+}
+
+fn owner_message(env: &Envelope, cfg: &Slack, bot: &Bot) -> Option<Incoming> {
     let payload = Callback::deserialize(&env.payload).ok()?;
     let msg = payload.event?;
     if env.kind != "events_api"
         || payload.kind != "event_callback"
         || payload.team_id.as_deref() != Some(cfg.team.as_str())
-        || msg.kind != "message"
-        || msg.channel_type.as_deref() != Some("group")
         || msg.channel.as_deref() != Some(cfg.channel.as_str())
         || msg.user.as_deref() != Some(cfg.user.as_str())
         || cfg.user == bot.user_id
@@ -100,19 +124,7 @@ fn owner_reply(env: &Envelope, cfg: &Slack, bot: &Bot) -> Option<Reply> {
     {
         return None;
     }
-    let parent = msg.thread_ts?;
-    let root = slack_timestamp(&parent)?;
-    let ts = msg.ts?;
-    let at = slack_timestamp(&ts)?;
-    let text = msg.text?;
-    (at > root && !text.trim().is_empty() && text.chars().count() <= SLACK_TEXT_LIMIT).then_some(
-        Reply {
-            parent,
-            ts,
-            at,
-            text,
-        },
-    )
+    Some(msg)
 }
 
 fn slack_timestamp(s: &str) -> Option<DateTime<Utc>> {
@@ -165,24 +177,64 @@ fn secret(dir: &Path, name: &str, prefix: &str) -> Result<String> {
 }
 
 /// Run the Slack service. Tokens are read once and a service restart reloads them.
-pub async fn run(bus: &Bus, cfg: Slack, controller: Seat, secret_dir: &Path) -> Result<()> {
+pub async fn run(
+    hub_url: &str,
+    credential: Credential,
+    cfg: Slack,
+    controller: Seat,
+    console_origin: &str,
+    secret_dir: &Path,
+) -> Result<()> {
+    cfg.validate().map_err(anyhow::Error::msg)?;
     let app = secret(secret_dir, APP_TOKEN_FILE, "xapp-")?;
     let bot = secret(secret_dir, BOT_TOKEN_FILE, "xoxb-")?;
-    let adapter = Adapter::new(
-        bus,
-        cfg,
-        controller,
-        Web::new("https://slack.com/api".into(), app, bot)?,
-    )
-    .await?;
+    let web = Web::new("https://slack.com/api".into(), app, bot)?;
+    let mut hub_retry = Backoff::default();
+    let bus = loop {
+        match Bus::connect_with(hub_url, Some(credential.clone())).await {
+            Ok(bus) => break bus,
+            Err(e) => {
+                pause(
+                    &mut hub_retry,
+                    Some(e.into()),
+                    "connecting the Slack adapter to the hub",
+                )
+                .await
+            }
+        }
+    };
+    let mut slack_retry = Backoff::default();
+    let adapter = loop {
+        match Adapter::new(
+            &bus,
+            cfg.clone(),
+            controller.clone(),
+            console_origin.into(),
+            web.clone(),
+        )
+        .await
+        {
+            Ok(adapter) => break adapter,
+            Err(e) => pause(&mut slack_retry, Some(e), "Slack adapter startup").await,
+        }
+    };
     tokio::join!(adapter.outbound_loop(), adapter.socket_loop());
     Ok(())
+}
+
+async fn pause(retries: &mut Backoff, error: Option<anyhow::Error>, operation: &str) {
+    let delay = retries.delay(error.as_ref());
+    if let Some(error) = error {
+        tracing::warn!(?delay, "{operation}: {error}");
+    }
+    sleep(delay).await;
 }
 
 struct Adapter<'a> {
     bus: &'a Bus,
     cfg: Slack,
     controller: Seat,
+    console_origin: String,
     bot: Bot,
     web: Web,
 }
@@ -195,6 +247,8 @@ struct Delivery {
     ts: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     opening_seq: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    parent: Option<String>,
 }
 
 impl Delivery {
@@ -206,12 +260,31 @@ impl Delivery {
             attempted: now,
             ts: None,
             opening_seq,
+            parent: None,
         }
+    }
+
+    fn thread_ts(&self) -> Option<&str> {
+        self.parent.as_deref().or(self.ts.as_deref())
+    }
+
+    fn wait_for_recovery(&self) -> Result<()> {
+        let seconds = (self.attempted + RETRY_AFTER - Utc::now().timestamp()).clamp(0, RETRY_AFTER);
+        if seconds > 0 {
+            return Err(RetryAfter(Duration::from_secs(seconds as u64)).into());
+        }
+        Ok(())
     }
 }
 
 impl<'a> Adapter<'a> {
-    async fn new(bus: &'a Bus, cfg: Slack, controller: Seat, web: Web) -> Result<Self> {
+    async fn new(
+        bus: &'a Bus,
+        cfg: Slack,
+        controller: Seat,
+        console_origin: String,
+        web: Web,
+    ) -> Result<Self> {
         cfg.validate().map_err(anyhow::Error::msg)?;
         let bot = web.identify().await?;
         ensure!(
@@ -227,6 +300,7 @@ impl<'a> Adapter<'a> {
             bus,
             cfg,
             controller,
+            console_origin,
             bot,
             web,
         })
@@ -242,7 +316,7 @@ impl<'a> Adapter<'a> {
             return Ok(Some(id));
         }
         // A reply can arrive after Slack accepted a post but before we saved its ts.
-        let Some(post) = self.web.root_at(&self.cfg.channel, parent).await? else {
+        let Some(post) = self.web.message_at(&self.cfg.channel, None, parent).await? else {
             return Ok(None);
         };
         let Some(marker) = post.marker(&self.bot) else {
@@ -262,9 +336,9 @@ impl<'a> Adapter<'a> {
             .map(|_| marker.question))
     }
 
-    async fn ingest_reply(&self, envelope: &Envelope) -> Result<()> {
+    async fn ingest_event(&self, envelope: &Envelope) -> Result<()> {
         let Some(reply) = owner_reply(envelope, &self.cfg, &self.bot) else {
-            return Ok(());
+            return self.ingest_start(envelope).await;
         };
         let Some(id) = self.thread_for(&reply.parent).await? else {
             return Ok(());
@@ -276,6 +350,52 @@ impl<'a> Adapter<'a> {
             Body::OwnerMessage { body: reply.text },
         )
         .await?;
+        Ok(())
+    }
+
+    async fn ingest_start(&self, envelope: &Envelope) -> Result<()> {
+        let Some(msg) = owner_message(envelope, &self.cfg, &self.bot).filter(|msg| {
+            msg.kind == "app_mention"
+                && msg.thread_ts.is_none()
+                && msg
+                    .channel_type
+                    .as_deref()
+                    .is_none_or(|kind| kind == "group")
+        }) else {
+            return Ok(());
+        };
+        let Some(ts) = msg.ts else {
+            return Ok(());
+        };
+        let Some(at) = slack_timestamp(&ts) else {
+            return Ok(());
+        };
+        let mention = format!("<@{}>", self.bot.user_id);
+        let Some(text) = msg
+            .text
+            .as_deref()
+            .and_then(|text| text.trim().strip_prefix(&mention))
+            .map(str::trim)
+            .filter(|text| valid_text(text))
+        else {
+            return Ok(());
+        };
+        let (title, body) = text.split_once('\n').unwrap_or((text, text));
+        if title.trim().is_empty() || title.trim().len() > 200 || body.trim().is_empty() {
+            return Ok(());
+        }
+        use sha2::{Digest as _, Sha256};
+        let hash = Sha256::digest(format!("{}:{}:{ts}", self.cfg.team, self.cfg.channel));
+        let id = format!("c-{}", hex::encode(&hash[..4]));
+        let key = format!("start_{}", timestamp_key(&ts));
+        let body = Body::Start {
+            title: title.trim().into(),
+            issue: None,
+            body: body.trim().into(),
+        };
+        if self.publish_action(&id, &key, at, body).await? {
+            self.map_thread(&id, &ts).await?;
+        }
         Ok(())
     }
 
@@ -296,7 +416,13 @@ impl<'a> Adapter<'a> {
             at: utc_stamp(at),
             body,
         };
-        if !matches!(event.body, Body::OwnerMessage { .. }) {
+        if matches!(event.body, Body::Start { .. }) {
+            if !fold(None, &subject, 1, &event, &self.controller)
+                .is_ok_and(|(_, effects)| effects.oversize.is_none())
+            {
+                return Ok(false);
+            }
+        } else if !matches!(event.body, Body::OwnerMessage { .. }) {
             let Some((root, _)) = self.bus.slack_get::<Delivery>(&self.root_key(id)).await? else {
                 return Ok(false);
             };
@@ -329,11 +455,14 @@ impl<'a> Adapter<'a> {
     }
 
     async fn socket_loop(&self) {
+        let mut retries = Backoff::default();
         loop {
-            if let Err(e) = self.socket_session().await {
-                tracing::warn!("Slack Socket Mode: {e}");
+            let started = Instant::now();
+            let result = self.socket_session().await;
+            if started.elapsed() >= HEALTHY {
+                retries = Backoff::default();
             }
-            sleep(RECONNECT).await;
+            pause(&mut retries, result.err(), "Slack Socket Mode").await;
         }
     }
 
@@ -364,7 +493,7 @@ impl<'a> Adapter<'a> {
                 continue;
             };
             let handled = match envelope.kind.as_str() {
-                "events_api" => self.ingest_reply(&envelope).await.map(|()| None),
+                "events_api" => self.ingest_event(&envelope).await.map(|()| None),
                 "interactive" => self.ingest_interaction(&envelope.payload).await,
                 _ => Ok(None),
             };
@@ -391,18 +520,22 @@ impl<'a> Adapter<'a> {
     }
 
     async fn outbound_loop(&self) {
+        let mut retries = Backoff::default();
         loop {
-            if let Err(e) = self.drain_feed().await {
-                tracing::warn!("Slack owner feed: {e}");
+            let started = Instant::now();
+            let result = self.drain_feed().await;
+            if started.elapsed() >= HEALTHY {
+                retries = Backoff::default();
             }
-            sleep(RECONNECT).await;
+            pause(&mut retries, result.err(), "Slack owner feed").await;
         }
     }
 
     async fn drain_feed(&self) -> Result<()> {
         let mut feed = self.open_feed().await?;
+        let mut retries = Backoff::default();
         loop {
-            let Some(message) = feed.next(RECONNECT).await? else {
+            let Some(message) = feed.next(FEED_POLL).await? else {
                 continue;
             };
             let delivery = timeout(DELIVERY_TIMEOUT, self.deliver(&message))
@@ -410,10 +543,13 @@ impl<'a> Adapter<'a> {
                 .context("Slack delivery timed out")
                 .and_then(|result| result);
             if let Err(error) = delivery {
-                tracing::warn!(seq = message.seq, "Slack delivery pending: {error}");
-                message.nak(RECONNECT).await?;
+                let delay = retries.delay(Some(&error));
+                tracing::warn!(seq = message.seq, ?delay, "Slack delivery pending: {error}");
+                message.nak(delay).await?;
+                sleep(delay).await;
             } else {
                 message.ack().await?;
+                retries = Backoff::default();
             }
         }
     }
@@ -436,23 +572,18 @@ impl<'a> Adapter<'a> {
         let Ok(ev) = serde_json::from_slice::<Event>(&message.payload) else {
             return Ok(());
         };
-        if hgl_ai_owner::check_id(&ev.id).is_err()
-            || event::parse_subject(&message.subject) != Some((ev.body.origin(), &ev.id))
-            || ev.v != event::EVENT_VERSION
-            || hgl_ai_proto::parse_stamp(&ev.at).is_none()
-        {
-            return Ok(());
-        }
-        let origin_ok = match ev.body.origin() {
-            Origin::Owner => ev.sender == OWNER,
-            Origin::Agent => Seat::new(ev.sender.clone()).is_ok_and(|seat| !seat.is_reserved()),
-        };
-        if !origin_ok {
+        if event::validate_event(&message.subject, &ev).is_err() {
             return Ok(());
         }
         let root_key = self.root_key(&ev.id);
         let event_id = delivery_id(&ev, &message.subject);
         let from_slack = ev.subject() != message.subject;
+        let source = match (from_slack, ev.body.origin()) {
+            (true, _) => "Slack",
+            (false, Origin::Owner) => "Console",
+            (false, Origin::Agent) => "hgl-ai",
+        };
+        let link = format!("{}/t/{}", self.console_origin, ev.id);
         let marker = Marker {
             event: event_id.clone(),
             question: ev.id.clone(),
@@ -465,12 +596,30 @@ impl<'a> Adapter<'a> {
                 else {
                     return Ok(());
                 };
-                let text = root_text(&thread);
-                let blocks = interaction::root_blocks(&thread, &text);
+                let parent = event::slack_source(&message.subject)
+                    .filter(|(team, channel, _)| {
+                        *team == self.cfg.team && *channel == self.cfg.channel
+                    })
+                    .and_then(|(_, _, key)| key.strip_prefix("start_"))
+                    .map(|ts| ts.replace('_', "."))
+                    .filter(|ts| slack_timestamp(ts).is_some());
+                let text = root_text(&thread, parent.is_none());
+                let mut blocks = interaction::root_blocks(&thread, &text);
+                blocks.push(interaction::console_link(&link));
                 let ts = self
-                    .post_once(&root_key, None, marker, &text, &blocks, Some(message.seq))
+                    .post_once(
+                        &root_key,
+                        parent.as_deref(),
+                        marker,
+                        &text,
+                        &blocks,
+                        Some(message.seq),
+                    )
                     .await?;
                 self.map_thread(&ev.id, &ts).await?;
+                let parent = parent.as_deref().unwrap_or(&ts);
+                self.map_thread(&ev.id, parent).await?;
+                self.store_link(&ev.id, parent).await?;
             }
             Body::Message { body } | Body::OwnerMessage { body }
                 if !from_slack && !body.trim().is_empty() =>
@@ -478,15 +627,20 @@ impl<'a> Adapter<'a> {
                 let Some((root, _)) = self.bus.slack_get::<Delivery>(&root_key).await? else {
                     return Ok(());
                 };
-                let parent = root.ts.context("the Slack thread is still pending")?;
+                let parent = root
+                    .thread_ts()
+                    .context("the Slack thread is still pending")?;
                 let who = ev.handle.as_deref().unwrap_or(&ev.sender);
-                let text = format!("{who}\n{body}");
+                let text = format!("{who} · {source}\n{body}");
+                let mut blocks = interaction::text_blocks(&text);
+                blocks.push(interaction::console_link(&link));
                 let key = self.key("out", &event_id);
-                self.post_once(&key, Some(&parent), marker, &text, &[], None)
+                self.post_once(&key, Some(parent), marker, &text, &blocks, None)
                     .await?;
             }
             Body::Answer { .. } | Body::Close | Body::Withdraw { .. } => {
-                self.edit_state(message, &ev, &event_id).await?;
+                self.edit_state(message, &ev, &event_id, &link, source)
+                    .await?;
             }
             _ => {}
         }
@@ -497,6 +651,18 @@ impl<'a> Adapter<'a> {
         self.key("question", id)
     }
 
+    async fn store_link(&self, id: &str, ts: &str) -> Result<()> {
+        let key = self.cfg.link_key(id);
+        if self.bus.slack_get::<String>(&key).await?.is_none() {
+            let link = self.web.permalink(&self.cfg.channel, ts).await?;
+            match self.bus.slack_put(&key, &link, 0).await {
+                Ok(_) | Err(BusError::Conflict { .. }) => {}
+                Err(e) => return Err(e.into()),
+            }
+        }
+        Ok(())
+    }
+
     async fn opening(&self, root: &Delivery) -> Result<Thread> {
         let seq = root
             .opening_seq
@@ -504,13 +670,20 @@ impl<'a> Adapter<'a> {
         let message = self.bus.owner_event_at(seq).await?;
         let ev: Event = serde_json::from_slice(&message.payload)?;
         ensure!(
-            ev.msg_id() == root.event,
+            delivery_id(&ev, &message.subject) == root.event,
             "the Slack thread points to the wrong opening event"
         );
         Ok(fold(None, &message.subject, seq, &ev, &self.controller)?.0)
     }
 
-    async fn edit_state(&self, message: &StreamMsg, ev: &Event, event_id: &str) -> Result<()> {
+    async fn edit_state(
+        &self,
+        message: &StreamMsg,
+        ev: &Event,
+        event_id: &str,
+        link: &str,
+        source: &str,
+    ) -> Result<()> {
         let key = self.key("state", &ev.id);
         let prior = self.bus.slack_get::<Delivery>(&key).await?;
         if prior
@@ -526,7 +699,7 @@ impl<'a> Adapter<'a> {
         else {
             return Ok(());
         };
-        let parent = root
+        let ts = root
             .ts
             .as_deref()
             .context("the Slack thread is still pending")?;
@@ -541,21 +714,20 @@ impl<'a> Adapter<'a> {
             return Ok(());
         };
         let (mut edit, revision) = if let Some((edit, revision)) = prior {
-            let posted = self.web.root_at(&self.cfg.channel, parent).await?;
+            edit.wait_for_recovery()?;
+            let posted = self
+                .web
+                .message_at(&self.cfg.channel, root.parent.as_deref(), ts)
+                .await?;
             if posted
                 .and_then(|post| post.marker(&self.bot))
                 .is_some_and(|marker| {
                     marker.event == root.event && marker.state_event.as_deref() == Some(event_id)
                 })
             {
-                self.record_post(&key, revision, edit, parent.into())
-                    .await?;
+                self.record_post(&key, revision, edit, ts.into()).await?;
                 return Ok(());
             }
-            ensure!(
-                Utc::now().timestamp() >= edit.attempted + RETRY_AFTER,
-                "waiting to reconcile a Slack edit"
-            );
             (edit, revision)
         } else {
             (Delivery::pending(event_id, None), 0)
@@ -567,17 +739,19 @@ impl<'a> Adapter<'a> {
             question: ev.id.clone(),
             state_event: Some(event_id.into()),
         };
-        let text = terminal_text(&opening, &thread);
+        let text = terminal_text(&opening, &thread, root.parent.is_none(), source);
+        let mut blocks = interaction::text_blocks(&text);
+        blocks.push(interaction::console_link(link));
         self.web
             .update(
                 &self.cfg.channel,
-                parent,
+                ts,
                 marker,
                 &escaped_text(&text, 4_000),
-                &interaction::text_blocks(&text),
+                &blocks,
             )
             .await?;
-        self.record_post(&key, claim, edit, parent.into()).await?;
+        self.record_post(&key, claim, edit, ts.into()).await?;
         Ok(())
     }
 
@@ -606,7 +780,6 @@ impl<'a> Adapter<'a> {
         blocks: &[Value],
         opening_seq: Option<u64>,
     ) -> Result<String> {
-        let now = Utc::now().timestamp();
         let (mut delivery, revision) = match self.bus.slack_get::<Delivery>(key).await? {
             Some((delivery, revision)) => {
                 if let Some(ts) = delivery.ts {
@@ -616,7 +789,8 @@ impl<'a> Adapter<'a> {
                     delivery.event == marker.event,
                     "the original Slack post is still pending"
                 );
-                let oldest = (delivery.started - 5).to_string();
+                delivery.wait_for_recovery()?;
+                let oldest = (delivery.started - CLOCK_SKEW).to_string();
                 if let Some(ts) = self
                     .web
                     .find(&self.cfg.channel, parent, &oldest, &marker.event, &self.bot)
@@ -624,14 +798,12 @@ impl<'a> Adapter<'a> {
                 {
                     return self.record_post(key, revision, delivery, ts).await;
                 }
-                if now < delivery.attempted + RETRY_AFTER {
-                    bail!("waiting to reconcile an earlier Slack post");
-                }
                 (delivery, revision)
             }
             None => (Delivery::pending(&marker.event, opening_seq), 0),
         };
         delivery.attempted = Utc::now().timestamp();
+        delivery.parent = parent.map(str::to_string);
         let claim = self.bus.slack_put(key, &delivery, revision).await?;
         let ts = self
             .web
@@ -659,7 +831,7 @@ impl<'a> Adapter<'a> {
     }
 }
 
-fn root_text(thread: &Thread) -> String {
+fn root_text(thread: &Thread, include_opening_message: bool) -> String {
     let mut text = thread.id.clone();
     if let Some(priority) = thread.priority {
         text.push_str(&format!(" · {priority}"));
@@ -674,7 +846,10 @@ fn root_text(thread: &Thread) -> String {
             .as_deref()
             .or(message.user.as_deref())
             .unwrap_or(&message.sender);
-        text.push_str(&format!("\n\n{who}\n{}", message.body));
+        text.push_str(&format!("\n\n{who} · {}", message.source()));
+        if include_opening_message {
+            text.push_str(&format!("\n{}", message.body));
+        }
     } else {
         text.push_str(&format!("\n\n{}", thread.question));
     }
@@ -692,7 +867,12 @@ fn root_text(thread: &Thread) -> String {
     text
 }
 
-fn terminal_text(opening: &Thread, thread: &Thread) -> String {
+fn terminal_text(
+    opening: &Thread,
+    thread: &Thread,
+    include_opening_message: bool,
+    source: &str,
+) -> String {
     let state = match thread.state {
         ThreadState::Answered => "Answered",
         ThreadState::Closed => "Closed",
@@ -706,11 +886,11 @@ fn terminal_text(opening: &Thread, thread: &Thread) -> String {
     let detail = detail
         .as_deref()
         .or_else(|| thread.messages.last().map(|m| m.body.as_str()));
-    let mut text = root_text(opening);
+    let mut text = root_text(opening, include_opening_message);
     if let Some(detail) = detail.filter(|detail| !detail.eq_ignore_ascii_case(state)) {
         text = format!("{detail}\n\n{text}");
     }
-    format!("{state}\n\n{text}")
+    format!("{state} · {source}\n\n{text}")
 }
 
 fn delivery_id(ev: &Event, subject: &str) -> String {

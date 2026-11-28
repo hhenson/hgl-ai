@@ -382,11 +382,21 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         }
         Role::Slack | Role::Admin => unreachable!(),
     }
-    deny.extend([
-        format!("$JS.API.DIRECT.GET.{slack_bucket}"),
-        format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
-        format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
-    ]);
+    deny.push(format!("$JS.API.DIRECT.GET.{slack_bucket}"));
+    deny.push(format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"));
+    // The console can read the link index (links.<scope>.<id>), while the
+    // four-token delivery and reverse mapping keys stay with the adapter.
+    let private_keys = if role == Role::Console {
+        "*.*.*.*"
+    } else {
+        ">"
+    };
+    deny.push(format!(
+        "$JS.API.DIRECT.GET.{slack_bucket}.$KV.{KV_SLACK}.{private_keys}"
+    ));
+    if role != Role::Console {
+        deny.push(format!("$JS.API.DIRECT.GET.{slack_bucket}.>"));
+    }
     Some(Permissions {
         publish_allow: allow,
         publish_deny: deny,

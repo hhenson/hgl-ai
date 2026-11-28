@@ -185,6 +185,10 @@ struct Posts {
     updates: usize,
     views: Vec<Value>,
     lose_response: bool,
+    rate_limit_open: Option<u64>,
+    socket_opens: usize,
+    history_calls: usize,
+    next_post_skew: i64,
 }
 
 #[derive(Clone)]
@@ -213,10 +217,21 @@ impl FakeSlack {
                 post(
                     |State(state): State<SlackState>, headers: HeaderMap| async move {
                         assert_eq!(headers["authorization"], "Bearer xapp-test");
-                        Json(json!({ "ok": true, "url": state.socket_url }))
+                        let mut posts = state.posts.lock().unwrap();
+                        posts.socket_opens += 1;
+                        if let Some(after) = posts.rate_limit_open.take() {
+                            return (StatusCode::TOO_MANY_REQUESTS, [("retry-after", after.to_string())]).into_response();
+                        }
+                        Json(json!({ "ok": true, "url": state.socket_url })).into_response()
                     },
                 ),
             )
+            .route("/chat.getPermalink", get(|headers: HeaderMap, Query(query): Query<BTreeMap<String, String>>| async move {
+                assert_eq!(headers["authorization"], "Bearer xoxb-test");
+                assert_eq!(query["channel"], "CQA");
+                let ts = query["message_ts"].replace('.', "");
+                Json(json!({"ok":true, "permalink": format!("https://qa.slack.com/archives/CQA/p{ts}") }))
+            }))
             .route(
                 "/auth.test",
                 post(|headers: HeaderMap| async move {
@@ -237,7 +252,8 @@ impl FakeSlack {
                         assert_eq!(body["channel"], "CQA");
                         assert_eq!(body["mrkdwn"], false);
                         let mut posts = state.posts.lock().unwrap();
-                        let ts = format!("{}.{:06}", Utc::now().timestamp(), posts.items.len() + 1);
+                        let timestamp = Utc::now().timestamp() + std::mem::take(&mut posts.next_post_skew);
+                        let ts = format!("{timestamp}.{:06}", posts.items.len() + 1);
                         body["ts"] = json!(ts);
                         body["user"] = json!("UQABOT");
                         posts.items.push(body);
@@ -298,6 +314,7 @@ impl FakeSlack {
             bus,
             settings(),
             Seat::new("seat").unwrap(),
+            "https://console.example.com".into(),
             Web::new(self.base.clone(), "xapp-test".into(), "xoxb-test".into()).unwrap(),
         )
         .await
@@ -350,12 +367,23 @@ async fn history(
     assert_eq!(headers["authorization"], "Bearer xoxb-test");
     assert_eq!(query["channel"], "CQA");
     assert_eq!(query["include_all_metadata"], "true");
-    let posts = state.posts.lock().unwrap();
+    let mut posts = state.posts.lock().unwrap();
+    posts.history_calls += 1;
+    let oldest = query["oldest"]
+        .split('.')
+        .next()
+        .unwrap()
+        .parse::<i64>()
+        .unwrap();
     let items: Vec<_> = posts
         .items
         .iter()
         .filter(|item| {
             item["thread_ts"].as_str() == query.get("ts").map(String::as_str)
+                && item["ts"]
+                    .as_str()
+                    .and_then(slack_timestamp)
+                    .is_some_and(|at| at.timestamp() >= oldest)
                 && query
                     .get("latest")
                     .is_none_or(|ts| item["ts"] == ts.as_str())
@@ -369,6 +397,17 @@ async fn next(feed: &mut Feed) -> StreamMsg {
         .await
         .unwrap()
         .expect("event in durable feed")
+}
+
+async fn elapse_recovery(adapter: &Adapter<'_>, key: &str) {
+    let (mut attempt, rev) = adapter
+        .bus
+        .slack_get::<Delivery>(key)
+        .await
+        .unwrap()
+        .unwrap();
+    attempt.attempted -= RETRY_AFTER + 1;
+    adapter.bus.slack_put(key, &attempt, rev).await.unwrap();
 }
 
 #[tokio::test]
@@ -411,6 +450,7 @@ async fn question_and_replies_survive_slack_and_jetstream_restart() {
         )
         .await
         .unwrap();
+        fake.state.posts.lock().unwrap().next_post_skew = -120;
         fake.lose_next_response();
         let ask = next(&mut feed).await;
         assert!(adapter.deliver(&ask).await.is_err());
@@ -462,6 +502,7 @@ async fn question_and_replies_survive_slack_and_jetstream_restart() {
     let adapter = fake.adapter(&slack).await;
     let mut feed = adapter.open_feed().await.unwrap();
     let ask = next(&mut feed).await;
+    elapse_recovery(&adapter, &adapter.root_key(&question)).await;
     adapter.deliver(&ask).await.unwrap();
     ask.ack().await.unwrap();
     assert_eq!(
@@ -615,6 +656,21 @@ async fn question_and_replies_survive_slack_and_jetstream_restart() {
     let from_console = next(&mut feed).await;
     fake.lose_next_response();
     assert!(adapter.deliver(&from_console).await.is_err());
+    let history_calls = fake.state.posts.lock().unwrap().history_calls;
+    assert!(
+        adapter
+            .deliver(&from_console)
+            .await
+            .unwrap_err()
+            .downcast_ref::<RetryAfter>()
+            .is_some()
+    );
+    assert_eq!(
+        fake.state.posts.lock().unwrap().history_calls,
+        history_calls
+    );
+    let event: Event = serde_json::from_slice(&from_console.payload).unwrap();
+    elapse_recovery(&adapter, &adapter.key("out", &event.msg_id())).await;
     adapter.deliver(&from_console).await.unwrap();
     from_console.ack().await.unwrap();
     let from_seat = next(&mut feed).await;
@@ -624,9 +680,35 @@ async fn question_and_replies_survive_slack_and_jetstream_restart() {
     let items = fake.items();
     assert_eq!(items.len(), 3);
     assert_eq!(items[1]["thread_ts"], root);
-    assert_eq!(items[1]["text"], "The Owner\nFollow-up from the console");
+    assert_eq!(
+        items[1]["text"],
+        "The Owner · Console\nFollow-up from the console"
+    );
     assert_eq!(items[2]["thread_ts"], root);
-    assert_eq!(items[2]["text"], "seat\nFollow-up from the asker");
+    assert_eq!(items[2]["text"], "seat · hgl-ai\nFollow-up from the asker");
+
+    let forged = Event {
+        v: event::EVENT_VERSION,
+        id: question,
+        sender: asker.to_string(),
+        at: hgl_ai_proto::utc_now_stamp(),
+        user: None,
+        handle: Some("The Owner".into()),
+        body: Body::Message {
+            body: "Forged author".into(),
+        },
+    };
+    let message = StreamMsg::detached(
+        10_000,
+        &forged.subject(),
+        serde_json::to_vec(&forged).unwrap(),
+    );
+    adapter.deliver(&message).await.unwrap();
+    assert_eq!(
+        fake.items(),
+        items,
+        "Slack refuses an agent event with an owner handle"
+    );
 }
 
 fn click(envelope: &str, root: &Value, action: &str, ts: &str) -> Value {
@@ -656,7 +738,7 @@ fn click(envelope: &str, root: &Value, action: &str, ts: &str) -> Value {
             "user": {"id": "UOWNER", "team_id": "TQA"},
             "channel": {"id": "CQA"}, "trigger_id": "trigger",
             "container": {"type": "message", "channel_id": "CQA", "message_ts": root["ts"]},
-            "message": {"ts": root["ts"], "user": "UQABOT"},
+            "message": {"ts": root["ts"], "thread_ts": root["thread_ts"], "user": "UQABOT"},
             "actions": [button]
         }
     })
@@ -693,10 +775,11 @@ async fn fold_next(console: &Bus, feed: &mut Feed, controller: &Seat) -> Thread 
     *thread
 }
 
-async fn deliver_next(adapter: &Adapter<'_>, feed: &mut Feed) {
+async fn deliver_next(adapter: &Adapter<'_>, feed: &mut Feed) -> u64 {
     let msg = next(feed).await;
     adapter.deliver(&msg).await.unwrap();
     msg.ack().await.unwrap();
+    msg.seq
 }
 
 fn assert_terminal(root: &Value, state: &str) {
@@ -826,6 +909,7 @@ async fn slack_and_console_share_owner_actions_once() {
         let msg = next(&mut outbound).await;
         assert!(adapter.deliver(&msg).await.is_err());
         let restarted = fake.adapter(&slack).await;
+        elapse_recovery(&restarted, &restarted.key("state", &id)).await;
         restarted.deliver(&msg).await.unwrap();
         restarted.deliver(&msg).await.unwrap();
         msg.ack().await.unwrap();
@@ -934,5 +1018,302 @@ async fn slack_and_console_share_owner_actions_once() {
                 .unwrap()
                 .is_none()
         );
+    }
+}
+
+#[tokio::test]
+async fn rate_limit_cools_down_a_method_for_every_caller() {
+    let fake = FakeSlack::start().await;
+    fake.state.posts.lock().unwrap().rate_limit_open = Some(90);
+    let web = Web::new(fake.base.clone(), "xapp-test".into(), "xoxb-test".into()).unwrap();
+    let Err(first) = web.socket().await else {
+        panic!("Slack should have rejected the request");
+    };
+    assert_eq!(
+        first.downcast_ref::<RetryAfter>().unwrap().0,
+        Duration::from_secs(90)
+    );
+    let Err(second) = web.clone().socket().await else {
+        panic!("method should still be limited");
+    };
+    let after = second.downcast_ref::<RetryAfter>().unwrap().0;
+    assert!((Duration::from_secs(80)..=Duration::from_secs(90)).contains(&after));
+    assert_eq!(fake.state.posts.lock().unwrap().socket_opens, 1);
+    // Slack limits by method, so a throttled socket open does not block auth.test.
+    web.identify().await.unwrap();
+}
+
+#[tokio::test]
+async fn switch_between_slack_and_console_on_one_conversation() {
+    if Command::new("nats-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: nats-server is unavailable");
+        return;
+    }
+    use hgl_ai_config::{Config, Console, Person, User};
+    use hgl_ai_console::{
+        App,
+        auth::{Session, session_key},
+    };
+    use reqwest::header::{CONTENT_TYPE, COOKIE, LOCATION, ORIGIN};
+
+    const CONSOLE: &str = "https://console.example.com";
+    let hub = Hub::new();
+    let _server = hub.start().await;
+    hub.bus("admin").await.provision().await.unwrap();
+    let slack = hub.bus("slack").await;
+    let console = Arc::new(hub.bus("console").await);
+    let fake = FakeSlack::start().await;
+    let adapter = fake.adapter(&slack).await;
+    let mut outbound = adapter.open_feed().await.unwrap();
+
+    let mut cfg = Config::new("hub");
+    cfg.github.controller = "seat".into();
+    cfg.paths.data_dir = hub.dir.path().join("console-data").display().to_string();
+    cfg.slack = Some(settings());
+    cfg.console = Some(Console {
+        url: CONSOLE.into(),
+        users: vec![User::Person(Person {
+            email: "owner@example.com".into(),
+            handle: Some("The Owner".into()),
+            github: None,
+            apple: None,
+            google: None,
+        })],
+        ..Console::default()
+    });
+    let app = Arc::new(App::new(cfg).unwrap());
+    app.set_hub(console.clone());
+    hgl_ai_console::service::start_background(app.clone()).await;
+    let session = Session {
+        id: "test-session".into(),
+        user: "owner@example.com".into(),
+        via: "passkey".into(),
+        csrf: "csrf-token".into(),
+        expires_at: Utc::now().timestamp() + 60,
+    };
+    let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+    app.auth
+        .attach(vec![(session_key(&session.id), session.clone())], tx);
+    let cookie = app
+        .auth
+        .session_cookie(&session)
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, hgl_ai_console::router(app))
+            .await
+            .unwrap()
+    });
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .unwrap();
+    let response = client
+        .post(format!("{base}/conversations"))
+        .header(COOKIE, &cookie)
+        .header(ORIGIN, CONSOLE)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("csrf=csrf-token&title=Release+planning&body=Kick+off+in+the+console")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    let path = response.headers()[LOCATION].to_str().unwrap();
+    let id = path.strip_prefix("/t/").unwrap();
+    deliver_next(&adapter, &mut outbound).await;
+    let root = fake.items()[0].clone();
+    let root_ts = root["ts"].as_str().unwrap();
+    let ts = action_ts(&root, 100_000);
+    let mut slack_reply = reply("reply", root_ts, &ts);
+    slack_reply["payload"]["event"]["text"] = json!("Follow up from Slack");
+    fake.state
+        .posts
+        .lock()
+        .unwrap()
+        .items
+        .push(slack_reply["payload"]["event"].clone());
+    fake.send(
+        &adapter,
+        vec![
+            slack_reply.clone(),
+            replace(slack_reply, "/envelope_id", json!("retry")),
+        ],
+    )
+    .await;
+    let reply_seq = deliver_next(&adapter, &mut outbound).await;
+    assert!(
+        hgl_ai_owner::wait_folded(&console, id, reply_seq, Duration::from_secs(3))
+            .await
+            .unwrap()
+            .is_some_and(|t| t.seq >= reply_seq)
+    );
+    let response = client
+        .post(format!("{base}{path}/close"))
+        .header(COOKIE, &cookie)
+        .header(ORIGIN, CONSOLE)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("csrf=csrf-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    deliver_next(&adapter, &mut outbound).await;
+
+    let page = client
+        .get(format!("{base}{path}"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    let permalink = format!(
+        "https://qa.slack.com/archives/CQA/p{}",
+        root_ts.replace('.', "")
+    );
+    assert!(page.contains(&permalink) && page.contains("Open in Slack"));
+    assert!(page.contains("· Slack") && page.contains("· Console"));
+    let messages = page
+        .split("<ol class=\"messages\">")
+        .nth(1)
+        .unwrap()
+        .split("</ol>")
+        .next()
+        .unwrap();
+    let expected = [
+        "Kick off in the console",
+        "Follow up from Slack",
+        ">closed<",
+    ];
+    for text in expected {
+        assert_eq!(messages.matches(text).count(), 1, "{messages}");
+    }
+    assert!(messages.find(expected[0]) < messages.find(expected[1]));
+    assert!(messages.find(expected[1]) < messages.find(expected[2]));
+    let items = fake.items();
+    assert_eq!(items.len(), 2, "one root and the native Slack reply");
+    assert_eq!(items[0]["ts"], root_ts);
+    assert_eq!(items[1]["thread_ts"], root_ts);
+    assert_eq!(items[1]["text"], "Follow up from Slack");
+    assert_eq!(
+        items[0]["text"]
+            .as_str()
+            .unwrap()
+            .matches("Kick off in the console")
+            .count(),
+        1
+    );
+    assert_terminal(&items[0], "Closed · Console");
+    assert!(
+        items[0]["blocks"]
+            .to_string()
+            .contains(&format!("{CONSOLE}{path}"))
+    );
+
+    // The other direction keeps a native Slack root, with controls in a bot reply.
+    let native_ts = format!("{}.900000", Utc::now().timestamp());
+    let native = json!({
+        "type": "app_mention", "ts": native_ts, "channel": "CQA", "user": "UOWNER",
+        "text": "<@UQABOT> Discuss the next release\nStart in Slack"
+    });
+    let start = json!({
+        "type": "events_api", "envelope_id": "start",
+        "payload": { "type": "event_callback", "team_id": "TQA", "event": native }
+    });
+    fake.state.posts.lock().unwrap().items.push(native);
+    fake.send(
+        &adapter,
+        vec![
+            start.clone(),
+            replace(start, "/envelope_id", json!("start-retry")),
+        ],
+    )
+    .await;
+    let start_seq = deliver_next(&adapter, &mut outbound).await;
+    let id = adapter.thread_for(&native_ts).await.unwrap().unwrap();
+    let thread = hgl_ai_owner::wait_folded(&console, &id, start_seq, Duration::from_secs(3))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.messages.len(), 1);
+    assert_eq!(thread.messages[0].source(), "Slack");
+    let control = fake.items().last().unwrap().clone();
+    assert_eq!(control["thread_ts"], native_ts);
+    assert!(!control["text"].as_str().unwrap().contains("Start in Slack"));
+    let answer = client
+        .post(format!("{base}/t/{id}/message"))
+        .header(COOKIE, &cookie)
+        .header(ORIGIN, CONSOLE)
+        .header(CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body("csrf=csrf-token&body=Continue+in+the+console")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(answer.status(), StatusCode::SEE_OTHER);
+    deliver_next(&adapter, &mut outbound).await;
+    let continued = fake.items().last().unwrap().clone();
+    assert_eq!(continued["thread_ts"], native_ts);
+    assert!(
+        continued["blocks"]
+            .to_string()
+            .contains(&format!("{CONSOLE}/t/{id}"))
+    );
+    let action = action_ts(&control, 950_000);
+    fake.send(
+        &adapter,
+        vec![click("close-native", &control, "hgl_close", &action)],
+    )
+    .await;
+    let close_seq = deliver_next(&adapter, &mut outbound).await;
+    let thread = hgl_ai_owner::wait_folded(&console, &id, close_seq, Duration::from_secs(3))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(thread.state, ThreadState::Closed);
+    assert_eq!(thread.messages.last().unwrap().source(), "Slack");
+    assert_terminal(&fake.items()[3], "Closed · Slack");
+}
+
+#[tokio::test]
+async fn socket_mode_retries_quick_disconnects_with_growing_delays() {
+    if Command::new("nats-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: nats-server is unavailable");
+        return;
+    }
+    let hub = Hub::new();
+    let _server = hub.start().await;
+    let slack = hub.bus("slack").await;
+    let fake = FakeSlack::start().await;
+    let adapter = fake.adapter(&slack).await;
+    let disconnects = async {
+        let mut previous = None;
+        for min_ms in [0, 500, 1000, 2000] {
+            let (stream, _) = fake.listener.accept().await.unwrap();
+            if let Some(last) = previous {
+                assert!(Instant::now() - last >= Duration::from_millis(min_ms));
+            }
+            let mut ws = ServerBuilder::new().accept(stream).await.unwrap();
+            previous = Some(Instant::now());
+            ws.send(Message::text(json!({"type": "disconnect"}).to_string()))
+                .await
+                .unwrap();
+        }
+    };
+    tokio::select! {
+        result = timeout(Duration::from_secs(12), disconnects) => result.unwrap(),
+        () = adapter.socket_loop() => panic!("Slack socket loop exited"),
     }
 }

@@ -1,23 +1,30 @@
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::{Context as _, Result, bail, ensure};
-use reqwest::{Client, RequestBuilder};
+use reqwest::{Client, RequestBuilder, StatusCode, header::RETRY_AFTER};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tokio::net::TcpStream;
+use tokio::time::{Instant, sleep_until};
 use tokio_websockets::{ClientBuilder, Limits, MaybeTlsStream, WebSocketStream};
 
+use crate::retry::RetryAfter;
 use crate::slack_timestamp;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 const METADATA_TYPE: &str = "hgl_ai_question_event";
 
+#[derive(Clone)]
 pub struct Web {
     client: Client,
     base: String,
     app: String,
     bot: String,
+    limited: Arc<Mutex<HashMap<&'static str, Instant>>>,
+    next_post: Arc<tokio::sync::Mutex<Instant>>,
 }
 
 #[derive(Deserialize)]
@@ -87,15 +94,43 @@ impl Web {
             base,
             app,
             bot,
+            limited: Arc::default(),
+            next_post: Arc::new(tokio::sync::Mutex::new(Instant::now())),
         })
     }
 
-    async fn call<T: DeserializeOwned>(&self, method: &str, request: RequestBuilder) -> Result<T> {
+    async fn call<T: DeserializeOwned>(
+        &self,
+        method: &'static str,
+        request: RequestBuilder,
+    ) -> Result<T> {
+        let now = Instant::now();
+        if let Some(until) = self.limited.lock().unwrap().get(method).copied()
+            && until > now
+        {
+            return Err(RetryAfter(until - now).into());
+        }
         // URLs from Slack and errors from the HTTP client can contain credentials.
         let response = request
             .send()
             .await
             .map_err(|_| anyhow::anyhow!("{method}: request failed"))?;
+        if response.status() == StatusCode::TOO_MANY_REQUESTS {
+            // Slack sends delta seconds. Keep the method unavailable to both loops.
+            let now = Instant::now();
+            let until = response
+                .headers()
+                .get(RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()?.parse::<u64>().ok())
+                .and_then(|seconds| now.checked_add(Duration::from_secs(seconds)))
+                .unwrap_or(now + Duration::from_secs(30));
+            let mut limits = self.limited.lock().unwrap();
+            let until = limits
+                .entry(method)
+                .and_modify(|old| *old = (*old).max(until))
+                .or_insert(until);
+            return Err(RetryAfter(until.saturating_duration_since(now)).into());
+        }
         ensure!(
             response.status().is_success(),
             "{method}: HTTP {}",
@@ -199,6 +234,12 @@ impl Web {
         text: &str,
         blocks: &[Value],
     ) -> Result<String> {
+        {
+            // The configured channel is shared by live traffic and the initial replay.
+            let mut next = self.next_post.lock().await;
+            sleep_until(*next).await;
+            *next = Instant::now() + Duration::from_secs(1);
+        }
         #[derive(Serialize)]
         struct Post<'a> {
             channel: &'a str,
@@ -258,6 +299,28 @@ impl Web {
             "{method}: unexpected channel or message timestamp"
         );
         Ok(sent.ts)
+    }
+
+    pub async fn permalink(&self, channel: &str, ts: &str) -> Result<String> {
+        #[derive(Deserialize)]
+        struct Link {
+            permalink: String,
+        }
+        let method = "chat.getPermalink";
+        let link: Link = self
+            .call(
+                method,
+                self.client
+                    .get(format!("{}/{method}", self.base))
+                    .bearer_auth(&self.bot)
+                    .query(&[("channel", channel), ("message_ts", ts)]),
+            )
+            .await?;
+        ensure!(
+            hgl_ai_config::slack::valid_permalink(&link.permalink),
+            "Slack returned an invalid permalink"
+        );
+        Ok(link.permalink)
     }
 
     pub async fn update(
@@ -329,8 +392,13 @@ impl Web {
     }
 
     /// Look up a root by its exact timestamp if its reverse mapping is still being written.
-    pub async fn root_at(&self, channel: &str, ts: &str) -> Result<Option<Posted>> {
-        let page = self.history(channel, None, ts, Some(ts), "").await?;
+    pub async fn message_at(
+        &self,
+        channel: &str,
+        parent: Option<&str>,
+        ts: &str,
+    ) -> Result<Option<Posted>> {
+        let page = self.history(channel, parent, ts, Some(ts), "").await?;
         Ok(page.messages.into_iter().find(|message| message.ts == ts))
     }
 

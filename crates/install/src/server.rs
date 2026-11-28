@@ -188,7 +188,7 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
     if o.slack {
         if srv.units != hgl_ai_config::Units::System || o.services || srv.auth != HubAuth::Users {
             return Err(other(
-                "Slack needs system services and an NKey hub (server install --users)",
+                "Slack requires a dedicated server user with system services and an NKey hub. Run server install --slack --users without --same-user",
             ));
         }
         if !o.console || cfg.console.is_none() || cfg.slack.is_none() {

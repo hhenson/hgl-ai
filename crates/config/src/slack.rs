@@ -14,6 +14,10 @@ pub struct Slack {
 }
 
 impl Slack {
+    pub fn link_key(&self, id: &str) -> String {
+        format!("links.{}_{}.{id}", self.team, self.channel)
+    }
+
     pub fn validate(&self) -> Result<(), String> {
         for (field, value, prefixes) in [
             ("team", self.team.as_str(), "T"),
@@ -32,4 +36,20 @@ impl Slack {
         }
         hgl_ai_proto::check_handle(&self.handle).map_err(|e| format!("[slack] handle: {e}"))
     }
+}
+
+/// A message link returned by Slack, safe to put in a console link.
+pub fn valid_permalink(link: &str) -> bool {
+    let Some((host, path)) = link
+        .strip_prefix("https://")
+        .and_then(|url| url.split_once('/'))
+    else {
+        return false;
+    };
+    host.ends_with(".slack.com")
+        && host
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'.' | b'-'))
+        && path.starts_with("archives/")
+        && !path.chars().any(char::is_whitespace)
 }

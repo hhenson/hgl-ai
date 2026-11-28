@@ -74,6 +74,12 @@ fn plain(text: &str) -> Value {
     json!({ "type": "plain_text", "text": text })
 }
 
+pub fn console_link(url: &str) -> Value {
+    json!({ "type": "section", "text": {
+        "type": "mrkdwn", "text": format!("<{url}|Open in console>"), "verbatim": true
+    } })
+}
+
 fn button(action: &str, label: &str, value: &str) -> Value {
     json!({ "type": "button", "action_id": action, "text": plain(label), "value": value })
 }
@@ -231,17 +237,13 @@ impl Adapter<'_> {
                     || container.is_ephemeral
                     || container.is_app_unfurl
                     || container.message_ts != message.ts
-                    || message
-                        .thread_ts
-                        .as_ref()
-                        .is_some_and(|ts| ts != &message.ts)
                     || (message.user.as_deref() != Some(&self.bot.user_id)
                         && message.bot_id.as_deref() != Some(&self.bot.bot_id))
                 {
                     return Ok(None);
                 }
                 if let [click] = actions.as_slice() {
-                    self.handle_click(&container.message_ts, click, trigger_id.as_deref())
+                    self.handle_click(&message, click, trigger_id.as_deref())
                         .await?;
                 }
                 Ok(None)
@@ -255,7 +257,13 @@ impl Adapter<'_> {
         }
     }
 
-    async fn handle_click(&self, parent: &str, click: &Click, trigger: Option<&str>) -> Result<()> {
+    async fn handle_click(
+        &self,
+        message: &Source,
+        click: &Click,
+        trigger: Option<&str>,
+    ) -> Result<()> {
+        let parent = message.thread_ts.as_deref().unwrap_or(&message.ts);
         let (Some(root), Some(at)) = (slack_timestamp(parent), slack_timestamp(&click.action_ts))
         else {
             return Ok(());

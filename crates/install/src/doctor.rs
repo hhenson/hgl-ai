@@ -4,6 +4,7 @@
 use std::path::Path;
 use std::time::Duration;
 
+use hgl_ai_config::slack::{APP_TOKEN_FILE, BOT_TOKEN_FILE};
 use hgl_ai_config::{CODEX_PROFILE, Config, ServerUser, codex_profile};
 use hgl_ai_proto::Runtime;
 use serde::Serialize;
@@ -306,12 +307,59 @@ fn server_user(sys: &dyn System, c: &Config, me: Option<&str>) -> Option<ServerU
     let (name, home) =
         service::system_account(sys, Service::Hub).filter(|(n, _)| Some(n.as_str()) != me)?;
     let home = home.or_else(|| crate::system::home_of(sys, &name))?;
+    let slack = service::system_account(sys, Service::Slack).is_some_and(|(user, _)| user == name);
     Some(ServerUser {
         name,
         home: home.display().to_string(),
         console_url: None,
+        slack,
         client_user: None,
     })
+}
+
+fn slack_file_checks(sys: &dyn System, server_user: Option<&ServerUser>) -> Vec<Check> {
+    let env = sys.env();
+    let (dir, owner) = match server_user {
+        Some(user) => (
+            env.expand(&user.home).join(".config/hgl-ai"),
+            Some(user.name.as_str()),
+        ),
+        None => (env.config_dir(), None),
+    };
+    ["hub-users/slack.cred", BOT_TOKEN_FILE, APP_TOKEN_FILE]
+        .into_iter()
+        .map(|file| {
+            let path = dir.join(file);
+            let name = format!("Slack {file}");
+            let fix = "`hgl-ai server install --slack --keep-token`";
+            let mut stat = match env.os {
+                crate::Os::Linux => Cmd::new("stat").args(["-c", "%U %a"]),
+                crate::Os::MacOs => Cmd::new("stat").args(["-f", "%Su %Lp"]),
+            }.arg(path.display().to_string());
+            if let Some(owner) = owner {
+                stat = Cmd::new("sudo").args(["-n", "-u", owner, "sh", "-c",
+                    "if test -f \"$1\" && test ! -L \"$1\"; then shift; exec \"$@\"; else echo missing; fi",
+                    "sh", &path.display().to_string()]).arg(stat.program).args(stat.args);
+            } else if !sys.exists(&path) {
+                return Check::fail(name, "missing", fix);
+            }
+            let want = owner.map(str::to_string).or_else(|| user_name(sys));
+            match sys.query(&stat) {
+                Ok(out) if out.ok() => {
+                    let shown = out.stdout.trim();
+                    if shown == "missing" {
+                        Check::fail(name, "missing or not a regular file", fix)
+                    } else if want.is_some_and(|user| shown == format!("{user} 600")) {
+                        Check::ok(name, "owned by the server user, mode 600")
+                    } else {
+                        Check::fail(name, format!("owner and mode {shown}, expected server user and 600"), fix)
+                    }
+                }
+                _ if owner.is_some() => Check::warn(name, "could not inspect as the server user", "run doctor as the server user"),
+                _ => Check::fail(name, "could not inspect file", fix),
+            }
+        })
+        .collect()
 }
 
 /// The server side and the client side apart (docs/install.md): the server user's home
@@ -750,6 +798,11 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             .server
             .as_ref()
             .is_some_and(|s| s.units == hgl_ai_config::Units::System);
+        let slack =
+            (system_units && c.slack.is_some()) || su.as_ref().is_some_and(|user| user.slack);
+        if slack {
+            out.extend(slack_file_checks(sys, su.as_ref()));
+        }
         // The server user (a system install) has no client of its own, nor has an
         // installer whose client is another user.
         let mut svcs = if system_units || client_user.is_some() {
@@ -767,6 +820,9 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 Service::Console,
                 "`hgl-ai server install --console-url https://<stable name>`".into(),
             ));
+        }
+        if slack {
+            svcs.push((Service::Slack, "`hgl-ai server install --slack`".into()));
         }
         // The client's own services (bridge, builder) are never the server user's.
         let client = |s: Service| matches!(s, Service::Bridge | Service::Builder);
@@ -1207,6 +1263,7 @@ mod tests {
             name: "hgl-ai".into(),
             home: "/var/lib/hgl-ai".into(),
             console_url: None,
+            slack: false,
             client_user: None,
         });
         crate::save_config(&f, &f.env, &cfg).unwrap();
@@ -1294,6 +1351,7 @@ mod tests {
             name: "hgl-ai".into(),
             home: "/var/lib/hgl-ai".into(),
             console_url: None,
+            slack: false,
             client_user: Some("agents".into()),
         });
         crate::save_config(&f, &f.env, &cfg).unwrap();

@@ -82,8 +82,9 @@ hgl-ai ...` (`server user add`, `doctor`).
 
 ### Slack Q&A
 
-Use the existing Slack app with Socket Mode, `chat:write`, `groups:history` and
-the `message.groups` bot event. Enable `settings.interactivity.is_enabled` in the
+Use the existing Slack app with Socket Mode, `chat:write`, `groups:history`,
+`app_mentions:read`, and the `message.groups` and `app_mention` bot events.
+Enable `settings.interactivity.is_enabled` in the
 app manifest for the answer and Close buttons. Socket Mode delivers their callbacks
 over the outbound connection. Install it in the workspace and invite it to the
 private `#hgl-qa` channel. In the server user's configuration add the workspace,
@@ -103,7 +104,8 @@ Permissions**. Run `hgl-ai server install --slack --keep-token --print-root-step
 and review the printed script before running it. Paste the tokens at its
 no-echo prompts. The script writes `slack-app.token` and `slack-bot.token` under
 the server user's `~/.config/hgl-ai/`, both mode 0600. Enter keeps a token file
-already in place.
+already in place. With `--keep-token`, only missing Slack tokens are prompted for.
+A plain server reinstall retains the Slack service once enabled.
 
 The script provisions the Slack hub user and starts `hgl-ai-slack` as the server
 user alongside the console. The adapter opens outbound HTTPS and WebSocket
@@ -139,6 +141,7 @@ hgl-ai server user ...`).
 
 The console keeps session state in `HGL_CONSOLE`. The Slack adapter reads its own
 delivery state, its durable `HGL_OWNER` feed and opening events by sequence.
+The console can read the Slack permalink index.
 Seat, coordinator and builder users read `HGL_OWNER` through short-lived consumers.
 
 ```sh

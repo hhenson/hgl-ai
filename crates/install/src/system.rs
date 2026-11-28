@@ -56,7 +56,7 @@ pub struct SystemOpts {
     /// The OS user this host's client runs as, when not the installer: the client
     /// credential goes to it, never to the installer.
     pub client_user: Option<String>,
-    /// Keep the coordinator's GitHub token without asking for it.
+    /// Keep the existing GitHub and Slack tokens without asking for them.
     pub keep_token: bool,
     pub wait: Duration,
 }
@@ -71,6 +71,7 @@ pub struct Previous {
     pub user: Option<String>,
     pub home: Option<String>,
     pub console_url: Option<String>,
+    pub slack: bool,
     pub client_user: Option<String>,
 }
 
@@ -92,6 +93,8 @@ pub fn previous(sys: &dyn System) -> Previous {
                 p.parse::<u16>().ok(),
             )
         });
+    let slack = su.slack
+        || service::system_account(sys, Service::Slack).is_some_and(|(user, _)| user == su.name);
     Previous {
         host: Some(cfg.host),
         listen: addr.as_ref().map(|(h, _)| h.clone()),
@@ -99,6 +102,7 @@ pub fn previous(sys: &dyn System) -> Previous {
         user: Some(su.name),
         home: Some(su.home),
         console_url: su.console_url,
+        slack,
         client_user: su.client_user,
     }
 }
@@ -182,13 +186,33 @@ impl Root<'_> {
     /// answer keeps the old one and runs nothing. Printed, the script's own shell reads
     /// it ([`SECRET_PROMPT`]) and pipes it. Nothing under `sudo` reads the terminal:
     /// under sudo's own pseudo-terminal it never sees the keys (hgl-ai#90).
-    fn secret(&mut self, why: &str, prompt: &str, to: Cmd) -> Result<()> {
+    fn secret(&mut self, why: &str, prompt: &str, to: Cmd, keep_if: Option<Cmd>) -> Result<()> {
         let line = format!("sudo {to}");
+        if let Some(check) = &keep_if {
+            if self.print_only {
+                self.script.push(format!("if ! sudo {check}; then"));
+            } else if self
+                .sys
+                .query(
+                    &Cmd::new("sudo")
+                        .arg("-n")
+                        .arg(&check.program)
+                        .args(check.args.iter()),
+                )
+                .is_ok_and(|out| out.ok())
+            {
+                self.note(&format!("{why}: kept (--keep-token)"));
+                return Ok(());
+            }
+        }
         if self.print_only {
             self.script.push(format!(
                 "# {why}; Enter keeps the current one\n{}\n[ -z \"$t\" ] || printf '%s\\n' \"$t\" | {line}",
                 SECRET_PROMPT.replace("PROMPT", &shell_quote(prompt))
             ));
+            if keep_if.is_some() {
+                self.script.push("fi".into());
+            }
             return Ok(());
         }
         self.sys.say(&format!(
@@ -204,7 +228,7 @@ impl Root<'_> {
             .read_secret(prompt)
             .map_err(|e| other(format!("reading the answer from the terminal: {e}")))?
             .ok_or_else(|| {
-                other("no terminal to read the answer on (`--keep-token` keeps the current one)")
+                other("no terminal to read the token on (use a terminal to enter missing tokens or `--keep-token` to keep existing ones)")
             })?;
         let answer = answer.trim();
         if answer.is_empty() {
@@ -654,23 +678,20 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
                 "sh",
                 &layout.github_token().display().to_string(),
             ]),
+            None,
         )?;
     }
     if o.slack {
         let dir = layout.config();
         let dir = dir.parent().expect("server configuration directory");
         for (kind, file) in [("bot", BOT_TOKEN_FILE), ("app-level", APP_TOKEN_FILE)] {
+            let file = dir.join(file).display().to_string();
             root.secret(
                 &format!("the Slack {kind} token, written as {user} (mode 0600)"),
                 &format!("Slack {kind} token (Enter keeps the current one): "),
-                Cmd::new("-u").args([
-                    user,
-                    "sh",
-                    "-c",
-                    SECRET_WRITER,
-                    "sh",
-                    &dir.join(file).display().to_string(),
-                ]),
+                Cmd::new("-u").args([user, "sh", "-c", SECRET_WRITER, "sh", &file]),
+                o.keep_token
+                    .then(|| Cmd::new("-u").args([user, "test", "-f", &file])),
             )?;
         }
     }
@@ -730,6 +751,7 @@ pub fn install(sys: &dyn System, o: &SystemOpts) -> Result<Option<String>> {
         name: user.to_string(),
         home: home.clone(),
         console_url: o.console_url.clone().filter(|_| o.console),
+        slack: o.slack,
         client_user: client_user.map(str::to_string),
     });
     cfg.hub.url = crate::server::local_url(&o.listen, o.port);
@@ -964,6 +986,7 @@ mod tests {
         for want in [BOT_TOKEN_FILE, APP_TOKEN_FILE, "stty -echo", "umask 077"] {
             assert!(script.find(want).unwrap() < start, "{want}");
         }
+        assert_eq!(script.matches("if ! sudo -u hgl-ai test -f ").count(), 2);
         let dir = f.env.home.join(".local/share/hgl-ai/system-units");
         let unit = std::fs::read_to_string(dir.join("hgl-ai-slack.service")).unwrap();
         assert!(unit.contains("User=hgl-ai\n"));
@@ -1052,6 +1075,7 @@ mod tests {
             name: "hgl-ai".into(),
             home: "/var/lib/hgl-ai".into(),
             console_url: None,
+            slack: false,
             client_user: None,
         };
         assert!(status(&f, &su, None));
@@ -1149,6 +1173,21 @@ mod tests {
             Some("https://console.example.com")
         );
         assert_eq!(p.user.as_deref(), Some("hgl-ai"));
+    }
+
+    #[test]
+    fn a_reinstall_keeps_slack_and_skips_existing_slack_tokens() {
+        let d = tempfile::tempdir().unwrap();
+        let f = fake(d.path(), Os::Linux, true);
+        let mut o = opts(false);
+        o.slack = true;
+        o.keep_token = true;
+        install(&f, &o).unwrap();
+        assert!(previous(&f).slack);
+        assert!(f.output().contains("Slack bot token"));
+        assert!(f.output().contains("Slack app-level token"));
+        assert_eq!(f.output().matches("kept (--keep-token)").count(), 3);
+        assert_eq!(f.secrets.borrow().len(), 1, "no secret prompt ran");
     }
 
     /// `script` with the terminal replaced by files under `d`, `answer` its input, and
