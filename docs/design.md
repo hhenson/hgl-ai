@@ -52,7 +52,7 @@ hgl-ai server install [--listen ADDR] [--port 4222] [--store DIR] [--users] [--n
                 [--console-listen ADDR] [--server-user NAME] [--server-home DIR]
                 [--print-root-steps] [--same-user]
 hgl-ai server start|stop|status|uninstall
-hgl-ai server user add NAME --role seat|coord|console|admin [--nkey PUBKEY] [--rotate]
+hgl-ai server user add NAME --role ROLE [--nkey PUBKEY] [--rotate]
 hgl-ai server user list|remove NAME
 hgl-ai client install --hub URL --token-file FILE --host LABEL [--work-root DIR] [--no-builder]
 hgl-ai client uninstall

@@ -96,6 +96,7 @@ impl Hub {
             ("lab2", Role::Seat),
             ("hub-slack", Role::Slack),
             ("screen", Role::Screen),
+            ("screen-rules", Role::ScreenRules),
         ] {
             let text = reg.issue(name, role, false).unwrap();
             creds.insert(name, hgl_ai_bus::parse_credential(&text).unwrap().unwrap());
@@ -1420,14 +1421,60 @@ use async_nats::jetstream::{self, consumer, kv};
 use hgl_ai_install::users::{Target, access_table, local_subject};
 
 /// The user of each role with an account.
-const ROLE_USERS: [(Role, &str); 6] = [
+const ROLE_USERS: [(Role, &str); 7] = [
     (Role::Seat, "build-1"),
     (Role::Coord, "hub-coord"),
     (Role::Builder, "lab1-builder"),
     (Role::Console, "console"),
     (Role::Slack, "hub-slack"),
     (Role::Screen, "screen"),
+    (Role::ScreenRules, "screen-rules"),
 ];
+
+#[tokio::test]
+async fn single_account_screen_rules_direct_permissions() {
+    let Some(hub) = Hub::start() else { return };
+    let admin = seeded(&hub).await;
+    let rules = hub.raw("screen-rules").await;
+    let log = "$JS.API.DIRECT.GET.KV_HGL_SCREEN.$KV.HGL_SCREEN.log.seed";
+    assert_eq!(rules.request(log, "".into()).await.unwrap().payload, "seed");
+    let js = jetstream::new(rules);
+    let allowed = "$KV.HGL_SCREEN.rule.allowed";
+    js.publish(allowed, "rule".into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(stored(&admin, allowed).await);
+
+    for (who, subjects) in [
+        ("build-1", &["$KV.HGL_SCREEN.rule.seat"][..]),
+        ("screen", &["$KV.HGL_SCREEN.rule.screen"][..]),
+        (
+            "screen-rules",
+            &[
+                "$KV.HGL_SCREEN.log.denied",
+                "$KV.HGL_SCREEN.other",
+                "$KV.HGL_STATE.denied",
+                "hgl.notes.screen.denied",
+            ][..],
+        ),
+    ] {
+        let (client, mut denied) = spy(&hub, who).await;
+        for &subject in subjects {
+            client.publish(subject, "denied".into()).await.unwrap();
+        }
+        client.flush().await.unwrap();
+        let errors = refusals(&mut denied, subjects.len()).await;
+        for &subject in subjects {
+            assert!(
+                errors.iter().any(|e| e.contains(&format!("\"{subject}\""))),
+                "{who}: {subject}"
+            );
+            assert!(!stored(&admin, subject).await, "{who}: {subject}");
+        }
+    }
+}
 
 #[tokio::test]
 async fn screen_notes_require_the_screen_sender_subject_and_kind_on_both_layouts() {
@@ -1666,7 +1713,7 @@ async fn seeded(hub: &Hub) -> jetstream::Context {
     }
     let screen = js.get_key_value(KV_SCREEN).await.unwrap();
     screen.put("rule.seed", "seed".into()).await.unwrap();
-    screen.put("log.seed", "private".into()).await.unwrap();
+    screen.put("log.seed", "seed".into()).await.unwrap();
     for s in [
         "hgl.notes.seed",
         "hgl.notes.screen",
@@ -1750,8 +1797,10 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                                 .map(|m| String::from_utf8_lossy(&m.payload).into_owned())
                             }
                         };
-                        let (key, private) = if bucket == KV_SCREEN {
+                        let (key, private) = if role == Role::Screen {
                             ("rule.seed", "log.seed")
+                        } else if role == Role::ScreenRules {
+                            ("log.seed", "rule.seed")
                         } else {
                             ("links.a.b", "d.a.b.c")
                         };
@@ -1900,7 +1949,7 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
         }
         // `doctor`'s `telemetry consumers` check lists the telemetry streams' consumers
         // (hgl-ai#105); only roles with access to all of them run it.
-        if !matches!(role, Role::Slack | Role::Screen) {
+        if !matches!(role, Role::Slack | Role::Screen | Role::ScreenRules) {
             hgl_ai_install::hub::lasting_consumers(&js)
                 .await
                 .unwrap_or_else(|e| panic!("{who} ({role}): {e}"));
@@ -1919,6 +1968,7 @@ async fn accounts_refuse_every_write_outside_a_row() {
     let patterns: Vec<String> = access_table()
         .iter()
         .filter_map(|r| write_pattern(&r.target))
+        .chain([format!("$KV.{KV_SCREEN}.>")])
         .collect();
     for (role, who) in ROLE_USERS {
         let (c, mut rx) = spy(&hub, who).await;
@@ -1951,10 +2001,12 @@ async fn accounts_refuse_every_write_outside_a_row() {
         }
 
         // By the reply route: requests the role may make, replying onto each subject.
-        let mut requests = vec![(
-            format!("{}.INFO", hgl_ai_proto::HUB_API_PREFIX),
-            String::new(),
-        )];
+        let request = if role == Role::ScreenRules {
+            "$JS.API.DIRECT.GET.KV_HGL_SCREEN.$KV.HGL_SCREEN.log.seed"
+        } else {
+            "$JS.API.INFO"
+        };
+        let mut requests = vec![(local_subject(request), String::new())];
         if let Some(w) = mine.first() {
             requests.push((local_subject(&sample(w, &format!("ok-{role}"))), "x".into()));
         }
@@ -1968,26 +2020,27 @@ async fn accounts_refuse_every_write_outside_a_row() {
             }
             _ => None,
         });
-        let (stream, durable, create) = pullable.unwrap();
-        if create {
-            js.get_stream(&stream)
-                .await
-                .unwrap()
-                .create_consumer(consumer::pull::Config {
-                    durable_name: Some(durable.clone()),
-                    ack_policy: consumer::AckPolicy::Explicit,
-                    ..Default::default()
-                })
-                .await
-                .unwrap();
+        if let Some((stream, durable, create)) = pullable {
+            if create {
+                js.get_stream(&stream)
+                    .await
+                    .unwrap()
+                    .create_consumer(consumer::pull::Config {
+                        durable_name: Some(durable.clone()),
+                        ack_policy: consumer::AckPolicy::Explicit,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+            }
+            requests.push((
+                format!(
+                    "{}.CONSUMER.MSG.NEXT.{stream}.{durable}",
+                    hgl_ai_proto::HUB_API_PREFIX
+                ),
+                r#"{"batch":5,"expires":500000000}"#.into(),
+            ));
         }
-        requests.push((
-            format!(
-                "{}.CONSUMER.MSG.NEXT.{stream}.{durable}",
-                hgl_ai_proto::HUB_API_PREFIX
-            ),
-            r#"{"batch":5,"expires":500000000}"#.into(),
-        ));
         for (req, body) in &requests {
             for s in &denied {
                 for reply in [s.clone(), local_subject(s)] {
