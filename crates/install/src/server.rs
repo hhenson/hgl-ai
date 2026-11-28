@@ -185,6 +185,11 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
         }
         cfg.console = Some(c);
     }
+    // The console's page reads the telemetry through the hub's WebSocket listener.
+    if cfg.console.is_some() && srv.auth == HubAuth::Users && srv.websocket_port.is_none() {
+        srv.websocket_port = Some(hgl_ai_config::DEFAULT_WEBSOCKET_PORT);
+        cfg.server = Some(srv.clone());
+    }
     if o.slack {
         if srv.units != hgl_ai_config::Units::System || o.services || srv.auth != HubAuth::Users {
             return Err(other(
@@ -275,6 +280,13 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
                     Role::Console,
                     &users::cred_path(&cdir, CONSOLE_USER),
                 )?);
+                // Read-only by subject, for the console's page (docs/owner.md §3; replies:
+                // hgl-ai#141).
+                let viewer = users::cred_path(&cdir, VIEWER_USER);
+                ensure_user(sys, &mut reg, VIEWER_USER, Role::Viewer, &viewer)?;
+                if let Some(c) = cfg.console.as_mut() {
+                    c.viewer_credential = Some(env.contract(&viewer));
+                }
             }
             if o.slack {
                 ensure_user(
@@ -291,7 +303,13 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
                 reg.users.len(),
                 env.contract(&users::registry_path(&data_dir))
             ));
-            nats::render_conf(&srv.listen, srv.port, &store, &nats::Auth::Users(&reg))
+            nats::render_conf_ws(
+                &srv.listen,
+                srv.port,
+                &store,
+                &nats::Auth::Users(&reg),
+                nats::websocket_of(&cfg).as_ref(),
+            )
         }
     };
 
@@ -357,6 +375,9 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
                 sys,
                 &format!("service: {} started", service_name(sys, Service::Console)),
             );
+            if let Some(ws) = nats::websocket_of(&cfg) {
+                sys.say(&crate::system::console_page_step(ws.port));
+            }
         } else {
             sys.say(
                 "console: not installed: no [console] in the configuration; rerun with \
@@ -414,6 +435,8 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
 
 /// The hub user name of the console.
 pub const CONSOLE_USER: &str = "console";
+/// The hub user name the console's page reads the telemetry as.
+pub const VIEWER_USER: &str = "viewer";
 pub const SLACK_USER: &str = "slack";
 
 #[derive(Default)]
@@ -507,11 +530,12 @@ fn apply_users(
     let env = sys.env();
     let data_dir = env.expand(&cfg.paths.data_dir);
     let conf = data_dir.join("nats.conf");
-    let text = nats::render_conf(
+    let text = nats::render_conf_ws(
         &srv.listen,
         srv.port,
         &env.expand(&srv.store_dir),
         &nats::Auth::Users(reg),
+        nats::websocket_of(cfg).as_ref(),
     );
     sys.write(&conf, text.as_bytes(), token::MODE)
         .map_err(io_at(&conf))?;
@@ -779,7 +803,7 @@ mod tests {
         assert_eq!(c.describe(), "hub user hub (seat)");
         assert_eq!(f.mode(&tok_path).unwrap(), 0o600);
         let creds = home.join(".config/hgl-ai/hub-users");
-        for n in ["hub-admin", "hub-coord", "console"] {
+        for n in ["hub-admin", "hub-coord", "console", "viewer"] {
             assert_eq!(
                 f.mode(&creds.join(format!("{n}.cred"))).unwrap(),
                 0o600,
@@ -800,12 +824,14 @@ mod tests {
                 ("console", Role::Console),
                 ("hub", Role::Seat),
                 ("hub-admin", Role::Admin),
-                ("hub-coord", Role::Coord)
+                ("hub-coord", Role::Coord),
+                ("viewer", Role::Viewer)
             ]
         );
         let conf_path = data.join("nats.conf");
         let conf = std::fs::read_to_string(&conf_path).unwrap();
         assert!(!conf.contains("token:"), "{conf}");
+        assert!(!conf.contains("websocket"), "no console, no page to serve");
         for u in &reg.users {
             assert!(conf.contains(&u.nkey), "{}", u.name);
         }
@@ -1051,6 +1077,24 @@ mod tests {
             "Environment=\"HGL_AI_HUB_CREDENTIAL={}\"",
             home.join(".config/hgl-ai/hub-users/console.cred").display()
         )));
+        // The page's read-only user, and the hub's WebSocket listener for it.
+        assert_eq!(
+            c.viewer_credential.as_deref(),
+            Some("~/.config/hgl-ai/hub-users/viewer.cred")
+        );
+        assert_eq!(cfg.server.as_ref().unwrap().websocket_port, Some(4223));
+        let conf = std::fs::read_to_string(home.join(".local/share/hgl-ai/nats.conf")).unwrap();
+        assert!(
+            conf.contains(
+                "port: 4223\n  no_tls: true\n  allowed_origins: [\"https://hub.example.com\"]"
+            ),
+            "{conf}"
+        );
+        assert!(
+            f.output().contains(
+                "tailscale serve --bg --https=443 --set-path /nats http://127.0.0.1:4223"
+            )
+        );
         let o = ServerOpts {
             console: false,
             ..ServerOpts::default()
