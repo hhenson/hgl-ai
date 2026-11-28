@@ -5,7 +5,7 @@
 //! sends the `receipt`, and removes the checkout. It advertises itself in
 //! `HGL_HOSTS/builder.<label>` with its health, and honours `drain` and `retire`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -1061,6 +1061,18 @@ pub fn lanes(
     cfg: &hgl_ai_config::Config,
     ssh_program: PathBuf,
 ) -> Result<Vec<Arc<Lane>>, ServiceError> {
+    lanes_with(cfg, ssh_program, ssh::Conn::new)
+}
+
+/// Construct lanes using the supplied connection factory.
+pub fn lanes_with<F>(
+    cfg: &hgl_ai_config::Config,
+    ssh_program: PathBuf,
+    connect: F,
+) -> Result<Vec<Arc<Lane>>, ServiceError>
+where
+    F: Fn(&str, &str, PathBuf, &Path, ssh::Dialect) -> std::io::Result<Arc<ssh::Conn>>,
+{
     use hgl_ai_proto::build::builder_inbox;
     let err = |e: &dyn std::fmt::Display| ServiceError::Other(e.to_string());
     let work_root = cfg.work_root().map_err(|e| err(&e))?;
@@ -1090,7 +1102,7 @@ pub fn lanes(
         let label = r.label(&cfg.host);
         let dialect = ssh::Dialect::parse(&r.shell)
             .ok_or_else(|| ServiceError::Other(format!("shell {:?}", r.shell)))?;
-        let conn = ssh::Conn::new(
+        let conn = connect(
             &label,
             &r.ssh,
             ssh_program.clone(),

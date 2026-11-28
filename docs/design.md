@@ -152,7 +152,7 @@ relax_required = ["lint", "test (ubuntu-latest)", "cpp (plain, runtime and core)
                   "cpp (sanitize, runtime and core)", "cpp (sanitize, sdk)"]
 
 [github.gate.hgl-ai]
-checks = ["lint", "test (ubuntu-latest)", "test (macos-latest)"]
+checks = ["lint", "lint (macos-latest)", "test (ubuntu-latest)", "test (macos-latest)"]
 
 [github.gate.hgl-project]
 checks = ["docs/readthedocs.org:hgl-project"]   # a commit status
