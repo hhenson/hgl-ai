@@ -8,7 +8,7 @@ use anyhow::{Context as _, bail};
 use hgl_ai_bridge::holder;
 use hgl_ai_bridge::lock::{self, FileLock};
 use hgl_ai_bus::{Bus, BusError, Delivery, Lease, MAX_NOTE_BYTES, StreamNote};
-use hgl_ai_proto::{Kind, Note, Seat, TaskClass, seat_lock_key};
+use hgl_ai_proto::{Kind, Note, NotePriority, Seat, TaskClass, seat_lock_key};
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::sync::{oneshot, watch};
 use tokio::task::JoinHandle;
@@ -52,6 +52,9 @@ struct SendArgs {
     /// approved, landed, closed, done or note.
     #[arg(long)]
     kind: Kind,
+    /// Priority for the next pending turn (normal or high).
+    #[arg(long, default_value = "normal")]
+    priority: NotePriority,
     /// Repository name, such as hgl-compiler.
     #[arg(long, value_name = "REPO")]
     repo: Option<String>,
@@ -153,6 +156,7 @@ async fn send(ctx: &Ctx, a: SendArgs) -> anyhow::Result<i32> {
         );
     }
     let mut note = Note::new(a.from, a.to, a.kind, body);
+    note.priority = a.priority;
     note.repo = a.repo;
     note.issue = a.issue.unwrap_or(0);
     note.head = a.head;

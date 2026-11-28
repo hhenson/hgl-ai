@@ -123,6 +123,11 @@ before hub users takes one shared token until it moves.
 }
 ```
 
+- Pending turns may carry `priority` (`normal` or `high`; absent means `normal`).
+  `hgl-ai note send --priority high` chooses a high-priority eligible turn first.
+  Sendbacks and reviews of an existing review tree precede new work; ties retain
+  stream order. Gate checks and task endings still apply.
+
 - **PROTO-10 — Revisions are exact.** A note about a pull request revision
   carries its full 40-character `head`. Any verdict applies to that head only.
 - **PROTO-11 — Body.** UTF-8 Markdown. First line names runtime and action,
