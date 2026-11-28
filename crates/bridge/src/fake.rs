@@ -38,6 +38,10 @@ struct Inner {
     hosts: Mutex<Vec<HostRecord>>,
     deleted_hosts: Mutex<Vec<String>>,
     trees: Mutex<BTreeMap<String, TreeRecord>>,
+    /// While set, each `tree_merge` waits for a permit ([`FakeBus::hold_tree_merges`]).
+    merge_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
+    /// `tree_merge` calls waiting at the gate.
+    merges_held: AtomicU64,
     events: Mutex<Vec<(u64, Ev)>>,
     seq: AtomicU64,
     /// name -> (holder, revision)
@@ -52,6 +56,8 @@ struct Inner {
     inbox_broken: AtomicBool,
     /// Lease refreshes fail as if the hub did not answer.
     refresh_down: AtomicBool,
+    /// Lease refreshes hang, as when the hub stalls silently.
+    refresh_hangs: AtomicBool,
     /// `HGL_LOCKS` max_age in milliseconds; 0 is the protocol's.
     lease_max_age_ms: AtomicU64,
 }
@@ -135,6 +141,22 @@ impl FakeBus {
         g(&self.0.trees).clone()
     }
 
+    /// Hold every `tree_merge` before it reads the record, until [`FakeBus::release_tree_merges`].
+    pub fn hold_tree_merges(&self) {
+        *g(&self.0.merge_gate) = Some(Arc::new(tokio::sync::Semaphore::new(0)));
+    }
+
+    pub fn release_tree_merges(&self) {
+        if let Some(s) = g(&self.0.merge_gate).take() {
+            s.close();
+        }
+    }
+
+    /// `tree_merge` calls waiting at the gate now.
+    pub fn tree_merges_held(&self) -> u64 {
+        self.0.merges_held.load(Ordering::SeqCst)
+    }
+
     pub fn last_host(&self) -> Option<HostRecord> {
         g(&self.0.hosts).last().cloned()
     }
@@ -170,6 +192,11 @@ impl FakeBus {
         self.0.refresh_down.store(down, Ordering::SeqCst);
     }
 
+    /// Lease refreshes hang (`true`) until it is cleared, or work.
+    pub fn refresh_hangs(&self, hang: bool) {
+        self.0.refresh_hangs.store(hang, Ordering::SeqCst);
+    }
+
     /// The `max_age` of `HGL_LOCKS` the bridge reads.
     pub fn set_lease_max_age(&self, d: Duration) {
         self.0
@@ -194,6 +221,21 @@ impl Registry for FakeBus {
     async fn tree_put(&self, rec: &TreeRecord) -> Result<()> {
         g(&self.0.trees).insert(rec.key(), rec.clone());
         Ok(())
+    }
+    async fn tree_merge(&self, rec: &TreeRecord) -> Result<TreeRecord> {
+        let gate = g(&self.0.merge_gate).clone();
+        if let Some(s) = gate {
+            self.0.merges_held.fetch_add(1, Ordering::SeqCst);
+            let _ = s.acquire().await;
+            self.0.merges_held.fetch_sub(1, Ordering::SeqCst);
+        }
+        let mut trees = g(&self.0.trees);
+        let mut merged = rec.clone();
+        if let Some(held) = trees.get(&rec.key()) {
+            merged.merge_held(held);
+        }
+        trees.insert(rec.key(), merged.clone());
+        Ok(merged)
     }
     async fn tree_del(&self, key: &str) -> Result<()> {
         g(&self.0.trees).remove(key);
@@ -314,6 +356,9 @@ pub struct FakeLease {
 
 impl LeaseApi for FakeLease {
     async fn refresh(&mut self) -> Result<()> {
+        while self.bus.0.refresh_hangs.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         if self.bus.0.refresh_down.load(Ordering::SeqCst) {
             return Err(BusError::Nats("HGL_LOCKS: no responders".into()));
         }

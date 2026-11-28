@@ -442,13 +442,7 @@ async fn a_sendback_to_another_seat_moves_the_task_there_at_its_class() {
 
     // hgl-ai#44: a sendback moves the task back to w1, into its older tree, kept: that
     // tree now holds the newest handoff, so verdicts without `--to` reach w1 again.
-    // After the startup report, whose listing would otherwise race the turn's record.
-    let reports = h.bus.sent_containing("work_root uses").len();
     let (tx, j) = h.start(&["w1"]);
-    eventually("startup report", || {
-        h.bus.sent_containing("work_root uses").len() > reports
-    })
-    .await;
     let back = h.bus.push(
         "w1",
         note(
@@ -467,6 +461,108 @@ async fn a_sendback_to_another_seat_moves_the_task_there_at_its_class() {
         "the kept tree keeps its seq and takes the newer handoff"
     );
     assert!(w1.handoff_seq > trees["build-1.w2.demo-41"].handoff_seq);
+    stop(tx, j).await;
+}
+
+/// hgl-ai#51: the report lists the trees, then a handoff turn registers a fresher record
+/// before the report writes its listing. The report keeps the turn's `handoff_seq`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_listed_before_a_handoff_turn_keeps_the_turns_record() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+    let key = "build-1.w1.demo-41";
+    assert_eq!(h.bus.trees()[key].handoff_seq, Some(a));
+
+    // The startup report has listed the tree (handoff `a`) and waits to write it.
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its listing", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let back = h.bus.push(
+        "w1",
+        note(
+            Kind::Sendback,
+            "w1",
+            41,
+            "[claude] Sent back: demo#41 at 1f461fa7",
+        ),
+    );
+    eventually("sendback acked", || h.bus.events(back) == [Ev::Ack]).await;
+    assert_eq!(
+        h.bus.trees()[key].handoff_seq,
+        Some(back),
+        "the turn's record"
+    );
+
+    h.bus.release_tree_merges();
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    let rec = &h.bus.trees()[key];
+    assert_eq!(
+        (rec.seq, rec.handoff_seq),
+        (Some(a), Some(back)),
+        "the report did not take the handoff back"
+    );
+    stop(tx, j).await;
+}
+
+/// r3 on #57: the report lists a tree, then `closed` removes it and an `assign` makes the
+/// task's tree anew at that key. The report keeps the newer tree's record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_listed_before_a_tree_was_made_anew_keeps_the_new_record() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+    let key = "build-1.w1.demo-41";
+
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its listing", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let c = h.bus.push(
+        "w1",
+        note(Kind::Closed, "w1", 41, "[claude] Closed: demo#41"),
+    );
+    eventually("closed acked", || h.bus.events(c) == [Ev::Ack]).await;
+    let again = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Again"),
+    );
+    eventually("assign acked", || h.bus.events(again) == [Ev::Ack]).await;
+    assert_eq!(h.bus.trees()[key].seq, Some(again), "the new tree's record");
+
+    h.bus.release_tree_merges();
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    let rec = &h.bus.trees()[key];
+    assert_eq!(
+        (rec.seq, rec.handoff_seq),
+        (Some(again), Some(again)),
+        "the report did not bring the removed tree back"
+    );
     stop(tx, j).await;
 }
 
@@ -2301,6 +2397,72 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
     })
     .await;
     stop(tx, j).await;
+}
+
+/// hgl-ai#65: the hub stalls silently, so every refresh hangs until it times out (`every`).
+/// The refreshes run at once, so with any number of seats each stops before its lease can
+/// expire: its last refresh was at most `every` before the stall, at `every == max_age / 6`.
+async fn hanging_refreshes_stop_every_seat_before_its_lease_can_expire(n: usize) {
+    let mut h = harness();
+    let max_age = Duration::from_secs(3);
+    let every = max_age / 6;
+    h.bus.set_lease_max_age(max_age);
+    h.opts.heartbeat_every = every;
+    let names: Vec<String> = (1..=n).map(|i| format!("w{i}")).collect();
+    let w = h.cfg.seats[0].clone();
+    h.cfg.seats = names
+        .iter()
+        .map(|name| {
+            let mut s = w.clone();
+            s.name = seat(name);
+            s
+        })
+        .collect();
+    h.cfg.validate().unwrap();
+    let only: Vec<&str> = names.iter().map(String::as_str).collect();
+    let (tx, j) = h.start(&only);
+    eventually("every seat served", || {
+        h.bus.last_host().is_some_and(|r| r.seats.len() == n)
+            && names
+                .iter()
+                .all(|s| h.bus.lease_holder(&format!("seat.{s}")).is_some())
+    })
+    .await;
+    h.bus.refresh_hangs(true);
+    let cut = std::time::Instant::now();
+    eventually("every seat stopped", || {
+        let told = h.bus.sent_containing("was not refreshed for");
+        names
+            .iter()
+            .all(|s| told.iter().any(|t| t.sender.as_str() == s))
+    })
+    .await;
+    let took = cut.elapsed();
+    assert!(
+        took < max_age - every,
+        "{n} seats: the last stopped after {took:?}, when its lease could have expired"
+    );
+    assert!(
+        took >= max_age / 2 - every,
+        "{n} seats: not before the deadline: {took:?}"
+    );
+    h.bus.refresh_hangs(false);
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_hanging_refresh_stops_one_seat_before_its_lease_can_expire() {
+    hanging_refreshes_stop_every_seat_before_its_lease_can_expire(1).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_refreshes_stop_three_seats_before_their_leases_can_expire() {
+    hanging_refreshes_stop_every_seat_before_its_lease_can_expire(3).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hanging_refreshes_stop_twenty_seats_before_their_leases_can_expire() {
+    hanging_refreshes_stop_every_seat_before_its_lease_can_expire(20).await;
 }
 
 /// The bot's P2: a removal on `landed` that fails (here the salvage patch cannot be written)

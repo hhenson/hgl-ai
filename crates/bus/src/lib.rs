@@ -945,6 +945,55 @@ impl Bus {
         put_json(store, &rec.key(), rec).await
     }
 
+    /// Register `rec` without losing a fresher record a concurrent writer put under its key
+    /// (hgl-ai#51): a compare-and-set of `rec` merged with the record held
+    /// ([`TreeRecord::merge_held`]), retried on a lost race. Returns the record now held.
+    pub async fn tree_merge(&self, rec: &TreeRecord) -> Result<TreeRecord> {
+        let key = rec.key();
+        check_kv_key(&key)?;
+        let store = self.store(&self.trees, KV_TREES).await?;
+        for attempt in 0..APPEND_ATTEMPTS {
+            let entry = live_entry(store, &key).await?;
+            let held = entry
+                .as_ref()
+                .and_then(|e| serde_json::from_slice::<TreeRecord>(&e.value).ok());
+            let mut merged = rec.clone();
+            if let Some(h) = &held {
+                merged.merge_held(h);
+                if &merged == h {
+                    return Ok(merged);
+                }
+            }
+            let value: bytes::Bytes = serde_json::to_vec(&merged)
+                .map_err(|e| nats(&format!("encoding tree {key}"), e))?
+                .into();
+            let done = match &entry {
+                Some(e) => store
+                    .update(&key, value, e.revision)
+                    .await
+                    .map(drop)
+                    .map_err(|e| {
+                        (
+                            e.kind() == kv::UpdateErrorKind::WrongLastRevision,
+                            e.to_string(),
+                        )
+                    }),
+                None => store.create(&key, value).await.map(drop).map_err(|e| {
+                    (
+                        e.kind() == kv::CreateErrorKind::AlreadyExists,
+                        e.to_string(),
+                    )
+                }),
+            };
+            match done {
+                Ok(()) => return Ok(merged),
+                Err((true, _)) => tokio::time::sleep(backoff(attempt)).await,
+                Err((false, e)) => return Err(nats(&format!("writing tree {key}"), e)),
+            }
+        }
+        Err(BusError::Conflict { key, expected: 0 })
+    }
+
     /// Deregister a tree by its key ([`TreeRecord::key`]). Deleting a missing key succeeds.
     pub async fn tree_del(&self, key: &str) -> Result<()> {
         check_kv_key(key)?;

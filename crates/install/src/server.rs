@@ -280,17 +280,8 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ServerOpts) -> Result
     let verb = if created { "created" } else { "updated" };
     sys.say(&format!("config: {} ({verb})", env.config_path.display()));
     if !o.services {
-        // The server user's step of a system install: its services are system units.
-        // The logs exist before a unit first starts, so root (which opens them for
-        // `StandardOutput=append:`) does not make them its own.
-        let logs = data_dir.join("logs");
-        sys.mkdir(&logs).map_err(io_at(&logs))?;
-        for s in [Service::Hub, Service::Coord, Service::Console] {
-            let log = service::log_path(&data_dir, s);
-            if !sys.exists(&log) {
-                sys.write(&log, b"", 0o600).map_err(io_at(&log))?;
-            }
-        }
+        // The server user's step of a system install: its services are system units,
+        // logging to the journal or a directory root owns (hgl-ai#63), never here.
         return Ok(cfg);
     }
 
@@ -1089,7 +1080,7 @@ mod tests {
     }
 
     /// The server user's step of a system install uses the `nats-server` the install
-    /// chose, and makes the logs before root can.
+    /// chose, and makes no logs in its home: root would open them (hgl-ai#63).
     #[tokio::test]
     async fn server_user_step_uses_the_chosen_nats_server() {
         let d = tempfile::tempdir().unwrap();
@@ -1109,10 +1100,7 @@ mod tests {
             "{out}"
         );
         assert!(f.runs().is_empty(), "nothing downloaded: {:?}", f.runs());
-        let logs = f.env.home.join(".local/share/hgl-ai/logs");
-        for n in ["hub.log", "coord.log", "console.log"] {
-            assert_eq!(f.mode(&logs.join(n)).unwrap(), 0o600, "{n}");
-        }
+        assert!(!f.env.home.join(".local/share/hgl-ai/logs").exists());
 
         // Chosen: the pinned release, which is not there yet: it is downloaded.
         let d = tempfile::tempdir().unwrap();
