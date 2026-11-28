@@ -414,6 +414,11 @@ async fn broadcasts_reach_only_inboxes_created_before_publish() {
         bus.inbox(&Seat::broadcast()).await.is_err(),
         "`all` has no inbox"
     );
+    assert!(
+        bus.peek(&Seat::broadcast(), 1, Duration::ZERO)
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]

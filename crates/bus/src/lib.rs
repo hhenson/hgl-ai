@@ -589,11 +589,7 @@ impl Bus {
     /// The durable inbox of `seat` with explicit consumer settings. The consumer
     /// is created, or updated to these settings if it exists.
     pub async fn inbox_with(&self, seat: &Seat, opts: InboxOptions) -> Result<Inbox> {
-        if seat.is_broadcast() {
-            return Err(BusError::Nats(format!(
-                "`{BROADCAST}` is the broadcast address; it has no inbox"
-            )));
-        }
+        check_inbox_seat(seat)?;
         let stream = self
             .js
             .get_stream(STREAM_NOTES)
@@ -745,6 +741,7 @@ impl Bus {
     /// after its acknowledgement floor (one acknowledged out of order may be among them).
     /// Until the inbox is created, only unicast is eligible.
     pub async fn peek(&self, seat: &Seat, max: usize, wait: Duration) -> Result<Vec<StreamNote>> {
+        check_inbox_seat(seat)?;
         let stream = self
             .js
             .get_stream(STREAM_NOTES)
@@ -1373,6 +1370,15 @@ async fn take_read(
         }
     }
     Ok((received, n))
+}
+
+fn check_inbox_seat(seat: &Seat) -> Result<()> {
+    if seat.is_broadcast() {
+        return Err(BusError::Nats(format!(
+            "`{BROADCAST}` is the broadcast address; it has no inbox"
+        )));
+    }
+    Ok(())
 }
 
 /// Use the hub's stored publish time and consumer creation time, independent of sender clocks.
