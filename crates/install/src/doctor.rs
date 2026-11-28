@@ -757,7 +757,9 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         });
         let mut health_cfg = c.clone();
         health_cfg.hub.token_file = env.expand(shown).display().to_string();
-        out.push(match hub.health(&health_cfg).await {
+        let health = hub.health(&health_cfg).await;
+        let reached = health.is_ok();
+        out.push(match health {
             Err(e) => Check::fail(
                 "hub",
                 format!("unreachable at {}: {e}", c.hub.url),
@@ -770,6 +772,31 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             ),
             Ok(_) => Check::ok("hub", format!("{} (stream and buckets present)", c.hub.url)),
         });
+        // On the hub's host (this user's own server, or a server user found from the hub
+        // unit, as for a `--client-user`): consumers on the telemetry streams that outlive
+        // a page. No fleet part makes one; the `viewer` user can (docs/design.md §9).
+        if reached && (c.server.is_some() || su.is_some()) {
+            out.push(match hub.durables(&health_cfg).await {
+                Ok(d) if d.is_empty() => {
+                    Check::ok("telemetry consumers", "none that outlives its page")
+                }
+                Ok(d) => Check::warn(
+                    "telemetry consumers",
+                    format!(
+                        "consumers no fleet part makes, durable or long-lived: {} (the \
+                         console page's `viewer` hub user can create them)",
+                        d.join(", ")
+                    ),
+                    "delete each as the admin hub user (`nats consumer rm <stream> <name>`); \
+                     if they come back, reissue the viewer's credential",
+                ),
+                Err(e) => Check::warn(
+                    "telemetry consumers",
+                    format!("cannot list them: {e}"),
+                    "rerun `hgl-ai server install`, which lets hub users list them",
+                ),
+            });
+        }
     }
 
     // The server user (a system install) runs no agents: no CLIs, skills, work_root
@@ -862,6 +889,30 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             if s == Service::Builder
                 && let Some(user) = c.builder.user.as_deref()
             {
+                if env.os == crate::Os::MacOs {
+                    let state = service::system_state(sys, s);
+                    if state != State::NotInstalled {
+                        let account = service::system_account(sys, s);
+                        out.push(
+                            if account.as_ref().is_none_or(|(actual, _)| actual != user) {
+                                Check::fail(
+                                    name,
+                                    format!("system service user does not match {user}"),
+                                    "correct the LaunchDaemon UserName",
+                                )
+                            } else if state == State::Running {
+                                Check::ok(name, format!("running (system, user {user})"))
+                            } else {
+                                Check::fail(
+                                    name,
+                                    format!("not running (system, user {user})"),
+                                    format!("check the builder service as {user}"),
+                                )
+                            },
+                        );
+                        continue;
+                    }
+                }
                 // Query the system manager once, including its configured service user.
                 let result = match env.os {
                     crate::Os::Linux => sys
@@ -1025,7 +1076,10 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         ));
         // Lingering keeps the client's user services up: none here on the server side,
         // nor for an installer whose client is another user.
-        if !no_client && let Ok(Some(on)) = service::linger(sys, false) {
+        if !server_side
+            && client_user.is_none()
+            && let Ok(Some(on)) = service::linger(sys, false)
+        {
             out.push(if on {
                 Check::ok("lingering", "on")
             } else {
@@ -1387,6 +1441,92 @@ mod tests {
             cs.iter()
                 .any(|c| c.name == "builder credential" && c.level == Level::Fail)
         );
+    }
+
+    #[tokio::test]
+    async fn builder_only_on_hub_uses_builder_credential_for_both_probes() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = Config::new("build-1");
+        cfg.builder.credential = Some("~/builder.cred".into());
+        cfg.server_user = Some(ServerUser {
+            name: "server".into(),
+            home: f.env.home.join("server").display().to_string(),
+            console_url: None,
+            slack: false,
+            client_user: None,
+        });
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        crate::sys::write_atomic(&f.env.home.join("builder.cred"), b"token", 0o600).unwrap();
+        let hub = FakeHub::up();
+        let cs = run(&f, &hub).await;
+        assert!(
+            cs.iter()
+                .any(|c| c.name == "telemetry consumers" && c.level == Level::Ok)
+        );
+        assert_eq!(*hub.calls.borrow(), ["health", "durables"]);
+        assert_eq!(
+            *hub.creds.borrow(),
+            vec![f.env.home.join("builder.cred").display().to_string(); 2]
+        );
+    }
+
+    #[tokio::test]
+    async fn seatless_user_builder_checks_lingering() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        crate::save_config(&f, &f.env, &Config::new("build-1")).unwrap();
+        for (answer, level) in [("yes", Level::Ok), ("no", Level::Warn)] {
+            f.on(move |c| match c.program.as_str() {
+                "id" => Output::success("1000\n"),
+                "loginctl" => Output::success(answer),
+                "systemctl" => Output::success("active\n"),
+                "df" => Output::success(DF),
+                _ => Output::success(""),
+            });
+            let cs = run(&f, &FakeHub::up()).await;
+            assert!(
+                cs.iter().any(|c| c.name == "lingering" && c.level == level),
+                "{cs:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn macos_configured_builder_checks_system_daemon_and_user() {
+        let d = tempfile::tempdir().unwrap();
+        let f = Fake::new(d.path(), Os::MacOs);
+        let mut cfg = Config::new("build-1");
+        cfg.builder.user = Some("builder".into());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        for (state, user, expected) in [
+            ("running", "builder", Level::Ok),
+            ("waiting", "builder", Level::Fail),
+            ("running", "other", Level::Fail),
+        ] {
+            f.on(move |c| {
+                let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
+                match (c.program.as_str(), a.as_slice()) {
+                    ("id", ["-un"]) => Output::success("agents\n"),
+                    ("launchctl", ["print", target])
+                        if target.starts_with("system/") && target.contains("builder") =>
+                    {
+                        Output::success(format!("state = {state}\n"))
+                    }
+                    ("launchctl", ["print", target]) if target.starts_with("gui/") => {
+                        panic!("system daemon was shadowed by user agent")
+                    }
+                    ("plutil", ["-extract", "UserName", ..]) => Output::success(user),
+                    _ => Output::failure(1, "not found"),
+                }
+            });
+            let cs = run(&f, &FakeHub::up()).await;
+            assert!(
+                cs.iter()
+                    .any(|c| c.name == "service builder" && c.level == expected),
+                "{cs:?}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1918,6 +2058,18 @@ mod tests {
         assert_eq!(get(&cs, "service bridge").detail, "running");
         assert!(!cs.iter().any(|c| c.name == "client user"));
         assert!(!any_fail(&cs), "{cs:?}");
+        // The hub is this host's, though this user's configuration has no `[server]`
+        // nor `server_user`: the telemetry consumers are checked.
+        let cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        assert!(cfg.server.is_none() && cfg.server_user.is_none());
+        assert_eq!(get(&cs, "telemetry consumers").level, Level::Ok);
+        let hub = FakeHub {
+            durables: vec!["KV_HGL_TREES/idle".into()],
+            ..FakeHub::up()
+        };
+        let w = get(&run(&f, &hub).await, "telemetry consumers");
+        assert_eq!(w.level, Level::Warn);
+        assert!(w.detail.contains("KV_HGL_TREES/idle"), "{w:?}");
 
         f.readable
             .borrow_mut()
@@ -1957,7 +2109,12 @@ mod tests {
         ] {
             respond(&f, unit);
             let cs = run(&f, &FakeHub::up()).await;
-            for n in ["server user", "console credential", "service hub"] {
+            for n in [
+                "server user",
+                "console credential",
+                "service hub",
+                "telemetry consumers",
+            ] {
                 assert!(!cs.iter().any(|c| c.name == n), "{n} for {unit:?}");
             }
         }
@@ -2073,6 +2230,37 @@ mod tests {
             !cs.iter()
                 .any(|c| c.name == "console credential" && c.level == Level::Warn)
         );
+    }
+
+    /// On the hub's host only: consumers on the telemetry streams that outlive a page.
+    #[tokio::test]
+    async fn lasting_telemetry_consumers() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(
+            !cs.iter().any(|c| c.name == "telemetry consumers"),
+            "not the hub's host"
+        );
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.server = Some(hgl_ai_config::Server::default());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let get = |cs: &[Check]| cs.iter().find(|c| c.name == "telemetry consumers").cloned();
+        let ok = get(&run(&f, &FakeHub::up()).await).unwrap();
+        assert_eq!(ok.level, Level::Ok);
+        let hub = FakeHub {
+            durables: vec!["KV_HGL_HOSTS/kept".into()],
+            ..FakeHub::up()
+        };
+        let w = get(&run(&f, &hub).await).unwrap();
+        assert_eq!(w.level, Level::Warn);
+        assert!(w.detail.contains("KV_HGL_HOSTS/kept"), "{}", w.detail);
+        assert!(
+            w.fix.as_deref().unwrap().contains("nats consumer rm"),
+            "{w:?}"
+        );
+        // Unreachable: the hub check says so; no second warning.
+        assert!(get(&run(&f, &FakeHub::down()).await).is_none());
     }
 
     #[tokio::test]

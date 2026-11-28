@@ -265,6 +265,23 @@ pub async fn sync<G: Gh>(
             pr.pointer("/head/sha")?.as_str()?.to_string(),
         ))
     });
+    // A branch name reflects only the primary pin; verify all desired gitlinks
+    // at the exact PR head before it can be reused or landed.
+    if let Some((number, head)) = &existing {
+        for (path, wanted, _) in &p.want {
+            if submodule_at(gh, s, &s.wrapper, path, head)
+                .await?
+                .as_deref()
+                != Some(wanted)
+            {
+                return Err(invalid(format!(
+                    "open pin pull request {}#{number} at {} has a stale or missing pin {path}; update or close it before syncing",
+                    s.wrapper,
+                    short(head)
+                )));
+            }
+        }
+    }
     let changes: Vec<String> = p
         .want
         .iter()
@@ -490,6 +507,43 @@ mod tests {
         let gh = FakeGh::default().fail("git/ref/heads/", "gh: Server Error (HTTP 502)");
         assert!(point_branch(&gh, w, b, &sha('2')).await.is_err());
         assert_eq!(gh.calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn existing_pr_must_match_every_wanted_pin() {
+        let s = settings();
+        let sub = |c: char| format!("{{\"type\":\"submodule\",\"sha\":\"{}\"}}", sha(c));
+        let make = |other: char| {
+            FakeGh::default()
+                .on(
+                    "hgl-compiler/git/ref/heads/main",
+                    &format!("{{\"object\":{{\"sha\":\"{}\"}}}}", sha('c')),
+                )
+                .on("hgl-compiler/contents/spec/hgl_spec", &sub('5'))
+                .on("hgl-compiler/contents/spec/hgl_core", &sub('6'))
+                .on("hgl-project/contents/hgl-compiler?ref=main", &sub('b'))
+                .on("hgl-project/contents/hgl_spec?ref=main", &sub('5'))
+                .on("hgl-project/contents/hgl_core?ref=main", &sub('6'))
+                .on(
+                    "hgl-project/pulls?state=open",
+                    &format!("[{{\"number\":7,\"head\":{{\"sha\":\"{}\"}}}}]", sha('d')),
+                )
+                .on("hgl-project/contents/hgl-compiler?ref=dddddddd", &sub('c'))
+                .on("hgl-project/contents/hgl_spec?ref=dddddddd", &sub(other))
+                .on("hgl-project/contents/hgl_core?ref=dddddddd", &sub('6'))
+        };
+        let matching = sync(&make('5'), &s, None, &PinOpts::default(), true)
+            .await
+            .unwrap();
+        assert!(
+            matching
+                .line()
+                .contains("would land the open pin pull request")
+        );
+        let stale = sync(&make('4'), &s, None, &PinOpts::default(), true)
+            .await
+            .unwrap_err();
+        assert!(stale.to_string().contains("stale or missing pin hgl_spec"));
     }
 
     #[tokio::test]

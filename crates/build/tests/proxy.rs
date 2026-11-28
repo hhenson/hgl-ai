@@ -5,6 +5,9 @@
 //! is POSIX `sh`; that PowerShell runs the Windows scripts as intended is checked only
 //! against a real Windows host. The service tests need `nats-server` on `PATH`.
 
+#[path = "support/short.rs"]
+mod short;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -51,6 +54,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// proxy's directories. Short paths, for the control socket.
 struct World {
     _tmp: tempfile::TempDir,
+    _socket_tmp: tempfile::TempDir,
+    socket_path: PathBuf,
     root: PathBuf,
     origin: String,
     head: String,
@@ -77,9 +82,12 @@ impl World {
         let remote = root.join("remote");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::create_dir_all(&remote).unwrap();
+        let (socket_tmp, socket_path) = short::tempdir();
         World {
             origin: bare.display().to_string(),
             _tmp: tmp,
+            _socket_tmp: socket_tmp,
+            socket_path,
             root,
             head,
             state,
@@ -87,15 +95,29 @@ impl World {
         }
     }
 
-    fn conn(&self) -> Arc<Conn> {
-        Conn::new(
-            "win1",
-            self.state.to_str().unwrap(),
-            fake_ssh(),
-            &self.root.join("ssh"),
-            Dialect::Posix,
+    fn conn(&self) -> Option<Arc<Conn>> {
+        if !short::fits(&self.socket_path, "win1") {
+            let conn = Conn::direct(
+                "win1",
+                self.state.to_str().unwrap(),
+                fake_ssh(),
+                &self.socket_path,
+                Dialect::Posix,
+            )
+            .unwrap();
+            assert!(conn.opts().iter().any(|o| o == "ControlPath=none"));
+            return None;
+        }
+        Some(
+            Conn::new(
+                "win1",
+                self.state.to_str().unwrap(),
+                fake_ssh(),
+                &self.socket_path,
+                Dialect::Posix,
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 
     fn checkout(&self, id: &str) -> Checkout {
@@ -154,7 +176,7 @@ fn step(name: &str, script: &str, time: Duration) -> StepSpec {
 #[test]
 fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
     let w = World::new();
-    let conn = w.conn();
+    let Some(conn) = w.conn() else { return };
     conn.connect().unwrap();
     assert!(
         w.state.join("master").is_file(),
@@ -220,6 +242,10 @@ fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
     assert_eq!(r.limit, Some("time"), "{r:?}");
     assert!(t0.elapsed() < Duration::from_secs(10), "{:?}", t0.elapsed());
     let pid = std::fs::read_to_string(&pidfile).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while alive(&pid) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
     assert!(!alive(&pid), "the remote child is gone");
 
     // A stop before the remote's pid has arrived still kills the remote tree.
@@ -382,7 +408,7 @@ fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
 #[test]
 fn a_drop_during_a_step_is_not_a_build_failure() {
     let w = World::new();
-    let conn = w.conn();
+    let Some(conn) = w.conn() else { return };
     conn.connect().unwrap();
     let ex = Ssh::new(
         Platform::Windows,
@@ -476,6 +502,37 @@ async fn until<F: std::future::Future<Output = bool>>(
     }
 }
 
+async fn receipt(
+    bus: &Bus,
+    reply: &Seat,
+    id: &str,
+    world: &World,
+    wait: Duration,
+    svc: &mut tokio::task::JoinHandle<Result<(), service::ServiceError>>,
+) -> Note {
+    let failure = tokio::select! {
+        result = svc => panic!("builder stopped while waiting for receipt to {reply}: {result:?}"),
+        result = tokio::time::timeout(wait + Duration::from_secs(10), bus.reply_wait(reply, wait)) => {
+            match result {
+                Ok(Ok(Some(note))) => return note,
+                Ok(Ok(None)) => format!("timed out waiting for receipt to {reply}"),
+                Ok(Err(err)) => format!("reading receipt to {reply} failed: {err}"),
+                Err(_) => format!("timed out waiting for receipt request to {reply}"),
+            }
+        }
+    };
+    let log = std::fs::read_to_string(world.state.join("log")).unwrap_or_default();
+    let tail: Vec<&str> = log.lines().rev().take(15).collect();
+    let (run, worker, builders) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), store::run_get(bus, id)),
+        tokio::time::timeout(Duration::from_secs(10), bus.state_get("builder.win1")),
+        tokio::time::timeout(Duration::from_secs(10), bus.builders())
+    );
+    panic!(
+        "{failure}; run {run:?}\nworker state {worker:?}\nbuilders {builders:?}\nremote log tail: {tail:#?}"
+    );
+}
+
 fn job(id: &str, head: &str) -> (Note, Seat) {
     let reply = reply_seat(id).unwrap();
     let j = BuildJob {
@@ -510,6 +567,9 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     let bus = Arc::new(Bus::connect_url(&n.2, Some(n.3.clone())).await.unwrap());
     bus.provision().await.unwrap();
     let w = World::new();
+    if w.conn().is_none() {
+        return;
+    }
     let recipe = "repo = \"demo\"\n[[step]]\nname = \"build\"\nrun = \"test -f main.c && sleep ${HOLD:-0}\"\ntime = \"2m\"\n";
     store::recipe_put(&bus, recipe, None).await.unwrap();
 
@@ -526,12 +586,15 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         .unwrap(),
     );
     cfg.validate().unwrap();
-    let lanes = service::lanes(&cfg, fake_ssh()).unwrap();
+    let lanes = service::lanes_with(&cfg, fake_ssh(), |label, alias, program, _, dialect| {
+        Conn::new(label, alias, program, &w.socket_path, dialect)
+    })
+    .unwrap();
     let origin = w.origin.clone();
     let settings = Settings {
         clone_url: Arc::new(move |_| origin.clone()),
         toolchains: vec!["git".into()],
-        heartbeat: Duration::from_millis(300),
+        heartbeat: Duration::from_secs(2),
         verdicts: true,
         pr_ended: None,
     };
@@ -547,7 +610,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     // Unreachable from the start.
     w.down(true);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
-    let svc = tokio::spawn(service::serve(bus.clone(), lanes, settings, stop_rx));
+    let mut svc = tokio::spawn(service::serve(bus.clone(), lanes, settings, stop_rx));
     until("an unreachable record", 15, || {
         let bus = bus.clone();
         async move {
@@ -602,11 +665,15 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     );
     // The cleanup goes through on a later heartbeat; then the job is built.
     mode(0o755);
-    let r = bus
-        .reply_wait(&reply, Duration::from_secs(60))
-        .await
-        .unwrap()
-        .expect("a receipt");
+    let r = receipt(
+        &bus,
+        &reply,
+        "20261127-090000-aaaaaa",
+        &w,
+        Duration::from_secs(60),
+        &mut svc,
+    )
+    .await;
     assert!(
         !jobs.join("20261126-000000-000000").exists(),
         "the leftover is gone"
@@ -653,20 +720,15 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     w.down(true);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     w.down(false);
-    let r = bus
-        .reply_wait(&reply, Duration::from_secs(90))
-        .await
-        .unwrap();
-    if r.is_none() {
-        let log = std::fs::read_to_string(w.state.join("log")).unwrap_or_default();
-        let tail: Vec<&str> = log.lines().rev().take(15).collect();
-        panic!(
-            "no receipt; run {:?}\nremote log tail: {tail:#?}\nbuilders {:?}",
-            store::run_get(&bus, "20261127-090000-bbbbbb").await,
-            bus.builders().await
-        );
-    }
-    let r = r.unwrap();
+    let r = receipt(
+        &bus,
+        &reply,
+        "20261127-090000-bbbbbb",
+        &w,
+        Duration::from_secs(90),
+        &mut svc,
+    )
+    .await;
     let s = store::parse_receipt(&r, "20261127-090000-bbbbbb").unwrap();
     assert_eq!(
         s.status,
@@ -701,11 +763,15 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     // The same request was taken before: its log directory holds it.
     std::fs::write(saved.join("request.json"), note.body.trim()).unwrap();
     bus.send(&note).await.unwrap();
-    let r = bus
-        .reply_wait(&reply, Duration::from_secs(30))
-        .await
-        .unwrap()
-        .expect("a receipt");
+    let r = receipt(
+        &bus,
+        &reply,
+        "20261127-090000-dddddd",
+        &w,
+        Duration::from_secs(30),
+        &mut svc,
+    )
+    .await;
     let got = store::parse_receipt(&r, "20261127-090000-dddddd").unwrap();
     assert_eq!(got.reason.as_deref(), Some("saved before the crash"));
     let log = std::fs::read_to_string(w.state.join("log")).unwrap();
@@ -794,7 +860,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
 #[test]
 fn a_session_lost_with_its_master_is_a_drop_after_a_quick_reconnect() {
     let w = World::new();
-    let conn = w.conn();
+    let Some(conn) = w.conn() else { return };
     conn.connect().unwrap();
     let ex = Ssh::new(
         Platform::Windows,
@@ -837,7 +903,7 @@ fn a_session_lost_with_its_master_is_a_drop_after_a_quick_reconnect() {
 #[test]
 fn remote_checkouts_take_turns_across_processes() {
     let w = World::new();
-    let conn = w.conn();
+    let Some(conn) = w.conn() else { return };
     conn.connect().unwrap();
     // Two executors with no state in common but the ssh directory, as two processes are.
     let a = Arc::new(Ssh::new(

@@ -57,9 +57,10 @@ The server user's step of `server install`:
    pinned release, checksum verified, into `<data_dir>/bin`). In a system install it
    uses the one chosen for the unit, downloading only the pinned release.
 2. Makes the hub users (below): `<host>-admin`, `<host>` (this host's client,
-   in `hub.token_file`), `<host>-coord` and `console`, keeping existing keys, and
-   writes `<data_dir>/nats.conf` (mode 0600: listen address, JetStream store,
-   one NKey user per client with its role's permissions).
+   in `hub.token_file`), `<host>-coord`, `console` and `viewer`, keeping existing
+   keys, and writes `<data_dir>/nats.conf` (mode 0600: listen address, JetStream
+   store, one NKey user per client with its role's permissions; with `[console]`,
+   the WebSocket listener for the console's page, below).
 3. Writes the `[server]` section, installs and starts the hub user service (its log
    in `<data_dir>/logs`; a system install has none there),
    waits for the port, provisions the streams and buckets as the admin user (as
@@ -76,6 +77,9 @@ The coordinator reads GitHub with its own token, not yours: make a fine-grained,
 read-only token (Metadata, Contents, Issues, Pull requests, Checks, Actions, Commit
 statuses: read) for the repositories. The token step above stores it as the server
 user (`[github] token_file`); run that step again to replace it.
+
+During the intake cutover, deploy and verify the coordinator's triage delivery
+before disabling the interim `hgl-intakewatch` timer.
 
 The server user's own commands run with `sudo -u hgl-ai env HOME=/var/lib/hgl-ai
 hgl-ai ...` (`server user add`, `doctor`).
@@ -137,12 +141,14 @@ hgl-ai server user ...`).
 | `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
 | `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
+| `viewer` | nothing by subject (replies are not enforced until hgl-ai#141): reads and watches `HGL_HOSTS`, `HGL_TREES`, `HGL_METRICS`, `HGL_BUILD`, `HGL_USAGE`, and of `HGL_STATE` only `prs`, `backlog`, `landed.log`, `tasks`, `mode`, `hold` (the console's page, docs/owner.md §3); consumers only in the filtered create form; subscribes to `_INBOX_VIEWER.>` only; no other stream or bucket, no consumer delete (docs/design.md §9) |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
 The console keeps session state in `HGL_CONSOLE`. The Slack adapter reads its own
 delivery state, its durable `HGL_OWNER` feed and opening events by sequence.
 The console can read the Slack permalink index.
 Seat, coordinator and builder users read `HGL_OWNER` through short-lived consumers.
+The `viewer` reads only the telemetry, as above.
 
 ```sh
 hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred
@@ -223,6 +229,20 @@ own hub user `console`.
    or the console's own certificate (`tailscale cert hub.example.ts.net`, or any CA),
    with `listen` on the tailnet address and `tls_cert`, `tls_key` in `[console]`.
    Never listen on `0.0.0.0` or a public interface.
+
+   The telemetry page reads the hub through its WebSocket listener, which `server
+   install` turns on with the console (hub users only): `[server] websocket_port`
+   (4223), on loopback, plain, taking only pages of the console's URL
+   (`allowed_origins`). The proxy serves it on the console's origin, so the page
+   stays same-origin; `server install` prints the step and does not run it:
+
+   ```sh
+   tailscale serve --bg --https=443 --set-path /nats http://127.0.0.1:4223
+   ```
+
+   The page reads as hub user `viewer`, whose credential `server install` writes and
+   names in `[console] viewer_credential`. A system install (`--server-user`) prints
+   the same step, with `--print-root-steps` as a comment.
 2. **Users.** `[console] users`, one entry per person, keyed by email:
 
    ```toml
