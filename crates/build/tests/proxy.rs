@@ -545,11 +545,15 @@ time = "2m"
     // startup cleanup is done.
     let jobs = w.remote.join("jobs");
     std::fs::create_dir_all(jobs.join("20261126-000000-000000/src")).unwrap();
-    let mode = |m: u32| {
+    let cache = w.remote.join("cargo-cache/windows");
+    let orphan = cache.join("cache-old-label.windows-20261126-000000-aaaaaa");
+    std::fs::create_dir_all(&orphan).unwrap();
+    let mode = |path: &Path, m: u32| {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&jobs, std::fs::Permissions::from_mode(m)).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(m)).unwrap();
     };
-    mode(0o500);
+    mode(&jobs, 0o500);
+    mode(&cache, 0o500);
     // Unreachable from the start.
     w.down(true);
     let (stop_tx, stop_rx) = tokio::sync::watch::channel(false);
@@ -606,8 +610,20 @@ time = "2m"
             .is_none(),
         "not taken before the startup cleanup"
     );
-    // The cleanup goes through on a later heartbeat; then the job is built.
-    mode(0o755);
+    // Checkout cleanup can succeed while the old cache's removal still fails.
+    mode(&jobs, 0o755);
+    until("checkout cleanup", 15, || async { !jobs.exists() }).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert!(orphan.exists());
+    assert!(
+        store::run_get(&bus, "20261127-090000-aaaaaa")
+            .await
+            .unwrap()
+            .is_none(),
+        "not taken before cache reconciliation"
+    );
+    // A later heartbeat retries cache cleanup before admitting the job.
+    mode(&cache, 0o755);
     let r = bus
         .reply_wait(&reply, Duration::from_secs(60))
         .await
@@ -640,7 +656,7 @@ time = "2m"
         "the remote job directory is gone: {:?}",
         w.jobs()
     );
-    let cache = w.remote.join("cargo-cache/windows");
+    assert!(!orphan.exists(), "the previous proxy's cache is gone");
     let slot = std::fs::read_dir(&cache).unwrap().next().unwrap().unwrap();
     assert_eq!(
         std::fs::read_to_string(slot.path().join("marker")).unwrap(),

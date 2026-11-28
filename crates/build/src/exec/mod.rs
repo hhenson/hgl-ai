@@ -198,6 +198,8 @@ pub trait Executor: Send + Sync {
     fn cleanup(&self, ws: &Workspace) -> Result<(), HostError>;
     /// Remove every job directory left by an earlier run of this builder.
     fn clean_all(&self) -> Result<(), HostError>;
+    /// Existing Cargo slot directory names in the executor's platform directory.
+    fn cargo_cache_slots(&self) -> Result<Vec<String>, HostError>;
     /// Absolute directory for a slot's Cargo intermediates on this executor's host.
     fn cargo_cache_path(&self, slot: &str) -> String;
     /// Size of a slot in bytes, or zero when Cargo did not create it.

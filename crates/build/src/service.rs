@@ -408,7 +408,7 @@ async fn lane_loop(
                     match blocking(move || -> Result<(), crate::exec::HostError> {
                         l.exec.clean_all()?;
                         if let Some(cache) = &l.cargo_cache {
-                            cache.prune(l.exec.as_ref());
+                            cache.clean(l.exec.as_ref())?;
                         }
                         Ok(())
                     })
@@ -418,6 +418,13 @@ async fn lane_loop(
                         Err(e) => {
                             tracing::warn!(builder = %lane.label, "startup cleanup: {e:?}; no job is taken until it is done")
                         }
+                    }
+                } else if reachable
+                    && let Some(cache) = lane.cargo_cache.as_ref().filter(|c| c.needs_retry())
+                {
+                    let (cache, ex) = (cache.clone(), lane.exec.clone());
+                    if let Err(e) = blocking(move || cache.prune(ex.as_ref())).await {
+                        tracing::warn!(builder = %lane.label, "retrying Cargo cache cleanup: {e:?}");
                     }
                 }
                 if reachable {
@@ -790,7 +797,7 @@ async fn run_job(
                 Ok(ws) => (Ok(ws), lease),
                 Err(e) => {
                     if let Some(lease) = lease {
-                        lease.finish(ex.as_ref(), false);
+                        lease.checkout_failed();
                     }
                     (Err(e), None)
                 }
@@ -893,9 +900,9 @@ async fn run_job(
         }
         let (ex, w) = (lane.exec.clone(), ws.clone());
         let keep = !driven.unreachable && driven.summary.status == BuildStatus::Pass;
-        if let Err((e, lease)) = blocking(move || {
+        if let Err(stale) = blocking(move || {
             if let Err(e) = ex.cleanup(&w) {
-                return Err((e, lease));
+                return Err(Box::new((e, lease)));
             }
             if let Some(lease) = lease {
                 lease.finish(ex.as_ref(), keep);
@@ -904,6 +911,7 @@ async fn run_job(
         })
         .await
         {
+            let (e, lease) = *stale;
             tracing::warn!(builder = %lane.label, "cleaning up {}: {e:?}; retrying when the remote answers", job.id);
             lane.stale
                 .lock()

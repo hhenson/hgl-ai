@@ -32,6 +32,8 @@ const SSH_FAILED: i32 = 255;
 const GIT_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SHORT: Duration = Duration::from_secs(30);
 const KILL_GRACE: Duration = Duration::from_secs(10);
+/// Recursive cache measurements and removals can traverse large Cargo trees.
+const FILE_TREE_TIMEOUT: Duration = Duration::from_secs(600);
 /// Longest transfer of one artifact.
 const ARTIFACT_TIMEOUT: Duration = Duration::from_secs(600);
 const PID_MARK: &[u8] = b"hgl-ai-pid ";
@@ -204,6 +206,21 @@ impl Dialect {
             Dialect::Posix => format!(
                 "df -Pk {} | awk 'NR==2 {{ print $4 * 1024 }}'",
                 self.quote(p)
+            ),
+        }
+    }
+
+    fn cache_slots(self, path: &str) -> String {
+        let p = self.quote(path);
+        match self {
+            Dialect::PowerShell => format!(
+                "if (!(Test-Path -LiteralPath {p} -ErrorAction Stop)) {{ exit 0 }}\n\
+                 Get-ChildItem -LiteralPath {p} -Directory -Force -Filter 'cache-*' -ErrorAction Stop | ForEach-Object {{ $_.Name }}"
+            ),
+            Dialect::Posix => format!(
+                "if [ ! -e {p} ]; then exit 0; fi\n\
+                 cd {p} || exit 1\n\
+                 find . ! -name . -prune -type d -name 'cache-*' -exec printf '%s\\0' {{}} +"
             ),
         }
     }
@@ -907,6 +924,10 @@ impl Ssh {
     fn is_absolute(&self, p: &str) -> bool {
         p.starts_with('/') || p.starts_with('\\') || p.as_bytes().get(1) == Some(&b':')
     }
+
+    fn cargo_cache_dir(&self) -> String {
+        format!("{}/cargo-cache/{}", self.work_dir, self.platform)
+    }
 }
 
 impl HostOps for Ssh {
@@ -944,7 +965,7 @@ impl HostOps for Ssh {
         }
     }
     fn remove(&self, path: &str) -> Result<(), HostError> {
-        let o = self.exec(&self.dialect.remove(path), Duration::from_secs(600))?;
+        let o = self.exec(&self.dialect.remove(path), FILE_TREE_TIMEOUT)?;
         if o.ok {
             Ok(())
         } else {
@@ -1212,12 +1233,32 @@ impl Executor for Ssh {
         self.remove(&format!("{}/jobs", self.work_dir))
     }
 
+    fn cargo_cache_slots(&self) -> Result<Vec<String>, HostError> {
+        let dir = self.cargo_cache_dir();
+        let out = self.exec(&self.dialect.cache_slots(&dir), SHORT)?;
+        if !out.ok {
+            return Err(HostError::Failed(format!(
+                "listing Cargo cache {dir}: {}",
+                last_line(out.stderr.as_bytes())
+            )));
+        }
+        Ok(match self.dialect {
+            Dialect::Posix => out
+                .stdout
+                .split('\0')
+                .filter_map(|name| name.strip_prefix("./"))
+                .map(str::to_string)
+                .collect(),
+            Dialect::PowerShell => out.stdout.lines().map(str::to_string).collect(),
+        })
+    }
+
     fn cargo_cache_path(&self, slot: &str) -> String {
-        format!("{}/cargo-cache/{}/{slot}", self.work_dir, self.platform)
+        format!("{}/{slot}", self.cargo_cache_dir())
     }
 
     fn cargo_cache_size(&self, path: &str) -> Result<u64, HostError> {
-        let out = self.exec(&self.dialect.cache_size(path), SHORT)?;
+        let out = self.exec(&self.dialect.cache_size(path), FILE_TREE_TIMEOUT)?;
         if out.ok
             && let Ok(bytes) = out.stdout.trim().parse()
         {
@@ -1317,6 +1358,19 @@ mod tests {
             "git -C 'C:/w/clones/x' 'fetch' 'origin'\nexit $LASTEXITCODE"
         );
         assert!(d.command(&"x".repeat(MAX_COMMAND)).is_err());
+    }
+
+    #[test]
+    fn cache_size_scripts_use_literal_paths_and_report_bytes() {
+        let path = "work dir/it's cache";
+        let ps = Dialect::PowerShell.cache_size(path);
+        assert!(ps.contains("Test-Path -LiteralPath 'work dir/it''s cache'"));
+        assert!(ps.contains("Get-ChildItem -LiteralPath 'work dir/it''s cache' -File -Force -Recurse -ErrorAction Stop"));
+        assert!(ps.ends_with("[uint64]$size"));
+        let sh = Dialect::Posix.cache_size(path);
+        assert!(sh.contains(r"du -sk 'work dir/it'\''s cache'"));
+        assert!(sh.contains("if [ ! -e "));
+        assert!(sh.contains("$1 * 1024"));
     }
 
     /// A transfer that stalls (a FIFO no one writes) ends at its deadline, or at a cancel,

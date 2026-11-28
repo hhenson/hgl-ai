@@ -36,6 +36,10 @@ impl Local {
     pub fn root(&self) -> &Path {
         &self.root
     }
+
+    fn cargo_cache_dir(&self) -> PathBuf {
+        self.root.join("cargo-cache").join(self.platform.as_str())
+    }
 }
 
 impl HostOps for Local {
@@ -275,13 +279,28 @@ impl Executor for Local {
         Ok(())
     }
 
+    fn cargo_cache_slots(&self) -> Result<Vec<String>, HostError> {
+        let dir = self.cargo_cache_dir();
+        let error = |e| HostError::Failed(format!("listing Cargo cache {}: {e}", dir.display()));
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(error(e)),
+        };
+        let mut slots = Vec::new();
+        for entry in entries {
+            let entry = entry.map_err(error)?;
+            if entry.file_type().map_err(error)?.is_dir()
+                && let Ok(name) = entry.file_name().into_string()
+            {
+                slots.push(name);
+            }
+        }
+        Ok(slots)
+    }
+
     fn cargo_cache_path(&self, slot: &str) -> String {
-        self.root
-            .join("cargo-cache")
-            .join(self.platform.as_str())
-            .join(slot)
-            .display()
-            .to_string()
+        self.cargo_cache_dir().join(slot).display().to_string()
     }
 
     fn cargo_cache_size(&self, path: &str) -> Result<u64, HostError> {
