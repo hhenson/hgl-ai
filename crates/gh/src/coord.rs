@@ -5,7 +5,8 @@
 //! check between rounds. The previous table (from the bus at start, then from memory) is
 //! what a round is compared with. After the pull request round, every
 //! [`backlog::BACKLOG_EVERY`], the backlog round: `HGL_STATE/backlog` and the day's
-//! `HGL_METRICS` samples, under the same `hold`.
+//! `HGL_METRICS` samples. Intake for triage runs on the same cadence and under the same
+//! `hold`, with its own cursor in `HGL_STATE/coord.intake`.
 //!
 //! An alert is kept until its send succeeds: in memory and on the hub
 //! (`HGL_STATE/coord.alerts`, the notes not sent yet), and sent again each round, so a hub
@@ -22,7 +23,7 @@ use serde_json::Value;
 use crate::backlog::{self, BACKLOG_EVERY};
 use crate::exec::{self, Gh};
 use crate::table::{self, Alert, HoldChange, PrInfo, RateLimit, Row, Table};
-use crate::{Error, Result, Settings, state, store};
+use crate::{Error, Result, Settings, intake, state, store};
 
 /// The shortest interval between rounds (docs/protocol.md §8).
 pub const MIN_INTERVAL: Duration = Duration::from_secs(300);
@@ -34,7 +35,7 @@ pub const UNSENT_KEEP: usize = 100;
 #[derive(Debug, Clone)]
 pub struct CoordOpts {
     pub once: bool,
-    /// Print the table, the alerts, the backlog and the samples; touch no state and send nothing.
+    /// Print the planned writes and notes without changing hub state.
     pub dry_run: bool,
     pub interval: Duration,
 }
@@ -244,9 +245,51 @@ async fn backlog_round<G: Gh>(
     Ok(())
 }
 
-/// Run rounds until stopped (or once: both rounds). Dry-run output goes to `out`. Fails at
-/// once when `gh` cannot run or is not signed in; a failed round or hub write is logged and
-/// the next round comes as usual (a failed backlog round is tried again at the next round).
+async fn intake_round<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: Option<&Bus>,
+    hold: &mut Option<String>,
+    last_rate: &mut Option<RateLimit>,
+    out: &mut impl Write,
+) -> Result<bool> {
+    let now = Utc::now();
+    let round = intake::Round::load(bus, now).await?;
+    let Some(from) = round.from() else {
+        if let Some(b) = bus {
+            round.retry(b).await?;
+        }
+        return Ok(true);
+    };
+    let reading = match intake::read(gh, s, from).await {
+        Ok(reading) => reading,
+        Err(Error::RateLimited(m)) => {
+            *hold = Some(on_rate_limit(gh, bus, last_rate.as_ref(), &m, now, out).await);
+            return Err(Error::RateLimited(m));
+        }
+        Err(e) => return Err(e),
+    };
+    let change = table::hold_after(&reading.rate, s.hold_below, hold.as_deref(), now);
+    if let Some(b) = bus {
+        write_hold(b, &change, &reading.rate, hold.as_deref()).await?;
+    }
+    match change {
+        HoldChange::Set(v) => *hold = Some(v),
+        HoldChange::Clear => *hold = None,
+        HoldChange::Keep => {}
+    }
+    *last_rate = Some(reading.rate);
+    let Some(items) = reading.items else {
+        tracing::info!("intake paused before all pages were read");
+        return Ok(false);
+    };
+    round.finish(bus, s, items, out).await?;
+    Ok(true)
+}
+
+/// Run rounds until stopped (or once). Dry-run output goes to `out`. Fails at
+/// once when `gh` cannot run or is not signed in. A failed round or hub write is
+/// logged and tried again at the next interval.
 pub async fn run<G: Gh>(
     gh: &G,
     s: &Settings,
@@ -280,6 +323,7 @@ pub async fn run<G: Gh>(
     }
     let mut last_rate: Option<RateLimit> = None;
     let mut last_backlog: Option<Instant> = None;
+    let mut last_intake: Option<Instant> = None;
     loop {
         let now = Utc::now();
         let mut hold = match bus {
@@ -387,6 +431,20 @@ pub async fn run<G: Gh>(
                 }
             }
         }
+        let started = Instant::now();
+        if backlog::due(last_intake, started, BACKLOG_EVERY)
+            && !hold
+                .as_deref()
+                .is_some_and(|h| table::hold_active(h, Utc::now()))
+        {
+            match intake_round(gh, s, bus, &mut hold, &mut last_rate, out).await {
+                Ok(true) => last_intake = Some(started),
+                Ok(false) => {}
+                Err(e @ Error::Auth(_)) => return Err(e),
+                Err(e) if o.once => return Err(e),
+                Err(e) => tracing::warn!("intake round failed: {e}"),
+            }
+        }
         if o.once {
             return Ok(());
         }
@@ -398,7 +456,7 @@ pub async fn run<G: Gh>(
 mod tests {
     use super::*;
     use crate::exec::fake::FakeGh;
-    use crate::testutil::{fixture, settings};
+    use crate::testutil::{empty_intake, fixture, settings};
 
     fn three() -> Settings {
         let mut s = settings();
@@ -412,11 +470,12 @@ mod tests {
         interval: MIN_INTERVAL,
     };
 
-    /// GitHub answering both rounds: the backlog query first, then any other query.
+    /// GitHub answering all scheduled queries.
     fn both(prs: &str) -> FakeGh {
         FakeGh::default()
             .on("auth status", "")
             .on("query Backlog", &fixture("backlog-batch.json"))
+            .on("query Intake", &empty_intake(3).to_string())
             .on("graphql", prs)
     }
 
@@ -455,8 +514,10 @@ mod tests {
         run(&gh, &s, None, &ONCE_DRY, &mut out).await.unwrap();
         let text = String::from_utf8(out).unwrap();
         let calls = gh.0.calls();
-        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert_eq!(calls.len(), 4, "{calls:?}");
         assert!(calls[2].contains("query=query Backlog("), "{}", calls[2]);
+        assert!(calls[3].contains("query=query Intake("), "{}", calls[3]);
+        assert!(!text.contains("[coord] Intake"), "{text}");
         let today = Utc::now().format("%Y-%m-%d").to_string();
         assert!(
             calls[2].contains(&format!(
@@ -497,16 +558,19 @@ mod tests {
         let mut out = Vec::new();
         run(&gh, &s, None, &ONCE_DRY, &mut out).await.unwrap();
         assert!(
-            !gh.calls().iter().any(|c| c.contains("query Backlog")),
+            !gh.calls()
+                .iter()
+                .any(|c| c.contains("query Backlog") || c.contains("query Intake")),
             "the pull request round set hold: {:?}",
             gh.calls()
         );
-        // The allowance is enough: both rounds.
+        // The allowance is enough for both scheduled scans.
         let gh = both(&fixture("coord-batch.json"));
         run(&gh, &s, None, &ONCE_DRY, &mut Vec::new())
             .await
             .unwrap();
         assert!(gh.calls().iter().any(|c| c.contains("query Backlog")));
+        assert!(gh.calls().iter().any(|c| c.contains("query Intake")));
     }
 
     #[tokio::test]
