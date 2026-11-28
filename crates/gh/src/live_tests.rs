@@ -1924,13 +1924,41 @@ async fn tasks_without_a_task_write_nothing() {
     assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
 }
 
-/// `gh` for [`a_pin_landing_finished_by_another_sync_is_done`]: at the first read of the pin
-/// pull request, another sync finishes its landing (its `landed.log` line, its record gone).
+/// `gh` for [`a_pin_landing_finished_by_another_sync_is_done`]: at the first call matching
+/// `trigger`, another sync finishes the landing of the pin pull request `n` (its
+/// `landed.log` line, its record gone).
 struct Racing {
     gh: FakeGh,
     bus: Bus,
     merge: String,
+    trigger: &'static str,
+    n: u64,
     raced: std::sync::atomic::AtomicBool,
+}
+
+impl Racing {
+    fn new(gh: FakeGh, bus: Bus, merge: &str, trigger: &'static str, n: u64) -> Racing {
+        Racing {
+            gh,
+            bus,
+            merge: merge.into(),
+            trigger,
+            n,
+            raced: Default::default(),
+        }
+    }
+}
+
+/// A fresh `prs` table whose row for the wrapper's pull request `n` says the review bot is
+/// at its usage limit: the gate's table check would stop a landing there (BOTLIMIT).
+async fn bot_limit_row(b: &Bus, n: u64) {
+    let text = format!(
+        "# read {}\nhgl-project\t{n}\t{}\topen\tlimit\t0\tpass\t{}\n",
+        hgl_ai_proto::utc_now_stamp(),
+        "d".repeat(40),
+        hgl_ai_proto::utc_now_stamp()
+    );
+    store::put_latest(b, state::KEY_PRS, &text).await.unwrap();
 }
 
 impl crate::exec::Gh for Racing {
@@ -1939,14 +1967,14 @@ impl crate::exec::Gh for Racing {
         args: Vec<String>,
         stdin: Option<Vec<u8>>,
     ) -> crate::Result<crate::exec::Output> {
-        if args.join(" ").contains("hgl-project/pulls/50")
+        if args.join(" ").contains(self.trigger)
             && !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst)
         {
-            let line = format!("20261128T000000Z hgl-project #50 {}", self.merge);
+            let line = format!("20261128T000000Z hgl-project #{} {}", self.n, self.merge);
             store::append_bounded(&self.bus, state::KEY_LANDED, &line, 100)
                 .await
                 .unwrap();
-            crate::progress::delete(&self.bus, "hgl-project", 50)
+            crate::progress::delete(&self.bus, "hgl-project", self.n)
                 .await
                 .unwrap();
         }
@@ -1955,7 +1983,8 @@ impl crate::exec::Gh for Racing {
 }
 
 /// hgl-ai#133: two syncs pick the same unfinished pin landing, and the other finishes it
-/// first. This one finds it landed: done, not `NotLanded`, and the plan is still read.
+/// first. This one finds it landed: done, not `NotLanded`, and the plan is still read. It
+/// finds that before the gate, whose table says BOTLIMIT for the pull request (r6).
 /// A dry run reads the hub too: it names an unfinished pin landing, rather than say the
 /// pins are current.
 #[tokio::test]
@@ -1985,12 +2014,14 @@ async fn a_pin_landing_finished_by_another_sync_is_done() {
             .is_some()
     );
 
-    let gh = Racing {
-        gh: pins_current_gh(50, pin_merge),
-        bus: bus(&h).await,
-        merge: pin_merge.into(),
-        raced: Default::default(),
-    };
+    bot_limit_row(&b, 50).await;
+    let gh = Racing::new(
+        pins_current_gh(50, pin_merge),
+        bus(&h).await,
+        pin_merge,
+        "hgl-project/pulls/50",
+        50,
+    );
     let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
         .await
         .unwrap();
@@ -2005,4 +2036,40 @@ async fn a_pin_landing_finished_by_another_sync_is_done() {
         b.state_get(state::KEY_MAIN).await.unwrap().is_none(),
         "not finished again"
     );
+}
+
+/// r6 on #133: a sync finds an open pin pull request, and another sync lands it while this
+/// one waits for the lock. This one finds it landed in `landed.log` before the gate (whose
+/// table says BOTLIMIT): done, not `NotLanded` with "already MERGED".
+#[tokio::test]
+async fn an_open_pin_pull_request_landed_by_another_sync_is_done() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let head = "d".repeat(40);
+    bot_limit_row(&b, 60).await;
+    let stale = format!("{{\"type\":\"submodule\",\"sha\":\"{}\"}}", "b".repeat(40));
+    let open = format!("[{{\"number\":60,\"head\":{{\"sha\":\"{head}\"}}}}]");
+    // First match wins: the wrapper's main holds an old compiler pin; the open pull
+    // request's head holds the wanted ones.
+    let gh = FakeGh::default()
+        .on("pulls?state=open", &open)
+        .on("hgl-project/contents/hgl-compiler?ref=main", &stale);
+    let more = pins_current_gh(60, pin_merge);
+    let r = std::mem::take(&mut *more.rules.lock().unwrap());
+    gh.rules.lock().unwrap().extend(r);
+    let gh = Racing::new(gh, bus(&h).await, pin_merge, "pulls?state=open", 60);
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(r.ok(), "{r:?}");
+    assert!(
+        matches!(&r, crate::pins::Synced::Landed(o) if o.kind == crate::gate::Kind::AlreadyMerged),
+        "{r:?}"
+    );
+    assert_eq!(posts(&gh.gh, "merge-async"), 0, "not merged again");
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "landed once: {log}");
 }

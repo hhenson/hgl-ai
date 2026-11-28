@@ -388,10 +388,11 @@ pub async fn sync<G: Gh>(
         &land_opts(o, Some(title)),
     )
     .await?;
-    Ok(if l.outcome.kind.landed() {
-        Synced::Landed(l.outcome)
-    } else {
-        Synced::NotLanded(l.outcome)
+    Ok(match l.outcome.kind {
+        k if k.landed() => Synced::Landed(l.outcome),
+        // Landed meanwhile by another sync, which held the lock while this one waited: done.
+        Kind::AlreadyMerged => Synced::Landed(l.outcome),
+        _ => Synced::NotLanded(l.outcome),
     })
 }
 
@@ -440,18 +441,19 @@ async fn unfinished<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<Vec<(u64, 
 }
 
 /// Whether `branch` is a pin pull request's: `<branch_prefix><pin_branch>` with every
-/// `{sha8}` the same eight hex digits, as [`texts`] makes it.
+/// `{sha8}` of `pin_branch` the same eight hex digits, as [`texts`] makes it. The prefix is
+/// literal there, so it is here: a `{sha8}` in it is not filled.
 pub(crate) fn is_pin_branch(s: &Settings, branch: &str) -> bool {
-    let template = format!("{}{}", s.branch_prefix, s.pin_branch);
-    let Some((before, _)) = template.split_once("{sha8}") else {
-        return branch == template;
+    let Some(rest) = branch.strip_prefix(s.branch_prefix.as_str()) else {
+        return false;
     };
-    branch
-        .strip_prefix(before)
-        .and_then(|rest| rest.get(..8))
+    let Some((before, _)) = s.pin_branch.split_once("{sha8}") else {
+        return rest == s.pin_branch;
+    };
+    rest.strip_prefix(before)
+        .and_then(|r| r.get(..8))
         .is_some_and(|sha| {
-            sha.bytes().all(|c| c.is_ascii_hexdigit())
-                && branch == format!("{}{}", s.branch_prefix, fill(&s.pin_branch, sha))
+            sha.bytes().all(|c| c.is_ascii_hexdigit()) && rest == fill(&s.pin_branch, sha)
         })
 }
 
@@ -586,6 +588,20 @@ mod tests {
         s.pin_branch = "pins".into();
         assert!(is_pin_branch(&s, "codex/pins"));
         assert!(!is_pin_branch(&s, "codex/pins-cccccccc"));
+        // A `{sha8}` in the prefix is literal, as `texts` writes it (r6 on #133).
+        let mut s = settings();
+        s.branch_prefix = "team-{sha8}/".into();
+        let (branch, ..) = texts(&s, &the_plan('b'), &PinOpts::default()).unwrap();
+        assert_eq!(branch, "team-{sha8}/pins-compiler-cccccccc");
+        assert!(is_pin_branch(&s, &branch));
+        for b in [
+            "team-cccccccc/pins-compiler-cccccccc",
+            "team-{sha8}/pins-compiler-zzzzzzzz",
+            "team-{sha8}/pins-compiler-",
+            "codex/pins-compiler-cccccccc",
+        ] {
+            assert!(!is_pin_branch(&s, b), "{b}");
+        }
     }
 
     #[tokio::test]
