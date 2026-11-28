@@ -13,7 +13,7 @@ export interface Session {
 }
 
 async function get<T>(path: string): Promise<T> {
-  const r = await fetch(path, { credentials: "same-origin", cache: "no-store" });
+  const r = await fetch(path, { credentials: "same-origin", cache: "no-store", signal: AbortSignal.timeout(10_000) });
   if (r.status === 401) {
     window.location.assign("/signin");
     throw new Error("not signed in");

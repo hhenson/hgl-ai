@@ -2535,10 +2535,11 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
     let max_age = Duration::from_secs(3);
     h.bus.set_lease_max_age(max_age);
     let pid = h.calls.join("pid");
+    // Publish the pid only after it is complete: redirection creates an empty file first.
     h.script(
         "codex",
         &format!(
-            "if [ \"$n\" -eq 1 ]; then echo $$ > '{p}'; sleep 60; fi\ncat '{f}'",
+            "if [ \"$n\" -eq 1 ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60; fi\ncat '{f}'",
             p = pid.display(),
             f = fixture("codex-ok.jsonl")
         ),

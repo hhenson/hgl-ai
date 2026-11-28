@@ -44,6 +44,11 @@ pub const KV_CONSOLE: &str = "HGL_CONSOLE";
 pub fn user_inbox(nkey: &str) -> String {
     format!("_INBOX.{nkey}")
 }
+/// Where a role's account finds the hub's JetStream API on a hub with an account per role
+/// (hgl-ai#141): `$JS.API.<x>` is `JS.HUB.API.<x>`, a bucket's `$KV.<b>.<k>` is
+/// `JS.HUB.API.$KV.<b>.<k>` (a JetStream context with this API prefix writes there), and
+/// note, owner and usage subjects and acknowledgements keep their names.
+pub const HUB_API_PREFIX: &str = "JS.HUB.API";
 /// The inbox prefix of the `viewer` hub user (the console's page, docs/owner.md §3): its
 /// replies and deliveries come here, the only subjects it may subscribe to, so it never
 /// sees another client's replies on `_INBOX.>`. The page uses the same (`web/src/hub.ts`).
