@@ -278,11 +278,10 @@ before hub users takes one shared token until it moves.
 ```json
 {"v": 1, "id": "20261127-083000-3fa9c1", "repo": "hgl-compiler", "head": "8a5c...", "host": "lab1",
  "platform": "linux", "executor": "local", "status": "fail", "steps": [{"name": "test", "status": "fail",
- "exit": 101, "wall_ms": 81000, "cpu_ms": 302000, "peak_bytes": 3650000000, "cap_bytes": 34359738368,
- "log": ".../test.log"}], "errors": [{"step": "test", "file": "src/lib.rs", "line": 10, "col": 5,
+ "exit": 101, "wall_ms": 81000, "cpu_ms": 302000, "peak_bytes": 3650000000, "cap_bytes": 34359738368}], "errors": [{"step": "test", "file": "src/lib.rs", "line": 10, "col": 5,
  "code": "E0308", "message": "mismatched types", "count": 1, "start": 1234, "end": 2345}],
  "errors_total": 1, "tests": {"passed": 120, "failed": 2, "skipped": 3, "failures": [...]},
- "warnings_total": 4, "warnings": {"unused_variables": 3, "dead_code": 1}, "log_dir": "..."}
+ "warnings_total": 4, "warnings": {"unused_variables": 3, "dead_code": 1}, "log_dir": ""}
 ```
 
   `status` is `pass`, `fail`, `not-run` (a missing prerequisite), or `stopped`.
