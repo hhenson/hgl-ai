@@ -49,24 +49,13 @@ pub struct Nav<'a> {
 
 /// The whole page around `body`. `nav` is absent on the sign-in pages.
 pub fn page(title: &str, nav: Option<&Nav>, banner: Option<&str>, body: &str) -> String {
-    page_with(title, nav, banner, body, "")
-}
-
-/// [`page`] with more of `<head>` (the telemetry page's grid), before the page's script.
-pub fn page_with(
-    title: &str,
-    nav: Option<&Nav>,
-    banner: Option<&str>,
-    body: &str,
-    head: &str,
-) -> String {
     let mut s = String::new();
     let _ = write!(
         s,
         "<!doctype html>\n<html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <meta name=\"color-scheme\" content=\"light dark\">\
-         <title>{} · hgl-ai console</title>{head}\
+         <title>{} · hgl-ai console</title>\
          <link rel=\"stylesheet\" href=\"/assets/style.css\">\
          <script src=\"/assets/app.js\" defer></script></head><body>\
          <a class=\"skip\" href=\"#main\">Skip to content</a><header>",

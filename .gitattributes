@@ -1,2 +1,2 @@
-# Vendored third-party files: shown as vendored, not diffed line by line.
-crates/console/assets/vendor/ag-grid/** linguist-vendored -diff
+# The telemetry page's build output (crates/console/web): generated, not diffed line by line.
+crates/console/web/dist/** linguist-generated -diff

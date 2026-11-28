@@ -1,5 +1,4 @@
-/* hgl-ai console: one stylesheet, embedded in the binary; light and dark follow the
-   browser. The telemetry grids use AG Grid's Quartz theme, coloured from here. */
+/* hgl-ai console: one stylesheet, embedded in the binary. */
 :root {
   --bg: #ffffff;
   --fg: #1a1a1a;
@@ -11,7 +10,6 @@
   --p2: #8a4b00;
   --p3: #3c4043;
   --panel: #f5f5f5;
-  --flash: #fff1b8;
   color-scheme: light dark;
 }
 @media (prefers-color-scheme: dark) {
@@ -26,7 +24,6 @@
     --p2: #fdd663;
     --p3: #c4c7c5;
     --panel: #1e1e1e;
-    --flash: #5c4a00;
   }
 }
 * { box-sizing: border-box; }
@@ -90,49 +87,7 @@ section { overflow-x: auto; }
 .facts { display: grid; grid-template-columns: max-content 1fr; gap: .25rem 1rem; }
 .facts dt { font-weight: 600; }
 .facts dd { margin: 0; }
-code, .mono { font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace; font-size: .9em; }
-
-/* Telemetry: tabs over panels. Without the script every panel shows in turn. */
-main:has(> #panels) { max-width: 100rem; }
-nav.tabs { position: sticky; top: 0; z-index: 2; background: var(--bg); border-bottom: 1px solid var(--line); margin: .5rem 0 0; }
-nav.tabs ul { display: flex; flex-wrap: nowrap; gap: .25rem; list-style: none; margin: 0; padding: 0; overflow-x: auto; scrollbar-width: thin; }
-nav.tabs a {
-  display: block; white-space: nowrap; padding: .6rem .85rem; color: var(--fg); text-decoration: none;
-  border-bottom: 3px solid transparent; min-height: 2.75rem;
-}
-nav.tabs a:hover { color: var(--accent); }
-nav.tabs a[aria-selected="true"] { color: var(--accent); border-bottom-color: var(--accent); font-weight: 600; }
-.count {
-  display: inline-block; min-width: 1.5rem; padding: 0 .4rem; margin-left: .25rem; border-radius: 1rem;
-  background: var(--panel); border: 1px solid var(--line); color: var(--muted); font-size: .8rem; text-align: center;
-}
-.panel { padding-top: .25rem; scroll-margin-top: 3.5rem; }
-.tabbed .panel > h2 { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
-.caption { color: var(--muted); margin: 1rem 0 .35rem; font-size: .95rem; }
-.tgrid { width: 100%; margin-bottom: 1rem; }
-.tgrid .empty { color: var(--muted); }
-.ag-theme-quartz-auto-dark.tgrid {
-  --ag-font-family: inherit;
-  --ag-font-size: 14px;
-  --ag-background-color: var(--bg);
-  --ag-foreground-color: var(--fg);
-  --ag-header-background-color: var(--panel);
-  --ag-border-color: var(--line);
-  --ag-active-color: var(--accent);
-  --ag-value-change-value-highlight-background-color: var(--flash);
-  --ag-wrapper-border-radius: .375rem;
-  /* A short table stays short; a long one grows with the page, which scrolls. */
-  --ag-auto-height-min-body-height: 42px;
-  --ag-auto-height-max-body-height: 1000000px;
-}
-.ag-theme-quartz-auto-dark.tgrid .ag-overlay-no-rows-wrapper { padding-top: 2.5rem; }
-/* A phone's overlay scrollbar lies over the last row: let the row show through. */
-.tgrid .ag-scrollbar-invisible > .ag-body-horizontal-scroll-viewport { background: transparent; }
-
 @media (max-width: 40rem) {
   form.grid { grid-template-columns: 1fr; }
   .signout { margin-left: 0; }
-  main { padding: .75rem .5rem; }
-  nav.tabs a { padding: .55rem .6rem; }
-  .ag-theme-quartz-auto-dark.tgrid { --ag-font-size: 13px; }
 }

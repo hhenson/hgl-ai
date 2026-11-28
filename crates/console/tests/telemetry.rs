@@ -1,32 +1,19 @@
-//! The telemetry page: the vendored grid served self-only, and the live feed's row diffs
-//! against a real `nats-server` (that part skipped without one).
+//! The telemetry page: served from the binary, self-only; the API that hands a signed-in
+//! page its hub credential; and the hub's WebSocket listener, which takes the console's
+//! pages only (that part against a real `nats-server`, skipped without one).
 
 mod common;
 
-use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::Duration;
 
 use common::*;
-use hgl_ai_bus::Bus;
-use hgl_ai_console::{AG_GRID_FILES, AG_GRID_VERSION, App, ag_grid_path};
-use hgl_ai_proto::build::{BuilderRecord, Platform};
-use hgl_ai_proto::usage::{UsageBucket, UsageRecord};
-use hgl_ai_proto::{Family, HostRecord, Role, Runtime, Seat, SeatRecord, TreeRecord};
-use serde_json::{Value, json};
+use hgl_ai_console::App;
+use serde_json::Value;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const CSP: &str = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self'; \
                    connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; \
                    form-action 'self'; object-src 'none'";
-
-async fn console() -> (Providers, Harness, String) {
-    let (pem, public) = apple_key();
-    let providers = Providers::start(public).await;
-    let h = Harness::new(&providers, &pem);
-    let app = Arc::new(App::new(h.cfg.clone()).unwrap());
-    let base = serve(app).await;
-    (providers, h, base)
-}
 
 fn header<'a>(r: &'a reqwest::Response, k: &str) -> &'a str {
     r.headers()
@@ -35,354 +22,208 @@ fn header<'a>(r: &'a reqwest::Response, k: &str) -> &'a str {
         .unwrap_or("")
 }
 
+/// A console whose `[console] viewer_credential` is `viewer` (if given).
+async fn console(viewer: Option<&std::path::Path>) -> (Providers, Harness, String) {
+    let (pem, public) = apple_key();
+    let providers = Providers::start(public).await;
+    let mut h = Harness::new(&providers, &pem);
+    h.cfg.console.as_mut().unwrap().viewer_credential = viewer.map(|p| p.display().to_string());
+    let app = Arc::new(App::new(h.cfg.clone()).unwrap());
+    let base = serve(app).await;
+    (providers, h, base)
+}
+
+/// The attribute values `attr="..."` in `html`.
+fn attrs<'a>(html: &'a str, attr: &str) -> Vec<&'a str> {
+    let pat = format!("{attr}=\"");
+    html.match_indices(&pat)
+        .map(|(i, _)| {
+            let rest = &html[i + pat.len()..];
+            &rest[..rest.find('"').unwrap()]
+        })
+        .collect()
+}
+
 #[tokio::test]
-async fn the_grid_is_served_from_the_console_only() {
-    let (_p, _h, base) = console().await;
+async fn the_page_and_its_files_are_the_consoles_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let cred = dir.path().join("viewer.cred");
+    let mut reg = hgl_ai_install::users::Registry::default();
+    let text = reg
+        .issue("viewer", hgl_ai_install::users::Role::Viewer, false)
+        .unwrap();
+    write_secret(&cred, &text);
+    let (_p, _h, base) = console(Some(&cred)).await;
+
+    // Signed out: the page sends the browser to sign in; the API says 401.
+    let mut anon = Browser::new(&base);
+    let r = anon.get("/telemetry").await;
+    assert_eq!(r.status(), 303);
+    assert_eq!(header(&r, "location"), "/signin");
+    for p in ["/api/session", "/api/viewer"] {
+        let r = anon.get(p).await;
+        assert_eq!(r.status(), 401, "{p}");
+        let v: Value = r.json().await.unwrap();
+        assert_eq!(v["error"], "not signed in");
+    }
+
     let (mut b, _key) = signed_in(&base).await;
     let page = b.get("/telemetry").await;
+    assert_eq!(page.status(), 200);
     assert_eq!(header(&page, "content-security-policy"), CSP);
-    let page = page.text().await.unwrap();
-    for f in [
-        "ag-grid.min.css",
-        "ag-theme-quartz.min.css",
-        "ag-grid-community.min.noStyle.js",
-    ] {
-        assert!(page.contains(&ag_grid_path(f)), "{f}");
+    assert_eq!(header(&page, "content-type"), "text/html; charset=utf-8");
+    assert_eq!(header(&page, "cache-control"), "no-store");
+    let html = page.text().await.unwrap();
+    // Only files of its own: no inline script or style, no other origin.
+    assert!(
+        !html.contains("<style") && !html.contains(" style="),
+        "{html}"
+    );
+    assert!(
+        !html.contains("http://") && !html.contains("https://"),
+        "{html}"
+    );
+    for s in html.split("<script").skip(1) {
+        assert!(s.trim_start().contains("src=\"/app/"), "inline script: {s}");
     }
-    // Only the console's own scripts; no inline script or style for the CSP to refuse.
-    assert_eq!(page.matches("<script").count(), 2, "{page}");
-    assert_eq!(page.matches("<script src=\"/assets/").count(), 2);
-    assert!(!page.contains(" style=") && !page.contains("<style"));
-    assert!(!page.contains("https://"), "no CDN");
-    // The tabs, and a plain table per grid for the page without the script.
-    for t in [
-        "hosts", "tasks", "prs", "queue", "backlog", "landings", "fleet", "builds", "usage",
-    ] {
-        assert!(
-            page.contains(&format!("<a href=\"#{t}\" id=\"tab-{t}\"")),
-            "{t}"
-        );
-        assert!(page.contains(&format!("<section class=\"panel\" id=\"{t}\"")));
-    }
-    assert!(page.contains("<table data-grid=\"runs\""));
-
-    // Every vendored file, with its type; an immutable cache, as the version is the path.
-    let mut urls = Vec::new();
-    for (name, body) in AG_GRID_FILES {
-        let r = b.get(&ag_grid_path(name)).await;
-        assert_eq!(r.status(), 200, "{name}");
-        let want = match name.rsplit('.').next().unwrap() {
+    let mut files: Vec<String> = attrs(&html, "src")
+        .into_iter()
+        .chain(attrs(&html, "href"))
+        .map(String::from)
+        .collect();
+    assert_eq!(files.len(), 2, "{files:?}");
+    let mut css_urls = Vec::new();
+    while let Some(f) = files.pop() {
+        assert!(f.starts_with("/app/assets/"), "{f}");
+        let r = b.get(&f).await;
+        assert_eq!(r.status(), 200, "{f}");
+        let want = match f.rsplit('.').next().unwrap() {
             "js" => "text/javascript; charset=utf-8",
             "css" => "text/css; charset=utf-8",
             "svg" => "image/svg+xml",
             "woff2" => "font/woff2",
-            e => panic!("{e}"),
+            e => panic!("{f}: {e}"),
         };
-        assert_eq!(header(&r, "content-type"), want, "{name}");
+        assert_eq!(header(&r, "content-type"), want, "{f}");
         assert_eq!(header(&r, "content-security-policy"), CSP);
         assert_eq!(header(&r, "x-content-type-options"), "nosniff");
         assert_eq!(
             header(&r, "cache-control"),
             "public, max-age=31536000, immutable"
         );
-        assert_eq!(&r.bytes().await.unwrap()[..], *body);
-        if name.ends_with(".css") {
-            let css = std::str::from_utf8(body).unwrap();
-            assert!(
-                !css.contains("data:"),
-                "{name}: a data: URL the CSP refuses"
-            );
+        if f.ends_with(".css") {
+            let css = r.text().await.unwrap();
+            assert!(!css.contains("data:"), "{f}: a data: URL the CSP refuses");
             for u in css.split("url(").skip(1) {
-                urls.push(
-                    u[..u.find(')').unwrap()]
-                        .trim_matches(['\'', '"'])
-                        .to_string(),
-                );
+                let u = u[..u.find(')').unwrap()].trim_matches(['\'', '"']);
+                assert!(!u.contains(':') && !u.starts_with('/'), "{u}");
+                css_urls.push(format!("/app/assets/{u}"));
             }
         }
     }
-    // What the stylesheets refer to is served beside them.
-    assert!(urls.iter().any(|u| u.ends_with(".woff2")), "{urls:?}");
-    for u in &urls {
-        assert!(!u.contains(':') && !u.starts_with('/'), "{u}");
-        assert_eq!(b.get(&ag_grid_path(u)).await.status(), 200, "{u}");
+    // What the stylesheet refers to is served beside it (the grid's icon font).
+    assert!(
+        css_urls.iter().any(|u| u.ends_with(".woff2")),
+        "{css_urls:?}"
+    );
+    for u in &css_urls {
+        assert_eq!(b.get(u).await.status(), 200, "{u}");
     }
     for bad in [
-        "/assets/ag-grid/0.0.1/ag-grid.min.css".to_string(),
-        ag_grid_path("lib.rs"),
-        ag_grid_path("..%2F..%2Fsrc%2Flib.rs"),
+        "/app/index.html",
+        "/app/assets/nothing.js",
+        "/app/..%2Fsrc%2Flib.rs",
     ] {
-        assert_eq!(b.get(&bad).await.status(), 404, "{bad}");
+        assert_eq!(b.get(bad).await.status(), 404, "{bad}");
     }
-    // The pinned version and its licence are recorded beside the files.
-    let vendor = include_str!("../assets/vendor/VENDOR.md");
-    assert!(vendor.contains(&format!("| ag-grid-community | {AG_GRID_VERSION} |")));
-    let licence = include_str!("../assets/vendor/ag-grid/LICENSE.txt");
-    assert!(licence.starts_with("The MIT License"));
-    // Other pages do not load the grid.
-    let front = b.get("/").await.text().await.unwrap();
-    assert!(!front.contains("/assets/ag-grid/"));
+
+    // Who is signed in, for the header and the sign-out form.
+    let r = b.get("/api/session").await;
+    assert_eq!(header(&r, "cache-control"), "no-store");
+    let s: Value = r.json().await.unwrap();
+    assert_eq!(s["user"], "This Dude (owner@example.com)");
+    assert_eq!(s["csrf"].as_str().unwrap().len(), 64, "{s}");
+    assert!(s["open_questions"].is_null(), "no hub, no count");
+
+    // The viewer credential, for this signed-in page only, never cached.
+    let r = b.get("/api/viewer").await;
+    assert_eq!(r.status(), 200);
+    assert_eq!(header(&r, "cache-control"), "no-store");
+    let v: Value = r.json().await.unwrap();
+    let hgl_ai_bus::Credential::Nkey { seed, .. } =
+        hgl_ai_bus::parse_credential(&text).unwrap().unwrap()
+    else {
+        unreachable!()
+    };
+    assert_eq!(v["user"], "viewer");
+    assert_eq!(v["seed"], seed.as_str());
+    assert_eq!(v["path"], "/nats");
+
+    // Without one configured, the page is told why.
+    let (_p2, _h2, base2) = console(None).await;
+    let (mut b2, _k2) = signed_in(&base2).await;
+    let r = b2.get("/api/viewer").await;
+    assert_eq!(r.status(), 503);
+    let v: Value = r.json().await.unwrap();
+    assert!(
+        v["error"].as_str().unwrap().contains("viewer_credential"),
+        "{v}"
+    );
 }
 
-/// One server-sent event.
-struct Ev {
-    event: String,
-    data: Value,
-}
-
-struct Feed {
-    r: reqwest::Response,
-    buf: String,
-}
-
-impl Feed {
-    async fn next(&mut self) -> Ev {
-        loop {
-            if let Some(at) = self.buf.find("\n\n") {
-                let block: String = self.buf.drain(..at + 2).collect();
-                let (mut event, mut data) = (String::new(), String::new());
-                for l in block.lines() {
-                    if let Some(v) = l.strip_prefix("event:") {
-                        event = v.trim().to_string();
-                    } else if let Some(v) = l.strip_prefix("data:") {
-                        data.push_str(v.strip_prefix(' ').unwrap_or(v));
-                    }
-                }
-                if event.is_empty() {
-                    continue; // a keep-alive comment
-                }
-                return Ev {
-                    event,
-                    data: serde_json::from_str(&data).unwrap(),
-                };
-            }
-            let chunk = tokio::time::timeout(Duration::from_secs(40), self.r.chunk())
-                .await
-                .expect("an event within 40 s")
-                .unwrap()
-                .expect("the feed stays open");
-            self.buf.push_str(std::str::from_utf8(&chunk).unwrap());
-        }
-    }
-}
-
-/// The page's view of the tables: rows by id, as the script keeps them.
-type View = BTreeMap<String, BTreeMap<String, Value>>;
-
-fn apply(view: &mut View, ev: &Ev) {
-    let tables = ev.data["tables"].as_object().unwrap();
-    for (name, t) in tables {
-        let rows = view.entry(name.clone()).or_default();
-        let id = |r: &Value| r["id"].as_str().unwrap().to_string();
-        match ev.event.as_str() {
-            "reset" => {
-                rows.clear();
-                for r in t.as_array().unwrap() {
-                    assert!(rows.insert(id(r), r.clone()).is_none(), "ids are unique");
-                }
-            }
-            "diff" => {
-                for r in t["add"].as_array().unwrap() {
-                    assert!(rows.insert(id(r), r.clone()).is_none(), "added once");
-                }
-                for r in t["update"].as_array().unwrap() {
-                    assert!(rows.insert(id(r), r.clone()).is_some(), "updates a row");
-                }
-                for r in t["remove"].as_array().unwrap() {
-                    assert!(rows.remove(r.as_str().unwrap()).is_some(), "removes a row");
-                }
-            }
-            e => panic!("event {e}"),
-        }
-    }
-}
-
-fn prs(rows: &[(u64, &str)]) -> String {
-    let mut s = "# read 20261128T050000Z\n".to_string();
-    for (n, checks) in rows {
-        s.push_str(&format!(
-            "alpha\t{n}\t{}\topen\tclean\t0\t{checks}\t20261128T050000Z\n",
-            n.to_string().repeat(40).get(..40).unwrap()
-        ));
-    }
-    s
+/// A WebSocket handshake to the hub's listener from a page of `origin`: the status line.
+async fn handshake(port: u16, origin: &str) -> String {
+    let mut s = tokio::net::TcpStream::connect(("127.0.0.1", port))
+        .await
+        .unwrap();
+    let req = format!(
+        "GET /nats HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\n\
+         Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\
+         Sec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n\r\n"
+    );
+    s.write_all(req.as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 1024];
+    let n = s.read(&mut buf).await.unwrap();
+    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+    text.lines().next().unwrap_or("").to_string()
 }
 
 #[tokio::test]
-async fn the_feed_sends_row_diffs() {
-    let Some(hub) = start_hub() else { return };
-    let admin = Bus::connect_with(&hub.url, Some(hub.creds["hub-admin"].clone()))
+async fn the_hub_takes_the_consoles_pages_and_the_viewer_credential_works() {
+    let Some(hub) = start_hub_with(Some(ORIGIN)) else {
+        return;
+    };
+    let ws = hub.ws_port.unwrap();
+    assert!(
+        handshake(ws, ORIGIN).await.contains(" 101 "),
+        "the console's own page"
+    );
+    let other = handshake(ws, "https://elsewhere.example.com").await;
+    assert!(other.contains(" 403 "), "another site's page: {other}");
+
+    // The credential the API hands out is the hub's viewer.
+    let (_p, _h, base) = console(Some(&hub.cred_files["viewer"])).await;
+    let (mut b, _key) = signed_in(&base).await;
+    let v: Value = b.get("/api/viewer").await.json().await.unwrap();
+    let cred = hgl_ai_bus::Credential::Nkey {
+        seed: v["seed"].as_str().unwrap().to_string(),
+        user: None,
+        role: None,
+    };
+    let admin = hgl_ai_bus::Bus::connect_with(&hub.url, Some(hub.creds["hub-admin"].clone()))
         .await
         .unwrap();
     admin.provision().await.unwrap();
-    let seat = Bus::connect_with(&hub.url, Some(hub.creds["hub"].clone()))
+    admin.state_put("mode", "normal").await.unwrap();
+    let viewer = hgl_ai_bus::Bus::connect_with(&hub.url, Some(cred))
         .await
         .unwrap();
-    let now = hgl_ai_proto::utc_stamp(chrono::Utc::now());
-    seat.host_put(&HostRecord {
-        host: "lab1".into(),
-        seats: vec![SeatRecord {
-            seat: Seat::new("w1").unwrap(),
-            role: Role::Implementor,
-            runtime: Runtime::Claude,
-            family: Family::Claude,
-            model: "claude-opus-5-5".into(),
-        }],
-        memcap_gb: 64,
-        work_root_free_gb: 500,
-        updated_at: now.clone(),
-    })
-    .await
-    .unwrap();
-    let tree: TreeRecord = serde_json::from_value(json!({
-        "host": "lab1", "seat": "w1", "task": {"repo": "alpha", "issue": 7},
-        "path": "/w/alpha-7", "branch": "codex/q7", "created_at": now,
-    }))
-    .unwrap();
-    seat.tree_put(&tree).await.unwrap();
-    seat.state_put("prs", &prs(&[(11, "pass"), (12, "pending")]))
-        .await
-        .unwrap();
-    seat.state_put(
-        "landed.log",
-        "20261128T040000Z alpha #5 0123456789abcdef0123456789abcdef01234567\n",
-    )
-    .await
-    .unwrap();
-    seat.builder_put(&BuilderRecord {
-        label: "lab1".into(),
-        inbox: Seat::new("builder-lab1").unwrap(),
-        platform: Platform::Linux,
-        arch: "x86_64".into(),
-        executor: "local".into(),
-        proxy: None,
-        reachable: true,
-        reason: None,
-        state: "idle".into(),
-        slots: 2,
-        busy: 0,
-        free_gb: Some(400),
-        toolchains: [("cargo".to_string(), "1.93.0".to_string())].into(),
-        updated_at: now.clone(),
-    })
-    .await
-    .unwrap();
-    let run = json!({
-        "v": 1, "id": "20261128-050000-3fa9c1", "repo": "alpha",
-        "head": "8a5c3d264c2edbbdaa61530d810bff276c3eebba", "dirty": false, "host": "lab1",
-        "platform": "linux", "executor": "local", "status": "pass",
-        "started_at": "20261128T050000Z", "wall_ms": 75000, "log_dir": "/w/logs",
-        "steps": [], "errors": [], "errors_total": 0,
-        "tests": {"passed": 120, "failed": 0, "skipped": 1}, "warnings_total": 0,
-        "warnings": {}
-    });
-    seat.build_put("run.20261128-050000-3fa9c1", run.to_string().as_bytes())
-        .await
-        .unwrap();
-    seat.usage_put(&UsageRecord {
-        runtime: Runtime::Claude,
-        account: "0123456789ab".into(),
-        label: None,
-        host: "lab1".into(),
-        plan: Some("max".into()),
-        observed_at: now.clone(),
-        collected_at: now.clone(),
-        source_age_s: 0,
-        buckets: vec![UsageBucket {
-            scope: "all".into(),
-            window: "week".into(),
-            used_pct: 41.25,
-            resets_at: None,
-        }],
-        limit_reached: None,
-        unparsed: vec![],
-    })
-    .await
-    .unwrap();
-
-    let (pem, public) = apple_key();
-    let providers = Providers::start(public).await;
-    let mut h = Harness::new(&providers, &pem);
-    h.cfg.hub.url = hub.url.clone();
-    let app = Arc::new(App::new(h.cfg.clone()).unwrap());
-    let bus = Arc::new(
-        Bus::connect_with(&hub.url, Some(hub.creds["console"].clone()))
-            .await
-            .unwrap(),
-    );
-    app.set_hub(bus);
-    hgl_ai_console::service::start_background(app.clone()).await;
-    let base = serve(app).await;
-    let (mut b, _key) = signed_in(&base).await;
     assert_eq!(
-        b.get("/telemetry/events")
-            .await
-            .headers()
-            .get("content-type")
-            .unwrap(),
-        "text/event-stream"
+        viewer.state_get("mode").await.unwrap().unwrap().value,
+        "normal"
     );
-    let mut feed = Feed {
-        r: b.get("/telemetry/events").await,
-        buf: String::new(),
-    };
-
-    // First a reset with every table; the first reading may come after it, as a diff.
-    let mut view = View::new();
-    let ev = feed.next().await;
-    assert_eq!(ev.event, "reset");
-    assert!(ev.data["meta"]["read"].is_string());
-    apply(&mut view, &ev);
-    while view["prs"].len() < 2 || view["usage"].is_empty() || view["runs"].is_empty() {
-        let ev = feed.next().await;
-        assert_eq!(ev.event, "diff");
-        apply(&mut view, &ev);
-    }
-    assert_eq!(view["prs"]["alpha#12"]["checks"], "pending");
-    assert_eq!(view["hosts"]["lab1/w1"]["model"], "claude-opus-5-5");
-    assert_eq!(
-        view["tasks"]["lab1/w1/alpha#7/implement"]["stage"],
-        "working"
+    assert!(
+        viewer.state_put("mode", "drain").await.is_err(),
+        "read-only"
     );
-    assert_eq!(view["runs"]["20261128-050000-3fa9c1"]["passed"], 120);
-    assert_eq!(view["builders"]["lab1"]["toolchains"], "cargo 1.93.0");
-    assert_eq!(
-        view["usage"]["claude.0123456789ab/all/week"]["used_pct"],
-        41.3
-    );
-    assert_eq!(view["landings"].len(), 1);
-    assert_eq!(view["fleet"]["mode"]["value"], "normal");
-
-    // One pull request lands, one changes, one opens: the next diff says just that.
-    seat.state_put("prs", &prs(&[(12, "pass"), (14, "pending")]))
-        .await
-        .unwrap();
-    let ev = loop {
-        let ev = feed.next().await;
-        assert_eq!(ev.event, "diff");
-        apply(&mut view, &ev);
-        if !ev.data["tables"]["prs"].is_null() {
-            break ev;
-        }
-    };
-    let d = &ev.data["tables"]["prs"];
-    assert_eq!(d["remove"], json!(["alpha#11"]));
-    assert_eq!(d["update"][0]["id"], "alpha#12");
-    assert_eq!(d["update"][0]["checks"], "pass");
-    assert_eq!(d["add"][0]["id"], "alpha#14");
-    assert_eq!(d["update"].as_array().unwrap().len(), 1, "{d}");
-    // Nothing else changed, so nothing else was sent (but a task's age, by the minute).
-    let others: Vec<&String> = ev.data["tables"]
-        .as_object()
-        .unwrap()
-        .keys()
-        .filter(|k| *k != "prs" && *k != "tasks")
-        .collect();
-    assert!(others.is_empty(), "{others:?}");
-    assert_eq!(
-        view["prs"].keys().collect::<Vec<_>>(),
-        ["alpha#12", "alpha#14"]
-    );
-    // The page's tab label counts follow.
-    assert_eq!(ev.data["meta"]["counts"]["prs"], 2);
 }

@@ -3,23 +3,23 @@
 //! user service gives it the console's own hub user, the only one that may publish the
 //! owner's words (OWN-5).
 //!
-//! Pages are rendered on the server; the one script, embedded like the stylesheet,
-//! drives the passkey ceremonies, live telemetry (server-sent events) and the answer form.
-//! The telemetry page also loads AG Grid Community, vendored at a pinned version
-//! (`assets/vendor/VENDOR.md`) and served from the console's own path.
+//! Status, questions and conversations are rendered on the server, with one small
+//! embedded script for the passkey ceremonies and the answer form. Telemetry is a page
+//! of its own (`web/`, React and TypeScript, built by Vite into `web/dist`, embedded
+//! here): it reads the hub's buckets over WebSocket as the `viewer` user, whose
+//! credential [`api`] hands to a signed-in page.
 
+pub mod api;
 pub mod auth;
-pub mod grid;
 mod html;
 pub mod jwt;
 mod pages;
 pub mod service;
-pub mod telemetry;
 
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
-use axum::extract::Path;
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -46,7 +46,6 @@ pub struct App {
     pub auth: Auth,
     pub controller: Seat,
     hub: tokio::sync::OnceCell<Arc<Bus>>,
-    pub telemetry: tokio::sync::watch::Sender<Arc<telemetry::Snapshot>>,
     pub(crate) notifier: Option<hgl_ai_notify::Notifier>,
     /// `p2` questions waiting for the hourly notification: id and title.
     pub(crate) pending_p2: Mutex<Vec<(String, String)>>,
@@ -85,7 +84,6 @@ impl App {
             auth,
             controller,
             hub: tokio::sync::OnceCell::new(),
-            telemetry: tokio::sync::watch::channel(Arc::new(telemetry::Snapshot::default())).0,
             notifier,
             pending_p2: Mutex::default(),
             unsent_p1: Mutex::default(),
@@ -153,36 +151,18 @@ async fn security_headers(mut r: Response) -> Response {
 const STYLE: &[u8] = include_bytes!("../assets/style.css");
 const SCRIPT: &[u8] = include_bytes!("../assets/app.js");
 
-/// The vendored AG Grid Community (`assets/vendor/VENDOR.md`), served under
-/// `/assets/ag-grid/<version>/`.
-pub const AG_GRID_VERSION: &str = "36.3.0";
-macro_rules! vendored {
-    ($($name:literal),* $(,)?) => {
-        &[$(($name, include_bytes!(concat!("../assets/vendor/ag-grid/", $name)))),*]
-    };
-}
-pub const AG_GRID_FILES: &[(&str, &[u8])] = vendored!(
-    "ag-grid-community.min.noStyle.js",
-    "ag-grid.min.css",
-    "ag-theme-quartz.min.css",
-    "data-32162e0dbc3e.svg",
-    "data-36b98d025184.svg",
-    "data-43d1b0e2ef6a.woff2",
-    "data-699c136b519a.svg",
-    "data-c56482da2aea.svg",
-);
-
-/// `/assets/ag-grid/<version>/<file>`
-pub fn ag_grid_path(file: &str) -> String {
-    format!("/assets/ag-grid/{AG_GRID_VERSION}/{file}")
-}
+/// The telemetry page: `web/dist`, the output of `npm run build` in `web/`, checked in so
+/// that building the binary needs no Node (docs/design.md).
+static WEB: include_dir::Dir<'static> = include_dir::include_dir!("$CARGO_MANIFEST_DIR/web/dist");
 
 fn content_type(name: &str) -> &'static str {
     match name.rsplit('.').next() {
+        Some("html") => "text/html; charset=utf-8",
         Some("js") => "text/javascript; charset=utf-8",
         Some("css") => "text/css; charset=utf-8",
         Some("svg") => "image/svg+xml",
         Some("woff2") => "font/woff2",
+        Some("png") => "image/png",
         _ => "application/octet-stream",
     }
 }
@@ -195,13 +175,27 @@ fn asset(kind: &'static str, cache: &'static str, body: &'static [u8]) -> Respon
         .into_response()
 }
 
-async fn ag_grid(Path((version, file)): Path<(String, String)>) -> Response {
-    match AG_GRID_FILES.iter().find(|(n, _)| *n == file) {
-        // The version is in the path, so a file never changes under it.
-        Some((n, body)) if version == AG_GRID_VERSION => {
-            asset(content_type(n), "public, max-age=31536000, immutable", body)
-        }
+/// `/app/<file>`: the page's files. Vite names them by their content, so they never change.
+async fn web_file(Path(file): Path<String>) -> Response {
+    match WEB.get_file(&file) {
+        Some(f) if file != "index.html" => asset(
+            content_type(&file),
+            "public, max-age=31536000, immutable",
+            f.contents(),
+        ),
         _ => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+    }
+}
+
+/// `/telemetry`: the page itself, for a signed-in browser.
+async fn telemetry(State(app): State<Arc<App>>, h: HeaderMap) -> Response {
+    let cookies = h.get(header::COOKIE).and_then(|v| v.to_str().ok());
+    if app.auth.session(cookies).is_none() {
+        return axum::response::Redirect::to("/signin").into_response();
+    }
+    match WEB.get_file("index.html") {
+        Some(f) => asset(content_type("index.html"), "no-store", f.contents()),
+        None => (StatusCode::NOT_FOUND, "not built\n").into_response(),
     }
 }
 
@@ -218,9 +212,10 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/t/{id}/answer", post(pages::answer))
         .route("/t/{id}/message", post(pages::message))
         .route("/t/{id}/close", post(pages::close))
-        .route("/telemetry", get(pages::telemetry))
-        .route("/telemetry.json", get(pages::telemetry_json))
-        .route("/telemetry/events", get(pages::telemetry_events))
+        .route("/telemetry", get(telemetry))
+        .route("/app/{*file}", get(web_file))
+        .route("/api/session", get(api::session_info))
+        .route("/api/viewer", get(api::viewer))
         .route("/signin", get(pages::signin))
         .route("/auth/github", get(pages::github_start))
         .route("/auth/github/callback", get(pages::github_callback))
@@ -245,7 +240,6 @@ pub fn router(app: Arc<App>) -> Router {
             "/assets/app.js",
             get(|| async { asset(content_type(".js"), "public, max-age=3600", SCRIPT) }),
         )
-        .route("/assets/ag-grid/{version}/{file}", get(ag_grid))
         .fallback(|| async { (StatusCode::NOT_FOUND, "not found\n") })
         .layer(axum::middleware::map_response(security_headers))
         .with_state(app)

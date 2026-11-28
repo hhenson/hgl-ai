@@ -7,9 +7,9 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use futures::stream::Stream;
+
 use hgl_ai_owner::{self as owner, Body, Choice, Priority, Thread, ThreadKind, ThreadState};
 use serde::Deserialize;
 use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
@@ -19,7 +19,7 @@ use crate::auth::{
     AuthError, ENROL_COOKIE, FLOW_COOKIE, LOGIN_COOKIE, PENDING_TTL, Provider, SESSION_COOKIE,
     Session,
 };
-use crate::html::{Nav, csrf, esc, page, page_with, text_block, time};
+use crate::html::{Nav, csrf, esc, page, text_block, time};
 
 type AppState = State<Arc<App>>;
 
@@ -105,18 +105,6 @@ async fn framed(
     body: &str,
     banner: Option<String>,
 ) -> Response {
-    framed_with(app, s, current, title, body, banner, "").await
-}
-
-async fn framed_with(
-    app: &App,
-    s: &Session,
-    current: &str,
-    title: &str,
-    body: &str,
-    banner: Option<String>,
-    head: &str,
-) -> Response {
     let user = app.auth.display(&s.user);
     let nav = Nav {
         user: &user,
@@ -131,7 +119,7 @@ async fn framed_with(
             })
         })
         .or_else(|| crate::service::undelivered(app));
-    Html(page_with(title, Some(&nav), banner.as_deref(), body, head)).into_response()
+    Html(page(title, Some(&nav), banner.as_deref(), body)).into_response()
 }
 
 fn prio(p: Option<Priority>) -> String {
@@ -643,79 +631,6 @@ pub async fn close(
         Err(r) => return r,
     };
     send_owner(&app, &s, &id, Body::Close).await
-}
-
-pub async fn telemetry(State(app): AppState, h: HeaderMap) -> Response {
-    let s = match viewer(&app, &h) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let snap = app.telemetry.borrow().clone();
-    let body = format!(
-        "<p id=\"live\" class=\"meta\" aria-live=\"polite\">Live updates start when the page has loaded.</p>\
-         <noscript><p class=\"meta\">Without the script this page shows the reading it was loaded with; reload for a newer one.</p></noscript>\
-         <div id=\"panels\" data-sse=\"/telemetry/events\">{}</div>",
-        crate::telemetry::render(&snap)
-    );
-    let head = format!(
-        "<link rel=\"stylesheet\" href=\"{}\"><link rel=\"stylesheet\" href=\"{}\">\
-         <script src=\"{}\" defer></script>",
-        crate::ag_grid_path("ag-grid.min.css"),
-        crate::ag_grid_path("ag-theme-quartz.min.css"),
-        crate::ag_grid_path("ag-grid-community.min.noStyle.js"),
-    );
-    framed_with(&app, &s, "/telemetry", "Telemetry", &body, None, &head).await
-}
-
-pub async fn telemetry_json(State(app): AppState, h: HeaderMap) -> Response {
-    if app.auth.session(cookies(&h)).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let snap = app.telemetry.borrow().clone();
-    Json(&*snap).into_response()
-}
-
-pub async fn telemetry_events(State(app): AppState, h: HeaderMap) -> Response {
-    if app.auth.session(cookies(&h)).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    Sse::new(row_events(app.telemetry.subscribe()))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
-        .into_response()
-}
-
-/// The live feed of one page (see [`crate::grid`]): `reset` with every row, then a
-/// `diff` for each reading that changed a row or the page's text.
-pub(crate) fn row_events(
-    rx: tokio::sync::watch::Receiver<Arc<crate::telemetry::Snapshot>>,
-) -> impl Stream<Item = Result<SseEvent, std::convert::Infallible>> {
-    use crate::grid::{Meta, Tables, diff, diff_json, reset_json};
-    use crate::telemetry::{meta, tables};
-    type Sent = Option<(Meta, Tables)>;
-    futures::stream::unfold(
-        (rx, None::<(Meta, Tables)>),
-        |(mut rx, sent): (_, Sent)| async move {
-            let Some((m0, t0)) = sent else {
-                let snap = rx.borrow_and_update().clone();
-                let (m, t) = (meta(&snap), tables(&snap));
-                let ev = SseEvent::default().event("reset").data(reset_json(&m, &t));
-                return Some((Ok(ev), (rx, Some((m, t)))));
-            };
-            loop {
-                if rx.changed().await.is_err() {
-                    return None;
-                }
-                let snap = rx.borrow_and_update().clone();
-                let (m, t) = (meta(&snap), tables(&snap));
-                let d = diff(&t0, &t);
-                if d.is_empty() && m == m0 {
-                    continue;
-                }
-                let ev = SseEvent::default().event("diff").data(diff_json(&m, &d));
-                return Some((Ok(ev), (rx, Some((m, t)))));
-            }
-        },
-    )
 }
 
 // ---- sign-in ----

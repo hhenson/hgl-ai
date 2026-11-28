@@ -284,19 +284,16 @@ async fn ask_answer_converse_and_refuse_forgery() {
     assert!(page.contains("**Landed** hgl-compiler#980."), "{page}");
     assert!(page.contains("from claude"));
 
-    // Telemetry reads the hub as the console's user.
-    // The first reading may predate the questions; the next comes within 10 s.
+    // The page's API counts open questions by priority, read as the console's user.
     let mut snap = serde_json::Value::Null;
     for _ in 0..150 {
-        snap = b.get("/telemetry.json").await.json().await.unwrap();
+        snap = b.get("/api/session").await.json().await.unwrap();
         if snap["open_questions"]["p3"] == 1 {
             break;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(snap["open_questions"]["p3"], 1, "{snap}");
-    assert_eq!(snap["mode"], "normal");
-    assert!(snap["error"].is_null(), "{}", snap["error"]);
 }
 
 /// A console restart keeps who is signed in and the pending p2 batch (both on the hub,
@@ -391,7 +388,7 @@ async fn sessions_and_the_p2_batch_survive_a_restart() {
 
     // Sign-out reaches the hub: a third start does not bring the session back, and
     // the sent batch stays sent.
-    let token = b.csrf("/telemetry").await;
+    let token = b.csrf("/").await;
     let before = b.jar.clone();
     let r = b
         .post_form("/auth/signout", &[("csrf", &token)], Some(ORIGIN))

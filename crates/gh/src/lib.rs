@@ -34,6 +34,7 @@ pub mod state;
 pub mod store;
 pub mod table;
 pub mod tap;
+pub mod tasks;
 pub mod verdict;
 
 use std::collections::BTreeMap;
