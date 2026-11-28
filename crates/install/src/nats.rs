@@ -120,24 +120,9 @@ pub fn ensure_server_with(
     if let Some(p) = sys.which("nats-server") {
         return Ok((p, NatsSource::Path));
     }
-    let ours = data_dir.join("bin/nats-server");
-    let pinned = || {
-        sys.query(
-            &Cmd::new(ours.display().to_string())
-                .arg("--version")
-                .timeout(std::time::Duration::from_secs(10)),
-        )
-        .is_ok_and(|o| {
-            o.ok()
-                && o.stdout
-                    .split_whitespace()
-                    .any(|w| w == format!("v{version}"))
-        })
-    };
-    if sys.exists(&ours) && pinned() {
-        return Ok((ours, NatsSource::Release));
-    }
-    if let Some(brew) = sys.which("brew").filter(|_| brew) {
+    if let Some(brew) = sys.which("brew").filter(|_| brew)
+        && !pinned_release(sys, data_dir, version)
+    {
         let brew = brew.display().to_string();
         run_ok(sys, &Cmd::new(&brew).args(["install", "nats-server"]))?;
         if let Some(p) = sys.which("nats-server") {
@@ -151,8 +136,60 @@ pub fn ensure_server_with(
             .ok_or_else(|| other("`brew --prefix` failed after installing nats-server"))?;
         return Ok((prefix.join("bin/nats-server"), NatsSource::Brew));
     }
-    install_release(sys, data_dir, version, base)?;
-    Ok((ours, NatsSource::Release))
+    Ok((
+        ensure_release(sys, data_dir, version, base)?,
+        NatsSource::Release,
+    ))
+}
+
+/// The `nats-server` a system install chose (`chosen`): the pinned release when it is
+/// `<data_dir>/bin/nats-server`, else that program as it is.
+pub fn ensure_chosen(
+    sys: &dyn System,
+    data_dir: &Path,
+    version: &str,
+    base: &str,
+    chosen: &Path,
+) -> Result<(PathBuf, NatsSource)> {
+    if chosen == release_path(data_dir) {
+        Ok((
+            ensure_release(sys, data_dir, version, base)?,
+            NatsSource::Release,
+        ))
+    } else {
+        Ok((chosen.to_path_buf(), NatsSource::Path))
+    }
+}
+
+/// Where the pinned release goes.
+pub fn release_path(data_dir: &Path) -> PathBuf {
+    data_dir.join("bin/nats-server")
+}
+
+fn pinned_release(sys: &dyn System, data_dir: &Path, version: &str) -> bool {
+    let ours = release_path(data_dir);
+    sys.exists(&ours)
+        && sys
+            .query(
+                &Cmd::new(ours.display().to_string())
+                    .arg("--version")
+                    .timeout(std::time::Duration::from_secs(10)),
+            )
+            .is_ok_and(|o| {
+                o.ok()
+                    && o.stdout
+                        .split_whitespace()
+                        .any(|w| w == format!("v{version}"))
+            })
+}
+
+/// The pinned release in `<data_dir>/bin`, downloaded when it is missing or another
+/// version.
+fn ensure_release(sys: &dyn System, data_dir: &Path, version: &str, base: &str) -> Result<PathBuf> {
+    if !pinned_release(sys, data_dir, version) {
+        install_release(sys, data_dir, version, base)?;
+    }
+    Ok(release_path(data_dir))
 }
 
 /// Download, verify and unpack the pinned release into `<data_dir>/bin/nats-server`.
