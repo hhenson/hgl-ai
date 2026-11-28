@@ -7,15 +7,14 @@ use std::collections::BTreeMap;
 use async_nats::jetstream::context::Publish;
 use async_nats::jetstream::kv;
 use async_nats::jetstream::stream::LastRawMessageErrorKind;
-use futures::StreamExt;
 use hgl_ai_proto::{
     KV_USAGE, STREAM_USAGE, UsageLabel, UsageRecord, check_account, check_label, parse_stamp,
     usage_label_key, utc_now_stamp,
 };
 
 use crate::{
-    APPEND_ATTEMPTS, Bus, BusError, MAX_VALUE_BYTES, Result, backoff, live_entry, missing, nats,
-    publish_error, put_json,
+    APPEND_ATTEMPTS, Bus, BusError, MAX_VALUE_BYTES, Result, backoff, keys, live_entry, missing,
+    nats, publish_error, put_json,
 };
 
 /// What [`Bus::usage_put`] did.
@@ -44,7 +43,7 @@ impl Bus {
         }
         let new_at = parse_stamp(&rec.observed_at);
         let store = self.store(&self.usage, KV_USAGE).await?;
-        let kv_subject = format!("$KV.{KV_USAGE}.{key}");
+        let kv_subject = self.kv_subject(KV_USAGE, &key);
         let mut revision = None;
         for attempt in 0..APPEND_ATTEMPTS {
             let held = live_entry(store, &key).await?;
@@ -171,7 +170,7 @@ impl Bus {
         check_account(account)?;
         let store = self.store(&self.usage, KV_USAGE).await?;
         let key = usage_label_key(account);
-        let subject = format!("$KV.{KV_USAGE}.{key}");
+        let subject = self.kv_subject(KV_USAGE, &key);
         match label {
             Some(l) => {
                 check_label(l)?;
@@ -195,13 +194,7 @@ impl Bus {
 
     async fn usage_all(&self) -> Result<(Vec<UsageRecord>, BTreeMap<String, String>)> {
         let store = self.store(&self.usage, KV_USAGE).await?;
-        let mut keys = store.keys().await.map_err(|e| nats("listing keys", e))?;
-        let mut names = Vec::new();
-        while let Some(k) = keys.next().await {
-            names.push(k.map_err(|e| nats("listing keys", e))?);
-        }
-        names.sort();
-        names.dedup();
+        let names = keys(self, store, |_| true).await?;
         let mut records = Vec::new();
         let mut labels = BTreeMap::new();
         for key in names {

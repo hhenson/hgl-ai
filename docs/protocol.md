@@ -348,11 +348,14 @@ Each bridge writes `HGL_HOSTS/<host>` every 30 s:
   "seats": [{"seat": "w3", "role": "implementor", "runtime": "codex", "family": "gpt", "model": "gpt-6.1-sol"}],
   "memcap_gb": 64,
   "work_root_free_gb": 812,
-  "updated_at": "20261127T083000Z"
+  "updated_at": "20261127T083000Z",
+  "accounts_capable": true
 }
 ```
 
 `host` is a configured label, never a network name or address.
+`accounts_capable` says the bridge supports role accounts. It defaults to false
+for older records.
 
 A builder writes `HGL_HOSTS/builder.<label>` with the same heartbeat and TTL
 (`hgl-ai hosts` leaves these out; `hgl-ai builder list` shows them):

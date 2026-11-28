@@ -43,6 +43,7 @@
 
 pub mod cred;
 mod feed;
+mod kv_read;
 mod usage;
 
 use std::path::Path;
@@ -58,15 +59,17 @@ use async_nats::jetstream::{self, AckKind, context::Publish, kv, stream};
 use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
-    BROADCAST, CONSOLE_PREFIX, EndedRecord, HostRecord, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS,
-    KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord, Note, OWNER_PREFIX,
-    STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord,
-    USAGE_PREFIX, ended_key, utc_now_stamp,
+    BROADCAST, CONSOLE_PREFIX, EndedRecord, HUB_API_PREFIX, HostRecord, KV_CONSOLE, KV_ENDED,
+    KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord,
+    Note, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey,
+    TreeRecord, USAGE_PREFIX, ended_key, utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
 use time::OffsetDateTime;
 use tokio::sync::OnceCell;
+
+use kv_read::keys;
 
 mod build;
 pub use build::BUILD_HISTORY;
@@ -148,6 +151,7 @@ pub const USAGE_MAX_AGE: Duration = Duration::from_secs(35 * 86_400);
 const APPEND_ATTEMPTS: u32 = 200;
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const DEFAULT_API_PREFIX: &str = "$JS.API";
 /// Longest single pull request; longer waits are split so a reconnect is noticed.
 const MAX_PULL: Duration = Duration::from_secs(30);
 /// Shortest pull expiry worth sending to the server.
@@ -233,6 +237,7 @@ pub fn read_token(path: &Path) -> Result<Option<String>> {
 pub struct Bus {
     client: async_nats::Client,
     js: jetstream::Context,
+    api_prefix: &'static str,
     url: String,
     who: String,
     /// The hub's permissions violations on this connection, newest last (a few kept).
@@ -275,17 +280,22 @@ impl Bus {
         let denied_tick = Arc::new(tokio::sync::Notify::new());
         let seen = denied.clone();
         let tick = denied_tick.clone();
+        let probe = format!("{HUB_API_PREFIX}.INFO");
+        let quoted_probe = format!("\"{probe}\"");
         let mut opts = async_nats::ConnectOptions::new()
             .name(name)
             .connection_timeout(CONNECT_TIMEOUT)
             .event_callback(move |ev| {
                 let seen = seen.clone();
                 let tick = tick.clone();
+                let quoted_probe = quoted_probe.clone();
                 async move {
                     if let async_nats::Event::ServerError(async_nats::ServerError::Other(m)) = &ev
                         && m.to_ascii_lowercase().contains("permissions violation")
                     {
-                        tracing::warn!("hub: {m}");
+                        if !m.contains(&quoted_probe) {
+                            tracing::warn!("hub: {m}");
+                        }
                         if let Ok(mut d) = seen.lock() {
                             d.push(m.clone());
                             let n = d.len();
@@ -313,10 +323,10 @@ impl Bus {
             url: url.to_string(),
             reason: e.to_string(),
         })?;
-        let js = jetstream::new(client.clone());
-        Ok(Bus {
+        let mut bus = Bus {
+            js: jetstream::new(client.clone()),
             client,
-            js,
+            api_prefix: DEFAULT_API_PREFIX,
             url: url.to_string(),
             who,
             denied,
@@ -332,7 +342,41 @@ impl Bus {
             slack: OnceCell::new(),
             usage: OnceCell::new(),
             build: OnceCell::new(),
-        })
+        };
+        // A legacy user may be refused the probe, and an admin in HUB has no import.
+        let imported = jetstream::with_prefix(bus.client.clone(), HUB_API_PREFIX);
+        let answered = bus
+            .guarded(&probe, async {
+                tokio::time::timeout(CONNECT_TIMEOUT, imported.query_account())
+                    .await
+                    .map_err(|e| nats("probing the hub API", e))?
+                    .map_err(|e| nats("probing the hub API", e))
+            })
+            .await;
+        if answered.is_ok() {
+            bus.js = imported;
+            bus.api_prefix = HUB_API_PREFIX;
+        }
+        Ok(bus)
+    }
+
+    fn api_subject(&self, suffix: &str) -> String {
+        format!("{}.{suffix}", self.api_prefix)
+    }
+
+    fn kv_subject(&self, bucket: &str, key: &str) -> String {
+        let subject = format!("$KV.{bucket}.{key}");
+        if self.api_prefix == HUB_API_PREFIX {
+            self.api_subject(&subject)
+        } else {
+            subject
+        }
+    }
+
+    fn legacy_kv_pull_denied(&self, error: &BusError) -> bool {
+        self.api_prefix == DEFAULT_API_PREFIX
+            && matches!(error, BusError::Denied { subject, .. }
+                if subject.starts_with("$JS.API.CONSUMER.MSG.NEXT.KV_"))
     }
 
     /// Who this connection is: `hub user NAME (ROLE)` or `shared token`.
@@ -688,11 +732,22 @@ impl Bus {
             })
             .await
             .map_err(|e| nats("opening a stream reader", e))?;
-        let name = reader.cached_info().name.clone();
         let mut last = None;
         let read = Self::read_with(&reader, max, wait, &mut out, &mut last, broadcast_start).await;
-        if let Err(e) = stream.delete_consumer(&name).await {
-            tracing::debug!("deleting the stream reader {name}: {e}");
+        if self.api_prefix == DEFAULT_API_PREFIX {
+            let name = &reader.cached_info().name;
+            let subject = self.api_subject(&format!("CONSUMER.DELETE.{STREAM_NOTES}.{name}"));
+            if let Err(e) = self
+                .guarded(&subject, async {
+                    stream
+                        .delete_consumer(name)
+                        .await
+                        .map_err(|e| nats("deleting a stream reader", e))
+                })
+                .await
+            {
+                tracing::debug!("deleting the stream reader {name}: {e}");
+            }
         }
         read.map(|()| (out, last))
     }
@@ -801,7 +856,7 @@ impl Bus {
         check_state_key(key)?;
         check_value_size(key, value.len())?;
         let store = self.store(&self.state, KV_STATE).await?;
-        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+        self.guarded(&self.kv_subject(KV_STATE, key), async {
             store
                 .put(key, value.as_bytes().to_vec().into())
                 .await
@@ -821,7 +876,7 @@ impl Bus {
         }
         check_value_size(key, value.len())?;
         let store = self.store(&self.state, KV_STATE).await?;
-        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+        self.guarded(&self.kv_subject(KV_STATE, key), async {
             store
                 .create(key, value.as_bytes().to_vec().into())
                 .await
@@ -859,7 +914,7 @@ impl Bus {
             },
             _ => nats(&format!("writing state {key}"), e),
         };
-        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+        self.guarded(&self.kv_subject(KV_STATE, key), async {
             if value.is_empty() {
                 store
                     .purge_expect_revision(key, Some(expected_revision))
@@ -909,7 +964,7 @@ impl Bus {
     pub async fn state_del(&self, key: &str) -> Result<()> {
         check_state_key(key)?;
         let store = self.store(&self.state, KV_STATE).await?;
-        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+        self.guarded(&self.kv_subject(KV_STATE, key), async {
             store
                 .purge(key)
                 .await
@@ -921,20 +976,7 @@ impl Bus {
     /// The live keys of `HGL_STATE` that start with `prefix`, sorted.
     pub async fn state_keys(&self, prefix: &str) -> Result<Vec<String>> {
         let store = self.store(&self.state, KV_STATE).await?;
-        let mut keys = store
-            .keys()
-            .await
-            .map_err(|e| nats("listing state keys", e))?;
-        let mut out = Vec::new();
-        while let Some(k) = keys.next().await {
-            let k = k.map_err(|e| nats("listing state keys", e))?;
-            if k.starts_with(prefix) {
-                out.push(k);
-            }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        keys(self, store, |key| key.starts_with(prefix)).await
     }
 
     /// Write `HGL_HOSTS/<host>`; it expires [`HOSTS_TTL`] after the last write.
@@ -957,7 +999,7 @@ impl Bus {
     /// [`Bus::builders`]).
     pub async fn hosts(&self) -> Result<Vec<HostRecord>> {
         let store = self.store(&self.hosts, KV_HOSTS).await?;
-        list_json_where(store, |k| !build::is_builder_key(k)).await
+        list_json_where(self, store, |k| !build::is_builder_key(k)).await
     }
 
     /// The live host whose bridge serves `seat`, if any. A seat is served by a
@@ -1039,7 +1081,7 @@ impl Bus {
     /// Every registered tree, ordered by key.
     pub async fn trees(&self) -> Result<Vec<TreeRecord>> {
         let store = self.store(&self.trees, KV_TREES).await?;
-        list_json(store).await
+        list_json(self, store).await
     }
 
     /// Take the lease `name` for `holder` if nobody holds it (create-if-absent: of
@@ -1584,25 +1626,17 @@ async fn put_json<T: Serialize>(store: &kv::Store, key: &str, rec: &T) -> Result
 
 /// Every live value of a JSON bucket, ordered by key. A value that does not
 /// parse is logged and skipped.
-async fn list_json<T: DeserializeOwned>(store: &kv::Store) -> Result<Vec<T>> {
-    list_json_where(store, |_| true).await
+async fn list_json<T: DeserializeOwned>(bus: &Bus, store: &kv::Store) -> Result<Vec<T>> {
+    list_json_where(bus, store, |_| true).await
 }
 
 /// [`list_json`] of the keys `keep` accepts.
 async fn list_json_where<T: DeserializeOwned>(
+    bus: &Bus,
     store: &kv::Store,
     keep: impl Fn(&str) -> bool,
 ) -> Result<Vec<T>> {
-    let mut keys = store.keys().await.map_err(|e| nats("listing keys", e))?;
-    let mut names = Vec::new();
-    while let Some(k) = keys.next().await {
-        let k = k.map_err(|e| nats("listing keys", e))?;
-        if keep(&k) {
-            names.push(k);
-        }
-    }
-    names.sort();
-    names.dedup();
+    let names = keys(bus, store, keep).await?;
     let mut out = Vec::with_capacity(names.len());
     for key in names {
         let Some(e) = live_entry(store, &key).await? else {

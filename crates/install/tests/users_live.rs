@@ -1114,6 +1114,7 @@ async fn the_page_watches_as_the_viewer() {
             memcap_gb: 64,
             work_root_free_gb: 100,
             updated_at: "20261128T000000Z".into(),
+            accounts_capable: false,
         })
         .await
         .unwrap();

@@ -201,6 +201,7 @@ mod tests {
             memcap_gb: 64,
             work_root_free_gb: 812,
             updated_at: "20261127T083000Z".into(),
+            accounts_capable: false,
         };
         assert_eq!(
             host_line(&h),
