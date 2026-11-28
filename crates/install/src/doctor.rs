@@ -785,7 +785,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 .is_some_and(|text| text.contains("\"_INBOX.>\""));
             let detail = if conf {
                 Some("nats.conf lets every hub user read every client's replies (`_INBOX.>`)")
-            } else if hub.shared_inbox(c).await == Some(true) {
+            } else if hub.shared_inbox(&health_cfg).await == Some(true) {
                 Some(
                     "the hub lets this host's user subscribe to every client's replies (`_INBOX.>`)",
                 )
@@ -1472,7 +1472,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn builder_only_on_hub_uses_builder_credential_for_both_probes() {
+    async fn builder_only_on_hub_uses_builder_credential_for_all_probes() {
         let d = tempfile::tempdir().unwrap();
         let f = healthy(d.path());
         let mut cfg = Config::new("build-1");
@@ -1486,16 +1486,24 @@ mod tests {
         });
         crate::save_config(&f, &f.env, &cfg).unwrap();
         crate::sys::write_atomic(&f.env.home.join("builder.cred"), b"token", 0o600).unwrap();
-        let hub = FakeHub::up();
+        std::fs::remove_file(f.env.home.join(".config/hgl-ai/hub.token")).unwrap();
+        let hub = FakeHub {
+            shared_inbox: Some(true),
+            ..FakeHub::up()
+        };
         let cs = run(&f, &hub).await;
+        assert!(
+            cs.iter()
+                .any(|c| c.name == "hub inboxes" && c.level == Level::Warn)
+        );
         assert!(
             cs.iter()
                 .any(|c| c.name == "telemetry consumers" && c.level == Level::Ok)
         );
-        assert_eq!(*hub.calls.borrow(), ["health", "durables"]);
+        assert_eq!(*hub.calls.borrow(), ["health", "shared_inbox", "durables"]);
         assert_eq!(
             *hub.creds.borrow(),
-            vec![f.env.home.join("builder.cred").display().to_string(); 2]
+            vec![f.env.home.join("builder.cred").display().to_string(); 3]
         );
     }
 
