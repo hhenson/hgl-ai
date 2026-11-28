@@ -76,6 +76,8 @@ The coordinator reads GitHub with its own token, not yours: make a fine-grained,
 read-only token (Metadata, Contents, Issues, Pull requests, Checks, Actions, Commit
 statuses: read) for the repositories. The token step above stores it as the server
 user (`[github] token_file`); run that step again to replace it.
+Automatic sendback comments require [Issues or Pull requests write access](https://docs.github.com/en/rest/issues/comments#create-an-issue-comment) on the routed repositories.
+With read-only access, the coordinator forwards findings to the controller for sendback.
 
 The server user's own commands run with `sudo -u hgl-ai env HOME=/var/lib/hgl-ai
 hgl-ai ...` (`server user add`, `doctor`).

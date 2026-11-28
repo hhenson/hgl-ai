@@ -1401,3 +1401,262 @@ async fn a_lost_running_with_a_queued_replacement_is_asked_once() {
     }
     r.stop().await;
 }
+
+#[tokio::test]
+async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller() {
+    use hgl_ai_config::ReviewPool;
+    use hgl_ai_proto::{
+        Family, HostRecord, Note, ReviewReceipt, Role, Runtime, SeatRecord, TaskKey, TreeRecord,
+        Verdict, utc_now_stamp,
+    };
+
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into()];
+    let seat = |name| Seat::new(name).unwrap();
+    let (r1, r2, r3, w1, w2) = (seat("r1"), seat("r2"), seat("r3"), seat("w1"), seat("w2"));
+    s.review_pools.insert(
+        "alpha".into(),
+        ReviewPool {
+            seats: vec![r1.clone(), r2.clone(), r3.clone()],
+            manual: false,
+        },
+    );
+    let h = HostRecord {
+        host: "test".into(),
+        seats: [
+            (&r1, Family::Claude),
+            (&r2, Family::Gemini),
+            (&r3, Family::Gpt),
+        ]
+        .into_iter()
+        .map(|(reviewer, family)| SeatRecord {
+            seat: reviewer.clone(),
+            role: Role::Reviewer,
+            runtime: Runtime::Agy,
+            family,
+            model: family.to_string(),
+        })
+        .collect(),
+        memcap_gb: 64,
+        work_root_free_gb: 200,
+        updated_at: utc_now_stamp(),
+    };
+    b.host_put(&h).await.unwrap();
+
+    let tree = |seat: &Seat, handoff| TreeRecord {
+        host: "test".into(),
+        seat: seat.clone(),
+        task: TaskKey {
+            repo: "alpha".into(),
+            issue: 980,
+        },
+        review: false,
+        path: "tree".into(),
+        branch: Some("codex/q980-fix".into()),
+        created_at: utc_now_stamp(),
+        size_bytes: 0,
+        families: vec![Family::Gpt],
+        class: None,
+        class_seq: None,
+        seq: Some(handoff),
+        handoff_seq: Some(handoff),
+    };
+    b.tree_put(&tree(&w1, 1)).await.unwrap();
+
+    let note = |kind, from: &Seat, to: &Seat, issue, head: &str, body: &str| {
+        let mut n = Note::new(from.clone(), to.clone(), kind, body);
+        n.repo = Some("alpha".into());
+        n.issue = issue;
+        n.head = Some(head.into());
+        n
+    };
+    let read = |head: &str| {
+        let response = serde_json::json!({
+            "data": {
+                "rateLimit": {"cost": 1, "remaining": 1000, "resetAt": "2100-01-01T00:00:00Z"},
+                "r0": {"pullRequests": {"nodes": [
+                    {"number": 7, "headRefOid": head, "headRefName": "codex/q980-fix", "baseRefName": "main"},
+                    {"number": 8, "headRefOid": HEAD, "headRefName": "codex/q981-other", "baseRefName": "main"},
+                    {"number": 9, "headRefOid": HEAD, "headRefName": "codex/q982-other", "baseRefName": "main"}
+                ]}}
+            }
+        });
+        crate::table::parse_batch(&response, &s.repos, &s.review_bot, &utc_now_stamp())
+            .unwrap()
+            .0
+    };
+    let ready = |from, head| {
+        note(
+            Kind::Ready,
+            from,
+            &s.coord_seat,
+            980,
+            head,
+            "Ready to review",
+        )
+    };
+    let receipt = |head: &str, verdict| {
+        let body = serde_json::to_string(&ReviewReceipt {
+            repo: "alpha".into(),
+            pr: 7,
+            head: head.into(),
+            main: "a".repeat(40),
+            reviewer: r2.clone(),
+            family: Family::Gemini,
+            model: "gemini-test".into(),
+            verdict,
+            evidence: "The retry loses a checkpoint.".into(),
+            limitations: "Linux".into(),
+        })
+        .unwrap();
+        note(Kind::Receipt, &r2, &s.coord_seat, 7, head, &body)
+    };
+    let no_gh = FakeGh::default();
+    b.send(&note(Kind::Review, &s.controller, &r1, 8, HEAD, "Queued"))
+        .await
+        .unwrap();
+    let first = b.send(&ready(&w1, HEAD)).await.unwrap();
+    crate::routing::round(&no_gh, &s, &b, &read(HEAD))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(
+            &[r1.clone(), r2.clone(), r3.clone(), s.controller.clone()],
+            first.seq,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 2);
+    assert_eq!(
+        notes[0].note.recipient, r2,
+        "same-family r3 is ineligible and r1 has queued work"
+    );
+    assert_eq!(notes[0].note.kind, Kind::Review);
+    assert_eq!(notes[0].note.issue, 7);
+    assert_eq!(notes[0].note.head.as_deref(), Some(HEAD));
+    assert!(notes[1].note.body.contains("review by r2"));
+    assert!(no_gh.calls().is_empty());
+
+    // A restart sees the new task seat. GitHub accepts the comment but loses its response.
+    b.tree_put(&tree(&w2, first.seq + 10)).await.unwrap();
+    let sequence = b.send(&receipt(HEAD, Verdict::Findings)).await.unwrap().seq;
+    let gh = FakeGh::default()
+        .on("comments?per_page", "[]")
+        .on("pulls/7", &fixture("pr-open.json"))
+        .fail("-X POST", "connection reset after sending the request");
+    assert!(
+        crate::routing::round(&gh, &s, &b, &read(HEAD))
+            .await
+            .is_err()
+    );
+    let inputs = gh.inputs.lock().unwrap().clone();
+    assert_eq!(inputs.len(), 1);
+    let posted: serde_json::Value = serde_json::from_str(&inputs[0].1).unwrap();
+    assert!(
+        posted["body"]
+            .as_str()
+            .unwrap()
+            .contains("The retry loses a checkpoint.")
+    );
+
+    let recovered = FakeGh::default().on(
+        "comments?per_page",
+        &serde_json::json!([posted]).to_string(),
+    );
+    crate::routing::round(&recovered, &s, &b, &read(HEAD))
+        .await
+        .unwrap();
+    crate::routing::round(&recovered, &s, &b, &read(HEAD))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(
+            &[w1.clone(), w2.clone(), s.controller.clone()],
+            sequence,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 2);
+    let sendback = &notes[0].note;
+    assert_eq!(
+        (sendback.kind, &sendback.recipient, sendback.issue),
+        (Kind::Sendback, &w2, 980)
+    );
+    assert_eq!(sendback.head.as_deref(), Some(HEAD));
+    assert_eq!(sendback.class, None);
+    assert!(notes[1].note.body.contains("sendback to w2"));
+    assert_eq!(
+        recovered.calls().len(),
+        1,
+        "only recover the GitHub comment"
+    );
+
+    // The earlier reviewer gets the rerun even though r1 has less queued work now.
+    b.send(&note(Kind::Review, &s.controller, &r2, 8, HEAD, "Queued"))
+        .await
+        .unwrap();
+    b.send(&note(Kind::Review, &s.controller, &r2, 9, HEAD, "Queued"))
+        .await
+        .unwrap();
+    let head = "b".repeat(40);
+    let sequence = b.send(&ready(&w2, &head)).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&head))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(&[r1, r2.clone()], sequence, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(notes[0].note.recipient, r2);
+    assert!(notes[0].note.body.contains(HEAD));
+
+    let mut second = receipt(&head, Verdict::Findings);
+    let sequence = b.send(&second).await.unwrap().seq;
+    second.recipient = s.controller.clone();
+    crate::routing::round(&no_gh, &s, &b, &read(&head))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(&[s.controller.clone(), w2], sequence, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert_eq!(
+        notes[0].note, second,
+        "the controller judges repeat findings"
+    );
+
+    let sequence = b.send(&receipt(&head, Verdict::Clean)).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&head))
+        .await
+        .unwrap();
+    let notes = b
+        .read_notes(
+            std::slice::from_ref(&s.controller),
+            sequence,
+            10,
+            Duration::ZERO,
+        )
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 1);
+    assert!(notes[0].note.body.contains("landing candidate"));
+    let receipts = crate::gate::receipts(&b, &s, "alpha", 7).await.unwrap();
+    assert_eq!(
+        receipts.len(),
+        3,
+        "the router and its forwarded copy share one receipt"
+    );
+    assert!(
+        receipts
+            .iter()
+            .any(|r| r.receipt.head == head && r.receipt.verdict == Verdict::Clean)
+    );
+}

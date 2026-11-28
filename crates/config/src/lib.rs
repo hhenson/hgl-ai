@@ -16,7 +16,7 @@ pub use console::{
     AppleOAuth, Console, GithubOAuth, GoogleOAuth, Identity, Ids, LinkedEntry, Member, Notify,
     Person, SmtpTls, Unresolved, User,
 };
-pub use github::{Pin, ReleaseWatch, RepoGate, Tap};
+pub use github::{Pin, ReleaseWatch, RepoGate, ReviewPool, Tap};
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -217,6 +217,9 @@ pub struct Github {
         skip_serializing_if = "github::is_hold_below"
     )]
     pub hold_below: u64,
+    /// Reviewer seats by repository. An absent or manual pool leaves routing to the controller.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub review_pools: BTreeMap<String, ReviewPool>,
     /// Path prefixes where a move of `main` brings every pull request up to date first.
     #[serde(
         default = "github::global_paths",
@@ -260,8 +263,8 @@ pub struct Github {
     /// Clone URL template; `{owner}` and `{repo}` are replaced.
     #[serde(default = "default_clone_url")]
     pub clone_url: String,
-    /// A GitHub token for `gh` (`GH_TOKEN`), mode 0600: the coordinator's own read-only
-    /// token when it runs as the server user. Without it, `gh`'s own sign-in.
+    /// The coordinator's GitHub token, mode 0600. Automatic sendbacks require permission to
+    /// comment on pull requests. Without this file, use `gh`'s own sign-in.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token_file: Option<String>,
 }
@@ -271,6 +274,15 @@ pub fn default_clone_url() -> String {
 }
 
 impl Github {
+    /// Repositories whose ordinary ready and receipt notes go to the coordinator.
+    pub fn routes_notes(&self, repo: &str) -> bool {
+        self.repos.iter().any(|r| r == repo)
+            && self
+                .review_pools
+                .get(repo)
+                .is_some_and(|pool| pool.automatic(repo))
+    }
+
     /// The clone URL of `repo` (`clone_url` with `{owner}` and `{repo}` filled in).
     pub fn clone_url_for(&self, repo: &str) -> String {
         self.clone_url
@@ -299,6 +311,7 @@ impl Default for Github {
             coord_seat: github::coord_seat(),
             coord_interval: github::coord_interval(),
             hold_below: github::hold_below(),
+            review_pools: BTreeMap::new(),
             global_paths: github::global_paths(),
             hygiene_files: github::hygiene_files(),
             hygiene_lines: github::hygiene_lines(),
