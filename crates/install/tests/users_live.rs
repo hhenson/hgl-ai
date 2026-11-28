@@ -1332,7 +1332,7 @@ async fn no_user_sees_another_users_replies() {
 
     // `doctor`'s probe: an upgraded hub refuses `_INBOX.>`; the admin and a bare seed
     // cannot tell.
-    for who in ["build-1", "console", "hub-coord"] {
+    for who in ["build-1", "console", "hub-coord", "hub-slack", "viewer"] {
         assert_eq!(hub.shared_inbox(who, false).await, Some(false), "{who}");
     }
     assert_eq!(hub.shared_inbox("hub-admin", false).await, None);
@@ -1373,7 +1373,7 @@ async fn own_inboxes_work_on_an_older_hub() {
             .is_some()
     );
     // `doctor`'s probe sees the open `_INBOX.>`.
-    for who in ["build-1", "console"] {
+    for who in ["build-1", "console", "hub-slack"] {
         assert_eq!(hub.shared_inbox(who, false).await, Some(true), "{who}");
     }
 }

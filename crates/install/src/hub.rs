@@ -19,8 +19,9 @@ pub trait Hub {
     /// Doctor: `Err` when unreachable, else the stream and buckets that are missing.
     fn health(&self, cfg: &Config) -> impl Future<Output = Result<Vec<String>, String>>;
     /// Doctor: `Some(true)` when the hub lets this host's hub user subscribe to `_INBOX.>`,
-    /// every client's replies (a `nats.conf` from before hgl-ai#111). `None`: cannot tell
-    /// (unreachable, the shared token, or a credential that is or may be the admin's).
+    /// every client's replies (a `nats.conf` from before hgl-ai#111), `Some(false)` when it
+    /// refuses. `None`: cannot tell (unreachable, no answer in time, the shared token, or a
+    /// credential that is or may be the admin's).
     fn shared_inbox(&self, cfg: &Config) -> impl Future<Output = Option<bool>>;
     /// Doctor, on the hub's host: the consumers on the telemetry streams that outlive a
     /// page ([`lasting_consumers`]), as `<stream>/<name>`.
@@ -114,8 +115,11 @@ impl Hub for BusHub {
         Ok(missing)
     }
 
-    /// Subscribes to `_INBOX.>` and flushes: an upgraded hub answers with a permissions
-    /// violation before the flush's `PONG`; the wait after it covers the event's delivery.
+    /// Subscribes to a canary, `_INBOX.hgl-ai-doctor.<n>`: outside this user's own prefix,
+    /// and no other client's. Then asks a JetStream API lookup it may make with the canary
+    /// as the reply subject. The reply arriving there proves `_INBOX.>` open; the
+    /// permissions violation naming the canary proves it closed; neither within the wait
+    /// is inconclusive (r6 on #119).
     async fn shared_inbox(&self, cfg: &Config) -> Option<bool> {
         let path = cfg.token_file().ok()?;
         let cred = hgl_ai_bus::read_credential(&path).ok()??;
@@ -124,18 +128,27 @@ impl Hub for BusHub {
             return None;
         };
         // The admin may subscribe to anything; a bare seed's role is unknown.
-        if role.as_deref().is_none_or(|r| r == "admin") {
-            return None;
-        }
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let role = role.filter(|r| r != "admin")?;
+        // A lookup each role may make; the Slack adapter's is its own bucket's.
+        let ask = if role == "slack" {
+            format!("$JS.API.STREAM.INFO.KV_{KV_SLACK}")
+        } else {
+            "$JS.API.INFO".to_string()
+        };
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let canary = format!("_INBOX.hgl-ai-doctor.{}{n}", std::process::id());
+        let (tx, mut refused) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let quoted = format!("\"{}\"", canary.to_ascii_lowercase());
         let client = async_nats::ConnectOptions::with_nkey(seed)
             .custom_inbox_prefix(inbox)
             .connection_timeout(Duration::from_secs(5))
             .event_callback(move |e| {
-                let tx = tx.clone();
+                let (tx, quoted) = (tx.clone(), quoted.clone());
                 async move {
                     let s = e.to_string().to_ascii_lowercase();
-                    if s.contains("permissions violation") && s.contains("\"_inbox.>\"") {
+                    if s.contains("permissions violation") && s.contains(&quoted) {
                         let _ = tx.send(());
                     }
                 }
@@ -143,12 +156,24 @@ impl Hub for BusHub {
             .connect(cfg.hub.url.as_str())
             .await
             .ok()?;
-        let _sub = client.subscribe("_INBOX.>").await.ok()?;
+        let mut sub = client.subscribe(canary.clone()).await.ok()?;
         client.flush().await.ok()?;
-        let refused = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+        client
+            .publish_with_reply(ask, canary, "".into())
             .await
-            .is_ok_and(|r| r.is_some());
-        Some(!refused)
+            .ok()?;
+        client.flush().await.ok()?;
+        use futures::StreamExt;
+        tokio::time::timeout(Duration::from_secs(3), async {
+            tokio::select! {
+                Some(()) = refused.recv() => Some(false),
+                Some(_) = sub.next() => Some(true),
+                else => None,
+            }
+        })
+        .await
+        .ok()
+        .flatten()
     }
 
     async fn durables(&self, cfg: &Config) -> Result<Vec<String>, String> {
@@ -226,6 +251,78 @@ pub(crate) mod fake {
                 .map(|()| self.durables.clone())
                 .map_err(|e| e.to_string())
         }
+    }
+}
+
+/// [`BusHub::shared_inbox`] against a scripted broker: a late denial and a silent hub
+/// (r6 on #119).
+#[cfg(test)]
+mod probe {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    use super::*;
+
+    /// A broker that answers `PING`s and, `deny` after the probe's request, refuses the
+    /// canary subscription; `None`: says nothing else.
+    async fn broker(deny: Option<Duration>) -> String {
+        let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("nats://{}", l.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (sock, _) = l.accept().await.unwrap();
+            let (r, mut w) = sock.into_split();
+            w.write_all(
+                b"INFO {\"server_id\":\"mock\",\"version\":\"2.10.0\",\"proto\":1,\
+                  \"max_payload\":1048576,\"headers\":true,\"auth_required\":true,\
+                  \"nonce\":\"bm9uY2U\"}\r\n",
+            )
+            .await
+            .unwrap();
+            let mut lines = BufReader::new(r).lines();
+            let mut canary = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.starts_with("PING") {
+                    let _ = w.write_all(b"PONG\r\n").await;
+                } else if let Some(rest) = line.strip_prefix("SUB ") {
+                    canary = rest.split(' ').next().unwrap().to_string();
+                } else if line.starts_with("PUB ")
+                    && let Some(d) = deny
+                {
+                    tokio::time::sleep(d).await;
+                    let e = format!(
+                        "-ERR 'Permissions Violation for Subscription to \"{canary}\"'\r\n"
+                    );
+                    let _ = w.write_all(e.as_bytes()).await;
+                }
+            }
+        });
+        url
+    }
+
+    async fn probe(url: String, role: &str) -> Option<bool> {
+        let d = tempfile::tempdir().unwrap();
+        let seed = nkeys::KeyPair::new_user().seed().unwrap();
+        let f = d.path().join("hub.token");
+        std::fs::write(&f, hgl_ai_bus::Credential::render_nkey("h", role, &seed)).unwrap();
+        let mut cfg = Config::new("t");
+        cfg.hub.url = url;
+        cfg.hub.token_file = f.display().to_string();
+        BusHub.shared_inbox(&cfg).await
+    }
+
+    #[tokio::test]
+    async fn a_late_denial_is_closed() {
+        let url = broker(Some(Duration::from_millis(1500))).await;
+        assert_eq!(probe(url, "seat").await, Some(false));
+    }
+
+    #[tokio::test]
+    async fn no_answer_is_inconclusive() {
+        assert_eq!(probe(broker(None).await, "seat").await, None);
+    }
+
+    #[tokio::test]
+    async fn the_admin_is_not_probed() {
+        assert_eq!(probe(broker(None).await, "admin").await, None);
     }
 }
 
