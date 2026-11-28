@@ -427,7 +427,7 @@ async fn a_gate_build_writes_its_own_platforms_verdict() {
     assert_eq!(s.base_sha.as_deref(), Some(r.heads[0].as_str()));
     let (_, v) = verdict(&r, &r.heads[1], &r.heads[0]).await;
     assert_eq!(
-        v.unwrap(),
+        v.clone().unwrap(),
         format!(
             "{} {} pass {} lab1 r{}",
             r.heads[1],
@@ -437,6 +437,10 @@ async fn a_gate_build_writes_its_own_platforms_verdict() {
         )
     );
     let keys = r.bus.state_keys("verdict.demo.7.").await.unwrap();
+    assert_eq!(
+        r.bus.verdict_get(&keys[0]).await.unwrap().unwrap().value,
+        v.unwrap()
+    );
     assert_eq!(keys.len(), 1, "no verdict for another platform: {keys:?}");
     assert!(store::run_get(&r.bus, &foreign.id).await.unwrap().is_none());
     r.stop().await;
@@ -499,12 +503,28 @@ async fn no_other_build_displaces_a_judged_verdict() {
         .to_string();
     let again = gate_job(&r, &ahead2, &r.heads[1], mine());
     send_pr(&r, &again).await;
-    assert_eq!(r.receipt(&again.id).await.status, BuildStatus::Fail);
+    let summary = r.receipt(&again.id).await;
+    assert_eq!(summary.status, BuildStatus::Fail);
     assert_eq!(
         r.bus.state_get(&key).await.unwrap().unwrap().value,
         pass,
         "the pass stands"
     );
+    // A final value already in the new bucket must win over a stale legacy value.
+    let running = format!(
+        "{} {} running 20261127-150000-aaaaaa lab1 r{} until=20990101-000000",
+        r.heads[1],
+        r.heads[0],
+        recipe_rev(&r).await
+    );
+    r.bus.state_put(&key, &running).await.unwrap();
+    assert!(
+        !store::verdict_put(&r.bus, &again, &summary, None)
+            .await
+            .unwrap()
+    );
+    assert_eq!(r.bus.state_get(&key).await.unwrap().unwrap().value, pass);
+
     std::fs::remove_file(&flag).unwrap();
     // Two builds asked in the same second, for two pairs: each judged in its own key.
     let a = gate_job(&r, "20261127-150000-ffffff", &r.heads[0], mine());
@@ -588,6 +608,19 @@ async fn verdicts_are_purged_only_for_pull_requests_github_reports_ended() {
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    while !r
+        .bus
+        .verdict_keys("verdict.demo.9.")
+        .await
+        .unwrap()
+        .is_empty()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the ended pull request's new verdicts stayed"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     let (_, still) = verdict(&r, &r.heads[1], &r.heads[0]).await;
     assert_eq!(
         still.as_deref(),
@@ -659,9 +692,10 @@ async fn the_sweep_ages_keys_by_the_hub_not_the_build_id() {
         store::verdicts_sweep(&r.bus, now + 16 * day, 15 * day, None)
             .await
             .unwrap(),
-        1
+        2
     );
     assert!(r.bus.state_get(&key).await.unwrap().is_none());
+    assert!(r.bus.verdict_get(&key).await.unwrap().is_none());
     // Within the age, a pull request GitHub reports ended: swept.
     r.bus.state_put(&key, &v).await.unwrap();
     let closed: store::PrEnded = std::sync::Arc::new(|_, pr| Box::pin(async move { Ok(pr == 7) }));

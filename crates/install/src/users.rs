@@ -13,6 +13,8 @@ use std::str::FromStr;
 
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::build::KV_BUILD;
+/// The local build verdict bucket, exported independently of `HGL_STATE`.
+pub use hgl_ai_proto::build::KV_VERDICTS;
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE,
     KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
@@ -362,8 +364,16 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     .map(String::from)
     .to_vec();
     let buckets = [
-        KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_USAGE,
+        KV_STATE,
+        KV_HOSTS,
+        KV_TREES,
+        KV_LOCKS,
+        KV_ENDED,
+        KV_THREADS,
+        KV_METRICS,
+        KV_USAGE,
         KV_BUILD,
+        KV_VERDICTS,
     ];
     // The usage history (PROTO-24) is read by every role through short-lived consumers.
     let mut streams: Vec<String> = vec![STREAM_NOTES.to_string(), STREAM_USAGE.to_string()];
@@ -399,6 +409,9 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             // which every builder runs, only the admin user writes: seats share their
             // host's credential, so no seat may (docs/build.md BUILD-1).
             allow.push(format!("$KV.{KV_BUILD}.run.>"));
+            if role == Role::Builder {
+                allow.push(format!("$KV.{KV_VERDICTS}.>"));
+            }
             if role == Role::Coord {
                 allow.push(format!("$KV.{KV_METRICS}.>"));
             }
@@ -529,10 +542,6 @@ pub fn render_authorization(reg: &Registry) -> String {
 
 /// The account that holds the streams and buckets, and the admin user.
 pub const HUB_ACCOUNT: &str = "HUB";
-
-/// The local build verdicts' own bucket (hgl-ai#145): an export cannot be "`HGL_STATE`
-/// but `verdict.*`".
-pub const KV_VERDICTS: &str = "HGL_VERDICTS";
 
 /// The console's durable `HGL_OWNER` feed (`hgl_ai_owner::FEED`).
 pub const CONSOLE_FEED: &str = "console";
@@ -975,6 +984,14 @@ mod tests {
             assert!(seat.publish_allow.iter().any(|a| a == s), "{s}");
         }
         // The local build verdicts: a builder's user only (BUILD-15).
+        for role in Role::ALL.into_iter().filter(|role| *role != Role::Admin) {
+            let p = permissions(role).unwrap();
+            assert_eq!(
+                p.publish_allow.iter().any(|a| a == "$KV.HGL_VERDICTS.>"),
+                role == Role::Builder,
+                "{role:?}"
+            );
+        }
         let builder = permissions(Role::Builder).unwrap();
         for p in [&seat, &coord] {
             assert!(

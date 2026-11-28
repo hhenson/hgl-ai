@@ -136,9 +136,9 @@ hgl-ai server user ...`).
 
 | Role | May publish |
 | --- | --- |
-| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`, `HGL_BUILD/run.*`, `HGL_USAGE`, `hgl.usage.>`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, recipes (`HGL_BUILD/recipe.*`), verdicts (`HGL_STATE/verdict.*`), stream changes |
+| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`, `HGL_BUILD/run.*`, `HGL_USAGE`, `hgl.usage.>`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, recipes (`HGL_BUILD/recipe.*`), verdicts (`HGL_STATE/verdict.*`, `HGL_VERDICTS`), stream changes |
 | `coord` | a seat's, and `HGL_METRICS` |
-| `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
+| `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` and `HGL_VERDICTS` (BUILD-15) |
 | `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
 | `viewer` | nothing by subject (replies are not enforced until hgl-ai#141): reads and watches `HGL_HOSTS`, `HGL_TREES`, `HGL_METRICS`, `HGL_BUILD`, `HGL_USAGE`, and of `HGL_STATE` only `prs`, `backlog`, `landed.log`, `tasks`, `mode`, `hold` (the console's page, docs/owner.md §3); consumers only in the filtered create form; subscribes to `_INBOX_VIEWER.>` only; no other stream or bucket, no consumer delete (docs/design.md §9) |

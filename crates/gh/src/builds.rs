@@ -2,7 +2,7 @@
 //! `gh land`, `gh merge-if-clean` and `build gate` ask a builder of each verdict's platform
 //! to build the head merged onto the `main` the gate saw, under the current recipe, and
 //! read the verdict the builder writes in the key of exactly that (head, `main`, recipe
-//! revision): `HGL_STATE/verdict.<repo>.<pr>.<name>.<pair>` (docs/protocol.md §8). A build
+//! revision): `HGL_VERDICTS/verdict.<repo>.<pr>.<name>.<pair>` (docs/protocol.md §8). A build
 //! of anything else writes another key, so it can never displace the one the gate reads; a
 //! `main` that moved or a recipe that changed is another key, asked for again. The
 //! requester writes no verdict: the builder's hub user alone may.
@@ -195,13 +195,31 @@ fn taking(builders: &[BuilderRecord], label: &str) -> bool {
 }
 
 /// The value in `key`: its text and what it says.
-async fn read(bus: &Bus, key: &str) -> Result<(String, Option<VerdictValue>)> {
-    let raw = bus
-        .state_get(key)
-        .await?
+async fn read(bus: &Bus, key: &str, w: &Want<'_>) -> Result<(String, Option<VerdictValue>)> {
+    let current = bus.verdict_get(key).await?;
+    let raw = current
+        .as_ref()
         .map(|e| e.value.trim().to_string())
         .unwrap_or_default();
     let v = VerdictValue::parse(&raw);
+    if judged(&raw, &v, w).is_some() {
+        return Ok((raw, v));
+    }
+    if let Some(legacy) = bus.state_get(key).await? {
+        let text = legacy.value.trim().to_string();
+        let parsed = VerdictValue::parse(&text);
+        let legacy_matches = parsed.as_ref().is_some_and(|v| v.is_for(w.head, w.main));
+        let current_matches = v.as_ref().is_some_and(|v| v.is_for(w.head, w.main));
+        if judged(&text, &parsed, w).is_some()
+            || (legacy_matches
+                && (!current_matches
+                    || current
+                        .as_ref()
+                        .is_none_or(|e| legacy.created_nanos > e.created_nanos)))
+        {
+            return Ok((text, parsed));
+        }
+    }
     Ok((raw, v))
 }
 
@@ -251,7 +269,7 @@ pub async fn verdict_state(
         recipe: recipe.revision,
     };
     let key = w.key();
-    let (raw, value) = read(bus, &key).await?;
+    let (raw, value) = read(bus, &key, &w).await?;
     if let Some(j) = judged(&raw, &value, &w) {
         return Ok(j);
     }
@@ -265,7 +283,7 @@ pub async fn verdict_state(
                 v.id.as_deref().unwrap_or("?"),
                 v.builder.as_deref().unwrap_or("?")
             )),
-            (None, Some(v)) if v.word == VerdictWord::NotRun => {
+            (None, Some(v)) if v.is_for(head, main) && v.word == VerdictWord::NotRun => {
                 VerdictState::Missing(Some(format!(
                     "not run: {}",
                     v.reason.as_deref().unwrap_or("no reason given")
@@ -301,7 +319,7 @@ pub async fn verdict_state(
         match run {
             Some(s) if s.status.is_final() => {
                 // The builder writes the verdict before the final run, so read it again.
-                let (raw, again) = read(bus, &key).await?;
+                let (raw, again) = read(bus, &key, &w).await?;
                 if let Some(j) = judged(&raw, &again, &w) {
                     return Ok(j);
                 }
@@ -373,7 +391,7 @@ pub async fn verdict_state(
                 Some(label),
             ))
         } else if run.as_ref().is_some_and(|s| s.status.is_final()) {
-            let (raw, again) = read(bus, &key).await?;
+            let (raw, again) = read(bus, &key, &w).await?;
             if let Some(j) = judged(&raw, &again, &w) {
                 return Ok(j);
             }

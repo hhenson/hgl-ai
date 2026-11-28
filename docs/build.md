@@ -129,11 +129,15 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
     `base` that is not a commit, one limited to some steps, or one pinned to a recipe
     revision. It merges the head onto `base`, runs every step of the current recipe, and
     records the commit it merged onto (`base_sha` in the summary).
-  - It writes `HGL_STATE/verdict.<repo>.<pr>.<name>.<pair>` (`docs/protocol.md` §8): the
-    key of exactly what it judges, the head, the `main` commit and the recipe revision.
+  - It writes `HGL_VERDICTS/verdict.<repo>.<pr>.<name>.<pair>` and, until cutover, the same key in
+    `HGL_STATE` (`docs/protocol.md` §8): the key of exactly what it judges, the head, the `main` commit and the recipe revision.
     It writes `running` once checked out, bounded by `until` (its steps' time limits and
     15 minutes). Then it writes `pass`, `fail` (the failing step) or `not-run` (why), with
-    the build id, its label and `r<rev>`, before the final `run.<id>`.
+    the build id, its label and `r<rev>`, before the final `run.<id>`. The gate and
+    `build gate` prefer a final verdict in the new bucket, then a final legacy verdict.
+    Otherwise they use the newest matching non-final copy by the hub's write time.
+    Provision the new bucket and updated hub permissions before deploying these readers
+    and builders.
   - In a key, `pass` and `fail` are final. A later build of the same pair replaces only
     `running` or `not-run` (compare-and-set on the key's revision). A build of anything
     else, a bogus head or a skewed clock writes another key, so nothing displaces a

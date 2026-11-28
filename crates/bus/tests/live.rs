@@ -179,6 +179,15 @@ async fn provision_is_idempotent_and_corrects_settings() {
         (state.max_messages_per_subject, state.storage),
         (5, jetstream::stream::StorageType::File)
     );
+    let verdicts = kv("HGL_VERDICTS").await;
+    assert_eq!(
+        (
+            verdicts.max_messages_per_subject,
+            verdicts.storage,
+            verdicts.max_age
+        ),
+        (5, jetstream::stream::StorageType::File, Duration::ZERO)
+    );
     let hosts = kv("HGL_HOSTS").await;
     assert_eq!(hosts.storage, jetstream::stream::StorageType::Memory);
     assert_eq!(hosts.max_age, Duration::from_secs(120));

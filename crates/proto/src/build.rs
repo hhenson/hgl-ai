@@ -14,6 +14,8 @@ use super::{ProtoError, Seat};
 
 /// Recipes (`recipe.<repo>`, versioned) and run summaries (`run.<id>`).
 pub const KV_BUILD: &str = "HGL_BUILD";
+/// Local build verdicts.
+pub const KV_VERDICTS: &str = "HGL_VERDICTS";
 /// Summary and job format version.
 pub const BUILD_VERSION: u32 = 1;
 /// Prefix of builder records in `HGL_HOSTS`; host records never contain a dot.
@@ -472,7 +474,7 @@ impl BuildJob {
     }
 }
 
-/// `HGL_STATE/verdict.<repo>.<pr>.<name>.<pair>`: the local build verdict `name` of pull
+/// `HGL_VERDICTS/verdict.<repo>.<pr>.<name>.<pair>`: the local build verdict `name` of pull
 /// request `pr` for `head` merged onto `main` under recipe revision `recipe`
 /// (docs/protocol.md §8). `<pair>` is 24 hex digits of SHA-256 over the three: each key
 /// holds what one build judges, so no build for another head, `main` or recipe can

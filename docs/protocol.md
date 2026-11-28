@@ -71,6 +71,7 @@ before hub users takes one shared token until it moves.
 | Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>`, `hgl.notes.all` and `hgl.notes.owner.<seat>`; explicit ack; `ack_wait` 300 s; `max_deliver` unlimited (PROTO-8) |
 | Owner | stream `HGL_OWNER`, KV `HGL_THREADS`, KV `HGL_METRICS`, KV `HGL_CONSOLE` | docs/owner.md §4 |
 | State | KV `HGL_STATE` | file storage, history 5 |
+| Build verdicts | KV `HGL_VERDICTS` | file storage, history 5 |
 | Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
 | Trees | KV `HGL_TREES` | file storage, history 1 |
 | Locks | KV `HGL_LOCKS` | file storage, history 1, `max_age` 30 min |
@@ -303,7 +304,9 @@ before hub users takes one shared token until it moves.
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
 | `coord.alerts` | coordinator service | JSON array of pending alert notes and delivery metadata, saved before `prs` advances. Retries run during holds and GitHub read failures. The queue retains at most 100 entries within the state byte limit and reports oldest-entry drops. Five failed sends replace an alert with a dead-letter note for the controller. |
 | `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
-| `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
+| `verdict.<repo>.<pr>.<name>.<pair>` (also in `HGL_VERDICTS` during migration) | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
+
+Builders write verdicts to both buckets until cutover. Gate readers prefer a final `HGL_VERDICTS` verdict, then a final legacy verdict; otherwise they use the newest matching non-final copy by the hub's write time. Only builder users may write either copy.
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.

@@ -2389,6 +2389,122 @@ async fn tasks_without_a_task_write_nothing() {
     assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
 }
 
+/// The new bucket takes precedence, with a fallback for legacy builders.
+#[tokio::test]
+async fn verdict_bucket_precedes_legacy_state() {
+    use crate::builds::VerdictState;
+    let Some(r) = GateRig::start(false).await else {
+        return;
+    };
+    let key = r.key(&r.head, &r.m1).await;
+    let pass = format!("{} {} pass 20261127-120000-aaaaaa lab1 r1", r.head, r.m1);
+    let fail = format!(
+        "{} {} fail 20261127-120000-bbbbbb lab1 r1 failed",
+        r.head, r.m1
+    );
+    r.b.state_put(&key, &pass).await.unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Pass(pass.clone())
+    );
+    for nonfinal in [
+        format!(
+            "{} {} running 20261127-120000-cccccc lab1 r1 until=20990101-000000",
+            r.head, r.m1
+        ),
+        format!(
+            "{} {} not-run 20261127-120000-cccccc lab1 r1 unavailable",
+            r.head, r.m1
+        ),
+        format!(
+            "{} {} pass 20261127-120000-cccccc lab1 r1",
+            "0".repeat(40),
+            r.m1
+        ),
+    ] {
+        r.b.verdict_put(&key, &nonfinal).await.unwrap();
+        assert_eq!(
+            r.state(None, &r.head, &r.m1).await,
+            VerdictState::Pass(pass.clone())
+        );
+    }
+    r.b.state_put(&key, &fail).await.unwrap();
+    r.b.verdict_put(
+        &key,
+        &format!(
+            "{} {} not-run 20261127-120000-cccccc lab1 r1 unavailable",
+            r.head, r.m1
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Fail(fail.clone())
+    );
+    r.b.state_put(&key, &pass).await.unwrap();
+    r.b.verdict_put(&key, &fail).await.unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Fail(fail)
+    );
+    r.stop().await;
+}
+
+/// Mixed-version builders can update the legacy copy after the new copy was written.
+#[tokio::test]
+async fn verdict_uses_newer_matching_nonfinal_copy() {
+    use crate::builds::VerdictState;
+    let Some(r) = GateRig::start(false).await else {
+        return;
+    };
+    let key = r.key(&r.head, &r.m1).await;
+    let running = |id: &str| {
+        format!(
+            "{} {} running {id} lab1 r1 until=29991231T000000Z",
+            r.head, r.m1
+        )
+    };
+    let old = running("20261127-120000-aaaaaa");
+    let newer = running("20261127-120000-bbbbbb");
+    r.b.verdict_put(&key, &old).await.unwrap();
+    r.b.state_put(&key, &newer).await.unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Building("building 20261127-120000-bbbbbb on lab1".into())
+    );
+    let not_run = format!(
+        "{} {} not-run 20261127-120000-cccccc lab1 r1 unavailable",
+        r.head, r.m1
+    );
+    r.b.state_put(&key, &not_run).await.unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Missing(Some("not run: unavailable".into()))
+    );
+    r.b.verdict_put(&key, &old).await.unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Building("building 20261127-120000-aaaaaa on lab1".into())
+    );
+    let wrong = format!(
+        "{} {} running 20261127-120000-dddddd lab1 r1 until=29991231T000000Z",
+        "0".repeat(40),
+        r.m1
+    );
+    r.b.verdict_put(&key, &wrong).await.unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Missing(Some("not run: unavailable".into()))
+    );
+    r.b.state_put(&key, &wrong).await.unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Missing(None)
+    );
+    r.stop().await;
+}
+
 /// `gh` for [`a_pin_landing_finished_by_another_sync_is_done`]: at the first call matching
 /// `trigger`, another sync finishes the landing of the pin pull request `n` (its
 /// `landed.log` line, its record gone).

@@ -164,9 +164,16 @@ fn notes_send_wait_peek() {
     };
     assert_eq!(
         ok(&hub.run(&["init"])),
-        "provisioned HGL_NOTES HGL_OWNER HGL_USAGE_LOG HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS HGL_ENDED HGL_THREADS HGL_METRICS HGL_CONSOLE HGL_SLACK HGL_USAGE HGL_BUILD\n"
+        "provisioned HGL_NOTES HGL_OWNER HGL_USAGE_LOG HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS HGL_ENDED HGL_THREADS HGL_METRICS HGL_CONSOLE HGL_SLACK HGL_USAGE HGL_BUILD HGL_VERDICTS\n"
     );
-    ok(&hub.run(&["init"]));
+    let json: serde_json::Value = serde_json::from_str(&ok(&hub.run(&["--json", "init"]))).unwrap();
+    assert!(
+        json["provisioned"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|name| name == "HGL_VERDICTS")
+    );
 
     let sent = ok(&hub.run(&[
         "note", "send", "--from", "w1", "--to", "claude", "--kind", "note", "--body", "first",

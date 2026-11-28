@@ -648,8 +648,17 @@ async fn only_builders_write_verdicts() {
         .state_put(key, &format!("{h} {h} pass 20261127-120000-aaaaaa lab1"))
         .await
         .unwrap();
+    builder.verdict_put(key, "new verdict").await.unwrap();
     for who in ["build-1", "hub-coord", "console"] {
         let b = hub.bus(who).await;
+        assert_eq!(
+            b.verdict_get(key).await.unwrap().unwrap().value,
+            "new verdict"
+        );
+        denied(b.verdict_put(key, "forged").await);
+        denied(b.verdict_create("verdict.other.1.linux", "forged").await);
+        denied(b.verdict_update(key, "forged", 1).await);
+        denied(b.verdict_del(key).await);
         denied(b.state_put(key, &format!("{h} {h} pass forged")).await);
         denied(
             b.state_update(key, &format!("{h} {h} pass forged"), 1)
@@ -699,7 +708,7 @@ async fn only_builders_write_verdicts() {
     }
     assert!(
         admin
-            .state_get("verdict._probe.0.lab1")
+            .verdict_get("verdict._probe.0.lab1")
             .await
             .unwrap()
             .is_none()
@@ -1444,7 +1453,7 @@ async fn own_inboxes_work_on_an_older_hub() {
 //
 // Raw JetStream requests under the hub's API prefix: `bus` uses it from hgl-ai#144.
 
-use async_nats::jetstream::{self, consumer, kv};
+use async_nats::jetstream::{self, consumer};
 use hgl_ai_install::users::{Target, access_table, local_subject};
 
 /// The user of each role with an account.
@@ -1525,13 +1534,6 @@ impl Hub {
 async fn seeded(hub: &Hub) -> jetstream::Context {
     hub.bus("hub-admin").await.provision().await.unwrap();
     let js = hub.admin_js().await;
-    js.create_key_value(kv::Config {
-        bucket: hgl_ai_install::users::KV_VERDICTS.into(),
-        history: 5,
-        ..Default::default()
-    })
-    .await
-    .unwrap();
     let buckets: std::collections::BTreeSet<String> = access_table()
         .into_iter()
         .filter_map(|r| match r.target {
