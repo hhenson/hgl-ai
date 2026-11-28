@@ -591,27 +591,32 @@ pub(crate) mod tests {
     async fn persistence_isolates_keys_and_replaces_failed_snapshots() {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(&str, &str)>();
         let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let gate = release.clone();
         let worker = tokio::spawn(persist_loop(
             rx,
             |p| p.0.to_owned(),
             move |p| {
                 let seen = seen_tx.clone();
+                let gate = gate.clone();
                 async move {
                     seen.send(p).unwrap();
                     if p.1 == "oversized" {
+                        gate.notified().await;
                         Err("too large")
                     } else {
                         Ok(())
                     }
                 }
             },
-            Duration::from_millis(30),
+            Duration::from_millis(1),
         ));
         tx.send(("p1", "oversized")).unwrap();
         assert_eq!(seen_rx.recv().await.unwrap(), ("p1", "oversized"));
         tx.send(("p1", "smaller")).unwrap();
         tx.send(("session", "revoked")).unwrap();
         assert_eq!(seen_rx.recv().await.unwrap(), ("session", "revoked"));
+        release.notify_one();
         assert_eq!(seen_rx.recv().await.unwrap(), ("p1", "smaller"));
         drop(tx);
         worker.await.unwrap();
