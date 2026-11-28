@@ -84,8 +84,12 @@ Open decisions are issues in this repository.
   `gh land` and `gh merge-if-clean` enforce it unless `[github.gate.<repo>]
   review_receipt = false`. For hgl-ai a receipt carries from a first-parent
   ancestor when every intervening commit merges a first-parent commit of `main`
-  with an empty remerge-diff and no conflicts. A conflict or intervening
-  non-merge commit requires a fresh receipt. A findings receipt at any merge
+  with no conflict outside documentation files (`docs/**`, `*.md`): an empty
+  remerge-diff, or one that touches only documentation files (HPH 2026-11-28;
+  the documentation-only case is proposed, not implemented, until hgl-ai#215, and the
+  controller applies it by hand). A conflict resolved in a code or test file needs a receipt for that
+  merge, covering the resolution only; an intervening non-merge commit needs a
+  fresh receipt. A findings receipt at any merge
   in the chain requires a clean other-family receipt at that commit to carry.
   The proof uses each merge's first-parent `.gitattributes` and Git 2.43 or later.
   A pull request the tool makes (the wrapper's pins) has
