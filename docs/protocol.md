@@ -68,19 +68,22 @@ before hub users takes one shared token until it moves.
 | Primitive | Name | Settings |
 | --- | --- | --- |
 | Stream | `HGL_NOTES`, subjects `hgl.notes.>` | file storage, `max_age` 14 d, dedup window 24 h |
-| Inbox | durable consumer `inbox-<seat>` | filter `hgl.notes.<seat>`, `hgl.notes.all` and `hgl.notes.owner.<seat>`; explicit ack; `ack_wait` 300 s; `max_deliver` unlimited (PROTO-8) |
+| Inbox | durable consumer `inbox-<seat>` | filters `hgl.notes.<seat>`, `hgl.notes.all`, `hgl.notes.owner.<seat>` and `hgl.notes.screen.<seat>`; explicit ack; `ack_wait` 300 s; `max_deliver` unlimited (PROTO-8) |
 | Owner | stream `HGL_OWNER`, KV `HGL_THREADS`, KV `HGL_METRICS`, KV `HGL_CONSOLE` | docs/owner.md §4 |
 | State | KV `HGL_STATE` | file storage, history 5 |
 | Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
 | Trees | KV `HGL_TREES` | file storage, history 1 |
+| Screen | KV `HGL_SCREEN` | file storage, history 5, `rule.>` and `log.>` keys |
 | Locks | KV `HGL_LOCKS` | file storage, history 1, `max_age` 30 min |
 | Ended | KV `HGL_ENDED` | file storage, history 1, `max_age` 15 d |
 | Usage | KV `HGL_USAGE`; stream `HGL_USAGE_LOG`, subjects `hgl.usage.>` | KV file storage, history 1; stream file storage, `max_age` 35 d, dedup window 24 h (§10) |
 | Builds | KV `HGL_BUILD` | file storage, history 64: `recipe.<repo>` (TOML), `run.<id>` (summary JSON; newest 1000 kept) |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
-  broadcast address. `owner` and `console` are senders, never seats: no seat takes
-  `all`, `owner` or `console`, and no note goes to `owner` or `console`. A seat is a logical address; the runtime and model bound
+  broadcast address. `owner` and `console` are sender names. `screen` is the
+  screen's sender and intake address. Those names are reserved in seat
+  configuration, and host labels also reserve `all` and `screen`.
+  A seat is a logical address; the runtime and model bound
   to it can change (§6) without peers noticing.
   A seat receives broadcasts published from its durable inbox's creation onward,
   measured by the hub. Unicast published earlier remains eligible while retained.
@@ -144,13 +147,19 @@ before hub users takes one shared token until it moves.
 | `build` | any → `builder-<label>` | Build `repo` at `head` (optionally merged onto `base`); the body is the job JSON (`docs/build.md`). The builder answers with a `receipt`. |
 | `tick` | console → controller | A status report is due (`[console] status_every`). |
 
-- **PROTO-20 — Owner notes.** A note with sender `owner` travels on
+- **PROTO-20 — Owner and screen notes.** A note with sender `owner` travels on
   `hgl.notes.owner.<recipient>`, which only the console's hub user may publish. The
   receiver accepts sender `owner` on that subject only, and only sender `owner` there;
   anything else is terminated as malformed. An owner note is an `answer` (to the
   asker of a question) or a `note` (an owner message; conversations go to the
   controller), and its body names the thread and the signed-in user. `by` carries the
   writer's handle (OWN-10); only an owner note has one.
+
+  Screen replies and digests travel on `hgl.notes.screen.<recipient>`, which
+  the `screen` hub role may publish. The receiver requires sender `screen`
+  on exactly that subject, kind `answer` or `note`, and one recipient. The
+  bridge labels these messages “From the screen, not a ruling.” Hub provisioning
+  creates `inbox-screen` so the screen can pull and acknowledge its intake.
 
 ## 5. Worktrees
 
