@@ -400,7 +400,7 @@ pub fn read_status(log_dir: &Path) -> Option<Summary> {
 
 /// The body of a build receipt: the summary as JSON, bounded when large.
 pub fn receipt_body(s: &Summary) -> String {
-    let full = serde_json::to_string(s).unwrap_or_default();
+    let full = serde_json::to_string(&crate::summary::portable(s)).unwrap_or_default();
     if full.len() <= RECEIPT_LIMIT {
         full
     } else {

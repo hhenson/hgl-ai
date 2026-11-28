@@ -1124,7 +1124,11 @@ async fn log_ranges_are_bounded() {
     let Some((r, summary)) = log_fixture().await else {
         return;
     };
-    let log_path = PathBuf::from(summary.steps[0].log.as_ref().unwrap());
+    let log_path = r
+        .root
+        .join("work/builder/logs/lab1")
+        .join(&summary.id)
+        .join("check.log");
     std::fs::write(&log_path, vec![b'x'; 100_000]).unwrap();
     assert_eq!(
         log_read(&r, &summary, "check", Some("0-999999"))
@@ -1161,7 +1165,11 @@ async fn log_access_is_limited_to_summary_steps_and_artifacts() {
             .await
             .is_err()
     );
-    let log_path = PathBuf::from(summary.steps[0].log.as_ref().unwrap());
+    let log_path = r
+        .root
+        .join("work/builder/logs/lab1")
+        .join(&summary.id)
+        .join("check.log");
     let artifact_path = log_path
         .parent()
         .unwrap()

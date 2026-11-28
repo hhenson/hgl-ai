@@ -46,8 +46,7 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
 - `needs`: `sdk:NAME` is met by `[builder.sdk] NAME = PREFIX` on the builder's host (steps
   see `HGL_SDK_NAME`); `tool:NAME` by a command on `PATH`; `step:NAME` by that earlier step
   passing. A missing SDK or tool is *not run*, not a failure.
-- Steps see `HGL_AI_BUILD_ID`, `HGL_AI_SRC`, `HGL_AI_BUILD_DIR` (CMake trees go there) and,
-  in a builder's checkout, `CARGO_TARGET_DIR` and `TMPDIR` inside the job directory. `env`
+- Steps see `HGL_AI_BUILD_ID`, `HGL_AI_SRC`, `HGL_AI_BUILD_DIR` (CMake trees go there) and `CARGO_TARGET_DIR` and `TMPDIR` inside the build workspace. `env`
   values expand `$VAR` from these.
 - `artifacts` are copied to `<log dir>/artifacts/<step>/`; `junit` and `catch2` read the
   `.xml` ones (else the log). `lines` takes `patterns = { error = [...], warning = [...] }`
@@ -75,13 +74,14 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
   - failing tests with their assertion or panic message (at most 20), and counts of passed,
     failed and skipped;
   - warnings counted by kind;
-  - the log's path and the byte ranges of each error, for reading more.
+  - the byte ranges of each error, for reading more.
 
   An agent reads the summary, not the log. The summary is bounded (at most 4 KiB of text;
   `summary.json` keeps 200 errors and failures). Steps run in recipe order; the first that
   does not pass skips the rest unless `--keep-going`. Logs go to
   `$HGL_AI_TASK_DIR/build-logs/<id>/<step>.log` (stdout and stderr together), with
   `status.json` and `summary.json`; `hgl-ai build log ID STEP --bytes A-B` prints a range.
+  Shared summaries omit host-local log paths; local status files retain them.
   Exit status 0 pass, 1 fail, 3 not run. Build ids are `YYYYMMDD-HHMMSS-xxxxxx` (UTC).
 - **BUILD-5 — Detached.** `--detach` returns a build id at once; `hgl-ai build status ID`
   and `hgl-ai build wait ID` report progress and the summary. A long build costs an agent no

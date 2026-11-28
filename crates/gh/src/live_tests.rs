@@ -520,7 +520,12 @@ async fn a_lost_landing_lock_stops_the_landing() {
         merge_commit: Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed".into()),
         head: HEAD.into(),
     };
-    let r = land::after_merge(&gh, &s, &a, "alpha", 7, &merged, &o, &held, None).await;
+    let mut p = crate::progress::Progress::new(HEAD, None);
+    let mut lines = Vec::new();
+    let r = land::after_merge(
+        &gh, &s, &a, "alpha", 7, &merged, &o, &held, &mut p, &mut lines,
+    )
+    .await;
     match r {
         Err(Error::LeaseLost(m)) => assert!(
             m.ends_with(
@@ -1035,10 +1040,11 @@ async fn a_merge_still_pending_keeps_its_record() {
     );
 }
 
-/// Carbon's check 4 (hgl-ai#7): the read right after the merge fails (one HTTP 502). The
-/// retry finds the pull request merged and finishes its landing (`landed.log`, `main`, the
-/// notes, the comment) instead of reporting it merged with nothing recorded; a third run
-/// finds it landed and does nothing.
+/// Carbon's check 4 (hgl-ai#7): the read right after the merge fails (one HTTP 502):
+/// `PARTIAL`, naming every step after the merge as not done, not a bare error. The retry
+/// finds the pull request merged and finishes its landing (`landed.log`, `main`, the notes,
+/// the comment) instead of reporting it merged with nothing recorded; a third run finds it
+/// landed and does nothing.
 #[tokio::test]
 async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     let Some(h) = hub() else { return };
@@ -1049,10 +1055,19 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     s.pins = vec![];
     let o = land::LandOpts::default();
     let gh = landing_gh(|g| g.push_fail_once("pulls/7", "gh: Server Error (HTTP 502)"));
-    let e = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o)
-        .await
-        .unwrap_err();
-    assert!(e.to_string().contains("HTTP 502"), "{e}");
+    let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(l.outcome.kind, crate::gate::Kind::Partial);
+    assert!(!l.outcome.kind.satisfied(), "exit 3");
+    assert!(
+        l.outcome.line.starts_with(
+            "alpha #7 is merged, but landed.log, main, the landed notes and the comment are not done ("
+        ) && l.outcome.line.contains("HTTP 502")
+            && l.outcome
+                .line
+                .ends_with("; run the same command again to finish PARTIAL"),
+        "{}",
+        l.outcome.line
+    );
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "merged");
     let rec = crate::progress::read(&b, "alpha", 7)
         .await
@@ -1099,8 +1114,29 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         "done"
     );
 
-    let again = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    // Asked with an older head (the gate updated the branch before the merge): the merged
+    // head is reported, and the line ends in its status word (r6 on #133).
+    let older = "e".repeat(40);
+    let again = land::land(&gh, &s, &b, "alpha", 7, &older, &o)
+        .await
+        .unwrap();
     assert_eq!(again.outcome.kind, crate::gate::Kind::AlreadyMerged);
+    assert_eq!(again.outcome.head, HEAD);
+    assert_eq!(again.outcome.merge_commit.as_deref(), Some(MERGE));
+    assert!(
+        again.outcome.line.ends_with(" MERGED")
+            && again
+                .outcome
+                .line
+                .contains(&format!("at {}", crate::short(HEAD))),
+        "{}",
+        again.outcome.line
+    );
+    let again = land::merge_once(&gh, &s, &b, "alpha", 7, &older, &o)
+        .await
+        .unwrap();
+    assert_eq!(again.outcome.kind, crate::gate::Kind::AlreadyMerged);
+    assert_eq!(again.outcome.head, HEAD);
     assert!(
         again.after[0].starts_with("landed earlier"),
         "{:?}",
@@ -1110,9 +1146,9 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     assert_eq!(landed_notes(&b).await.len(), 3);
 }
 
-/// `main` cannot be read after the merge (HTTP 502, three times): the landing fails rather
-/// than write a `main` without the repository; the retry finishes from where it stopped,
-/// without a second `landed.log` line.
+/// `main` cannot be read after the merge (HTTP 502, three times): `PARTIAL` rather than a
+/// `main` without the repository, naming the steps left; the retry finishes from where it
+/// stopped, without a second `landed.log` line.
 #[tokio::test]
 async fn a_landing_that_could_not_read_main_resumes_there() {
     let Some(h) = hub() else { return };
@@ -1130,10 +1166,18 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
             .push_fail_once("git/ref/heads/main", "gh: Server Error (HTTP 502)")
             .push_fail_once("git/ref/heads/main", "gh: Server Error (HTTP 502)")
     });
-    let e = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o)
-        .await
-        .unwrap_err();
-    assert!(e.to_string().contains("HTTP 502"), "{e}");
+    let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(l.outcome.kind, crate::gate::Kind::Partial);
+    assert_eq!(l.outcome.merge_commit.as_deref(), Some(MERGE));
+    assert!(
+        l.outcome.line.starts_with(&format!(
+            "alpha #7 is merged at {}, but main, the landed notes and the comment are not done (",
+            &MERGE[..8]
+        )) && l.outcome.line.contains("HTTP 502"),
+        "{}",
+        l.outcome.line
+    );
+    assert!(l.after.is_empty(), "{:?}", l.after);
     assert!(
         b.state_get(state::KEY_MAIN).await.unwrap().is_none(),
         "no partial main"
@@ -1159,6 +1203,91 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
     assert_eq!(landed_notes(&b).await.len(), 3);
     assert_eq!(posts(&gh, "issues/7/comments"), 1);
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1);
+}
+
+/// hgl-ai#7: the comment cannot be posted after the merge (one HTTP 502) under
+/// `merge-if-clean`: `PARTIAL`, naming only the comment, with the lines of the steps done;
+/// the record keeps them done. The same command posts the comment, and sends no note again.
+#[tokio::test]
+async fn a_landing_whose_comment_failed_is_partial_and_finished_by_its_retry() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into()];
+    s.pins = vec![];
+    let o = land::LandOpts::default();
+    let gh = landing_gh(|g| {
+        g.push_fail_once("issues/7/comments -f body", "gh: Server Error (HTTP 502)")
+    });
+    // Ahead of the rule that answers every comments call.
+    {
+        let mut rules = gh.rules.lock().unwrap();
+        let i = rules
+            .iter()
+            .position(|r| r.0 == "issues/7/comments -f body")
+            .unwrap();
+        let r = rules.remove(i);
+        rules.insert(0, r);
+    }
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(l.outcome.kind, crate::gate::Kind::Partial);
+    assert!(!l.outcome.kind.satisfied(), "exit 3");
+    assert_eq!(l.outcome.merge_commit.as_deref(), Some(MERGE));
+    assert!(
+        l.outcome.line.starts_with(&format!(
+            "alpha #7 is merged at {}, but the comment is not done (",
+            &MERGE[..8]
+        )) && l.outcome.line.contains("HTTP 502"),
+        "{}",
+        l.outcome.line
+    );
+    assert!(
+        l.after
+            .iter()
+            .any(|a| a.starts_with("sent landed for alpha-980 to w1")),
+        "{:?}",
+        l.after
+    );
+    let rec = crate::progress::read(&b, "alpha", 7)
+        .await
+        .unwrap()
+        .expect("the record is kept");
+    assert_eq!(
+        rec.done,
+        [
+            crate::progress::LANDED_LOG,
+            crate::progress::MAIN,
+            crate::progress::NOTES
+        ]
+    );
+    assert_eq!(landed_notes(&b).await.len(), 3);
+
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Resumed,
+        "{}",
+        l.outcome.line
+    );
+    assert_eq!(l.after, ["commented on alpha#7"]);
+    assert_eq!(
+        posts(&gh, "issues/7/comments"),
+        2,
+        "the failed post and one more"
+    );
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "not merged again");
+    assert_eq!(landed_notes(&b).await.len(), 3, "no note sent again");
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
@@ -1585,6 +1714,185 @@ async fn a_lost_running_with_a_queued_replacement_is_asked_once() {
     r.stop().await;
 }
 
+/// What GitHub shows for the wrapper's pins current at `cccccccc` (the compiler's `main`)
+/// and pin pull request `n` merged at `merge`.
+fn pins_current_gh(n: u64, merge: &str) -> FakeGh {
+    let sha = |c: char| c.to_string().repeat(40);
+    let sub = |c: char| format!("{{\"type\":\"submodule\",\"sha\":\"{}\"}}", sha(c));
+    let pr = fixture("pr-merged.json")
+        .replace("\"number\": 7", &format!("\"number\": {n}"))
+        .replace(MERGE, merge)
+        .replace(HEAD, &sha('d'))
+        .replace("codex/980-format-patterns", "codex/pins-compiler-cccccccc");
+    FakeGh::default()
+        .on(&format!("hgl-project/pulls/{n}"), &pr)
+        .on("hgl-compiler/pulls/7", &fixture("pr-merged.json"))
+        .on(
+            "git/ref/heads/main",
+            &format!("{{\"object\":{{\"sha\":\"{}\"}}}}", sha('c')),
+        )
+        .on("hgl-compiler/contents/spec/hgl_spec", &sub('5'))
+        .on("hgl-compiler/contents/spec/hgl_core", &sub('6'))
+        .on("hgl-project/contents/hgl-compiler", &sub('c'))
+        .on("hgl-project/contents/hgl_spec", &sub('5'))
+        .on("hgl-project/contents/hgl_core", &sub('6'))
+}
+
+/// hgl-ai#133: a compiler landing raised the pins, and the pin pull request's landing
+/// stopped after its merge (its record holds the merge, nothing done); the compiler's
+/// landing is `PARTIAL`. Its retry finds the pins current, and finishes the pin pull
+/// request's landing (`landed.log`, `main`, the record) before its own, rather than delete
+/// its own record and leave the pin landing's behind.
+#[tokio::test]
+async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let pin_head = "d".repeat(40);
+    // The compiler's landing: every step under the lock done, the pins left.
+    let mut src = crate::progress::Progress::new(HEAD, Some(MERGE.into()));
+    for step in [
+        crate::progress::LANDED_LOG,
+        crate::progress::MAIN,
+        crate::progress::NOTES,
+        crate::progress::COMMENT,
+    ] {
+        src.mark(step);
+    }
+    crate::progress::write(&b, "hgl-compiler", 7, &src)
+        .await
+        .unwrap();
+    // The pin pull request's: merged, its `landed.log` write failed.
+    let pin = crate::progress::Progress::new(&pin_head, Some(pin_merge.into()));
+    crate::progress::write(&b, "hgl-project", 50, &pin)
+        .await
+        .unwrap();
+
+    let gh = pins_current_gh(50, pin_merge);
+    let o = land::LandOpts::default();
+    let l = land::land(&gh, &s, &b, "hgl-compiler", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Resumed,
+        "{}",
+        l.outcome.line
+    );
+    assert!(l.outcome.kind.satisfied(), "exit 0");
+    assert!(
+        l.after
+            .iter()
+            .any(|a| a.starts_with("hgl-project #50 was merged at 02e99ea5")),
+        "{:?}",
+        l.after
+    );
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(
+        log.trim_end()
+            .ends_with(&format!("hgl-project #50 {pin_merge}")),
+        "{log}"
+    );
+    let main = b.state_get(state::KEY_MAIN).await.unwrap().unwrap().value;
+    assert!(
+        main.contains(&format!("hgl-project pins hgl-compiler {}", "c".repeat(40))),
+        "{main}"
+    );
+    for (repo, n) in [("hgl-compiler", 7), ("hgl-project", 50)] {
+        assert!(
+            crate::progress::read(&b, repo, n).await.unwrap().is_none(),
+            "{repo} #{n} finished"
+        );
+    }
+    assert_eq!(posts(&gh, "merge-async"), 0, "nothing merged");
+
+    // Only the intent was recorded (the merge commit's write failed), and GitHub shows it
+    // merged: `gh pins sync` finishes it too.
+    let pin = crate::progress::Progress::new(&pin_head, None);
+    crate::progress::write(&b, "hgl-project", 51, &pin)
+        .await
+        .unwrap();
+    // An intent whose pull request is not merged is the gate's, not resumed here.
+    crate::progress::write(&b, "hgl-project", 52, &pin)
+        .await
+        .unwrap();
+    let open = fixture("pr-open.json")
+        .replace("\"number\": 7", "\"number\": 52")
+        .replace("codex/980-format-patterns", "codex/pins-compiler-cccccccc");
+    // A wrapper pull request that is not a pin one, merged, its notes and comment left:
+    // its own command finishes it, with them; the sync does not.
+    let mut other = crate::progress::Progress::new(HEAD, Some(MERGE.into()));
+    other.mark(crate::progress::LANDED_LOG);
+    other.mark(crate::progress::MAIN);
+    crate::progress::write(&b, "hgl-project", 53, &other)
+        .await
+        .unwrap();
+    let merged = fixture("pr-merged.json").replace("\"number\": 7", "\"number\": 53");
+    let gh = FakeGh::default()
+        .on("hgl-project/pulls/52", &open)
+        .on("hgl-project/pulls/53", &merged)
+        .on("auth status", "");
+    let gh = {
+        let more = pins_current_gh(51, pin_merge);
+        let r = std::mem::take(&mut *more.rules.lock().unwrap());
+        gh.rules.lock().unwrap().extend(r);
+        gh
+    };
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&r, crate::pins::Synced::Landed(o) if o.line.starts_with("hgl-project #51 is merged at 02e99ea5")),
+        "{r:?}"
+    );
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert!(
+        log.trim_end()
+            .ends_with(&format!("hgl-project #51 {pin_merge}")),
+        "{log}"
+    );
+    assert!(
+        crate::progress::read(&b, "hgl-project", 51)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        crate::progress::read(&b, "hgl-project", 52)
+            .await
+            .unwrap()
+            .is_some(),
+        "not merged: left"
+    );
+    assert_eq!(
+        crate::progress::read(&b, "hgl-project", 53)
+            .await
+            .unwrap()
+            .map(|p| p.done),
+        Some(vec![
+            crate::progress::LANDED_LOG.to_string(),
+            crate::progress::MAIN.to_string()
+        ]),
+        "not a pin pull request: left"
+    );
+    assert!(!log.contains("hgl-project #53"), "{log}");
+    assert_eq!(posts(&gh, "merge-async"), 0);
+    // Current, with nothing left to finish.
+    for n in [52, 53] {
+        crate::progress::delete(&b, "hgl-project", n).await.unwrap();
+    }
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&r, crate::pins::Synced::Current(l) if l == "pins current at cccccccc"),
+        "{r:?}"
+    );
+}
+
 /// `tasks` with no task is never written empty (an empty create fails every round), and
 /// a text left from a task that is gone is cleared.
 #[tokio::test]
@@ -1751,4 +2059,154 @@ async fn verdict_uses_newer_matching_nonfinal_copy() {
         VerdictState::Missing(None)
     );
     r.stop().await;
+}
+
+/// `gh` for [`a_pin_landing_finished_by_another_sync_is_done`]: at the first call matching
+/// `trigger`, another sync finishes the landing of the pin pull request `n` (its
+/// `landed.log` line, its record gone).
+struct Racing {
+    gh: FakeGh,
+    bus: Bus,
+    merge: String,
+    trigger: &'static str,
+    n: u64,
+    raced: std::sync::atomic::AtomicBool,
+}
+
+impl Racing {
+    fn new(gh: FakeGh, bus: Bus, merge: &str, trigger: &'static str, n: u64) -> Racing {
+        Racing {
+            gh,
+            bus,
+            merge: merge.into(),
+            trigger,
+            n,
+            raced: Default::default(),
+        }
+    }
+}
+
+/// A fresh `prs` table whose row for the wrapper's pull request `n` says the review bot is
+/// at its usage limit: the gate's table check would stop a landing there (BOTLIMIT).
+async fn bot_limit_row(b: &Bus, n: u64) {
+    let text = format!(
+        "# read {}\nhgl-project\t{n}\t{}\topen\tlimit\t0\tpass\t{}\n",
+        hgl_ai_proto::utc_now_stamp(),
+        "d".repeat(40),
+        hgl_ai_proto::utc_now_stamp()
+    );
+    store::put_latest(b, state::KEY_PRS, &text).await.unwrap();
+}
+
+impl crate::exec::Gh for Racing {
+    async fn exec(
+        &self,
+        args: Vec<String>,
+        stdin: Option<Vec<u8>>,
+    ) -> crate::Result<crate::exec::Output> {
+        if args.join(" ").contains(self.trigger)
+            && !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let line = format!("20261128T000000Z hgl-project #{} {}", self.n, self.merge);
+            store::append_bounded(&self.bus, state::KEY_LANDED, &line, 100)
+                .await
+                .unwrap();
+            crate::progress::delete(&self.bus, "hgl-project", self.n)
+                .await
+                .unwrap();
+        }
+        self.gh.exec(args, stdin).await
+    }
+}
+
+/// hgl-ai#133: two syncs pick the same unfinished pin landing, and the other finishes it
+/// first. This one finds it landed: done, not `NotLanded`, and the plan is still read. It
+/// finds that before the gate, whose table says BOTLIMIT for the pull request (r6).
+/// A dry run reads the hub too: it names an unfinished pin landing, rather than say the
+/// pins are current.
+#[tokio::test]
+async fn a_pin_landing_finished_by_another_sync_is_done() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let pin = crate::progress::Progress::new(&"d".repeat(40), Some(pin_merge.into()));
+    crate::progress::write(&b, "hgl-project", 50, &pin)
+        .await
+        .unwrap();
+
+    let dry = crate::exec::ReadOnly(pins_current_gh(50, pin_merge));
+    let r = crate::pins::sync(&dry, &s, Some(&b), &crate::pins::PinOpts::default(), true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&r, crate::pins::Synced::Would(l) if l == "would finish the landing of the pin pull request hgl-project#50"),
+        "{r:?}"
+    );
+    assert!(
+        crate::progress::read(&b, "hgl-project", 50)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    bot_limit_row(&b, 50).await;
+    let gh = Racing::new(
+        pins_current_gh(50, pin_merge),
+        bus(&h).await,
+        pin_merge,
+        "hgl-project/pulls/50",
+        50,
+    );
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(r.ok(), "{r:?}");
+    assert!(
+        matches!(&r, crate::pins::Synced::Current(l) if l == "pins current at cccccccc"),
+        "{r:?}"
+    );
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "landed once: {log}");
+    assert!(
+        b.state_get(state::KEY_MAIN).await.unwrap().is_none(),
+        "not finished again"
+    );
+}
+
+/// r6 on #133: a sync finds an open pin pull request, and another sync lands it while this
+/// one waits for the lock. This one finds it landed in `landed.log` before the gate (whose
+/// table says BOTLIMIT): done, not `NotLanded` with "already MERGED".
+#[tokio::test]
+async fn an_open_pin_pull_request_landed_by_another_sync_is_done() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let head = "d".repeat(40);
+    bot_limit_row(&b, 60).await;
+    let stale = format!("{{\"type\":\"submodule\",\"sha\":\"{}\"}}", "b".repeat(40));
+    let open = format!("[{{\"number\":60,\"head\":{{\"sha\":\"{head}\"}}}}]");
+    // First match wins: the wrapper's main holds an old compiler pin; the open pull
+    // request's head holds the wanted ones.
+    let gh = FakeGh::default()
+        .on("pulls?state=open", &open)
+        .on("hgl-project/contents/hgl-compiler?ref=main", &stale);
+    let more = pins_current_gh(60, pin_merge);
+    let r = std::mem::take(&mut *more.rules.lock().unwrap());
+    gh.rules.lock().unwrap().extend(r);
+    let gh = Racing::new(gh, bus(&h).await, pin_merge, "pulls?state=open", 60);
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(r.ok(), "{r:?}");
+    assert!(
+        matches!(&r, crate::pins::Synced::Landed(o) if o.kind == crate::gate::Kind::AlreadyMerged),
+        "{r:?}"
+    );
+    assert_eq!(posts(&gh.gh, "merge-async"), 0, "not merged again");
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "landed once: {log}");
 }

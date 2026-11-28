@@ -14,8 +14,9 @@ use hgl_ai_config::Pin;
 use serde_json::{Value, json};
 
 use crate::exec::{self, Gh};
-use crate::gate::{self, Outcome};
+use crate::gate::{self, Kind, Outcome};
 use crate::land::{self, LandOpts};
+use crate::progress;
 use crate::{Error, Result, Settings, invalid, short};
 
 #[derive(Debug, Clone)]
@@ -242,15 +243,44 @@ pub async fn sync<G: Gh>(
     o: &PinOpts,
     dry_run: bool,
 ) -> Result<Synced> {
+    // A pin pull request merged by an earlier sync whose landing stopped after the merge:
+    // finish it first, or the pins read current and its landing is never finished.
+    let mut resumed = None;
+    if let Some(b) = bus {
+        for (n, head) in unfinished(gh, s, b).await? {
+            if dry_run {
+                return Ok(Synced::Would(format!(
+                    "would finish the landing of the pin pull request {}#{n}",
+                    s.wrapper
+                )));
+            }
+            let l = Box::pin(land::land(
+                gh,
+                s,
+                b,
+                &s.wrapper,
+                n,
+                &head,
+                &land_opts(o, None),
+            ))
+            .await?;
+            match l.outcome.kind {
+                k if k.landed() => resumed = Some(l.outcome),
+                // Finished meanwhile by another sync: done; the plan says what is left.
+                Kind::AlreadyMerged => {}
+                _ => return Ok(Synced::NotLanded(l.outcome)),
+            }
+        }
+    }
     let p = read_plan(gh, s).await?;
     let Some((_, primary, _)) = p.primary().cloned() else {
         return Ok(Synced::Current("no pins configured".into()));
     };
     if p.current() {
-        return Ok(Synced::Current(format!(
-            "pins current at {}",
-            short(&primary)
-        )));
+        return Ok(match resumed {
+            Some(o) => Synced::Landed(o),
+            None => Synced::Current(format!("pins current at {}", short(&primary))),
+        });
     }
     let (branch, title, message, body) = texts(s, &p, o)?;
     let w = s.full(&s.wrapper);
@@ -348,7 +378,27 @@ pub async fn sync<G: Gh>(
             (n, sha)
         }
     };
-    let lo = LandOpts {
+    let l = land::land(
+        gh,
+        s,
+        bus,
+        &s.wrapper,
+        number,
+        &head,
+        &land_opts(o, Some(title)),
+    )
+    .await?;
+    Ok(match l.outcome.kind {
+        k if k.landed() => Synced::Landed(l.outcome),
+        // Landed meanwhile by another sync, which held the lock while this one waited: done.
+        Kind::AlreadyMerged => Synced::Landed(l.outcome),
+        _ => Synced::NotLanded(l.outcome),
+    })
+}
+
+/// How a pin pull request is landed.
+fn land_opts(o: &PinOpts, what: Option<String>) -> LandOpts {
+    LandOpts {
         // Made by the tool, not an agent: no author family for a review receipt to differ
         // from (ROLE-11); the review bot and the checks still gate it.
         gate: gate::Opts {
@@ -360,15 +410,51 @@ pub async fn sync<G: Gh>(
         comment: false,
         notify: false,
         sync_pins: false,
-        what: Some(title),
+        what,
         ..LandOpts::default()
+    }
+}
+
+/// The wrapper's pin pull requests with a landing record that are merged and not finished,
+/// as (number, head): a record with the merge commit, or only the intent of a pull request
+/// GitHub shows merged. An intent whose pull request is not merged is left to the sync
+/// itself; any other wrapper pull request's landing to its own command, which knows its
+/// notes and comment.
+async fn unfinished<G: Gh>(gh: &G, s: &Settings, bus: &Bus) -> Result<Vec<(u64, String)>> {
+    let prefix = progress::key(&s.wrapper, 0);
+    let prefix = prefix.trim_end_matches('0');
+    let mut out = Vec::new();
+    for key in bus.state_keys(prefix).await? {
+        let Some(n) = key.strip_prefix(prefix).and_then(|n| n.parse::<u64>().ok()) else {
+            continue;
+        };
+        let Some(p) = progress::read(bus, &s.wrapper, n).await? else {
+            continue;
+        };
+        let pr = gate::fetch_pr(gh, s, &s.wrapper, n).await?;
+        if !is_pin_branch(s, &pr.branch) || (p.merge.is_none() && !pr.merged) {
+            continue;
+        }
+        out.push((n, if p.head.is_empty() { pr.head } else { p.head }));
+    }
+    Ok(out)
+}
+
+/// Whether `branch` is a pin pull request's: `<branch_prefix><pin_branch>` with every
+/// `{sha8}` of `pin_branch` the same eight hex digits, as [`texts`] makes it. The prefix is
+/// literal there, so it is here: a `{sha8}` in it is not filled.
+pub(crate) fn is_pin_branch(s: &Settings, branch: &str) -> bool {
+    let Some(rest) = branch.strip_prefix(s.branch_prefix.as_str()) else {
+        return false;
     };
-    let l = land::land(gh, s, bus, &s.wrapper, number, &head, &lo).await?;
-    Ok(if l.outcome.kind.landed() {
-        Synced::Landed(l.outcome)
-    } else {
-        Synced::NotLanded(l.outcome)
-    })
+    let Some((before, _)) = s.pin_branch.split_once("{sha8}") else {
+        return rest == s.pin_branch;
+    };
+    rest.strip_prefix(before)
+        .and_then(|r| r.get(..8))
+        .is_some_and(|sha| {
+            sha.bytes().all(|c| c.is_ascii_hexdigit()) && rest == fill(&s.pin_branch, sha)
+        })
 }
 
 /// Point `refs/heads/<branch>` of `w` at `sha`: a branch left by an earlier attempt (or one
@@ -468,6 +554,54 @@ mod tests {
             t["tree"][1],
             json!({"path": "hgl_spec", "mode": "160000", "type": "commit", "sha": sha('5')})
         );
+    }
+
+    #[test]
+    fn pin_branches() {
+        let s = settings();
+        assert!(is_pin_branch(&s, "codex/pins-compiler-cccccccc"));
+        assert!(is_pin_branch(&s, "codex/pins-compiler-01e99ea5"));
+        for b in [
+            "codex/980-format-patterns",
+            "codex/pins-compiler-",
+            "codex/pins-compiler-cccccccc0",
+            "codex/pins-compiler-zzzzzzzz",
+            "pins-compiler-cccccccc",
+        ] {
+            assert!(!is_pin_branch(&s, b), "{b}");
+        }
+        // Every `{sha8}` is filled, with the same commit.
+        let mut s = settings();
+        s.pin_branch = "pins-{sha8}-compiler-{sha8}".into();
+        let p = the_plan('b');
+        let (branch, ..) = texts(&s, &p, &PinOpts::default()).unwrap();
+        assert_eq!(branch, "codex/pins-cccccccc-compiler-cccccccc");
+        assert!(is_pin_branch(&s, &branch));
+        for b in [
+            "codex/pins-cccccccc-compiler-dddddddd",
+            "codex/pins-cccccccc-compiler-{sha8}",
+            "codex/pins-cccccccc-compiler-",
+        ] {
+            assert!(!is_pin_branch(&s, b), "{b}");
+        }
+        // No placeholder: the name itself.
+        s.pin_branch = "pins".into();
+        assert!(is_pin_branch(&s, "codex/pins"));
+        assert!(!is_pin_branch(&s, "codex/pins-cccccccc"));
+        // A `{sha8}` in the prefix is literal, as `texts` writes it (r6 on #133).
+        let mut s = settings();
+        s.branch_prefix = "team-{sha8}/".into();
+        let (branch, ..) = texts(&s, &the_plan('b'), &PinOpts::default()).unwrap();
+        assert_eq!(branch, "team-{sha8}/pins-compiler-cccccccc");
+        assert!(is_pin_branch(&s, &branch));
+        for b in [
+            "team-cccccccc/pins-compiler-cccccccc",
+            "team-{sha8}/pins-compiler-zzzzzzzz",
+            "team-{sha8}/pins-compiler-",
+            "codex/pins-compiler-cccccccc",
+        ] {
+            assert!(!is_pin_branch(&s, b), "{b}");
+        }
     }
 
     #[tokio::test]
