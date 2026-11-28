@@ -59,9 +59,9 @@ use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
     BROADCAST, CONSOLE_PREFIX, EndedRecord, HostRecord, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS,
-    KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord, Note, OWNER_PREFIX,
-    STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord,
-    USAGE_PREFIX, ended_key, utc_now_stamp,
+    KV_METRICS, KV_SCREEN, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord, Note,
+    OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey,
+    TreeRecord, USAGE_PREFIX, ended_key, utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -430,6 +430,8 @@ impl Bus {
             })
             .await
             .map_err(|e| nats(&format!("provisioning stream {STREAM_NOTES}"), e))?;
+        self.create_inbox_consumer(&Seat::screen(), InboxOptions::default())
+            .await?;
         self.js
             .create_or_update_stream(stream::Config {
                 name: STREAM_OWNER.to_string(),
@@ -524,6 +526,13 @@ impl Bus {
                 Duration::ZERO,
             ),
             (
+                KV_SCREEN,
+                "hgl-ai screen rules and log",
+                stream::StorageType::File,
+                STATE_HISTORY,
+                Duration::ZERO,
+            ),
+            (
                 KV_USAGE,
                 "hgl-ai subscription usage per login",
                 stream::StorageType::File,
@@ -549,9 +558,8 @@ impl Bus {
         Ok(())
     }
 
-    /// Validate and publish a note to its subject ([`Note::subject`]: `hgl.notes.<recipient>`,
-    /// or `hgl.notes.owner.<recipient>` for the owner's) with its message id, and wait for
-    /// the hub's acknowledgement.
+    /// Validate and publish a note to its subject ([`Note::subject`]) with its message id,
+    /// and wait for the hub's acknowledgement.
     pub async fn send(&self, note: &Note) -> Result<SendReceipt> {
         self.send_with_id(note, &note.msg_id()).await
     }
@@ -584,38 +592,25 @@ impl Bus {
         })
     }
 
-    /// The durable inbox of `seat`, created on first use. Only broadcasts published
-    /// from its creation onward are delivered; any retained unicast is eligible.
+    /// The durable inbox of `seat`, created on first use (at provisioning for the screen).
+    /// Only broadcasts published from its creation onward are delivered.
     pub async fn inbox(&self, seat: &Seat) -> Result<Inbox> {
         self.inbox_with(seat, InboxOptions::default()).await
     }
 
     /// The durable inbox of `seat` with explicit consumer settings. The consumer
-    /// is created, or updated to these settings if it exists.
+    /// is created, or updated to these settings if it exists. The screen's consumer
+    /// uses the settings installed by provisioning.
     pub async fn inbox_with(&self, seat: &Seat, opts: InboxOptions) -> Result<Inbox> {
         check_inbox_seat(seat)?;
-        let stream = self
-            .js
-            .get_stream(STREAM_NOTES)
-            .await
-            .map_err(|e| missing(&format!("stream {STREAM_NOTES}"), e))?;
-        let mut consumer = stream
-            .create_consumer(pull::Config {
-                durable_name: Some(seat.consumer()),
-                description: Some(format!("inbox of seat {seat}")),
-                deliver_policy: DeliverPolicy::All,
-                ack_policy: AckPolicy::Explicit,
-                ack_wait: opts.ack_wait,
-                max_deliver: opts.max_deliver,
-                filter_subjects: vec![
-                    seat.subject(),
-                    Seat::broadcast().subject(),
-                    seat.owner_subject(),
-                ],
-                ..Default::default()
-            })
-            .await
-            .map_err(|e| nats(&format!("opening the inbox of {seat}"), e))?;
+        let mut consumer = if seat.is_screen() {
+            self.js
+                .get_consumer_from_stream(seat.consumer(), STREAM_NOTES)
+                .await
+                .map_err(|e| nats("opening the screen inbox (provisioned by hgl-ai init)", e))?
+        } else {
+            self.create_inbox_consumer(seat, opts).await?
+        };
         // After a hub restart, CREATE can report the reload time as `created`.
         // INFO refreshes the cached creation time used to skip old broadcasts.
         consumer
@@ -627,6 +622,36 @@ impl Bus {
             consumer,
             client: self.client.clone(),
         })
+    }
+
+    async fn create_inbox_consumer(
+        &self,
+        seat: &Seat,
+        opts: InboxOptions,
+    ) -> Result<jetstream::consumer::Consumer<pull::Config>> {
+        let stream = self
+            .js
+            .get_stream(STREAM_NOTES)
+            .await
+            .map_err(|e| missing(&format!("stream {STREAM_NOTES}"), e))?;
+        stream
+            .create_consumer(pull::Config {
+                durable_name: Some(seat.consumer()),
+                description: Some(format!("inbox of seat {seat}")),
+                deliver_policy: DeliverPolicy::All,
+                ack_policy: AckPolicy::Explicit,
+                ack_wait: opts.ack_wait,
+                max_deliver: opts.max_deliver,
+                filter_subjects: vec![
+                    seat.subject(),
+                    seat.owner_subject(),
+                    seat.screen_subject(),
+                    Seat::broadcast().subject(),
+                ],
+                ..Default::default()
+            })
+            .await
+            .map_err(|e| nats(&format!("opening the inbox of {seat}"), e))
     }
 
     /// The notes for `seats` from stream sequence `from` on, oldest first, at most `max`;
@@ -757,7 +782,7 @@ impl Bus {
             .get_stream(STREAM_NOTES)
             .await
             .map_err(|e| missing(&format!("stream {STREAM_NOTES}"), e))?;
-        let mut subjects = vec![seat.subject(), seat.owner_subject()];
+        let mut subjects = vec![seat.subject(), seat.owner_subject(), seat.screen_subject()];
         let (from, broadcast_start) = match stream.consumer_info(seat.consumer()).await {
             Ok(i) => {
                 subjects.push(Seat::broadcast().subject());
@@ -1489,6 +1514,13 @@ fn parse_note(subject: &str, payload: &[u8]) -> std::result::Result<Note, String
     let note: Note = serde_json::from_slice(payload).map_err(|e| format!("not a note: {e}"))?;
     note.validate().map_err(|e| e.to_string())?;
     if subject != note.subject() {
+        if note.sender.is_screen() || subject == note.recipient.screen_subject() {
+            return Err(format!(
+                "sender {} on {subject}: screen notes require sender screen on {}",
+                note.sender,
+                note.recipient.screen_subject()
+            ));
+        }
         if note.sender.is_owner() || subject == note.recipient.owner_subject() {
             return Err(format!(
                 "sender {} on {subject}: owner notes come only from the console on {}",

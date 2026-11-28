@@ -273,7 +273,7 @@ fn notes_send_wait_peek() {
     };
     assert_eq!(
         ok(&hub.run(&["init"])),
-        "provisioned HGL_NOTES HGL_OWNER HGL_USAGE_LOG HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS HGL_ENDED HGL_THREADS HGL_METRICS HGL_CONSOLE HGL_SLACK HGL_USAGE HGL_BUILD\n"
+        "provisioned HGL_NOTES HGL_OWNER HGL_USAGE_LOG HGL_STATE HGL_HOSTS HGL_TREES HGL_LOCKS HGL_ENDED HGL_THREADS HGL_METRICS HGL_CONSOLE HGL_SLACK HGL_SCREEN HGL_USAGE HGL_BUILD\n"
     );
     ok(&hub.run(&["init"]));
 
@@ -353,6 +353,16 @@ fn notes_send_wait_peek() {
         "note", "send", "--from", "w1", "--to", "claude", "--kind", "note",
     ]);
     assert_eq!(usage.status.code(), Some(2), "a body is required");
+
+    let screen = ok(&hub.run(&[
+        "note", "send", "--from", "screen", "--to", "claude", "--kind", "answer", "--body", "seen",
+    ]));
+    assert_eq!(screen, "seq 3\n");
+    let peeked = ok(&hub.run(&["note", "peek", "claude"]));
+    assert!(
+        peeked.contains("--- seq=3 from=screen kind=answer at "),
+        "{peeked}"
+    );
 }
 
 #[test]

@@ -623,17 +623,21 @@ impl Config {
                 self.host
             )));
         }
-        if self.host == hgl_ai_proto::BROADCAST {
-            // The bridge's notes about the host are sent from its label.
-            return Err(ConfigError::Invalid(
-                "host label `all` is the broadcast address; choose another".into(),
-            ));
+        // The bridge's notes about the host are sent from its label.
+        if matches!(
+            self.host.as_str(),
+            hgl_ai_proto::BROADCAST | hgl_ai_proto::SCREEN
+        ) {
+            return Err(ConfigError::Invalid(format!(
+                "host label `{}` is reserved by the protocol",
+                self.host
+            )));
         }
         let mut seen = std::collections::BTreeSet::new();
         for s in &self.seats {
             if s.name.is_reserved() {
                 return Err(ConfigError::Invalid(format!(
-                    "a seat cannot be named `{}`: `all`, `owner` and `console` are reserved",
+                    "seat name `{}` is reserved by the protocol",
                     s.name
                 )));
             }
@@ -732,9 +736,7 @@ impl Config {
         let invalid = |why: String| ConfigError::Invalid(format!("github.controller: {why}"));
         let s = Seat::new(self.github.controller.clone()).map_err(|e| invalid(e.to_string()))?;
         if s.is_reserved() {
-            return Err(invalid(
-                "not `all`, `owner` or `console`; name one seat".into(),
-            ));
+            return Err(invalid(format!("`{s}` is reserved by the protocol")));
         }
         Ok(s)
     }
@@ -913,7 +915,7 @@ model = "claude-opus-5-5-high"
         c.github.controller = "boss".into();
         assert_eq!(c.controller().unwrap().as_str(), "boss");
         assert!(c.validate().is_ok());
-        for bad in ["all", "owner", "console", "Not A Seat"] {
+        for bad in ["all", "owner", "console", "screen", "Not A Seat"] {
             c.github.controller = bad.into();
             assert!(c.validate().is_err(), "{bad}");
         }
@@ -930,11 +932,24 @@ model = "claude-opus-5-5-high"
     }
 
     #[test]
+    fn reserved_host_labels() {
+        for label in ["all", "screen"] {
+            let error = Config::new(label).validate().unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("host label `{label}` is reserved"))
+            );
+        }
+    }
+
+    #[test]
     fn reserved_seat_names() {
         for name in [
             "all",
             "owner",
             "console",
+            "screen",
             "builder-lab1",
             "r-20261127-083000-3fa9c1",
         ] {

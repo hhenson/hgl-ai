@@ -141,11 +141,15 @@ hgl-ai server user ...`).
 | `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
 | `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
+| `screen` | publishes `hgl.notes.screen.<seat>` and `HGL_SCREEN/log.>`; pulls and acknowledges `inbox-screen`; reads `HGL_STATE`, `HGL_TREES` and `HGL_SCREEN/rule.>` |
+| `screen-rules` | writes `HGL_SCREEN/rule.>` and reads `HGL_SCREEN/log.>` by key |
 | `viewer` | nothing by subject (replies are not enforced until hgl-ai#141): reads and watches `HGL_HOSTS`, `HGL_METRICS`, `HGL_BUILD`, `HGL_USAGE`, and of `HGL_STATE` only `prs`, `backlog`, `landed.log`, `tasks`, `mode`, `hold` (the console's page, docs/owner.md §3); consumers only in the filtered create form; subscribes to `_INBOX_VIEWER.>` only; no other stream or bucket, no consumer delete (docs/design.md §9) |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
 The console keeps session state in `HGL_CONSOLE`. The Slack adapter reads its own
 delivery state, its durable `HGL_OWNER` feed and opening events by sequence.
+The controller uses `screen-rules` for rule writes and log reads. The `SCREEN`
+and `SCREEN_RULES` accounts isolate JetStream replies on the role-account layout.
 The console can read the Slack permalink index.
 Seat, coordinator and builder users read `HGL_OWNER` through short-lived consumers.
 The `viewer` reads only the telemetry, as above.
@@ -166,6 +170,23 @@ hgl-ai server user add lab1-builder --role builder # its builder: [builder] cred
 hgl-ai server user list
 hgl-ai server user remove build-1                  # the hub refuses it from then on
 ```
+
+Generate the `screen-rules` credential in the owner's OS account on the hub host.
+Keep the seed in that account's private configuration. Only the public key goes
+to the server user. [NATS `nk` commands](https://github.com/nats-io/nkeys/blob/main/nk/README.md)
+
+```sh
+(
+    umask 077
+    set -C
+    mkdir -p ~/.config/hgl-ai/hub-users &&
+        nk -gen user > ~/.config/hgl-ai/hub-users/controller-rules.seed
+)
+nk -inkey ~/.config/hgl-ai/hub-users/controller-rules.seed -pubout
+```
+
+Register the printed public key as the hub's server user with
+`hgl-ai server user add controller-rules --role screen-rules --nkey U...`.
 
 `user add` and `remove` rewrite `nats.conf` and reload the hub (SIGHUP through
 its pid file; connections that stay valid are kept). On the client: `hgl-ai client install --token-file <the .cred>`. A

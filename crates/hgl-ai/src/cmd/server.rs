@@ -52,11 +52,11 @@ enum UserCmd {
     Add {
         /// The user: a host label for a seat user.
         name: String,
-        /// seat (a client host), coord, console or admin.
+        /// seat, coord, builder, console, viewer, slack, screen, screen-rules or admin.
         #[arg(long, value_parser = |s: &str| s.parse::<install::users::Role>())]
         role: install::users::Role,
         /// Register this public NKey (U...) instead of making a credential: the
-        /// user's seed stays on its own host.
+        /// user's seed stays on its own host. Required for screen-rules.
         #[arg(long, value_name = "PUBKEY")]
         nkey: Option<String>,
         /// Give an existing user a new key; its old credential stops working.
