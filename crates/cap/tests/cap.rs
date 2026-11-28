@@ -338,6 +338,9 @@ fn run_reports_a_missing_command() {
 
 #[test]
 fn without_the_address_limit_only_the_watchdog_limits() {
+    let inherited = sh("ulimit -v").output().unwrap();
+    assert!(inherited.status.success());
+    let inherited = String::from_utf8(inherited.stdout).unwrap();
     let read = |spec: CapSpec| {
         let mut child = CapCommand::new(spec, &sh("ulimit -v"))
             .method(Method::Rlimit)
@@ -355,9 +358,16 @@ fn without_the_address_limit_only_the_watchdog_limits() {
     };
     let on = CapSpec::new(512 * MIB);
     if cfg!(target_os = "linux") {
-        assert_eq!(read(on), (512 * 1024).to_string());
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `limit` is valid storage for the inherited limit.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_AS, &mut limit) }, 0);
+        let expected = (512 * MIB as libc::rlim_t).min(limit.rlim_max) / 1024;
+        assert_eq!(read(on), expected.to_string());
     }
-    assert_eq!(read(on.with_address_limit(false)), "unlimited");
+    assert_eq!(read(on.with_address_limit(false)), inherited.trim());
     assert!(
         !Method::Rlimit
             .warning(&on.with_address_limit(false))
