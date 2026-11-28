@@ -446,7 +446,10 @@ impl BuildJob {
                     "verdict {v}: not a platform's name (linux, macos or mac, windows)"
                 ));
             }
-            super::check_state_key(&verdict_key(&self.repo, self.issue, v))
+            // The base is the `main` commit the verdict binds, not a branch that moves.
+            let base = self.base.as_deref().unwrap_or_default();
+            super::check_head(base).map_err(|e| format!("verdict {v}: base {e}"))?;
+            super::check_state_key(&verdict_key(&self.repo, self.issue, v, &self.head, base, 0))
                 .map_err(|e| e.to_string())?;
         }
         if reply_seat(&self.id).ok().as_ref() != Some(&self.reply_to) {
@@ -466,10 +469,24 @@ impl BuildJob {
     }
 }
 
-/// `HGL_STATE/verdict.<repo>.<pr>.<name>`: a local build verdict the merge gate reads
-/// (docs/protocol.md §8).
-pub fn verdict_key(repo: &str, pr: u64, name: &str) -> String {
-    format!("verdict.{repo}.{pr}.{name}")
+/// `HGL_STATE/verdict.<repo>.<pr>.<name>.<pair>`: the local build verdict `name` of pull
+/// request `pr` for `head` merged onto `main` under recipe revision `recipe`
+/// (docs/protocol.md §8). `<pair>` is 24 hex digits of SHA-256 over the three: each key
+/// holds what one build judges, so no build for another head, `main` or recipe can
+/// displace it, and the gate reads only the key of what it needs.
+pub fn verdict_key(repo: &str, pr: u64, name: &str, head: &str, main: &str, recipe: u64) -> String {
+    let mut h = Sha256::new();
+    h.update(format!("{head} {main} r{recipe}").as_bytes());
+    format!(
+        "{}{name}.{}",
+        verdict_prefix(repo, pr),
+        &hex::encode(h.finalize())[..24]
+    )
+}
+
+/// The prefix of every verdict key of pull request `pr`: `verdict.<repo>.<pr>.`.
+pub fn verdict_prefix(repo: &str, pr: u64) -> String {
+    format!("verdict.{repo}.{pr}.")
 }
 
 /// The platform a verdict name stands for: a platform's name, or `mac` for macOS.
@@ -636,6 +653,11 @@ impl VerdictValue {
         self.head == head && self.main == main
     }
 
+    /// `pass` or `fail`: final in its key.
+    pub fn judged(&self) -> bool {
+        matches!(self.word, VerdictWord::Pass | VerdictWord::Fail)
+    }
+
     /// A `running` value past its bound at `now` (`YYYYMMDDTHHMMSSZ`): its builder is
     /// presumed gone.
     pub fn expired(&self, now: &str) -> bool {
@@ -653,22 +675,6 @@ fn split_word(s: &str) -> Option<(&str, &str)> {
         Some(i) => (&s[..i], &s[i..]),
         None => (s, ""),
     })
-}
-
-/// Whether a value from build `mine` may replace `old` (BUILD-15): builds are ordered by
-/// their ids, which the requester stamps when it asks, so a build asked later (for a newer
-/// `main` or head) is never overwritten by one asked earlier that ends after it.
-pub fn verdict_replaces(mine: &str, old: Option<&VerdictValue>) -> bool {
-    match old.and_then(|o| o.id.as_deref()) {
-        Some(theirs) => mine >= theirs,
-        None => true,
-    }
-}
-
-/// The UTC time a build id was stamped, as `YYYYMMDDTHHMMSSZ`.
-pub fn build_id_stamp(id: &str) -> Option<String> {
-    check_build_id(id).ok()?;
-    Some(format!("{}T{}Z", &id[..8], &id[9..15]))
 }
 
 /// The inbox of the builder `label`: `builder-<label>`.
@@ -782,8 +788,10 @@ mod tests {
         // A gate build: a pull request, a base, every step, a platform's name.
         let mut gate = job.clone();
         gate.issue = 7;
+        gate.base = Some("0a".repeat(20));
         gate.verdict = Some("mac".into());
         n.issue = 7;
+        n.base = gate.base.clone();
         gate.check(&n).unwrap();
         let bad_gate = |f: &dyn Fn(&mut BuildJob)| {
             let mut j = gate.clone();
@@ -794,6 +802,12 @@ mod tests {
         assert!(bad_gate(&|j| j.steps = Some(vec!["test".into()])).contains("every step"));
         assert!(bad_gate(&|j| j.keep_going = true).contains("every step"));
         assert!(bad_gate(&|j| j.recipe_rev = Some(3)).contains("current recipe"));
+        // The base is a commit, never a branch that moves under the verdict.
+        let mut branch = gate.clone();
+        branch.base = Some("main".into());
+        let mut nb = n.clone();
+        nb.base = branch.base.clone();
+        assert!(branch.check(&nb).unwrap_err().contains("base"));
         let mut no_pr = gate.clone();
         no_pr.issue = 0;
         n.issue = 0;
@@ -805,10 +819,22 @@ mod tests {
     #[test]
     fn verdict_values() {
         let (h, m) = ("h".repeat(40), "m".repeat(40));
-        assert_eq!(
-            verdict_key("hgl-compiler", 1037, "mac"),
-            "verdict.hgl-compiler.1037.mac"
-        );
+        // One key per head, main and recipe revision, under the pull request's prefix.
+        let k = verdict_key("hgl-compiler", 1037, "mac", &h, &m, 4);
+        assert!(k.starts_with("verdict.hgl-compiler.1037.mac."), "{k}");
+        assert_eq!(k.len(), "verdict.hgl-compiler.1037.mac.".len() + 24);
+        crate::check_state_key(&verdict_key("homebrew-hgraph", 99999, "windows", &h, &m, 9))
+            .unwrap();
+        assert_eq!(k, verdict_key("hgl-compiler", 1037, "mac", &h, &m, 4));
+        for other in [
+            verdict_key("hgl-compiler", 1037, "mac", &m, &m, 4),
+            verdict_key("hgl-compiler", 1037, "mac", &h, &h, 4),
+            verdict_key("hgl-compiler", 1037, "mac", &h, &m, 5),
+            verdict_key("hgl-compiler", 1037, "linux", &h, &m, 4),
+        ] {
+            assert_ne!(k, other);
+        }
+        assert!(k.starts_with(&verdict_prefix("hgl-compiler", 1037)));
         assert_eq!(verdict_platform("mac"), Some(Platform::Macos));
         assert_eq!(verdict_platform("macos"), Some(Platform::Macos));
         assert_eq!(verdict_platform("linux"), Some(Platform::Linux));
@@ -851,23 +877,6 @@ mod tests {
         let back = VerdictValue::parse(&t).unwrap();
         assert_eq!(back, run);
         assert!(back.expired("20261127T090001Z") && !back.expired("20261127T085959Z"));
-        // An earlier build never replaces a later one's value.
-        assert!(verdict_replaces("20261127-083000-3fa9c1", Some(&back)));
-        assert!(verdict_replaces("20261127-090000-000000", Some(&back)));
-        assert!(!verdict_replaces("20261127-082959-ffffff", Some(&back)));
-        assert!(verdict_replaces("20261127-082959-ffffff", None));
-        assert_eq!(
-            build_id_stamp("20261127-083000-3fa9c1").as_deref(),
-            Some("20261127T083000Z")
-        );
-        let back = VerdictValue::parse(&text).unwrap();
-        assert_eq!(
-            back.reason.as_deref(),
-            Some("head does not merge onto main")
-        );
-        assert_eq!(back.id.as_deref(), Some("20261127-083000-3fa9c1"));
-        assert!(VerdictValue::parse("junk").is_none());
-        assert!(VerdictValue::parse(&format!("{h} {m} maybe")).is_none());
     }
 
     #[test]

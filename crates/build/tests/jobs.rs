@@ -362,33 +362,47 @@ async fn send_pr(r: &Rig, j: &BuildJob) {
     r.bus.send(&n).await.unwrap();
 }
 
-/// hgl-ai#6: a builder writes only its own platform's verdict, binding the main it merged
-/// onto; a verdict for another platform is refused before anything runs.
+fn mine() -> &'static str {
+    hgl_ai_proto::build::Platform::current().unwrap().as_str()
+}
+
+async fn recipe_rev(r: &Rig) -> u64 {
+    store::recipe_get(&r.bus, "demo", None)
+        .await
+        .unwrap()
+        .unwrap()
+        .revision
+}
+
+/// The verdict key of `head` on `main` under the current recipe, and its value.
+async fn verdict(r: &Rig, head: &str, main: &str) -> (String, Option<String>) {
+    let rev = recipe_rev(r).await;
+    let key = hgl_ai_proto::build::verdict_key("demo", 7, mine(), head, main, rev);
+    let v = r.bus.state_get(&key).await.unwrap().map(|e| e.value);
+    (key, v)
+}
+
+/// hgl-ai#6: a builder writes only its own platform's verdict, in the key of the head, the
+/// main it merged onto and the recipe it ran; a verdict for another platform is refused
+/// before anything runs.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_gate_build_writes_its_own_platforms_verdict() {
     let Some(r) = Rig::start().await else { return };
-    let mine = hgl_ai_proto::build::Platform::current().unwrap().as_str();
-    let other = if mine == "windows" {
+    let other = if mine() == "windows" {
         "linux"
     } else {
         "windows"
     };
     let foreign = gate_job(&r, "20261127-120000-aaaaaa", &r.heads[1], other);
     send_pr(&r, &foreign).await;
-    let ok = gate_job(&r, "20261127-120000-bbbbbb", &r.heads[1], mine);
+    let ok = gate_job(&r, "20261127-120000-bbbbbb", &r.heads[1], mine());
     send_pr(&r, &ok).await;
     let s = r.receipt(&ok.id).await;
     assert_eq!(s.status, BuildStatus::Pass);
     assert_eq!(s.base_sha.as_deref(), Some(r.heads[0].as_str()));
-    let v = r
-        .bus
-        .state_get(&format!("verdict.demo.7.{mine}"))
-        .await
-        .unwrap()
-        .unwrap()
-        .value;
+    let (_, v) = verdict(&r, &r.heads[1], &r.heads[0]).await;
     assert_eq!(
-        v,
+        v.unwrap(),
         format!(
             "{} {} pass {} lab1 r{}",
             r.heads[1],
@@ -397,88 +411,130 @@ async fn a_gate_build_writes_its_own_platforms_verdict() {
             s.recipe_rev.unwrap()
         )
     );
-    assert!(
-        r.bus
-            .state_get(&format!("verdict.demo.7.{other}"))
-            .await
-            .unwrap()
-            .is_none(),
-        "no verdict for another platform"
-    );
+    let keys = r.bus.state_keys("verdict.demo.7.").await.unwrap();
+    assert_eq!(keys.len(), 1, "no verdict for another platform: {keys:?}");
     assert!(store::run_get(&r.bus, &foreign.id).await.unwrap().is_none());
     r.stop().await;
 }
 
-/// hgl-ai#6 (r3 on #56, finding 2): a gate build asked earlier never replaces the verdict
-/// of one asked later, whichever ends last; `running` is bounded; an id stamped in the
-/// future is refused.
+/// r1 on #56: build ids order nothing. A seat's bogus build, or one stamped in the future,
+/// for another pair writes another key; one for the same pair finds its `pass` final; two
+/// builds asked in the same second each keep their own; `running` is bounded.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn an_earlier_gate_build_never_replaces_a_later_ones_verdict() {
+async fn no_other_build_displaces_a_judged_verdict() {
     let Some(r) = Rig::start().await else { return };
-    let mine = hgl_ai_proto::build::Platform::current().unwrap().as_str();
-    let key = format!("verdict.demo.7.{mine}");
-    // The later request (a newer main) runs first.
-    let mut later = gate_job(&r, "20261127-130000-bbbbbb", &r.heads[1], mine);
-    later.base = Some(r.heads[1].clone());
-    send_pr(&r, &later).await;
-    assert_eq!(r.receipt(&later.id).await.status, BuildStatus::Pass);
-    let held = r.bus.state_get(&key).await.unwrap().unwrap().value;
-    assert!(held.contains(&later.id), "{held}");
-    // The earlier request (main before it moved) ends after it: refused.
-    let earlier = gate_job(&r, "20261127-120000-aaaaaa", &r.heads[1], mine);
-    send_pr(&r, &earlier).await;
-    assert_eq!(r.receipt(&earlier.id).await.status, BuildStatus::Pass);
-    assert_eq!(
-        r.bus.state_get(&key).await.unwrap().unwrap().value,
-        held,
-        "the later build's verdict stays"
+    // The step fails once `flag` exists: the same pair, built again, would fail.
+    let flag = r.root.join("flag");
+    let recipe = format!(
+        "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"sleep 1 && test ! -e '{}' && test -f f.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n",
+        flag.display()
     );
-    // A slow gate build shows `running`, bounded by its steps' limits and a margin.
-    let slow = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"sleep 3 && test -f f.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
-    store::recipe_put(&r.bus, slow, None).await.unwrap();
-    let now = gate_job(&r, &hgl_ai_proto::build::new_build_id(), &r.heads[1], mine);
-    send_pr(&r, &now).await;
+    store::recipe_put(&r.bus, &recipe, None).await.unwrap();
+    let honest = gate_job(
+        &r,
+        &hgl_ai_proto::build::new_build_id(),
+        &r.heads[1],
+        mine(),
+    );
+    send_pr(&r, &honest).await;
+    // While it builds: `running`, bounded by the step's limit and the margin.
     let deadline = Instant::now() + Duration::from_secs(30);
     let running = loop {
-        let v = r.bus.state_get(&key).await.unwrap().unwrap().value;
-        let p = hgl_ai_proto::build::VerdictValue::parse(&v).unwrap();
-        if p.word == hgl_ai_proto::build::VerdictWord::Running {
-            break p;
+        if let (_, Some(v)) = verdict(&r, &r.heads[1], &r.heads[0]).await {
+            let p = hgl_ai_proto::build::VerdictValue::parse(&v).unwrap();
+            if p.word == hgl_ai_proto::build::VerdictWord::Running {
+                break p;
+            }
         }
-        assert!(Instant::now() < deadline, "no running verdict: {v}");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(Instant::now() < deadline, "no running verdict");
+        tokio::time::sleep(Duration::from_millis(50)).await;
     };
-    assert_eq!(running.id.as_deref(), Some(now.id.as_str()));
-    let rev = store::recipe_get(&r.bus, "demo", None)
+    assert_eq!(running.recipe, Some(recipe_rev(&r).await));
+    let until = running.until.unwrap();
+    let lo = hgl_ai_proto::utc_stamp(chrono::Utc::now() + chrono::Duration::minutes(16));
+    let hi = hgl_ai_proto::utc_stamp(chrono::Utc::now() + chrono::Duration::minutes(18));
+    assert!(until > lo && until <= hi, "{until}");
+    assert_eq!(r.receipt(&honest.id).await.status, BuildStatus::Pass);
+    let (key, pass) = verdict(&r, &r.heads[1], &r.heads[0]).await;
+    let pass = pass.unwrap();
+    assert!(pass.contains(" pass "), "{pass}");
+    // From now on the same pair would fail.
+    std::fs::write(&flag, "x").unwrap();
+    // A seat's build of a bogus head and base, stamped hours ahead: another key.
+    let ahead = (chrono::Utc::now() + chrono::Duration::hours(3))
+        .format("%Y%m%d-%H%M%S-ffffff")
+        .to_string();
+    let mut bogus = gate_job(&r, &ahead, &"0".repeat(40), mine());
+    bogus.base = Some("0".repeat(40));
+    send_pr(&r, &bogus).await;
+    assert_eq!(r.receipt(&bogus.id).await.status, BuildStatus::NotRun);
+    // The same pair from the future: it fails, and finds the key final.
+    let ahead2 = (chrono::Utc::now() + chrono::Duration::hours(3))
+        .format("%Y%m%d-%H%M%S-eeeeee")
+        .to_string();
+    let again = gate_job(&r, &ahead2, &r.heads[1], mine());
+    send_pr(&r, &again).await;
+    assert_eq!(r.receipt(&again.id).await.status, BuildStatus::Fail);
+    assert_eq!(
+        r.bus.state_get(&key).await.unwrap().unwrap().value,
+        pass,
+        "the pass stands"
+    );
+    std::fs::remove_file(&flag).unwrap();
+    // Two builds asked in the same second, for two pairs: each judged in its own key.
+    let a = gate_job(&r, "20261127-150000-ffffff", &r.heads[0], mine());
+    let mut b = gate_job(&r, "20261127-150000-000000", &r.heads[1], mine());
+    b.base = Some(r.heads[1].clone());
+    send_pr(&r, &a).await;
+    send_pr(&r, &b).await;
+    assert_eq!(r.receipt(&a.id).await.status, BuildStatus::Pass);
+    assert_eq!(r.receipt(&b.id).await.status, BuildStatus::Pass);
+    let (_, va) = verdict(&r, &r.heads[0], &r.heads[0]).await;
+    let (_, vb) = verdict(&r, &r.heads[1], &r.heads[1]).await;
+    assert!(va.unwrap().contains(&format!(" pass {} ", a.id)));
+    assert!(vb.unwrap().contains(&format!(" pass {} ", b.id)));
+    assert_eq!(r.bus.state_get(&key).await.unwrap().unwrap().value, pass);
+    r.stop().await;
+}
+
+/// The controller on #56: a pull request's verdict keys go when it lands (a `landed` note
+/// to `all`); another's stay.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn verdicts_are_purged_when_their_pull_request_lands() {
+    let Some(r) = Rig::start().await else { return };
+    let j = gate_job(&r, "20261127-160000-aaaaaa", &r.heads[1], mine());
+    send_pr(&r, &j).await;
+    assert_eq!(r.receipt(&j.id).await.status, BuildStatus::Pass);
+    r.bus
+        .state_put("verdict.demo.8.linux.x", "keep")
+        .await
+        .unwrap();
+    let mut landed = Note::new(
+        Seat::new("controller").unwrap(),
+        Seat::broadcast(),
+        Kind::Landed,
+        "demo #7 landed",
+    );
+    landed.repo = Some("demo".into());
+    landed.issue = 7;
+    r.bus.send(&landed).await.unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !r
+        .bus
+        .state_keys("verdict.demo.7.")
         .await
         .unwrap()
-        .unwrap()
-        .revision;
-    assert_eq!(running.recipe, Some(rev), "it records the recipe it runs");
-    let until = running.until.clone().unwrap();
-    let in_16m = hgl_ai_proto::utc_stamp(chrono::Utc::now() + chrono::Duration::minutes(16));
-    let in_18m = hgl_ai_proto::utc_stamp(chrono::Utc::now() + chrono::Duration::minutes(18));
+        .is_empty()
+    {
+        assert!(Instant::now() < deadline, "not purged");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
     assert!(
-        until.as_str() > in_16m.as_str() && until.as_str() <= in_18m.as_str(),
-        "{until}"
-    );
-    assert_eq!(r.receipt(&now.id).await.status, BuildStatus::Pass);
-    // An id stamped an hour ahead would hold the key against every real build.
-    let ahead = (chrono::Utc::now() + chrono::Duration::hours(1)).format("%Y%m%d-%H%M%S-cccccc");
-    let future = gate_job(&r, &ahead.to_string(), &r.heads[1], mine);
-    send_pr(&r, &future).await;
-    let ok = r.job("20261127-140000-dddddd", &r.heads[0]);
-    r.send(&ok).await;
-    assert_eq!(r.receipt(&ok.id).await.status, BuildStatus::Pass);
-    assert!(store::run_get(&r.bus, &future.id).await.unwrap().is_none());
-    assert!(
-        !r.bus
-            .state_get(&key)
+        r.bus
+            .state_get("verdict.demo.8.linux.x")
             .await
             .unwrap()
-            .unwrap()
-            .value
-            .contains("cccccc")
+            .is_some()
     );
     r.stop().await;
 }
@@ -495,21 +551,14 @@ async fn a_builder_without_a_builder_user_runs_no_gate_build() {
     else {
         return;
     };
-    let mine = hgl_ai_proto::build::Platform::current().unwrap().as_str();
-    let j = gate_job(&r, "20261127-120000-cccccc", &r.heads[1], mine);
+    let j = gate_job(&r, "20261127-120000-cccccc", &r.heads[1], mine());
     send_pr(&r, &j).await;
     let s = r.receipt(&j.id).await;
     assert_eq!(s.status, BuildStatus::NotRun);
     assert!(s.reason.unwrap().contains("builder hub user"));
     assert!(s.steps.is_empty(), "nothing built");
     // It does not try to write a verdict its hub user may not write.
-    assert!(
-        r.bus
-            .state_get(&format!("verdict.demo.7.{mine}"))
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(r.bus.state_keys("verdict.").await.unwrap().is_empty());
     r.stop().await;
 }
 

@@ -39,11 +39,6 @@ pub fn render_main(
     s
 }
 
-/// State key of one local build verdict: `verdict.<repo>.<pr>.<name>`.
-pub fn verdict_key(repo: &str, pr: u64, name: &str) -> String {
-    hgl_ai_proto::build::verdict_key(repo, pr, name)
-}
-
 /// A verdict value `<head> <main> pass|fail [detail]` for this head on this main:
 /// `Some(true)` pass, `Some(false)` fail, `None` absent, for another pair, or not a
 /// judgement (`running`, `not-run`).
@@ -225,10 +220,6 @@ mod tests {
     #[test]
     fn verdicts() {
         let (h, m) = ("h".repeat(40), "m".repeat(40));
-        assert_eq!(verdict_key("alpha", 7, "linux"), "verdict.alpha.7.linux");
-        assert!(
-            hgl_ai_proto::check_state_key(&verdict_key("hgl-compiler", 1037, "windows")).is_ok()
-        );
         assert_eq!(
             verdict_for(Some(&format!("{h} {m} pass")), &h, &m).map(|v| v.0),
             Some(true)

@@ -886,6 +886,25 @@ impl Bus {
         .await
     }
 
+    /// The live keys of `HGL_STATE` that start with `prefix`, sorted.
+    pub async fn state_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let store = self.store(&self.state, KV_STATE).await?;
+        let mut keys = store
+            .keys()
+            .await
+            .map_err(|e| nats("listing state keys", e))?;
+        let mut out = Vec::new();
+        while let Some(k) = keys.next().await {
+            let k = k.map_err(|e| nats("listing state keys", e))?;
+            if k.starts_with(prefix) {
+                out.push(k);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
     /// Write `HGL_HOSTS/<host>`; it expires [`HOSTS_TTL`] after the last write.
     pub async fn host_put(&self, rec: &HostRecord) -> Result<()> {
         let store = self.store(&self.hosts, KV_HOSTS).await?;

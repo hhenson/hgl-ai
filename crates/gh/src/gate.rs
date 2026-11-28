@@ -1981,9 +1981,20 @@ mod tests {
             .on("check-runs", r#"{"check_runs":[]}"#);
         let gh = fake_with(gh, &["pr-open.json"]);
         let gh = crate::exec::ReadOnly(gh);
-        let o = evaluate(&gh, &s, None, REPO, 7, HEAD, &Opts::default(), false, None)
-            .await
-            .unwrap();
+        let o = evaluate(
+            &gh,
+            &s,
+            None,
+            REPO,
+            7,
+            HEAD,
+            &Opts::default(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(o.kind, Kind::Wait, "{}", o.line);
         assert!(
             o.line

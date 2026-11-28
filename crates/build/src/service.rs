@@ -23,9 +23,11 @@ use crate::store;
 
 /// Added to a gate build's step time limits to bound its `running` verdict.
 const RUNNING_MARGIN: Duration = Duration::from_secs(15 * 60);
-/// How far in the future a gate build's id (its request time) may be: an id orders
-/// verdicts, so one stamped later than now would hold the key against every real build.
-const ID_SKEW: chrono::Duration = chrono::Duration::minutes(5);
+/// Heartbeats between sweeps of the verdict keys of pull requests that closed without a
+/// `landed` note (about an hour).
+const VERDICT_SWEEP_EVERY: u32 = 120;
+/// Verdict keys older than this are swept (the notes' history and a day).
+const VERDICT_KEEP_DAYS: i64 = 15;
 /// How often a lane writes its record and checks its gate.
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(60);
@@ -406,6 +408,20 @@ async fn lane_loop(
                         *lane.probe.lock().unwrap_or_else(|e| e.into_inner()) = p;
                     }
                 }
+                if settings.verdicts && beat.is_multiple_of(VERDICT_SWEEP_EVERY) {
+                    let cutoff = (chrono::Utc::now() - chrono::Duration::days(VERDICT_KEEP_DAYS))
+                        .format("%Y%m%d-%H%M%S")
+                        .to_string();
+                    match store::verdicts_expire(&bus, &cutoff).await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            tracing::info!(builder = %lane.label, "{n} old verdict keys swept")
+                        }
+                        Err(e) => {
+                            tracing::warn!(builder = %lane.label, "sweeping old verdict keys: {e}")
+                        }
+                    }
+                }
                 was_reachable = reachable;
                 beat = beat.wrapping_add(1);
                 if lost.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
@@ -469,6 +485,22 @@ async fn lane_loop(
         };
         for d in deliveries {
             if d.note.kind != Kind::Build {
+                // A pull request landed or closed: its verdicts are done with (BUILD-15).
+                if d.note.kind.ends_task()
+                    && settings.verdicts
+                    && let Some(repo) = d.note.repo.as_deref()
+                    && d.note.issue > 0
+                {
+                    match store::verdicts_purge(&bus, repo, d.note.issue).await {
+                        Ok(0) => {}
+                        Ok(n) => {
+                            tracing::info!(builder = %lane.label, "{repo} #{}: {n} verdict keys purged", d.note.issue)
+                        }
+                        Err(e) => {
+                            tracing::warn!(builder = %lane.label, "purging the verdicts of {repo} #{}: {e}", d.note.issue)
+                        }
+                    }
+                }
                 let _ = d.ack().await;
                 continue;
             }
@@ -856,14 +888,7 @@ fn check_verdict(lane: &Lane, job: &BuildJob) -> Result<(), String> {
     if verdict_platform(v) != Some(p) {
         return Err(format!("verdict {v} is not this builder's platform ({p})"));
     }
-    let latest = hgl_ai_proto::utc_stamp(chrono::Utc::now() + ID_SKEW);
-    match hgl_ai_proto::build::build_id_stamp(&job.id) {
-        Some(t) if t <= latest => Ok(()),
-        _ => Err(format!(
-            "build id {} is stamped in the future; a gate build's id is its request time",
-            job.id
-        )),
-    }
+    Ok(())
 }
 
 /// The request a log directory belongs to: the job as it came.

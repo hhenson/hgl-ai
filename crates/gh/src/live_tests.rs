@@ -1033,88 +1033,160 @@ async fn judged(
     }
 }
 
+/// A hub, an origin with `main` at m1 and a pull request head off it, the recipe, and a
+/// local builder `lab1` (unless `builder` is false).
+struct GateRig {
+    h: Hub,
+    b: Bus,
+    _tmp: tempfile::TempDir,
+    seed: std::path::PathBuf,
+    m1: String,
+    head: String,
+    name: &'static str,
+    stop: Option<tokio::sync::watch::Sender<bool>>,
+    svc: Option<
+        tokio::task::JoinHandle<std::result::Result<(), hgl_ai_build::service::ServiceError>>,
+    >,
+}
+
+const GATE_RECIPE: &str = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"test -f g.txt -o -f bad.txt && test ! -f bad.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
+
+impl GateRig {
+    async fn start(builder: bool) -> Option<GateRig> {
+        use hgl_ai_build::service::{self, Settings};
+        use std::sync::Arc;
+        let h = hub()?;
+        let b = bus(&h).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        let bare = root.join("origin.git");
+        std::fs::create_dir_all(&bare).unwrap();
+        git(&bare, &["init", "--quiet", "--bare", "-b", "main"]);
+        git(&root, &["clone", "--quiet", bare.to_str().unwrap(), "seed"]);
+        let seed = root.join("seed");
+        git(&seed, &["checkout", "--quiet", "-b", "main"]);
+        std::fs::write(seed.join("f.txt"), "one\n").unwrap();
+        git(&seed, &["add", "f.txt"]);
+        git(&seed, &["commit", "--quiet", "-m", "c0"]);
+        git(&seed, &["push", "--quiet", "origin", "main"]);
+        let m1 = git(&seed, &["rev-parse", "HEAD"]);
+        let head = commit_on(&seed, "feature", &m1, "g.txt", "g\n");
+        hgl_ai_build::store::recipe_put(&b, GATE_RECIPE, None)
+            .await
+            .unwrap();
+        let name = hgl_ai_proto::build::Platform::current().unwrap().as_str();
+        let (mut stop, mut svc) = (None, None);
+        if builder {
+            let mut cfg = hgl_ai_config::Config::new("lab1");
+            cfg.paths.work_root = root.join("work").display().to_string();
+            cfg.paths.data_dir = root.join("data").display().to_string();
+            let lanes = service::lanes(&cfg, std::path::PathBuf::from("ssh")).unwrap();
+            let origin = bare.display().to_string();
+            let settings = Settings {
+                clone_url: Arc::new(move |_| origin.clone()),
+                toolchains: vec!["git".into()],
+                heartbeat: Duration::from_millis(300),
+                verdicts: true,
+            };
+            let svc_bus = Arc::new(Bus::connect_url(&h.url, None).await.unwrap());
+            let (tx, rx) = tokio::sync::watch::channel(false);
+            svc = Some(tokio::spawn(service::serve(svc_bus, lanes, settings, rx)));
+            stop = Some(tx);
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while b.builders().await.unwrap().is_empty() {
+                assert!(Instant::now() < deadline, "the builder did not register");
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Some(GateRig {
+            h,
+            b,
+            _tmp: tmp,
+            seed,
+            m1,
+            head,
+            name,
+            stop,
+            svc,
+        })
+    }
+
+    async fn rev(&self) -> u64 {
+        hgl_ai_build::store::recipe_get(&self.b, "demo", None)
+            .await
+            .unwrap()
+            .unwrap()
+            .revision
+    }
+
+    async fn key(&self, head: &str, main: &str) -> String {
+        hgl_ai_proto::build::verdict_key("demo", 7, self.name, head, main, self.rev().await)
+    }
+
+    async fn state(
+        &self,
+        builds: Option<&crate::builds::GateBuilds>,
+        head: &str,
+        main: &str,
+    ) -> crate::builds::VerdictState {
+        crate::builds::verdict_state(Some(&self.b), builds, "demo", 7, self.name, head, main)
+            .await
+            .unwrap()
+    }
+
+    async fn stop(mut self) {
+        if let Some(s) = self.stop.take() {
+            let _ = s.send(true);
+        }
+        if let Some(svc) = self.svc.take() {
+            tokio::time::timeout(Duration::from_secs(60), svc)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        drop(self.h);
+    }
+}
+
+fn controller_builds() -> crate::builds::GateBuilds {
+    crate::builds::GateBuilds::new(Seat::new("controller").unwrap(), "controller")
+}
+
 /// hgl-ai#6: the gate asks a builder for the local build verdict of the head merged onto
-/// the `main` it saw; the builder writes `<head> <main> pass|fail ...`; a verdict for a
-/// `main` that has moved does not pass the gate and is asked again; a build that fails or
-/// does not merge says so.
+/// the `main` it saw, and reads the key of exactly that pair; a `main` that has moved is
+/// another key, asked again; a build that fails or does not merge says so.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn gate_builds_write_verdicts_and_a_moved_main_is_built_again() {
-    use crate::builds::{GateBuilds, VerdictState, verdict_state};
-    use hgl_ai_build::service::{self, Settings};
-    use std::sync::Arc;
-    let Some(h) = hub() else { return };
-    let b = bus(&h).await;
-    let tmp = tempfile::tempdir().unwrap();
-    let root = tmp.path().to_path_buf();
-    let bare = root.join("origin.git");
-    std::fs::create_dir_all(&bare).unwrap();
-    git(&bare, &["init", "--quiet", "--bare", "-b", "main"]);
-    git(&root, &["clone", "--quiet", bare.to_str().unwrap(), "seed"]);
-    let seed = root.join("seed");
-    git(&seed, &["checkout", "--quiet", "-b", "main"]);
-    std::fs::write(seed.join("f.txt"), "one\n").unwrap();
-    git(&seed, &["add", "f.txt"]);
-    git(&seed, &["commit", "--quiet", "-m", "c0"]);
-    git(&seed, &["push", "--quiet", "origin", "main"]);
-    let m1 = git(&seed, &["rev-parse", "HEAD"]);
-    let head = commit_on(&seed, "feature", &m1, "g.txt", "g\n");
-    let recipe = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"test -f g.txt -o -f bad.txt && test ! -f bad.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
-    hgl_ai_build::store::recipe_put(&b, recipe, None)
-        .await
-        .unwrap();
-    // A local builder of this host's platform.
-    let platform = hgl_ai_proto::build::Platform::current().unwrap();
-    let name = platform.as_str();
-    let mut cfg = hgl_ai_config::Config::new("lab1");
-    cfg.paths.work_root = root.join("work").display().to_string();
-    cfg.paths.data_dir = root.join("data").display().to_string();
-    let lanes = service::lanes(&cfg, std::path::PathBuf::from("ssh")).unwrap();
-    let origin = bare.display().to_string();
-    let settings = Settings {
-        clone_url: Arc::new(move |_| origin.clone()),
-        toolchains: vec!["git".into()],
-        heartbeat: Duration::from_millis(300),
-        verdicts: true,
+    use crate::builds::VerdictState;
+    let Some(r) = GateRig::start(true).await else {
+        return;
     };
-    let svc_bus = Arc::new(Bus::connect_url(&h.url, None).await.unwrap());
-    let (stop, rx) = tokio::sync::watch::channel(false);
-    let svc = tokio::spawn(service::serve(svc_bus, lanes, settings, rx));
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while b.builders().await.unwrap().is_empty() {
-        assert!(Instant::now() < deadline, "the builder did not register");
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    let key = state::verdict_key("demo", 7, name);
+    let (b, head, m1, name) = (&r.b, r.head.clone(), r.m1.clone(), r.name);
     // Nothing there and nothing asked (a dry run): missing.
-    assert_eq!(
-        verdict_state(Some(&b), None, "demo", 7, name, &head, &m1)
-            .await
-            .unwrap(),
-        VerdictState::Missing(None)
-    );
-    let builds = GateBuilds::new(Seat::new("controller").unwrap(), "controller");
-    let first = judged(&b, &builds, name, &head, &m1).await;
+    assert_eq!(r.state(None, &head, &m1).await, VerdictState::Missing(None));
+    let builds = controller_builds();
+    let first = judged(b, &builds, name, &head, &m1).await;
     let VerdictState::Pass(v) = &first else {
         panic!("{first:?}")
     };
     assert!(v.starts_with(&format!("{head} {m1} pass ")), "{v}");
-    assert!(v.contains(" lab1 r"), "{v}");
-    let value = b.state_get(&key).await.unwrap().unwrap().value;
-    let id = hgl_ai_proto::build::VerdictValue::parse(&value)
+    assert!(v.ends_with(&format!(" lab1 r{}", r.rev().await)), "{v}");
+    let k1 = r.key(&head, &m1).await;
+    assert_eq!(&b.state_get(&k1).await.unwrap().unwrap().value, v);
+    let id = hgl_ai_proto::build::VerdictValue::parse(v)
         .unwrap()
         .id
         .unwrap();
-    let run = hgl_ai_build::store::run_get(&b, &id)
-        .await
-        .unwrap()
-        .unwrap();
+    let run = hgl_ai_build::store::run_get(b, &id).await.unwrap().unwrap();
     assert_eq!(
         run.base_sha.as_deref(),
         Some(m1.as_str()),
         "it built onto m1"
     );
-    // `build gate` by hand: the pull request's head on GitHub's `main`, every configured
-    // verdict, nothing asked again for a judged pair.
+    // Judged: not asked again.
+    assert_eq!(r.state(Some(&builds), &head, &m1).await, first);
+    // `build gate` by hand: the pull request's head on GitHub's `main`.
     let mut st = crate::testutil::settings();
     st.gates.entry("demo".into()).or_default().verdicts = vec![name.to_string()];
     let pr = fixture("pr-open.json").replace("1f461fa77bba922fe81383df4c475feb58b7c233", &head);
@@ -1122,130 +1194,38 @@ async fn gate_builds_write_verdicts_and_a_moved_main_is_built_again() {
         "git/ref/heads/main",
         &format!("{{\"object\":{{\"sha\":\"{m1}\"}}}}"),
     );
-    let (h0, m0, by_hand) = crate::builds::gate(&fake, &st, &b, &builds, "demo", 7)
+    let (h0, m0, by_hand) = crate::builds::gate(&fake, &st, b, &builds, "demo", 7)
         .await
         .unwrap();
     assert_eq!((h0.as_str(), m0.as_str()), (head.as_str(), m1.as_str()));
     assert_eq!(by_hand, vec![(name.to_string(), first.clone())]);
     st.gates.get_mut("demo").unwrap().verdicts.clear();
     assert!(
-        crate::builds::gate(&fake, &st, &b, &builds, "demo", 7)
+        crate::builds::gate(&fake, &st, b, &builds, "demo", 7)
             .await
             .is_err()
     );
-    // Asked once: judged now, it is not asked again.
-    assert_eq!(
-        verdict_state(Some(&b), Some(&builds), "demo", 7, name, &head, &m1)
-            .await
-            .unwrap(),
-        first
-    );
-    // r3 on #56, finding 2b: a `running` value whose builder is gone, or that ran past its
-    // bound, never holds the gate: it is asked again of a live builder.
-    for (label, until, why) in [
-        (
-            "ghost",
-            "29991231T000000Z",
-            "builder ghost of 20261127-120000-eeeeee is gone",
-        ),
-        (
-            "lab1",
-            "20000101T000000Z",
-            "20261127-120000-eeeeee on lab1 ran past its bound",
-        ),
-    ] {
-        b.state_put(
-            &key,
-            &format!("{head} {m1} running 20261127-120000-eeeeee {label} r- until={until}"),
-        )
-        .await
-        .unwrap();
-        let again = GateBuilds::new(Seat::new("controller").unwrap(), "controller");
-        match verdict_state(Some(&b), Some(&again), "demo", 7, name, &head, &m1)
-            .await
-            .unwrap()
-        {
-            VerdictState::Building(w) => {
-                assert!(w.starts_with(why) && w.contains("; asked "), "{w}")
-            }
-            other => panic!("a lost build held the gate: {other:?}"),
-        }
-        assert!(matches!(
-            judged(&b, &again, name, &head, &m1).await,
-            VerdictState::Pass(_)
-        ));
-    }
-    // A live one's is waited for.
-    b.state_put(
-        &key,
-        &format!("{head} {m1} running 20261127-120000-ffffff lab1 r- until=29991231T000000Z"),
-    )
-    .await
-    .unwrap();
-    let wait = GateBuilds::new(Seat::new("controller").unwrap(), "controller");
-    assert!(matches!(
-        verdict_state(Some(&b), Some(&wait), "demo", 7, name, &head, &m1)
-            .await
-            .unwrap(),
-        VerdictState::Building(w) if w == "building 20261127-120000-ffffff on lab1"
-    ));
-    // `main` moves: the verdict for m1 no longer passes, and is asked again for m2.
-    git(&seed, &["checkout", "--quiet", "main"]);
-    std::fs::write(seed.join("h.txt"), "h\n").unwrap();
-    git(&seed, &["add", "h.txt"]);
-    git(&seed, &["commit", "--quiet", "-m", "c1"]);
-    git(&seed, &["push", "--quiet", "origin", "main"]);
-    let m2 = git(&seed, &["rev-parse", "HEAD"]);
-    assert_eq!(state::verdict_for(Some(&value), &head, &m2), None);
-    match verdict_state(Some(&b), None, "demo", 7, name, &head, &m2)
-        .await
-        .unwrap()
-    {
-        VerdictState::Missing(Some(w)) => assert!(w.contains(&m1[..8]), "{w}"),
-        other => panic!("a stale verdict counted: {other:?}"),
-    }
-    match verdict_state(Some(&b), Some(&builds), "demo", 7, name, &head, &m2)
-        .await
-        .unwrap()
-    {
+    // `main` moves: m2's key is empty, so the gate waits and asks; m1's pass stays its own.
+    git(&r.seed, &["checkout", "--quiet", "main"]);
+    std::fs::write(r.seed.join("h.txt"), "h\n").unwrap();
+    git(&r.seed, &["add", "h.txt"]);
+    git(&r.seed, &["commit", "--quiet", "-m", "c1"]);
+    git(&r.seed, &["push", "--quiet", "origin", "main"]);
+    let m2 = git(&r.seed, &["rev-parse", "HEAD"]);
+    assert_eq!(r.state(None, &head, &m2).await, VerdictState::Missing(None));
+    match r.state(Some(&builds), &head, &m2).await {
         VerdictState::Building(w) => assert!(w.starts_with("asked "), "{w}"),
         other => panic!("not asked again: {other:?}"),
     }
-    let second = judged(&b, &builds, name, &head, &m2).await;
+    let second = judged(b, &builds, name, &head, &m2).await;
     let VerdictState::Pass(v2) = &second else {
         panic!("{second:?}")
     };
     assert!(v2.starts_with(&format!("{head} {m2} pass ")), "{v2}");
-    let now = b.state_get(&key).await.unwrap().unwrap().value;
-    assert_eq!(state::verdict_for(Some(&now), &head, &m1), None);
-    assert_eq!(
-        state::verdict_for(Some(&now), &head, &m2).map(|v| v.0),
-        Some(true)
-    );
-    // r3 on #56, finding 2a: the key holds a later build's value for another pair (a main
-    // this gate has not seen yet). The build this gate asked ended pass without its verdict
-    // standing: that is no "wrote no verdict" block; it is asked again.
-    let newer = hgl_ai_proto::build::new_build_id();
-    b.state_put(
-        &key,
-        &format!("{head} {} pass {newer} lab1 r1", "c".repeat(40)),
-    )
-    .await
-    .unwrap();
-    match verdict_state(Some(&b), Some(&builds), "demo", 7, name, &head, &m2)
-        .await
-        .unwrap()
-    {
-        VerdictState::Building(w) => assert!(w.contains("without its verdict; asked "), "{w}"),
-        other => panic!("{other:?}"),
-    }
-    assert!(matches!(
-        judged(&b, &builds, name, &head, &m2).await,
-        VerdictState::Pass(_)
-    ));
+    assert_eq!(&b.state_get(&k1).await.unwrap().unwrap().value, v);
     // A head whose build fails: fail, naming the step.
-    let bad = commit_on(&seed, "feature", &m1, "bad.txt", "x\n");
-    match judged(&b, &builds, name, &bad, &m2).await {
+    let bad = commit_on(&r.seed, "feature", &m1, "bad.txt", "x\n");
+    match judged(b, &builds, name, &bad, &m2).await {
         VerdictState::Fail(v) => {
             assert!(v.starts_with(&format!("{bad} {m2} fail ")), "{v}");
             assert!(v.ends_with("step check failed"), "{v}");
@@ -1253,15 +1233,136 @@ async fn gate_builds_write_verdicts_and_a_moved_main_is_built_again() {
         other => panic!("{other:?}"),
     }
     // A head that does not merge onto main: not run, and the gate is told why.
-    let clash = commit_on(&seed, "feature", &m1, "h.txt", "clash\n");
-    match judged(&b, &builds, name, &clash, &m2).await {
+    let clash = commit_on(&r.seed, "feature", &m1, "h.txt", "clash\n");
+    match judged(b, &builds, name, &clash, &m2).await {
         VerdictState::NotRun(why) => assert!(why.contains("does not merge"), "{why}"),
         other => panic!("{other:?}"),
     }
-    let _ = stop.send(true);
-    tokio::time::timeout(Duration::from_secs(60), svc)
+    r.stop().await;
+}
+
+/// The controller on #56: the gate needs the verdict of the current recipe. An update is
+/// another key, asked again; the old revision's pass no longer counts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_recipe_update_asks_again() {
+    use crate::builds::VerdictState;
+    let Some(r) = GateRig::start(true).await else {
+        return;
+    };
+    let builds = controller_builds();
+    let VerdictState::Pass(old) = judged(&r.b, &builds, r.name, &r.head, &r.m1).await else {
+        panic!("no first pass")
+    };
+    let r1 = r.rev().await;
+    hgl_ai_build::store::recipe_put(&r.b, &format!("{GATE_RECIPE}# stricter\n"), None)
         .await
-        .unwrap()
-        .unwrap()
         .unwrap();
+    let r2 = r.rev().await;
+    assert!(r2 > r1);
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Missing(None)
+    );
+    let VerdictState::Pass(new) = judged(&r.b, &builds, r.name, &r.head, &r.m1).await else {
+        panic!("no pass under the new recipe")
+    };
+    assert!(old.ends_with(&format!(" r{r1}")) && new.ends_with(&format!(" r{r2}")));
+    assert_ne!(old, new);
+    r.stop().await;
+}
+
+/// r3 and r1 on #56: a `running` value whose builder is gone, or that ran past its bound,
+/// never holds the gate: it is asked again of a live builder, once. While that replacement
+/// is queued the old value is not judged again and nothing more is asked; a live one's
+/// `running` is waited for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_running_with_a_queued_replacement_is_asked_once() {
+    use crate::builds::VerdictState;
+    // No builder serves: the replacement stays queued with `parked`, a record only.
+    let Some(r) = GateRig::start(false).await else {
+        return;
+    };
+    let platform = hgl_ai_proto::build::Platform::current().unwrap();
+    let parked = hgl_ai_proto::build::BuilderRecord {
+        label: "parked".into(),
+        inbox: hgl_ai_proto::build::builder_inbox("parked").unwrap(),
+        platform,
+        arch: String::new(),
+        executor: "local".into(),
+        proxy: None,
+        reachable: true,
+        reason: None,
+        state: "active".into(),
+        slots: 1,
+        busy: 1,
+        free_gb: None,
+        toolchains: Default::default(),
+        updated_at: hgl_ai_proto::utc_now_stamp(),
+    };
+    r.b.builder_put(&parked).await.unwrap();
+    let key = r.key(&r.head, &r.m1).await;
+    for (label, until, why) in [
+        (
+            "ghost",
+            "29991231T000000Z",
+            "builder ghost of 20261127-120000-eeeeee is gone",
+        ),
+        (
+            "parked",
+            "20000101T000000Z",
+            "20261127-120000-eeeeee on parked ran past its bound",
+        ),
+    ] {
+        r.b.state_put(
+            &key,
+            &format!(
+                "{} {} running 20261127-120000-eeeeee {label} r1 until={until}",
+                r.head, r.m1
+            ),
+        )
+        .await
+        .unwrap();
+        let builds = controller_builds();
+        let VerdictState::Building(w) = r.state(Some(&builds), &r.head, &r.m1).await else {
+            panic!("a lost build held the gate")
+        };
+        assert!(w.starts_with(why) && w.contains("; asked "), "{w}");
+        let id = w
+            .rsplit("; asked ")
+            .next()
+            .unwrap()
+            .split(' ')
+            .next()
+            .unwrap()
+            .to_string();
+        // Rounds later the old value is still there and the replacement still queued:
+        // waited for, never asked again.
+        for _ in 0..4 {
+            assert_eq!(
+                r.state(Some(&builds), &r.head, &r.m1).await,
+                VerdictState::Building(format!("asked {id} of parked"))
+            );
+        }
+        let queued = hgl_ai_build::store::run_get(&r.b, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(queued.status, hgl_ai_proto::build::BuildStatus::Queued);
+    }
+    // A live builder's bounded `running`: waited for, nothing asked.
+    r.b.state_put(
+        &key,
+        &format!(
+            "{} {} running 20261127-120000-ffffff parked r1 until=29991231T000000Z",
+            r.head, r.m1
+        ),
+    )
+    .await
+    .unwrap();
+    let builds = controller_builds();
+    assert_eq!(
+        r.state(Some(&builds), &r.head, &r.m1).await,
+        VerdictState::Building("building 20261127-120000-ffffff on parked".into())
+    );
+    r.stop().await;
 }

@@ -5,8 +5,7 @@ use std::path::Path;
 
 use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_proto::build::{
-    BuildJob, Summary, VerdictValue, VerdictWord, recipe_key, run_key, verdict_key,
-    verdict_replaces,
+    BuildJob, Summary, VerdictValue, VerdictWord, recipe_key, run_key, verdict_key, verdict_prefix,
 };
 use hgl_ai_proto::{Kind, Note, Seat};
 
@@ -103,42 +102,57 @@ pub async fn run_put(bus: &Bus, s: &Summary) -> Result<(), StoreError> {
     Ok(())
 }
 
-/// Write a gate build's verdict (BUILD-15): `HGL_STATE/verdict.<repo>.<pr>.<name>` from
-/// its summary, or `running` (bounded by `until`) while it builds. Compare-and-set: a value
-/// from a build asked later is never replaced ([`verdict_replaces`]); `Ok(false)` then.
-/// Nothing for a job that is no gate build, or a summary that has no value (a judged
-/// build that does not know its main).
+/// Write a gate build's verdict (BUILD-15) from its summary, or `running` (bounded by
+/// `until`) while it builds, in the key of what it judges: its head, the `main` commit it
+/// was asked to merge onto, and the recipe revision it runs ([`verdict_key`]). In that key
+/// `pass` and `fail` are final: a later build of the same pair replaces only `running` or
+/// `not-run` (compare-and-set on the revision); `Ok(false)` when the key was final. Nothing
+/// for a job that is no gate build, or a build that never read its recipe (the gate reads
+/// why from the run).
 pub async fn verdict_put(
     bus: &Bus,
     job: &BuildJob,
     s: &Summary,
     running_until: Option<String>,
 ) -> Result<bool, StoreError> {
-    let Some(name) = &job.verdict else {
+    let (Some(name), Some(base), Some(recipe)) = (&job.verdict, &job.base, s.recipe_rev) else {
         return Ok(true);
     };
-    let value = match running_until {
-        Some(until) => s.base_sha.as_ref().map(|m| VerdictValue {
+    if s.base_sha.as_ref().is_some_and(|m| m != base) {
+        return Err(StoreError::Other(format!(
+            "{}: merged onto {} for a verdict on {base}; not written",
+            s.id,
+            s.base_sha.as_deref().unwrap_or_default()
+        )));
+    }
+    let mut v = match running_until {
+        Some(until) => VerdictValue {
             head: job.head.clone(),
-            main: m.clone(),
+            main: base.clone(),
             word: VerdictWord::Running,
             id: Some(s.id.clone()),
             builder: Some(s.host.clone()),
-            recipe: s.recipe_rev,
+            recipe: Some(recipe),
             until: Some(until),
             reason: None,
-        }),
-        None => VerdictValue::of(s),
+        },
+        None => match VerdictValue::of(s) {
+            Some(v) => v,
+            None => return Ok(true),
+        },
     };
-    let Some(v) = value else {
-        return Ok(true);
-    };
-    let key = verdict_key(&job.repo, job.issue, name);
+    // A build that stopped before its merge still judged nothing about this pair: say so
+    // in its key.
+    v.main = base.clone();
+    let key = verdict_key(&job.repo, job.issue, name, &job.head, base, recipe);
     let text = v.render();
     for _ in 0..16 {
         let cur = bus.state_get(&key).await?;
         let old = cur.as_ref().and_then(|e| VerdictValue::parse(&e.value));
-        if !verdict_replaces(&s.id, old.as_ref()) {
+        if old
+            .as_ref()
+            .is_some_and(|o| o.judged() && o.is_for(&job.head, base))
+        {
             return Ok(false);
         }
         match bus
@@ -153,6 +167,35 @@ pub async fn verdict_put(
     Err(StoreError::Other(format!(
         "{key} kept changing; not written"
     )))
+}
+
+/// Delete every verdict key of `repo#pr` (it landed or closed). Returns how many went.
+pub async fn verdicts_purge(bus: &Bus, repo: &str, pr: u64) -> Result<usize, StoreError> {
+    let keys = bus.state_keys(&verdict_prefix(repo, pr)).await?;
+    for k in &keys {
+        bus.state_del(k).await?;
+    }
+    Ok(keys.len())
+}
+
+/// Delete the verdict keys whose build was asked before `cutoff` (`YYYYMMDD-HHMMSS`, a
+/// build id's time), or that hold no verdict: those of pull requests closed without a
+/// `landed` note. Returns how many went.
+pub async fn verdicts_expire(bus: &Bus, cutoff: &str) -> Result<usize, StoreError> {
+    let mut n = 0;
+    for k in bus.state_keys("verdict.").await? {
+        let Some(e) = bus.state_get(&k).await? else {
+            continue;
+        };
+        let old = VerdictValue::parse(&e.value)
+            .and_then(|v| v.id)
+            .is_none_or(|id| id.get(..15).is_none_or(|t| t < cutoff));
+        if old {
+            bus.state_del(&k).await?;
+            n += 1;
+        }
+    }
+    Ok(n)
 }
 
 /// Whether this connection's hub user may write the local build verdicts (BUILD-15), as
