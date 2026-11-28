@@ -1223,7 +1223,7 @@ impl<B: BusApi> Bridge<B> {
         if !matches!(out.outcome, Outcome::Busy(_)) {
             lock(&seat.busy_told).remove(&r.target);
         }
-        if !matches!(out.outcome, Outcome::PrepFailed(_)) {
+        if !matches!(out.outcome, Outcome::PrepFailed(_) | Outcome::Blocked(_)) {
             st.prep_failures.remove(&r.target);
             lock(&seat.prep_told).remove(&r.target);
         }
@@ -1255,23 +1255,29 @@ impl<B: BusApi> Bridge<B> {
                 }
                 st.pending.splice(0..0, newest(ds));
             }
-            Outcome::PrepFailed(msg) => {
-                // It may heal (the network, the hub, a fetch): held and tried again, backing off.
+            Outcome::PrepFailed(ref msg) | Outcome::Blocked(ref msg) => {
+                // It may heal (the network, the hub, a fetch, a push resolving a stale tree):
+                // held and tried again, backing off.
                 let n = st.prep_failures.entry(r.target.clone()).or_insert(0);
                 *n += 1;
                 let wait = self.opts.prep_retry * (1u32 << (*n - 1).min(4));
                 st.busy.insert(r.target.clone(), Instant::now() + wait);
                 st.pending.splice(0..0, newest(ds));
                 if lock(&seat.prep_told).insert(r.target.clone()) {
+                    let (kind, what) = match out.outcome {
+                        Outcome::Blocked(_) => {
+                            (Kind::Blocked, "blocked: a turn would run on a stale tree")
+                        }
+                        _ => (Kind::Note, "could not prepare"),
+                    };
                     let body = format!(
-                        "[bridge] {}/{}: could not prepare {} for a turn: {msg}. Its notes are held and tried again (backing off to {:?}); a `closed` note for the task drops them.",
+                        "[bridge] {}/{}: {what} {} for a turn: {msg}. Its notes are held and tried again (backing off to {:?}); a `closed` note for the task drops them.",
                         self.cfg.host,
                         seat.name(),
                         r.target,
                         self.opts.prep_retry * 16
                     );
-                    self.tell(seat.name(), Kind::Note, r.target.task(), body)
-                        .await;
+                    self.tell(seat.name(), kind, r.target.task(), body).await;
                 }
             }
             Outcome::CannotStart(msg) => {
