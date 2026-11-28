@@ -77,7 +77,7 @@ before hub users takes one shared token until it moves.
 | Ended | KV `HGL_ENDED` | file storage, history 1, `max_age` 15 d |
 | Usage | KV `HGL_USAGE`; stream `HGL_USAGE_LOG`, subjects `hgl.usage.>` | KV file storage, history 1; stream file storage, `max_age` 35 d, dedup window 24 h (§10) |
 | Builds | KV `HGL_BUILD` | file storage, history 64: `recipe.<repo>` (TOML), `run.<id>` (summary JSON; newest 1000 kept) |
-| Canary | KV `HGL_CANARY` | file storage, history 1, `max_age` 7 d; only the admin writes it (`probe`, at provisioning); every role reads it and acknowledges `probe` through its own consumer: `doctor` (`hub boundary`) checks a write outside its role's rights does not arrive |
+| Canary | KV `HGL_CANARY` | file storage, history 1, no age limit (the probe must not expire); only the admin writes it (`probe`, at provisioning); every role reads it and acknowledges `probe` through its own consumer: `doctor` (`hub boundary`) checks a write outside its role's rights does not arrive |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
   broadcast address. `owner` and `console` are senders, never seats: no seat takes

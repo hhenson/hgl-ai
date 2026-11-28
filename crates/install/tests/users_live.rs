@@ -2109,6 +2109,9 @@ async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
             s.info().await.unwrap().state.messages
         };
         let before = count().await;
+        // The probe never ages out of the canary (bot on #192).
+        let mut s = admin.get_stream(&canary).await.unwrap();
+        assert_eq!(s.info().await.unwrap().config.max_age, Duration::ZERO);
         for (_, who) in ROLE_USERS {
             let cfg = hub.host_cfg(who);
             assert_eq!(

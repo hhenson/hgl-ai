@@ -146,8 +146,6 @@ pub const INBOX_MAX_DELIVER: i64 = -1;
 pub const MAX_NOTE_BYTES: usize = 1 << 20;
 /// Largest value a bucket holds.
 pub const MAX_VALUE_BYTES: usize = 1 << 20;
-/// How long a write that reached `HGL_CANARY` stays there.
-pub const CANARY_MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
 /// `HGL_USAGE_LOG` keeps usage records 35 days, the burn-down history (PROTO-23).
 pub const USAGE_MAX_AGE: Duration = Duration::from_secs(35 * 86_400);
 /// Attempts [`Bus::append_line`] makes before giving up with [`BusError::Conflict`].
@@ -578,13 +576,15 @@ impl Bus {
                 Duration::ZERO,
             ),
             build::BUCKET,
-            // Stays empty while the hub enforces role boundaries (`doctor`, `hub boundary`).
+            // Holds only its probe while the hub enforces role boundaries (`doctor`,
+            // `hub boundary`). No age limit: the probe must not expire. A write that
+            // arrives (one account, about 100 bytes a doctor run) stays until purged.
             (
                 KV_CANARY,
                 "hgl-ai role boundary canary; no role writes it",
                 stream::StorageType::File,
                 1,
-                CANARY_MAX_AGE,
+                Duration::ZERO,
             ),
         ];
         for (bucket, description, storage, history, max_age) in buckets {
