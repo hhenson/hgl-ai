@@ -305,7 +305,7 @@ before hub users takes one shared token until it moves.
 | `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
-`BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
+`BOT` is `clean`, `findings`, `running`, `requested`, `none` or `limit`. `requested` means an owner-authored bot request marker for this head was seen; `none` is pending a request. The coordinator samples early and late comments, so the request command also checks all comments before posting. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.
 
 Intake scans open issues and PRs across `[github].repos` every 15 minutes under

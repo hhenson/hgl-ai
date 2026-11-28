@@ -99,6 +99,7 @@ pub enum BotState {
     Clean,
     Findings,
     Running,
+    Requested,
     None,
     Limit,
 }
@@ -109,6 +110,7 @@ impl BotState {
             BotState::Clean => "clean",
             BotState::Findings => "findings",
             BotState::Running => "running",
+            BotState::Requested => "requested",
             BotState::None => "none",
             BotState::Limit => "limit",
         }
@@ -118,6 +120,7 @@ impl BotState {
             "clean" => BotState::Clean,
             "findings" => BotState::Findings,
             "running" => BotState::Running,
+            "requested" => BotState::Requested,
             "none" => BotState::None,
             "limit" => BotState::Limit,
             _ => return None,

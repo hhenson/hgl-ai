@@ -49,7 +49,13 @@ pub async fn round<G: Gh>(gh: &G, s: &Settings) -> Result<(Vec<PrInfo>, RateLimi
     }
     let vars: Vec<(&str, String)> = vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     let pages = exec::graphql(gh, &q, &vars, false).await?;
-    table::parse_batch(&pages[0], &s.repos, &s.review_bot, &utc_now_stamp())
+    table::parse_batch(
+        &pages[0],
+        &s.repos,
+        &s.review_bot,
+        &s.owner,
+        &utc_now_stamp(),
+    )
 }
 
 /// The GraphQL reset time from the REST `rate_limit` endpoint (it costs nothing), when a

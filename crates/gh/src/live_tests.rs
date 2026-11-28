@@ -1667,18 +1667,13 @@ async fn bot_request_repeated_passes_use_hub_lease_and_scripted_github() {
     ));
     assert!(!gh.calls().iter().any(|c| c.contains("-X POST")));
     held.release().await;
-    assert_eq!(
-        bot_request::request(&gh, &s, &b, "alpha", 7, head)
-            .await
-            .unwrap(),
-        Request::Posted
-    );
-    assert_eq!(
-        bot_request::request(&gh, &s, &b, "alpha", 7, head)
-            .await
-            .unwrap(),
-        Request::Already
-    );
+    store::put_latest(&b, state::KEY_PRS, &format!("# read 20261128T000000Z\nalpha\t7\t{head}\topen\tnone\t0\tpending\t20261128T000000Z\nalpha\t8\t{head}\tdraft\tnone\t0\tpending\t20261128T000000Z\nalpha\t9\t{head}\topen\trequested\t0\tpending\t20261128T000000Z\n")).await.unwrap();
+    let pass = bot_request::pass(&gh, &s, &b, false).await.unwrap();
+    assert_eq!(pass.len(), 1);
+    assert!(matches!(pass[0].3, Ok(Request::Posted)));
+    let pass = bot_request::pass(&gh, &s, &b, false).await.unwrap();
+    assert_eq!(pass.len(), 1);
+    assert!(matches!(pass[0].3, Ok(Request::Already)));
     assert_eq!(
         gh.calls().iter().filter(|c| c.contains("-X POST")).count(),
         1

@@ -129,6 +129,9 @@ impl Table {
             } else if let [repo, num, head, kind, bot, unres, checks, updated] =
                 line.split('\t').collect::<Vec<_>>()[..]
             {
+                if !matches!(kind, "open" | "draft") {
+                    continue;
+                }
                 let (Ok(number), Ok(unresolved), Some(bot), Some(checks)) = (
                     num.parse(),
                     unres.parse(),
@@ -219,6 +222,7 @@ pub fn parse_batch(
     v: &Value,
     repos: &[String],
     bot: &str,
+    owner: &str,
     read: &str,
 ) -> Result<(Vec<PrInfo>, RateLimit, Vec<String>)> {
     let data = v.get("data").ok_or_else(|| resp("no data"))?;
@@ -232,7 +236,7 @@ pub fn parse_batch(
         };
         let mut infos: Vec<PrInfo> = nodes(r, &["pullRequests"])
             .iter()
-            .filter_map(|p| pr_info(repo, p, bot, read))
+            .filter_map(|p| pr_info(repo, p, bot, owner, read))
             .collect();
         infos.sort_by_key(|i| i.row.number);
         out.extend(infos);
@@ -257,7 +261,7 @@ pub fn parse_rate(data: &Value) -> Result<RateLimit> {
     })
 }
 
-fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
+fn pr_info(repo: &str, p: &Value, bot: &str, owner: &str, read: &str) -> Option<PrInfo> {
     let number = p.get("number")?.as_u64()?;
     let head = p.get("headRefOid")?.as_str()?.to_string();
     let unresolved = nodes(p, &["reviewThreads"])
@@ -291,7 +295,12 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
             repo: repo.to_string(),
             number,
             draft: p.get("isDraft").and_then(Value::as_bool).unwrap_or(false),
-            bot: view.state_at(&head),
+            bot: match view.state_at(&head) {
+                BotState::None if crate::bot_request::requested(&comments, owner, &head) => {
+                    BotState::Requested
+                }
+                state => state,
+            },
             unresolved,
             checks: Checks::from_rollup(rollup),
             updated: read.to_string(),
@@ -526,7 +535,34 @@ mod tests {
     }
 
     fn batch() -> (Vec<PrInfo>, RateLimit, Vec<String>) {
-        parse_batch(&json("coord-batch.json"), &repos(), BOT, READ).unwrap()
+        parse_batch(&json("coord-batch.json"), &repos(), BOT, "owner", READ).unwrap()
+    }
+
+    #[test]
+    fn request_marker_is_scoped_to_owner_and_head() {
+        let head = "1111111111111111111111111111111111111111";
+        let mut p = serde_json::json!({"number":7, "headRefOid":head, "isDraft":false,
+            "early":{"nodes":[]}, "late":{"nodes":[]}});
+        let comment = |author: &str, sha: &str| serde_json::json!({"author":{"login":author}, "body":crate::bot_request::body(sha)});
+        p["late"]["nodes"] = serde_json::json!([comment("other", head)]);
+        assert_eq!(
+            pr_info("alpha", &p, BOT, "owner", READ).unwrap().row.bot,
+            BotState::None
+        );
+        p["late"]["nodes"] =
+            serde_json::json!([comment("owner", "2222222222222222222222222222222222222222")]);
+        assert_eq!(
+            pr_info("alpha", &p, BOT, "owner", READ).unwrap().row.bot,
+            BotState::None
+        );
+        p["late"]["nodes"] = serde_json::json!([comment("owner", head)]);
+        let row = pr_info("alpha", &p, BOT, "owner", READ).unwrap().row;
+        assert_eq!(row.bot, BotState::Requested);
+        let table = Table {
+            rows: vec![row],
+            ..Table::default()
+        };
+        assert_eq!(Table::parse(&table.render()), table);
     }
 
     #[test]

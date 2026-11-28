@@ -65,6 +65,17 @@ enum Cmd {
 
 #[derive(clap::Subcommand)]
 enum BotCmd {
+    /// Process pending bot reviews from the coordinator table, repeatedly.
+    Run {
+        /// Process one table and exit.
+        #[arg(long)]
+        once: bool,
+        /// Time between passes (default: 5m).
+        #[arg(long, value_parser = duration, default_value = "5m")]
+        interval: Duration,
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Request one review per exact head.
     Request {
         repo: String,
@@ -371,6 +382,45 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
         gh_client(&cfg).await?
     };
     match *args.cmd {
+        Cmd::Bot {
+            cmd:
+                BotCmd::Run {
+                    once,
+                    interval,
+                    dry_run,
+                },
+        } => {
+            if interval.is_zero() {
+                anyhow::bail!("interval must be positive");
+            }
+            hgl_ai_gh::bot_request::verify_owner(&gh, &s)
+                .await
+                .map_err(lift)?;
+            let bus = Bus::connect(&cfg).await?;
+            loop {
+                let results = hgl_ai_gh::bot_request::pass(&gh, &s, &bus, dry_run)
+                    .await
+                    .map_err(lift)?;
+                let mut failed = false;
+                for (repo, pr, head, result) in results {
+                    match result {
+                        Ok(outcome) => println!("{repo}#{pr} at {head}: {outcome:?}"),
+                        Err(e) => {
+                            eprintln!("{repo}#{pr} at {head}: {e}");
+                            failed = true;
+                        }
+                    }
+                }
+                if once {
+                    return if failed {
+                        Err(NotReady("one or more bot requests failed".into()).into())
+                    } else {
+                        Ok(EXIT_OK)
+                    };
+                }
+                tokio::time::sleep(interval).await;
+            }
+        }
         Cmd::Bot {
             cmd:
                 BotCmd::Request {
