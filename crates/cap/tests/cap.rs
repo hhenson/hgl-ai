@@ -507,15 +507,24 @@ fn a_turn_slice_is_named_to_its_command_and_removed() {
         lines.any(|l| l.starts_with("hgl-ai-cap-")),
         "the report file is in the command's TMPDIR: {out}"
     );
-    // The slice is gone with the run.
-    let show = Command::new("systemctl")
-        .args(["--user", "show", "-p", "ActiveState", &slice])
-        .output()
-        .unwrap();
-    assert!(
-        String::from_utf8_lossy(&show.stdout).contains("inactive"),
-        "{show:?}"
-    );
+    // Stopping the slice is asynchronous; allow systemd time to finish.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let show = Command::new("systemctl")
+            .args(["--user", "show", "-p", "ActiveState,LoadState", &slice])
+            .output()
+            .unwrap();
+        let state = String::from_utf8_lossy(&show.stdout);
+        if show.status.success()
+            && state
+                .lines()
+                .any(|line| line == "ActiveState=inactive" || line == "LoadState=not-found")
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline, "slice did not stop: {show:?}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 /// The slice of a bridge that died before it could stop it is removed by the next one.
