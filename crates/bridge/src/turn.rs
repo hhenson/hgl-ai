@@ -432,6 +432,7 @@ impl<B: BusApi> Bridge<B> {
                     let (s, t) = (name.clone(), task.clone());
                     match tokio::task::spawn_blocking(move || trees.remove(&s, &t, true)).await {
                         Ok(Ok(Some(rm))) => {
+                            let _reg = self.registry_lock(&rm.key).await;
                             let _ = self.bus.tree_del(&rm.key).await;
                         }
                         Ok(Ok(None)) => {}

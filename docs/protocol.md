@@ -163,6 +163,9 @@ before hub users takes one shared token until it moves.
   compare-and-set merged with the record held, so a fresher record never goes
   back: `families` only grow, `handoff_seq` and `class_seq` never fall, and of
   two trees made at that key the later made (by `seq`, then creation time) stays.
+  It writes a tree only while that tree's `task.json` still names it, checked
+  under a per-key lock that a removal holds across its deregistering, so a tree
+  removed after the listing is not registered again.
 - **PROTO-14 — Removal is the bridge's.** On `landed` or `closed` for an
   issue, the bridge stops any turn in that task, saves uncommitted changes as
   a patch under `<work_root>/salvage/` if there are any, removes the worktree

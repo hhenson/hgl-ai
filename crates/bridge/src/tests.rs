@@ -519,24 +519,32 @@ async fn a_report_listed_before_a_handoff_turn_keeps_the_turns_record() {
 }
 
 /// r3 on #57: the report lists a tree, then `closed` removes it and an `assign` makes the
-/// task's tree anew at that key. The report keeps the newer tree's record.
+/// task's tree anew at that key. The report keeps the newer tree's record. (Its write of
+/// demo#40, listed first, is held: a held write of demo#41 holds that key's removal, #58.)
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_report_listed_before_a_tree_was_made_anew_keeps_the_new_record() {
     let h = harness();
     h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
     let (tx, j) = h.start(&["w1"]);
-    let a = h.bus.push(
-        "w1",
-        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
-    );
-    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    for (i, t) in [(40, "Move it"), (41, "Rename it")] {
+        let a = h.bus.push(
+            "w1",
+            note(
+                Kind::Assign,
+                "w1",
+                i,
+                &format!("[claude] Assign: demo#{i} {t}"),
+            ),
+        );
+        eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    }
     stop(tx, j).await;
     let key = "build-1.w1.demo-41";
 
     h.bus.hold_tree_merges();
     let reports = h.bus.sent_containing("work_root uses").len();
     let (tx, j) = h.start(&["w1"]);
-    eventually("the report holds its listing", || {
+    eventually("the report holds its write of demo#40", || {
         h.bus.tree_merges_held() == 1
     })
     .await;
@@ -562,6 +570,106 @@ async fn a_report_listed_before_a_tree_was_made_anew_keeps_the_new_record() {
         (rec.seq, rec.handoff_seq),
         (Some(again), Some(again)),
         "the report did not bring the removed tree back"
+    );
+    stop(tx, j).await;
+}
+
+/// hgl-ai#58: the report has listed the tree and is writing it when `closed` removes the
+/// tree. The removal's deregistering waits for that write, so no record is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_writing_a_tree_as_cleanup_removes_it_leaves_no_record() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+    let key = "build-1.w1.demo-41";
+    let dir = h.work().join("w1/demo-41");
+    assert!(h.bus.trees().contains_key(key) && dir.exists());
+
+    // The report is past its check that the tree is there, inside the write.
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its write", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let c = h.bus.push(
+        "w1",
+        note(Kind::Closed, "w1", 41, "[claude] Closed: demo#41"),
+    );
+    eventually("the tree removed", || !dir.exists()).await;
+
+    h.bus.release_tree_merges();
+    eventually("closed acked", || h.bus.events(c) == [Ev::Ack]).await;
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    assert!(
+        !h.bus.trees().contains_key(key),
+        "the report did not register the removed tree"
+    );
+    stop(tx, j).await;
+}
+
+/// hgl-ai#58: the report lists two trees; while it writes the first, `closed` removes the
+/// second. The report, checking before each write, does not register the second again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_does_not_register_a_tree_removed_after_its_listing() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    for (i, t) in [(41, "Rename it"), (42, "Move it")] {
+        let a = h.bus.push(
+            "w1",
+            note(
+                Kind::Assign,
+                "w1",
+                i,
+                &format!("[claude] Assign: demo#{i} {t}"),
+            ),
+        );
+        eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    }
+    stop(tx, j).await;
+    let (first, second) = ("build-1.w1.demo-41", "build-1.w1.demo-42");
+    let dir = h.work().join("w1/demo-42");
+    assert!(h.bus.trees().contains_key(second) && dir.exists());
+
+    // The report holds its write of the first tree (they are listed in key order).
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its first write", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let c = h.bus.push(
+        "w1",
+        note(Kind::Closed, "w1", 42, "[claude] Closed: demo#42"),
+    );
+    eventually("the second tree removed", || !dir.exists()).await;
+
+    h.bus.release_tree_merges();
+    eventually("closed acked", || h.bus.events(c) == [Ev::Ack]).await;
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    let trees = h.bus.trees();
+    assert!(
+        trees.contains_key(first),
+        "the first tree is still registered"
+    );
+    assert!(
+        !trees.contains_key(second),
+        "the report did not register the removed tree"
     );
     stop(tx, j).await;
 }
