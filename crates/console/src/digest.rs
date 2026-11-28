@@ -168,11 +168,12 @@ pub(crate) async fn round(
     }
     let mut open = Vec::new();
     let mut open_count = 0;
+    // Read current state from the stream while the console's fold catches up.
     for (id, title) in questions {
-        if owner::show(bus, &id)
+        if owner::thread_at(bus, &app.controller, &id, u64::MAX)
             .await?
             .as_ref()
-            .is_none_or(Thread::is_open)
+            .is_some_and(Thread::is_open)
         {
             open_count += 1;
             if open.len() < QUESTIONS {

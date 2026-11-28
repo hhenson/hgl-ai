@@ -1492,7 +1492,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn empty_slack_checkpoint_keeps_new_and_migrated_p2_across_downtime() {
+    async fn slack_digest_catches_up_to_open_p2_across_downtime() {
         use hgl_ai_owner::digest::{self, Digest};
 
         let Some((_srv, url, token)) = hub() else {
@@ -1515,6 +1515,13 @@ pub(crate) mod tests {
             suggested: None,
         };
 
+        let triage = Seat::new("triage").unwrap();
+        let stale_open = owner::ask(&bus, &triage, ask("Open before downtime"))
+            .await
+            .unwrap();
+        let mut feed = feed(&bus).await;
+        fold_to(&first, &bus, &mut feed, &stale_open, 0).await;
+
         let migrated = owner::ask(&bus, &first.controller, ask("Already queued"))
             .await
             .unwrap();
@@ -1535,10 +1542,25 @@ pub(crate) mod tests {
         assert!(p2_batch(&first).is_none());
         drop(first);
 
-        let queued_during_downtime =
-            owner::ask(&bus, &Seat::new("triage").unwrap(), ask("While down"))
+        let queued_during_downtime = owner::ask(&bus, &triage, ask("While down")).await.unwrap();
+        let never_indexed = owner::ask(&bus, &triage, ask("Asked and withdrawn while down"))
+            .await
+            .unwrap();
+        owner::withdraw(&bus, &triage, &never_indexed, "superseded")
+            .await
+            .unwrap();
+        owner::withdraw(&bus, &triage, &stale_open, "superseded")
+            .await
+            .unwrap();
+        assert!(owner::show(&bus, &never_indexed).await.unwrap().is_none());
+        assert!(
+            owner::show(&bus, &stale_open)
                 .await
-                .unwrap();
+                .unwrap()
+                .unwrap()
+                .is_open()
+        );
+
         let restarted = app(dir.path());
         let next = cutoff + P2_BATCH * 3;
         assert!(
