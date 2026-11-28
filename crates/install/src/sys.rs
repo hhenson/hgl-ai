@@ -220,7 +220,14 @@ pub trait System {
     }
     /// Whether this process may read `p` (a probe; nothing is read).
     fn can_read(&self, p: &Path) -> bool {
-        std::fs::File::open(p).is_ok()
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            options.custom_flags(libc::O_NONBLOCK);
+        }
+        options.open(p).is_ok()
     }
     /// The numeric owner of `p`.
     fn owner_uid(&self, p: &Path) -> io::Result<u32> {
@@ -705,6 +712,7 @@ pub(crate) mod fake {
             arch: "x86_64".into(),
             exe: home.join(".cargo/bin/hgl-ai"),
             in_tmux: false,
+            runtime_root: None,
         }
     }
 

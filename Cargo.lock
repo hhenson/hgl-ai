@@ -1299,6 +1299,7 @@ dependencies = [
  "hgl-ai-install",
  "hgl-ai-owner",
  "hgl-ai-proto",
+ "hgl-ai-slack",
  "hgl-ai-tree",
  "hgl-ai-usage",
  "libc",
@@ -1521,6 +1522,34 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror 2.0.21",
+]
+
+[[package]]
+name = "hgl-ai-slack"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "axum",
+ "chrono",
+ "futures",
+ "hex",
+ "hgl-ai-bus",
+ "hgl-ai-config",
+ "hgl-ai-console",
+ "hgl-ai-install",
+ "hgl-ai-owner",
+ "hgl-ai-proto",
+ "libc",
+ "reqwest",
+ "rustls",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-websockets",
+ "tracing",
 ]
 
 [[package]]

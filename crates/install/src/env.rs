@@ -38,6 +38,10 @@ pub struct Env {
     pub exe: PathBuf,
     /// Inside a tmux client (`$TMUX` set).
     pub in_tmux: bool,
+    /// Linux, when neither `XDG_RUNTIME_DIR` nor `DBUS_SESSION_BUS_ADDRESS` is set (a
+    /// plain `sudo -u NAME`): where the user managers' runtime directories are
+    /// (`/run/user`), so `systemctl --user` can still reach this user's.
+    pub runtime_root: Option<PathBuf>,
 }
 
 impl Env {
@@ -64,6 +68,11 @@ impl Env {
             arch: std::env::consts::ARCH.to_string(),
             exe,
             in_tmux: std::env::var_os("TMUX").is_some_and(|t| !t.is_empty()),
+            runtime_root: (Os::current() == Os::Linux
+                && ["XDG_RUNTIME_DIR", "DBUS_SESSION_BUS_ADDRESS"]
+                    .iter()
+                    .all(|v| std::env::var_os(v).is_none_or(|x| x.is_empty())))
+            .then(|| PathBuf::from("/run/user")),
         })
     }
 

@@ -14,6 +14,7 @@ pub mod note;
 pub mod owner;
 pub mod seat;
 pub mod server;
+pub mod slack;
 pub mod state;
 pub mod tree;
 pub mod usage;

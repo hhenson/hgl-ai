@@ -77,8 +77,42 @@ read-only token (Metadata, Contents, Issues, Pull requests, Checks, Actions, Com
 statuses: read) for the repositories. The token step above stores it as the server
 user (`[github] token_file`); run that step again to replace it.
 
+During the intake cutover, deploy and verify the coordinator's triage delivery
+before disabling the interim `hgl-intakewatch` timer.
+
 The server user's own commands run with `sudo -u hgl-ai env HOME=/var/lib/hgl-ai
 hgl-ai ...` (`server user add`, `doctor`).
+
+### Slack Q&A
+
+Use the existing Slack app with Socket Mode, `chat:write`, `groups:history`,
+`app_mentions:read`, and the `message.groups` and `app_mention` bot events.
+Enable `settings.interactivity.is_enabled` in the
+app manifest for the answer and Close buttons. Socket Mode delivers their callbacks
+over the outbound connection. Install it in the workspace and invite it to the
+private `#hgl-qa` channel. In the server user's configuration add the workspace,
+channel and owner member IDs, and use the owner's console handle:
+
+```toml
+[slack]
+team = "T12345678"
+channel = "C12345678"
+user = "U12345678"
+handle = "Owner Handle"
+```
+
+In the app settings, generate an app-level token with `connections:write` under
+**Basic Information** and copy the installed bot token from **OAuth &
+Permissions**. Run `hgl-ai server install --slack --keep-token --print-root-steps`
+and review the printed script before running it. Paste the tokens at its
+no-echo prompts. The script writes `slack-app.token` and `slack-bot.token` under
+the server user's `~/.config/hgl-ai/`, both mode 0600. Enter keeps a token file
+already in place. With `--keep-token`, only missing Slack tokens are prompted for.
+A plain server reinstall retains the Slack service once enabled.
+
+The script provisions the Slack hub user and starts `hgl-ai-slack` as the server
+user alongside the console. The adapter opens outbound HTTPS and WebSocket
+connections. `server status` shows its service state and log location.
 
 ### Upgrading an install from before hgl-ai#63
 
@@ -104,12 +138,14 @@ hgl-ai server user ...`).
 | `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`, `HGL_BUILD/run.*`, `HGL_USAGE`, `hgl.usage.>`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, recipes (`HGL_BUILD/recipe.*`), verdicts (`HGL_STATE/verdict.*`), stream changes |
 | `coord` | a seat's, and `HGL_METRICS` |
 | `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
-| `console` | `hgl.owner.>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
+| `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
+| `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
-Every role reads every stream and bucket but `HGL_CONSOLE` (the console's own); seat
-and coordinator users read `HGL_OWNER` through short-lived consumers and may not
-touch the console's durable feed.
+The console keeps session state in `HGL_CONSOLE`. The Slack adapter reads its own
+delivery state, its durable `HGL_OWNER` feed and opening events by sequence.
+The console can read the Slack permalink index.
+Seat, coordinator and builder users read `HGL_OWNER` through short-lived consumers.
 
 ```sh
 hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred
@@ -222,7 +258,12 @@ own hub user `console`.
    passkey; later sign-ins use the passkey. A new device: a provider again.
 
 The console's credential and secrets belong to the server user; `doctor`, run as
-you, checks that you (and so your agents) cannot read them.
+the client user, checks that it (and so its agents) cannot read them. It finds the
+server user and its home from the hub's system unit (`User=`, `HOME`). With
+`--client-user NAME`, `doctor` as you checks the server side only and points at
+`sudo -u NAME env HOME=<its home> hgl-ai doctor`; there it finds the bridge without a
+login session (`/run/user/<uid>`) and the CLIs on the bridge unit's `PATH` or in
+`~/.local/bin`.
 
 ## Agents
 
