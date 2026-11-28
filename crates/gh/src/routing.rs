@@ -103,10 +103,14 @@ struct History {
 
 #[derive(Default)]
 struct PullHistory {
-    reviews: BTreeSet<(String, Seat)>,
+    /// Review requests by head and reviewer, with the request's sequence.
+    reviews: BTreeMap<(String, Seat), u64>,
     receipts: BTreeMap<(String, Seat), (u64, Verdict)>,
     sendbacks: BTreeSet<String>,
     earlier: BTreeMap<Seat, EarlierReview>,
+    /// The latest review request, at a head the pull request has left, still without
+    /// a receipt: a `ready` at the new head retargets it.
+    outstanding: Option<(Seat, String)>,
     sent_back: bool,
 }
 
@@ -169,7 +173,7 @@ impl History {
                     .entry(key)
                     .or_default()
                     .reviews
-                    .insert((head, n.recipient.clone()));
+                    .insert((head, n.recipient.clone()), item.seq);
             }
             Kind::Receipt => {
                 if let Some(receipt) = state::routed_receipt(n)
@@ -196,11 +200,17 @@ impl History {
                 continue;
             };
             let head = &pull.pr.row.head;
+            past.outstanding = past
+                .reviews
+                .iter()
+                .max_by_key(|(_, seq)| **seq)
+                .filter(|(review, _)| &review.0 != head && !past.receipts.contains_key(*review))
+                .map(|((sha, seat), _)| (seat.clone(), sha.clone()));
             past.receipts.retain(|(sha, seat), (seq, verdict)| {
                 if sha == head {
                     return true;
                 }
-                if past.reviews.contains(&(sha.clone(), seat.clone()))
+                if past.reviews.contains_key(&(sha.clone(), seat.clone()))
                     && past
                         .earlier
                         .get(seat)
@@ -222,7 +232,7 @@ impl History {
             });
             past.sendbacks.clear();
             past.reviews
-                .retain(|(sha, _)| sha == head && pull.current_head(&key.repo, head));
+                .retain(|(sha, _), _| sha == head && pull.current_head(&key.repo, head));
         }
     }
 
@@ -231,7 +241,7 @@ impl History {
             .values()
             .map(|p| {
                 p.reviews
-                    .iter()
+                    .keys()
                     .filter(|review| &review.1 == seat && !p.receipts.contains_key(*review))
                     .count()
             })
@@ -258,6 +268,14 @@ enum Action {
         to: Seat,
         earlier: Option<String>,
         url: String,
+        /// The review still out at an older head that this one replaces.
+        #[serde(default)]
+        retargets: Option<(Seat, String)>,
+    },
+    /// A `ready` or `receipt` at a head the pull request has left: dropped once GitHub
+    /// confirms it, with a digest line.
+    Superseded {
+        pr: u64,
     },
     Sendback {
         pr: u64,
@@ -308,7 +326,7 @@ impl Facts<'_> {
                 }
         });
         let Some(pull) = matching.next() else {
-            return self.forward();
+            return self.superseded(n, &key, head);
         };
         if matching.next().is_some() {
             return self.forward();
@@ -325,7 +343,7 @@ impl Facts<'_> {
 
         match n.kind {
             Kind::Ready if current.as_slice() == std::slice::from_ref(&n.sender) => {
-                if past.reviews.iter().any(|(sha, _)| sha == head) {
+                if past.reviews.keys().any(|(sha, _)| sha == head) {
                     return Action::AlreadyRouted;
                 }
                 self.pick_reviewer(pull, &pool.seats, &authors, past)
@@ -335,7 +353,7 @@ impl Facts<'_> {
                     return self.forward();
                 };
                 if state::reviewer_family_matches(&self.hosts, &receipt) != Some(true)
-                    || !past.reviews.contains(&(receipt.head, n.sender.clone()))
+                    || !past.reviews.contains_key(&(receipt.head, n.sender.clone()))
                     || authors.contains(&receipt.family)
                     || self
                         .trees
@@ -365,6 +383,39 @@ impl Facts<'_> {
         }
     }
 
+    /// A note naming exactly one routed pull request whose head has moved on. A receipt
+    /// names its pull request; a `ready` must come from the implementor tree on the pull
+    /// request's branch, so a new pull request missing from the batch is not mistaken
+    /// for an old one.
+    fn superseded(&self, n: &Note, key: &TaskKey, head: &str) -> Action {
+        let receipt = match n.kind {
+            Kind::Ready => None,
+            Kind::Receipt => match state::routed_receipt(n) {
+                Some(r) => Some(r),
+                None => return self.forward(),
+            },
+            _ => return self.forward(),
+        };
+        let mut same = self.pulls.iter().filter(|p| {
+            p.pr.row.repo == key.repo
+                && p.pr.base == "main"
+                && if let Some(r) = &receipt {
+                    p.number() == r.pr && r.head == head
+                } else {
+                    self.trees.iter().any(|t| {
+                        !t.review
+                            && t.seat == n.sender
+                            && t.task.repo == key.repo
+                            && t.branch.as_deref() == Some(&p.pr.branch)
+                    })
+                }
+        });
+        match (same.next(), same.next()) {
+            (Some(p), None) if p.pr.row.head != head => Action::Superseded { pr: p.number() },
+            _ => self.forward(),
+        }
+    }
+
     fn eligible(&self, pull: &Pull<'_>, seat: &Seat, authors: &[Family]) -> bool {
         let mut records = self
             .hosts
@@ -387,6 +438,20 @@ impl Facts<'_> {
         authors: &[Family],
         past: &PullHistory,
     ) -> Action {
+        let focus = |seat: &Seat| past.earlier.get(seat).and_then(|e| e.focused_head.clone());
+        let retargets = past.outstanding.clone();
+        if let Some((seat, _)) = &retargets
+            && pool.contains(seat)
+            && self.eligible(pull, seat, authors)
+        {
+            return Action::Review {
+                pr: pull.number(),
+                to: seat.clone(),
+                earlier: focus(seat),
+                url: pull.pr.url.clone(),
+                retargets,
+            };
+        }
         let earlier = past
             .earlier
             .iter()
@@ -398,6 +463,7 @@ impl Facts<'_> {
                 to: seat.clone(),
                 earlier: earlier.focused_head.clone(),
                 url: pull.pr.url.clone(),
+                retargets,
             };
         }
         pool.iter()
@@ -408,6 +474,7 @@ impl Facts<'_> {
                 to: to.clone(),
                 earlier: None,
                 url: pull.pr.url.clone(),
+                retargets: retargets.clone(),
             })
     }
 
@@ -460,13 +527,26 @@ impl Pending {
             )
         };
         let line = match &action {
+            Action::Review {
+                pr,
+                to,
+                retargets: Some((seat, old)),
+                ..
+            } => Some(format!(
+                "{} → review by {to}, retargeted from {seat} at {}",
+                label(*pr),
+                short(old)
+            )),
             Action::Review { pr, to, .. } => Some(format!("{} → review by {to}", label(*pr))),
             Action::Candidate { pr } => Some(format!(
                 "{} → landing candidate (clean receipt by {})",
                 label(*pr),
                 item.note.sender
             )),
-            Action::Forward { .. } | Action::Sendback { .. } | Action::AlreadyRouted => None,
+            Action::Forward { .. }
+            | Action::Sendback { .. }
+            | Action::Superseded { .. }
+            | Action::AlreadyRouted => None,
         };
         Self {
             seq: item.seq,
@@ -479,7 +559,11 @@ impl Pending {
         match &self.action {
             Action::Forward { to } | Action::Review { to, .. } => Some(to),
             // Either the implementor got the sendback or the controller got the receipt.
-            Action::Sendback { .. } | Action::Candidate { .. } | Action::AlreadyRouted => None,
+            // A superseded note is dropped or, if GitHub says it is current, forwarded.
+            Action::Sendback { .. }
+            | Action::Candidate { .. }
+            | Action::Superseded { .. }
+            | Action::AlreadyRouted => None,
         }
     }
 }
@@ -708,12 +792,19 @@ async fn execute<G: Gh>(
             to,
             earlier,
             url,
+            retargets,
         } => {
             let prior = earlier.as_ref().map_or_else(String::new, |sha| {
                 format!("\nEarlier reviewed head: {sha}. Check the fixes and their diff if the changes are limited to the findings (hgl-ai#118).")
             });
+            let moved = retargets.as_ref().map_or_else(String::new, |(seat, old)| {
+                format!(
+                    "\nReplaces the review by {seat} at {}; a receipt there is dropped as superseded.",
+                    short(old)
+                )
+            });
             let body = format!(
-                "[coord] Review: {repo}#{pr} at {}\n\nReady from {}.\n{url}\n{prior}",
+                "[coord] Review: {repo}#{pr} at {}\n\nReady from {}.\n{url}\n{moved}{prior}",
                 short(head),
                 n.sender,
             );
@@ -773,6 +864,20 @@ async fn execute<G: Gh>(
                 line = None;
                 forward(fallback, item)
             }
+        }
+        Action::Superseded { pr } => {
+            // The batch may predate the note: drop it only if GitHub has moved on too.
+            let current = crate::gate::fetch_pr(gh, s, repo, *pr).await?;
+            if current.head == head {
+                return deliver(bus, lease, item.seq, None, forward(&s.controller, item)).await;
+            }
+            let line = format!(
+                "{repo}#{pr} at {head} → dropped {} from {}: superseded by {}",
+                n.kind,
+                n.sender,
+                short(&current.head)
+            );
+            return Ok((Some(line), None));
         }
         Action::Candidate { .. } | Action::AlreadyRouted => return Ok((line, None)),
     };
@@ -1021,8 +1126,8 @@ mod tests {
             .unwrap();
             let mut history = History::default();
             let past = history.pulls.entry(key.clone()).or_default();
-            past.reviews.insert((old.clone(), seat.clone()));
-            past.reviews.insert(("c".repeat(40), seat.clone()));
+            past.reviews.insert((old.clone(), seat.clone()), 0);
+            past.reviews.insert(("c".repeat(40), seat.clone()), 0);
             past.receipts
                 .insert((old.clone(), seat.clone()), (1, verdict));
             if sendback {

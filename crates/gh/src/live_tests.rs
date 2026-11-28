@@ -2761,6 +2761,256 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
     assert!(no_gh.calls().is_empty());
 }
 
+/// hgl-ai#183: a `ready` or `receipt` at a head the pull request has left is dropped with
+/// a digest line; a `ready` at a new head retargets the review still out to the same
+/// reviewer; a batch older than the note forwards it; other repositories stay with the
+/// controller.
+#[tokio::test]
+async fn coordinator_drops_superseded_heads_and_retargets_reviews() {
+    use hgl_ai_config::ReviewPool;
+    use hgl_ai_proto::{
+        Family, HostRecord, ReviewReceipt, Role, Runtime, SeatRecord, TaskKey, TreeRecord, Verdict,
+        utc_now_stamp,
+    };
+
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into(), "hgl_core".into(), "beta".into()];
+    let seat = |name| Seat::new(name).unwrap();
+    let (r1, r2, w1) = (seat("r1"), seat("r2"), seat("w1"));
+    let pool = ReviewPool {
+        seats: vec![r1.clone(), r2.clone()],
+        manual: false,
+    };
+    s.review_pools.insert("alpha".into(), pool.clone());
+    s.review_pools.insert("hgl_core".into(), pool);
+    let reviewers = HostRecord {
+        host: "test".into(),
+        seats: [(&r1, Family::Claude), (&r2, Family::Gemini)]
+            .into_iter()
+            .map(|(reviewer, family)| SeatRecord {
+                seat: reviewer.clone(),
+                role: Role::Reviewer,
+                runtime: Runtime::Agy,
+                family,
+                model: family.to_string(),
+            })
+            .collect(),
+        memcap_gb: 64,
+        work_root_free_gb: 200,
+        updated_at: utc_now_stamp(),
+    };
+    b.host_put(&reviewers).await.unwrap();
+    for repo in ["alpha", "hgl_core", "beta"] {
+        b.tree_put(&TreeRecord {
+            host: "test".into(),
+            seat: w1.clone(),
+            task: TaskKey {
+                repo: repo.into(),
+                issue: 980,
+            },
+            review: false,
+            path: "tree".into(),
+            branch: Some("codex/q980-fix".into()),
+            created_at: utc_now_stamp(),
+            size_bytes: 0,
+            families: vec![Family::Gpt],
+            class: None,
+            class_seq: None,
+            seq: Some(1),
+            handoff_seq: Some(1),
+        })
+        .await
+        .unwrap();
+    }
+
+    let (old, new, newer) = (HEAD.to_string(), "b".repeat(40), "c".repeat(40));
+    let read = |head: &str| {
+        let pulls = serde_json::json!({"pullRequests": {"nodes": [
+            {"number": 7, "headRefOid": head, "headRefName": "codex/q980-fix", "baseRefName": "main"},
+            {"number": 8, "headRefOid": HEAD, "headRefName": "codex/q981-other", "baseRefName": "main"}
+        ]}});
+        let response = serde_json::json!({"data": {
+            "rateLimit": {"cost": 1, "remaining": 1000, "resetAt": "2100-01-01T00:00:00Z"},
+            "r0": pulls, "r1": pulls, "r2": pulls
+        }});
+        crate::table::parse_batch(&response, &s.repos, &s.review_bot, &utc_now_stamp())
+            .unwrap()
+            .0
+    };
+    let note = |kind, from: &Seat, repo: &str, issue, head: &str, body: &str| {
+        let mut n = Note::new(from.clone(), s.coord_seat.clone(), kind, body);
+        n.repo = Some(repo.into());
+        n.issue = issue;
+        n.head = Some(head.into());
+        n
+    };
+    let ready = |repo, head| note(Kind::Ready, &w1, repo, 980, head, "Ready to review");
+    let receipt = |head: &str| {
+        let body = serde_json::to_string(&ReviewReceipt {
+            repo: "alpha".into(),
+            pr: 7,
+            head: head.into(),
+            main: "a".repeat(40),
+            reviewer: r1.clone(),
+            family: Family::Claude,
+            model: "claude-test".into(),
+            verdict: Verdict::Findings,
+            evidence: "The retry loses a checkpoint.".into(),
+            limitations: "Linux".into(),
+        })
+        .unwrap();
+        note(Kind::Receipt, &r1, "alpha", 7, head, &body)
+    };
+    let at = |head: &str| fixture("pr-open.json").replace(HEAD, head);
+    let everyone = [r1.clone(), r2.clone(), w1.clone(), s.controller.clone()];
+    let after = |from| {
+        let b = &b;
+        let everyone = &everyone;
+        async move {
+            b.read_notes(everyone, from, 20, Duration::ZERO)
+                .await
+                .unwrap()
+        }
+    };
+    let no_gh = FakeGh::default();
+
+    // The first review goes to r1 (both idle; the lower seat).
+    let first = b.send(&ready("alpha", &old)).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&old))
+        .await
+        .unwrap();
+    let notes = after(first).await;
+    assert_eq!(notes.len(), 2);
+    assert_eq!(
+        (notes[0].note.kind, &notes[0].note.recipient),
+        (Kind::Review, &r1)
+    );
+
+    // r1 now has more queued work than r2, but the review still out at the old head
+    // follows the new head to r1.
+    let queued = note(Kind::Review, &s.controller, "alpha", 8, HEAD, "Queued");
+    let queued = Note {
+        sender: s.controller.clone(),
+        recipient: r1.clone(),
+        ..queued
+    };
+    b.send(&queued).await.unwrap();
+    let seq = b.send(&ready("alpha", &new)).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&new))
+        .await
+        .unwrap();
+    let notes = after(seq).await;
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    let review = &notes[0].note;
+    assert_eq!((review.kind, &review.recipient), (Kind::Review, &r1));
+    assert_eq!(review.head.as_deref(), Some(new.as_str()));
+    assert!(
+        review
+            .body
+            .contains(&format!("Replaces the review by r1 at {}", &old[..8])),
+        "{}",
+        review.body
+    );
+    assert!(notes[1].note.body.contains(&format!(
+        "alpha#7 at {new} → review by r1, retargeted from r1 at {}",
+        &old[..8]
+    )));
+    assert!(no_gh.calls().is_empty());
+
+    // r1's receipt at the old head and a late ready there are dropped once GitHub
+    // confirms the new head: only the digest reaches the controller, and no sendback.
+    let gh = FakeGh::default().on("pulls/7", &at(&new));
+    let seq = b.send(&receipt(&old)).await.unwrap().seq;
+    let late = Note {
+        body: "Ready again".into(),
+        ..ready("alpha", &old)
+    };
+    assert!(!b.send(&late).await.unwrap().duplicate);
+    crate::routing::round(&gh, &s, &b, &read(&new))
+        .await
+        .unwrap();
+    let notes = after(seq).await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    let digest = &notes[0].note;
+    assert_eq!(
+        (digest.kind, &digest.recipient, digest.sender.as_str()),
+        (Kind::Note, &s.controller, s.coord_seat.as_str())
+    );
+    for kind in ["receipt from r1", "ready from w1"] {
+        assert!(
+            digest.body.contains(&format!(
+                "alpha#7 at {old} → dropped {kind}: superseded by {}",
+                &new[..8]
+            )),
+            "{}",
+            digest.body
+        );
+    }
+    assert_eq!(gh.calls().len(), 2);
+
+    // The dropped receipt does not answer the retargeted review: the next head still
+    // retargets r1's review.
+    let seq = b.send(&ready("alpha", &newer)).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&newer))
+        .await
+        .unwrap();
+    let notes = after(seq).await;
+    assert_eq!(notes.len(), 2, "{notes:?}");
+    assert_eq!(notes[0].note.recipient, r1);
+    assert!(notes[1].note.body.contains(&format!(
+        "alpha#7 at {newer} → review by r1, retargeted from r1 at {}",
+        &new[..8]
+    )));
+
+    // A batch read before the push: GitHub has the note's head, so the controller gets
+    // the note as sent.
+    let latest = "d".repeat(40);
+    let gh = FakeGh::default().on("pulls/7", &at(&latest));
+    let mut stale = ready("alpha", &latest);
+    let seq = b.send(&stale).await.unwrap().seq;
+    crate::routing::round(&gh, &s, &b, &read(&newer))
+        .await
+        .unwrap();
+    stale.recipient = s.controller.clone();
+    let notes = after(seq).await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].note, stale);
+    assert_eq!(gh.calls().len(), 1);
+
+    // hgl_core (a pool, but never automatic) and beta (no pool): superseded notes go
+    // to the controller unchanged, without reading GitHub.
+    for repo in ["hgl_core", "beta"] {
+        let mut late = Note {
+            body: "Ready again".into(),
+            ..ready(repo, &old)
+        };
+        let seq = b.send(&late).await.unwrap().seq;
+        crate::routing::round(&no_gh, &s, &b, &read(&new))
+            .await
+            .unwrap();
+        late.recipient = s.controller.clone();
+        let notes = after(seq).await;
+        assert_eq!(notes.len(), 1, "{repo}: {notes:?}");
+        assert_eq!(notes[0].note, late);
+    }
+    // A seat without the branch's tree may be naming another pull request.
+    let mut other = Note {
+        sender: seat("w2"),
+        ..ready("alpha", &old)
+    };
+    let seq = b.send(&other).await.unwrap().seq;
+    crate::routing::round(&no_gh, &s, &b, &read(&new))
+        .await
+        .unwrap();
+    other.recipient = s.controller.clone();
+    let notes = after(seq).await;
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert_eq!(notes[0].note, other);
+    assert!(no_gh.calls().is_empty());
+}
+
 #[tokio::test]
 async fn routing_recovers_retained_outputs_and_drains_a_disabled_pool() {
     use hgl_ai_proto::Note;

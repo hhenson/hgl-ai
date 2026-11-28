@@ -153,6 +153,9 @@ the coordinator, `note send --to controller` routes `ready` and structured revie
 receipts through the coordinator. The coordinator validates against the current PR
 round and forwards exceptions with the original sender, kind, head and body. It sends
 the controller a digest of routine routes and clean landing candidates after each round.
+A `ready` or receipt at a head the pull request has left (GitHub confirms it) is dropped
+with one digest line. A `ready` at a new head while a review is out retargets that
+review, to the same reviewer when ROLE-11 and the pool allow.
 The controller handles findings following any earlier sendback so it can apply ROLE-15.
 The controller also handles `hgl_spec`, `hgl_core`, and repositories in `github.spec_repos`.
 
