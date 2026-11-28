@@ -62,6 +62,13 @@ findings, and a `done` note.
   each after its gates on the `main` it merges onto (ROLE-10); ones that merge cleanly
   together may land as one batch. When `main` moves, merge it into each open branch it
   now conflicts with and rerun the checks; a pull request that conflicts is not Ready.
+  Ready order is the time of the `Ready` comment declaring the pull request's head
+  (`at <hex>`, 8 to 40 characters), unless a later `Sent back`, `Blocked`, `Landed`, or an
+  `Approved` naming another head cleared it; failing such a comment, of the latest `ready`
+  note at that exact head after any clearing comment. Where
+  `[github.gate.<repo>] coordinator_lands` opts in (explicit configuration only), the
+  coordinator takes them as landing candidates in this order; it is never on for `hgl_spec`
+  or `hgl_core`.
   On hgl-ai a clean reviewer receipt carries through conflict-free merges of `main`
   once the checks and review bot pass at the new head (ROLE-10, ROLE-11).
 - **WORK-7 — One conflict once.** Two tasks that turn out to touch the same code: finish

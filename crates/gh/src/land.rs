@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use hgl_ai_bus::Bus;
 use hgl_ai_proto::{Kind as NoteKind, Note, Seat, utc_now_stamp};
 
-use crate::bot::{Comment, ready_signers};
+use crate::bot::{Comment, by_note_authors, ready_signers};
 use crate::exec::{self, Gh};
 use crate::gate::{self, Kind, Opts, Outcome};
 use crate::lock::{LandLock, holder};
@@ -773,10 +773,23 @@ async fn commented<G: Gh>(
         ),
     )
     .await?;
-    Ok(list
+    Ok(has_first_line(&list, &s.note_authors, first))
+}
+
+/// Whether a note author's comment among the REST `comments` has the first line `first`; a
+/// stranger's copy of the line does not count, or it could stop the landing's comment.
+fn has_first_line(comments: &[serde_json::Value], authors: &[String], first: &str) -> bool {
+    let comments: Vec<Comment> = comments.iter().map(Comment::from_rest).collect();
+    by_note_authors(&comments, authors)
         .iter()
-        .map(Comment::from_rest)
-        .any(|c| c.body.lines().next().map(str::trim) == Some(first.trim())))
+        .any(|c| c.body.lines().next().map(str::trim) == Some(first.trim()))
+}
+
+/// The seats that signed a note author's `Ready` comment among the REST `comments`; a
+/// stranger's `[codex] (w1) Ready` names no seat.
+fn note_signers(comments: &[serde_json::Value], authors: &[String]) -> Vec<String> {
+    let comments: Vec<Comment> = comments.iter().map(Comment::from_rest).collect();
+    ready_signers(&by_note_authors(&comments, authors))
 }
 
 /// Append the landing to `landed.log`, unless the line is there already (a resumed landing).
@@ -990,7 +1003,6 @@ pub(crate) async fn author_seats<G: Gh>(
         ),
     )
     .await?;
-    let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
     let pick = if current {
         state::current_seats
     } else {
@@ -1002,7 +1014,7 @@ pub(crate) async fn author_seats<G: Gh>(
         branch,
         issue.unwrap_or(number),
         &known,
-        &ready_signers(&comments),
+        &note_signers(&list, &s.note_authors),
     ))
 }
 
@@ -1046,6 +1058,27 @@ async fn send_landed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_note_authors_comments_name_seats_or_count_as_posted() {
+        let c = |login: &str, body: &str| serde_json::json!({"user": {"login": login}, "body": body, "created_at": "x"});
+        let fleet = vec!["fleet".to_string(), "owner".to_string()];
+        let first = "[claude] Landed: o/r#7 at 11111111 as 22222222";
+        let stranger = [
+            c("stranger", "[codex] (w1) Ready: o/r#7 at 11111111"),
+            c("stranger", first),
+        ];
+        assert!(note_signers(&stranger, &fleet).is_empty());
+        assert!(!has_first_line(&stranger, &fleet, first));
+        let own = [
+            c("fleet", "[codex] (w2) Ready: o/r#7 at 11111111"),
+            c("owner", first),
+        ];
+        assert_eq!(note_signers(&own, &fleet), ["w2"]);
+        assert!(has_first_line(&own, &fleet, first));
+        let both: Vec<_> = stranger.iter().chain(&own).cloned().collect();
+        assert_eq!(note_signers(&both, &fleet), ["w2"]);
+    }
     use crate::exec::fake::FakeGh;
     use crate::testutil::{fixture, settings, without_receipts};
 

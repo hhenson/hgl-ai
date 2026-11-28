@@ -7,7 +7,8 @@ this repository.
 
 - **PROTO-1 — GitHub is the record.** Issues, pull requests, reviews, checks
   and merges live on GitHub. A `ready`, `blocked`, `sendback`, `approved` or
-  `landed` note also gets one GitHub comment, posted once by its sender.
+  `landed` note also gets one GitHub comment, posted once by its sender. Only
+  comments by `[github] note_authors` and `owner` are read as these notes.
 - **PROTO-2 — The bus is transport.** NATS JetStream carries notes and shared
   state between agents and hosts. History is bounded (14 days); nothing that
   decides something lives only on the bus.

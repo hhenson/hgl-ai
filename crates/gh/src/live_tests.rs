@@ -2158,6 +2158,50 @@ async fn a_lost_running_with_a_queued_replacement_is_asked_once() {
     r.stop().await;
 }
 
+/// Ready order (WORK-6) from the hub: the latest `ready` note to the controller per
+/// repository and head, other kinds and other seats' notes left out.
+#[tokio::test]
+async fn ready_notes_are_read_from_the_controllers_notes() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let note = |kind: Kind, to: &str, head: &str, at: &str| {
+        let mut n = hgl_ai_proto::Note::new(
+            Seat::new("w1").unwrap(),
+            Seat::new(to).unwrap(),
+            kind,
+            format!("[codex] {kind}: alpha#7 at {head} ({at})"),
+        );
+        n.repo = Some("alpha".into());
+        n.issue = 7;
+        n.head = Some(head.into());
+        n.created_at = at.into();
+        n
+    };
+    let other = "2222222222222222222222222222222222222222";
+    for n in [
+        note(Kind::Ready, "controller", HEAD, "20261128T090000Z"),
+        note(Kind::Ready, "controller", HEAD, "20261128T100000Z"),
+        note(Kind::Ready, "controller", other, "20261128T080000Z"),
+        note(Kind::Blocked, "controller", HEAD, "20261128T110000Z"),
+        note(Kind::Ready, "r1", HEAD, "20261128T120000Z"),
+    ] {
+        b.send(&n).await.unwrap();
+    }
+    let got = crate::candidates::read_ready_notes(&b, &settings())
+        .await
+        .unwrap();
+    let at = |s| crate::table::parse_time(s).unwrap();
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert_eq!(
+        got[&("alpha".to_string(), HEAD.to_string())],
+        at("20261128T100000Z")
+    );
+    assert_eq!(
+        got[&("alpha".to_string(), other.to_string())],
+        at("20261128T080000Z")
+    );
+}
+
 /// What GitHub shows for the wrapper's pins current at `cccccccc` (the compiler's `main`)
 /// and pin pull request `n` merged at `merge`.
 fn pins_current_gh(n: u64, merge: &str) -> FakeGh {
