@@ -157,6 +157,8 @@ impl Table {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PrInfo {
     pub row: Row,
+    pub branch: String,
+    pub base: String,
     pub note: Option<NoteState>,
     pub url: String,
     pub review_url: Option<String>,
@@ -297,6 +299,16 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
             updated: read.to_string(),
             head: head.clone(),
         },
+        branch: p
+            .get("headRefName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
+        base: p
+            .get("baseRefName")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .into(),
         note: note_state(&comments),
         url: p
             .get("url")

@@ -3,7 +3,7 @@
 
 use std::sync::LazyLock;
 
-use hgl_ai_proto::{Family, ReviewReceipt, Seat, TreeRecord};
+use hgl_ai_proto::{Family, Kind, Note, ReviewReceipt, Seat, TreeRecord, check_head};
 use regex::Regex;
 
 use crate::short;
@@ -149,6 +149,23 @@ pub fn parse_receipt(body: &str) -> Option<ReviewReceipt> {
     }
     let (a, z) = (body.find('{')?, body.rfind('}')?);
     (a < z).then(|| serde_json::from_str(&body[a..=z]).ok())?
+}
+
+/// A review receipt whose payload agrees with the routed note's envelope.
+pub fn routed_receipt(note: &Note) -> Option<ReviewReceipt> {
+    if note.kind != Kind::Receipt {
+        return None;
+    }
+    let receipt = parse_receipt(&note.body)?;
+    (receipt.reviewer == note.sender
+        && Some(receipt.repo.as_str()) == note.repo.as_deref()
+        && receipt.pr == note.issue
+        && receipt.pr != 0
+        && Some(receipt.head.as_str()) == note.head.as_deref()
+        && check_head(&receipt.head).is_ok()
+        && check_head(&receipt.main).is_ok()
+        && !receipt.model.trim().is_empty())
+    .then_some(receipt)
 }
 
 /// Body of a `landed` note (PROTO-11).

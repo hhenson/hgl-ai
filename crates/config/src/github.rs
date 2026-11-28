@@ -4,7 +4,24 @@
 
 use std::collections::BTreeMap;
 
+use hgl_ai_proto::Seat;
 use serde::{Deserialize, Serialize};
+
+/// The reviewer pool for one repository: `[github.review_pools.<repo>]`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewPool {
+    pub seats: Vec<Seat>,
+    /// The controller handles all review routing for this repository.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub manual: bool,
+}
+
+impl ReviewPool {
+    pub fn automatic(&self, repo: &str) -> bool {
+        repo != "hgl_spec" && !self.manual && !self.seats.is_empty()
+    }
+}
 
 /// Gate settings of one repository: `[github.gate.<repo>]`. A repository not listed has
 /// the defaults ([`RepoGate::default`]): a review receipt is required.

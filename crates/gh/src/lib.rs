@@ -32,6 +32,7 @@ pub mod merge;
 pub mod pins;
 pub mod progress;
 pub mod release;
+pub mod routing;
 pub mod state;
 pub mod store;
 pub mod table;
@@ -43,7 +44,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use hgl_ai_config::{Config, Pin, ReleaseWatch, RepoGate, Tap, parse_duration};
+use hgl_ai_config::{Config, Pin, ReleaseWatch, RepoGate, ReviewPool, Tap, parse_duration};
 use hgl_ai_proto::Seat;
 use regex::Regex;
 
@@ -132,6 +133,7 @@ pub struct Settings {
     pub coord_seat: Seat,
     pub coord_interval: Duration,
     pub hold_below: u64,
+    review_pools: BTreeMap<String, ReviewPool>,
     global_paths: Vec<String>,
     hygiene_files: Vec<Regex>,
     hygiene_lines: Vec<Regex>,
@@ -176,6 +178,26 @@ impl Settings {
             .seat(&g.controller)
             .map(|s| s.binding.runtime.to_string())
             .unwrap_or_else(|| "claude".to_string());
+        let controller = cfg.controller()?;
+        let coord_seat = Seat::new(g.coord_seat.clone())?;
+        if g.repos.iter().any(|repo| g.routes_notes(repo))
+            && (coord_seat.is_reserved() || coord_seat == controller)
+        {
+            return Err(invalid(
+                "github.coord_seat must be a separate seat for review routing",
+            ));
+        }
+        for (repo, pool) in &g.review_pools {
+            if pool
+                .seats
+                .iter()
+                .any(|seat| seat.is_reserved() || *seat == controller || *seat == coord_seat)
+            {
+                return Err(invalid(format!(
+                    "github.review_pools.{repo}: give reviewer seats"
+                )));
+            }
+        }
         Ok(Settings {
             host: cfg.host.clone(),
             owner: g.owner.clone(),
@@ -183,10 +205,11 @@ impl Settings {
             branch_prefix: g.branch_prefix.clone(),
             wrapper: g.wrapper.clone(),
             review_bot: g.review_bot.clone(),
-            controller: Seat::new(g.controller.clone())?,
-            coord_seat: Seat::new(g.coord_seat.clone())?,
+            controller,
+            coord_seat,
             coord_interval: dur("github.coord_interval", &g.coord_interval)?,
             hold_below: g.hold_below,
+            review_pools: g.review_pools.clone(),
             global_paths: g.global_paths.clone(),
             hygiene_files: regexes("github.hygiene_files", &g.hygiene_files)?,
             hygiene_lines: regexes("github.hygiene_lines", &g.hygiene_lines)?,

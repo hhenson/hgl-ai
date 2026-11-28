@@ -22,6 +22,7 @@ use serde_json::Value;
 
 use crate::backlog::{self, BACKLOG_EVERY};
 use crate::exec::{self, Gh};
+use crate::routing;
 use crate::table::{self, Alert, HoldChange, PrInfo, RateLimit, Row, Table};
 use crate::{Error, Result, Settings, intake, state, store};
 
@@ -403,6 +404,26 @@ pub async fn run<G: Gh>(
                     HoldChange::Set(v) => hold = Some(v),
                     HoldChange::Clear => hold = None,
                     HoldChange::Keep => {}
+                }
+                if let Some(b) = bus
+                    && !hold
+                        .as_deref()
+                        .is_some_and(|h| table::hold_active(h, Utc::now()))
+                {
+                    match routing::round(gh, s, b, &infos).await {
+                        Err(Error::RateLimited(m)) => {
+                            hold = Some(
+                                on_rate_limit(gh, bus, last_rate.as_ref(), &m, Utc::now(), out)
+                                    .await,
+                            );
+                            if o.once {
+                                return Err(Error::RateLimited(m));
+                            }
+                        }
+                        Err(e) if o.once => return Err(e),
+                        Err(e) => tracing::warn!("routing review notes: {e}"),
+                        Ok(()) => {}
+                    }
                 }
             }
             Err(Error::RateLimited(m)) => {
