@@ -1637,4 +1637,3 @@ mod tests {
         }
     }
 }
-compile_error!(env!("NODE_PROBE"));
