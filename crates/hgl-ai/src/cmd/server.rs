@@ -101,6 +101,9 @@ struct InstallArgs {
     /// Do not install the console service.
     #[arg(long)]
     no_console: bool,
+    /// Install the Slack Q&A system service using the server's [slack] configuration.
+    #[arg(long)]
+    slack: bool,
     /// Configure the console: its origin, https://<stable name>[:port].
     #[arg(long, value_name = "URL")]
     console_url: Option<String>,
@@ -133,7 +136,7 @@ struct InstallArgs {
     /// Print the steps that need root as a script, and run none of them.
     #[arg(long)]
     print_root_steps: bool,
-    /// Keep the coordinator's GitHub token in the server user's home: no prompt for it.
+    /// Keep existing tokens in the server user's home without prompting.
     #[arg(long)]
     keep_token: bool,
     /// Write the configuration, credentials and nats.conf only (a system install's
@@ -178,6 +181,7 @@ impl InstallArgs {
             (self.no_coord, "--no-coord"),
             (self.users, "--users"),
             (self.no_console, "--no-console"),
+            (self.slack, "--slack"),
         ] {
             if on {
                 v.push(flag.into());
@@ -219,7 +223,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     let dry = DryRun::new(&real);
     let pick = |d: bool| -> &dyn System { if d { &dry } else { &real } };
     match args.cmd {
-        Sub::Install(a) if !a.same_user => {
+        Sub::Install(mut a) if !a.same_user => {
             let os = real.env().os;
             // A reinstall keeps what an earlier one set unless told otherwise.
             let prev = install::system::previous(&real);
@@ -229,6 +233,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 .or(prev.host)
                 .unwrap_or_else(|| server::DEFAULT_HOST.to_string());
             let console_url = a.console_url.clone().or(prev.console_url);
+            a.slack |= prev.slack && !a.no_console;
             let o = install::system::SystemOpts {
                 user: a
                     .server_user
@@ -251,6 +256,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 port: a.port.or(prev.port).unwrap_or(4222),
                 coord: !a.no_coord,
                 console: !a.no_console && console_url.is_some(),
+                slack: a.slack,
                 console_url,
                 client_user: a.client_user.clone().or(prev.client_user),
                 keep_token: a.keep_token,
@@ -274,6 +280,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 users: a.users,
                 coord: !a.no_coord,
                 console: !a.no_console,
+                slack: a.slack,
                 console_url: a.console_url,
                 console_listen: a.console_listen,
                 console_users: a.console_users,

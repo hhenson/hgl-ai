@@ -150,7 +150,7 @@ impl H {
         let c = self.calls.join(rt);
         std::fs::create_dir_all(&c).unwrap();
         let text = format!(
-            "#!/bin/sh\nC='{c}'\nn=$(cat \"$C/n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$C/n\"\nd=\"$C/$n\"; mkdir -p \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/args\"\npwd > \"$d/cwd\"\nenv > \"$d/env\"\ncat > \"$d/stdin\"\n{body}\n",
+            "#!/bin/sh\nC='{c}'\nn=$(cat \"$C/n\" 2>/dev/null || echo 0); n=$((n+1)); echo $n > \"$C/n.tmp\"; mv \"$C/n.tmp\" \"$C/n\"\nd=\"$C/$n\"; mkdir -p \"$d\"\nprintf '%s\\n' \"$@\" > \"$d/args\"\npwd > \"$d/cwd\"\nenv > \"$d/env\"\ncat > \"$d/stdin\"\ntouch \"$d/ready\"\n{body}\n",
             c = c.display()
         );
         let p = self.bin.join(rt);
@@ -167,6 +167,9 @@ impl H {
         (1..=n)
             .filter_map(|i| {
                 let d = c.join(i.to_string());
+                if !d.join("ready").exists() {
+                    return None;
+                }
                 let args = std::fs::read_to_string(d.join("args"))
                     .ok()?
                     .lines()
@@ -1643,7 +1646,7 @@ async fn landed_drops_the_queued_notes_of_its_task() {
     h.script(
         "codex",
         &format!(
-            "case \"$(pwd)\" in *demo-11*) while [ ! -e '{g}' ]; do sleep 0.05; done;; esac\ncat '{f}'",
+            "case \"$(pwd)\" in *demo-11*) i=0; while [ ! -e '{g}' ]; do i=$((i+1)); if [ \"$i\" -ge 400 ]; then echo 'timed out waiting for gate' >&2; exit 1; fi; sleep 0.05; done;; esac\ncat '{f}'",
             g = gate.display(),
             f = fixture("codex-ok.jsonl")
         ),
