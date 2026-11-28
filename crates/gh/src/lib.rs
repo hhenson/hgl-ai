@@ -132,6 +132,8 @@ pub struct Settings {
     pub coord_seat: Seat,
     pub coord_interval: Duration,
     pub hold_below: u64,
+    /// `github.queue_priority`: repositories first in the backlog's queue.
+    pub queue_priority: Vec<String>,
     global_paths: Vec<String>,
     hygiene_files: Vec<Regex>,
     hygiene_lines: Vec<Regex>,
@@ -162,6 +164,11 @@ impl Settings {
         let dur = |what: &str, s: &str| {
             parse_duration(s).ok_or_else(|| invalid(format!("{what}: duration {s:?}")))
         };
+        if let Some(r) = g.queue_priority.iter().find(|r| !g.repos.contains(r)) {
+            return Err(invalid(format!(
+                "github.queue_priority: {r:?} is not one of github.repos"
+            )));
+        }
         for (repo, rules) in &g.gate {
             regexes(
                 &format!("github.gate.{repo}.relax_paths"),
@@ -187,6 +194,7 @@ impl Settings {
             coord_seat: Seat::new(g.coord_seat.clone())?,
             coord_interval: dur("github.coord_interval", &g.coord_interval)?,
             hold_below: g.hold_below,
+            queue_priority: g.queue_priority.clone(),
             global_paths: g.global_paths.clone(),
             hygiene_files: regexes("github.hygiene_files", &g.hygiene_files)?,
             hygiene_lines: regexes("github.hygiene_lines", &g.hygiene_lines)?,
@@ -325,5 +333,13 @@ mod tests {
         let mut cfg = Config::new("test");
         cfg.github.controller = "Not A Seat".into();
         assert!(Settings::from_config(&cfg).is_err());
+        let mut cfg = Config::new("test");
+        cfg.github.queue_priority = vec!["not-configured".into()];
+        assert!(Settings::from_config(&cfg).is_err());
+        cfg.github.queue_priority = vec!["hgl_core".into()];
+        assert_eq!(
+            Settings::from_config(&cfg).unwrap().queue_priority,
+            ["hgl_core"]
+        );
     }
 }

@@ -81,6 +81,7 @@ impl<B: BusApi> Bridge<B> {
                         runtime: r.runtime,
                         family: r.family,
                         model: r.model,
+                        turn: lock(&s.turn).as_ref().map(|(_, t)| t.clone()),
                     })
                 })
                 .collect()
@@ -103,6 +104,8 @@ impl<B: BusApi> Bridge<B> {
             self.gate_check().await;
             tokio::select! {
                 _ = tokio::time::sleep(self.opts.heartbeat_every) => {}
+                // A turn started or ended: say so now, not at the next beat.
+                _ = self.beat_now.notified() => {}
                 _ = down(&mut shutdown) => return,
             }
         }

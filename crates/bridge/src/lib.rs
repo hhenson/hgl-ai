@@ -28,7 +28,7 @@ use std::time::Duration;
 
 use hgl_ai_bus::BusError;
 use hgl_ai_config::{Binding, Config, SeatConfig};
-use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, TaskKey, seat_lock_key};
+use hgl_ai_proto::{Family, Kind, Note, Role, Runtime, Seat, SeatTurn, TaskKey, seat_lock_key};
 use hgl_ai_tree::{Create, IsClosed, Trees};
 use tokio::sync::{mpsc, watch};
 use tokio::task::{JoinError, JoinHandle};
@@ -177,6 +177,8 @@ pub struct Bridge<B: BusApi> {
     /// deregistering, so the report never registers a tree removed after its listing
     /// (hgl-ai#58).
     registry: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Write the host record now: a seat's turn started or ended.
+    beat_now: Arc<tokio::sync::Notify>,
 }
 
 /// The seat leases' refresh, from `HGL_LOCKS`' `max_age` (PROTO-6): written every `every`
@@ -231,6 +233,52 @@ struct SeatRt {
     /// When the seat last moved to a fallback binding; it returns to the primary after the
     /// cool-down.
     failed_over_at: Mutex<Option<Instant>>,
+    /// The turn running now, for the heartbeat, with the id of its [`TurnMark`].
+    turn: Mutex<Option<(u64, SeatTurn)>>,
+}
+
+/// Marks of turns started, for [`TurnMark`].
+static MARKS: AtomicU64 = AtomicU64::new(0);
+
+/// A seat's running turn as the heartbeat shows it: set when made, cleared when dropped
+/// (with the [`Running`] that holds it), unless a later turn has replaced it. Either way
+/// the host record is written again at once.
+struct TurnMark {
+    seat: Arc<SeatRt>,
+    id: u64,
+    beat: Arc<tokio::sync::Notify>,
+}
+
+impl TurnMark {
+    fn new(seat: &Arc<SeatRt>, target: &Target, beat: &Arc<tokio::sync::Notify>) -> TurnMark {
+        let id = MARKS.fetch_add(1, Ordering::Relaxed);
+        let (task, review) = match target {
+            Target::Inbox => (None, false),
+            Target::Tree { task, review } => (Some(task.clone()), *review),
+        };
+        let turn = SeatTurn {
+            task,
+            review,
+            started_at: hgl_ai_proto::utc_now_stamp(),
+        };
+        *lock(&seat.turn) = Some((id, turn));
+        beat.notify_one();
+        TurnMark {
+            seat: seat.clone(),
+            id,
+            beat: beat.clone(),
+        }
+    }
+}
+
+impl Drop for TurnMark {
+    fn drop(&mut self) {
+        let mut t = lock(&self.seat.turn);
+        if t.as_ref().is_some_and(|(id, _)| *id == self.id) {
+            *t = None;
+            self.beat.notify_one();
+        }
+    }
 }
 
 impl SeatRt {
@@ -248,6 +296,7 @@ impl SeatRt {
             failures: Mutex::new(failures),
             quota_until: Mutex::new(None),
             failed_over_at: Mutex::new(None),
+            turn: Mutex::new(None),
         }
     }
     fn name(&self) -> &Seat {
@@ -309,6 +358,8 @@ struct Running<D> {
     stop: watch::Sender<Stop>,
     handle: JoinHandle<TurnOut>,
     slot: TreeSlot,
+    /// Shows the turn in the host record while it is held.
+    _mark: TurnMark,
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -340,6 +391,7 @@ impl<B: BusApi> Bridge<B> {
             served: Mutex::default(),
             leases: tokio::sync::Mutex::default(),
             registry: Mutex::default(),
+            beat_now: Arc::default(),
         })
     }
 
@@ -1188,7 +1240,9 @@ impl<B: BusApi> Bridge<B> {
             slot: slot.clone(),
         };
         let handle = tokio::spawn(self.clone().turn(job));
+        let mark = TurnMark::new(seat, &target, &self.beat_now);
         Some(Running {
+            _mark: mark,
             target,
             start,
             deliveries: Arc::new(Mutex::new(group)),

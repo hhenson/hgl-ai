@@ -380,7 +380,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                     // Beside the rounds, every few seconds: each task's last note.
                     tokio::select! {
                         r = round => r.map_err(lift)?,
-                        () = hgl_ai_gh::tasks::run(&bus) => {}
+                        () = hgl_ai_gh::tasks::run(&bus, &gh, &s) => {}
                     }
                 }
             }

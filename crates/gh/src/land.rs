@@ -602,11 +602,27 @@ async fn commented<G: Gh>(
 }
 
 /// Append the landing to `landed.log`, unless the line is there already (a resumed landing).
+/// The title is the one `prs` holds, if any: a hub read, not a GitHub call.
 async fn append_landed(bus: &Bus, repo: &str, number: u64, merge: &str) -> Result<()> {
     if progress::landed(bus, repo, number, Some(merge)).await? {
         return Ok(());
     }
-    let line = state::landed_line(&utc_now_stamp(), repo, number, merge);
+    let title = match bus.state_get(state::KEY_PRS).await {
+        Ok(e) => e
+            .and_then(|e| {
+                table::Table::parse(&e.value)
+                    .rows
+                    .into_iter()
+                    .find(|r| r.repo == repo && r.number == number)
+            })
+            .map(|r| r.detail.title)
+            .unwrap_or_default(),
+        Err(e) => {
+            tracing::warn!("{}: {e}; the landing's line has no title", state::KEY_PRS);
+            String::new()
+        }
+    };
+    let line = state::landed_line(&utc_now_stamp(), repo, number, merge, &title);
     store::append_bounded(bus, state::KEY_LANDED, &line, state::LANDED_KEEP).await
 }
 

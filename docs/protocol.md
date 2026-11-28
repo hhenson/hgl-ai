@@ -293,12 +293,12 @@ before hub users takes one shared token until it moves.
 | Key | Writer | Content |
 | --- | --- | --- |
 | `main` | controller | `updated <UTC>`, then `<repo> main <sha>` lines and the wrapper's pins. Rewritten after each merge. |
-| `prs` | coordinator service | `# read <UTC>`, `# cost <n> remaining <n> resetAt <ISO>`, then rows `REPO NUMBER HEAD draft\|open BOT UNRESOLVED CHECKS UPDATED`. At most every 5 min; stale after 15 min. |
-| `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha>` per merge. |
+| `prs` | coordinator service | `# read <UTC>`, `# cost <n> remaining <n> resetAt <ISO>`, then rows `REPO NUMBER HEAD draft\|open BOT UNRESOLVED CHECKS UPDATED`, each followed by `# pr REPO NUMBER PASSED TOTAL TITLE` (checks passed and in all, `-` without a rollup). At most every 5 min; stale after 15 min. |
+| `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha> [<title>]` per merge; the title is the one `prs` held. |
 | `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
 | `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
-| `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted. Read from the notes stream every 10 s; written when it changes. |
+| `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted; then `# title REPO ISSUE TITLE` per task whose issue title is known (read from GitHub once per task). Read from the notes stream every 10 s; written when it changes. |
 | `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
@@ -306,7 +306,8 @@ before hub users takes one shared token until it moves.
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
-`pass`, `fail`, `pending` or `none`.
+`pass`, `fail`, `pending` or `none`. A `#` line a reader does not know is skipped,
+so the `# pr` and `# title` lines are invisible to older readers.
 
 Intake scans open issues and PRs across `[github].repos` every 15 minutes under
 `hold`. The first scan looks back 15 minutes. Later scans resume from the saved
@@ -340,17 +341,22 @@ earlier one; a record outlives the notes stream by a day.
 
 ## 9. Host record
 
-Each bridge writes `HGL_HOSTS/<host>` every 30 s:
+Each bridge writes `HGL_HOSTS/<host>` every 30 s, and at once when a turn starts or
+ends:
 
 ```json
 {
   "host": "build-1",
-  "seats": [{"seat": "w3", "role": "implementor", "runtime": "codex", "family": "gpt", "model": "gpt-6.1-sol"}],
+  "seats": [{"seat": "w3", "role": "implementor", "runtime": "codex", "family": "gpt", "model": "gpt-6.1-sol",
+             "turn": {"task": {"repo": "hgl-ai", "issue": 173}, "started_at": "20261127T082500Z"}}],
   "memcap_gb": 64,
   "work_root_free_gb": 812,
   "updated_at": "20261127T083000Z"
 }
 ```
+
+`turn` is the seat's running turn, absent when it runs none: its task (absent for the
+inbox), `"review": true` in a review tree, and when it started.
 
 `host` is a configured label, never a network name or address.
 

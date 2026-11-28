@@ -169,7 +169,17 @@ fn host_line(h: &HostRecord) -> String {
     let seats: Vec<String> = h
         .seats
         .iter()
-        .map(|s| format!("{} {}/{}/{}", s.seat, s.role, s.runtime, s.model))
+        .map(|s| {
+            let turn = match &s.turn {
+                None => String::new(),
+                Some(t) => match &t.task {
+                    None => " (in a turn: inbox)".into(),
+                    Some(k) if t.review => format!(" (in a turn: {}#{} review)", k.repo, k.issue),
+                    Some(k) => format!(" (in a turn: {}#{})", k.repo, k.issue),
+                },
+            };
+            format!("{} {}/{}/{}{turn}", s.seat, s.role, s.runtime, s.model)
+        })
         .collect();
     let seats = if seats.is_empty() {
         "no seats".to_string()
@@ -197,6 +207,7 @@ mod tests {
                 runtime: Runtime::Codex,
                 family: Family::Gpt,
                 model: "gpt-6.1-sol".into(),
+                turn: None,
             }],
             memcap_gb: 64,
             work_root_free_gb: 812,
@@ -206,6 +217,15 @@ mod tests {
             host_line(&h),
             "build-1 at 20261127T083000Z memcap 64G free 812 GB: w3 implementor/codex/gpt-6.1-sol"
         );
+        h.seats[0].turn = Some(hgl_ai_proto::SeatTurn {
+            task: Some(hgl_ai_proto::TaskKey {
+                repo: "alpha".into(),
+                issue: 7,
+            }),
+            review: false,
+            started_at: "20261127T082900Z".into(),
+        });
+        assert!(host_line(&h).ends_with("gpt-6.1-sol (in a turn: alpha#7)"));
         h.seats.clear();
         assert!(host_line(&h).ends_with(": no seats"));
     }

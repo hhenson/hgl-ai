@@ -19,9 +19,15 @@ pub const KEY_TASKS: &str = "tasks";
 /// Lines of `landed.log` kept: far below the bus's 1 MiB value limit; GitHub holds the rest.
 pub const LANDED_KEEP: usize = 2000;
 
-/// `<UTC> <repo> #<pr> <merge sha>`
-pub fn landed_line(stamp: &str, repo: &str, pr: u64, merge: &str) -> String {
-    format!("{stamp} {repo} #{pr} {merge}")
+/// `<UTC> <repo> #<pr> <merge sha>`, then ` <title>` when there is one (one line).
+pub fn landed_line(stamp: &str, repo: &str, pr: u64, merge: &str, title: &str) -> String {
+    let title = crate::backlog::clean_title(title);
+    let title = title.trim();
+    if title.is_empty() {
+        format!("{stamp} {repo} #{pr} {merge}")
+    } else {
+        format!("{stamp} {repo} #{pr} {merge} {title}")
+    }
 }
 
 /// `updated <UTC>`, `<repo> main <sha>` per repository, then `<wrapper> pins <path> <sha>`.
@@ -179,8 +185,11 @@ mod tests {
 
     #[test]
     fn landed_log() {
-        let l = landed_line("20260105T120000Z", "alpha", 12, &"c".repeat(40));
+        let l = landed_line("20260105T120000Z", "alpha", 12, &"c".repeat(40), "");
         assert_eq!(l, format!("20260105T120000Z alpha #12 {}", "c".repeat(40)));
+        let l = landed_line("20260105T120000Z", "alpha", 12, "m", " Fix\tthe\nparser ");
+        assert_eq!(l, "20260105T120000Z alpha #12 m Fix the parser");
+        assert!(crate::progress::log_has(&l, "alpha", 12, Some("m")));
         assert!(crate::store::newest_lines(&"x\n".repeat(LANDED_KEEP + 1), LANDED_KEEP).is_some());
     }
 

@@ -136,15 +136,15 @@ is the URL fragment (`/telemetry#prs`):
 
 | Tab | Shows | Source |
 | --- | --- | --- |
-| Hosts and seats | live hosts: seat, role, runtime, model, memory cap, free disk | `HGL_HOSTS` |
-| Tasks | seat, issue, implement or review, stage (assigned, working, ready, review, sendback, approved, blocked), last note, host, age, stale | `HGL_TREES`, `HGL_STATE/tasks` |
-| Pull requests | head, state, bot, threads, checks; when read | `HGL_STATE/prs` |
-| Queue | claimable issues in order, priority first | `HGL_STATE/backlog` |
-| Backlog | open issues by label and repository; open, opened, closed and net per day (burndown, 14 days) | `HGL_STATE/backlog`, `HGL_METRICS` |
-| Landings | the newest 50 | `HGL_STATE/landed.log` |
+| Hosts and seats | live hosts: seat, what it does now (idle, or the task and title of its running turn), role, runtime, model, memory cap, free disk | `HGL_HOSTS`, `HGL_STATE/tasks` |
+| Tasks | issue and title, seat, implement or review, stage (assigned, in progress, ready, in review, sent back, approved, blocked, done), whether a turn runs now, last note and when, host, tree age, stale | `HGL_TREES`, `HGL_HOSTS`, `HGL_STATE/tasks` |
+| Pull requests | number and title, draft, review bot, unresolved threads, checks passed of all; when read | `HGL_STATE/prs` |
+| Queue | claimable issues in the order work is handed out (`codex-priority`, then `queue_priority`, then oldest), with titles | `HGL_STATE/backlog` |
+| Backlog | open issues per repository and label as bars; open, opened, closed and net per day (burndown, 14 days) | `HGL_STATE/backlog`, `HGL_METRICS` |
+| Landings | the newest 50, with titles; the merge commit on a row's detail | `HGL_STATE/landed.log` |
 | Fleet | `mode`, `hold`, stale trees, open questions by priority | `HGL_STATE`, `HGL_TREES`, `GET /api/session` |
 | Builds | the newest 40 runs; live builders: platform, executor, state, reachable, slots and busy, free disk, toolchains | `HGL_BUILD/run.*`, `HGL_HOSTS/builder.*` |
-| Usage | per login and limit: runtime, host, plan, scope, window, percent used, reset, observed | `HGL_USAGE` |
+| Usage | per login and limit: a bar of percent used, reset, and run-out risk (the window's burn rate so far against the time to reset); runtime, host, plan, observed | `HGL_USAGE` |
 
 A put or delete in a bucket changes rows, never the page: per table, the rows it
 changes are one grid transaction by row id (the KV key where a key is a row; else a
@@ -165,8 +165,9 @@ repository per day.
 - `HGL_METRICS/<repo>.<YYYYMMDD>`: `{repo, date, open, opened, closed, labels,
   taken_at}`, rewritten each backlog round; the day's last write is its sample.
 - A task's stage is its last note's kind: `assign` assigned, `ready` ready, `review` or
-  `receipt` review, `sendback` sendback, `approved`, `blocked`, else working; a
-  reviewer's tree is in review. The coordinator keeps each task's last note in
+  `receipt` in review, `sendback` sent back, `approved`, `blocked`, `done`, `landed` or
+  `closed` done, else in progress; a reviewer's tree is in review. Whether a turn runs
+  is the seat's `turn` in `HGL_HOSTS` (docs/protocol.md §9), not the tree. The coordinator keeps each task's last note in
   `HGL_STATE/tasks` (docs/protocol.md §8), so the page reads no notes.
 
 ## 4. Storage

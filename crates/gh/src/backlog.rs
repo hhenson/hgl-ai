@@ -5,14 +5,17 @@
 //! # read <UTC>
 //! # open <repo> <count>
 //! # label <repo> <label> <count>
+//! # priority <repo> <repo> ...
 //! REPO<TAB>NUMBER<TAB>codex-priority|codex<TAB>CREATED<TAB>TITLE
 //! ```
 //!
 //! One `open` line per repository; one `label` line per repository and label with open
 //! issues, sorted (a label may contain spaces: the repository is the first word, the count the
 //! last). The rows are the claimable queue in order (docs/work.md WORK-1, WORK-3): every issue
-//! labelled `codex-priority`, then those labelled `codex`, each oldest first across the
-//! repositories (ties in the configured order of repositories, then by number). An issue also
+//! labelled `codex-priority`, then those labelled `codex`; within each, the repositories of
+//! `github.queue_priority` first, in its order, then the rest; then oldest first (ties in the
+//! configured order of repositories, then by number). The `priority` line, present when that
+//! list is not empty, names it. An issue also
 //! labelled `codex-claimed`, `codex-blocked`, `needs-owner` or `codex-ready` is left out.
 //! Times are UTC in the compact form of a note's `created_at`. A title has tabs, CR and LF as
 //! spaces and at most 200 characters.
@@ -78,6 +81,8 @@ pub struct Backlog {
     pub labels: BTreeMap<(String, String), u64>,
     /// The claimable queue, in the order it is taken.
     pub queue: Vec<QueueRow>,
+    /// `github.queue_priority`: the repositories whose issues come first, in order.
+    pub priority: Vec<String>,
 }
 
 /// Tabs, CR and LF as spaces.
@@ -98,6 +103,9 @@ impl Backlog {
         }
         for ((repo, label), n) in self.labels.iter().filter(|(_, n)| **n > 0) {
             s.push_str(&format!("# label {repo} {} {n}\n", one_line(label)));
+        }
+        if !self.priority.is_empty() {
+            s.push_str(&format!("# priority {}\n", self.priority.join(" ")));
         }
         for r in &self.queue {
             s.push_str(&format!(
@@ -124,6 +132,8 @@ impl Backlog {
                 {
                     b.open.insert(repo.to_string(), n);
                 }
+            } else if let Some(rest) = line.strip_prefix("# priority ") {
+                b.priority = rest.split_whitespace().map(String::from).collect();
             } else if let Some(rest) = line.strip_prefix("# label ") {
                 if let Some((repo, rest)) = rest.split_once(' ')
                     && let Some((label, n)) = rest.rsplit_once(' ')
@@ -448,7 +458,16 @@ pub async fn read<G: Gh>(gh: &G, s: &Settings, now: DateTime<Utc>) -> Result<Rea
         later.push((repo, exec::graphql(gh, &page_query(), &vars, true).await?));
     }
     add_pages(&mut r, &s.repos, &later);
+    prioritise(&mut r.backlog, &s.queue_priority);
     Ok(r)
+}
+
+/// Within each class, the issues of the repositories of `first` first, in its order; the
+/// order is otherwise kept.
+pub fn prioritise(b: &mut Backlog, first: &[String]) {
+    let rank = |repo: &str| first.iter().position(|f| f == repo).unwrap_or(first.len());
+    b.queue.sort_by_key(|q| (!q.priority, rank(&q.repo)));
+    b.priority = first.to_vec();
 }
 
 /// Write a reading to the hub: `backlog`, then each repository's sample of the day.
@@ -640,6 +659,35 @@ mod tests {
             .map(|x| (x.repo.as_str(), x.number))
             .collect();
         assert_eq!(tie, [("beta", 3), ("alpha", 101), ("gamma", 21)]);
+    }
+
+    /// `github.queue_priority` puts its repositories first within each class, and the
+    /// backlog names it.
+    #[test]
+    fn the_queue_by_repository_priority() {
+        let mut b = reading().backlog;
+        prioritise(&mut b, &["gamma".into(), "beta".into()]);
+        let q: Vec<(&str, u64)> = b
+            .queue
+            .iter()
+            .map(|x| (x.repo.as_str(), x.number))
+            .collect();
+        assert_eq!(
+            q,
+            [
+                ("beta", 8),
+                ("alpha", 105),
+                ("gamma", 21),
+                ("beta", 3),
+                ("alpha", 101),
+                ("alpha", 107),
+            ]
+        );
+        let text = b.render();
+        assert!(text.contains("\n# priority gamma beta\n"), "{text}");
+        assert_eq!(Backlog::parse(&text), b);
+        prioritise(&mut b, &[]);
+        assert!(!b.render().contains("# priority"));
     }
 
     #[test]

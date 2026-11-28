@@ -266,6 +266,7 @@ fn bridged_seats_refuse_interactive_waits() {
                 runtime: Runtime::Codex,
                 family: Family::Gpt,
                 model: "gpt-6.1-sol".into(),
+                turn: None,
             }],
             memcap_gb: 64,
             work_root_free_gb: 812,

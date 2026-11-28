@@ -1409,6 +1409,60 @@ async fn the_lease_of_a_crashed_bridge_of_this_host_is_taken_over() {
     stop(tx, j).await;
 }
 
+/// The host record shows a seat's running turn, its task and when it started, and drops
+/// it when the turn ends (hgl-ai#173).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_host_record_shows_the_running_turn() {
+    let h = harness();
+    let (started, release) = (h.calls.join("started"), h.calls.join("release"));
+    h.script(
+        "codex",
+        &format!(
+            "touch '{s}'; i=0; while [ ! -e '{r}' ]; do i=$((i+1)); [ \"$i\" -ge 400 ] && exit 1; sleep 0.05; done; cat '{f}'",
+            s = started.display(),
+            r = release.display(),
+            f = fixture("codex-ok.jsonl")
+        ),
+    );
+    let (tx, j) = h.start(&["w1"]);
+    let turn = || {
+        h.bus
+            .last_host()
+            .and_then(|r| r.seats.into_iter().find(|s| s.seat.as_str() == "w1"))
+            .and_then(|s| s.turn)
+    };
+    eventually("advertised idle", || {
+        h.bus.last_host().is_some_and(|r| r.seats.len() == 1)
+    })
+    .await;
+    assert_eq!(turn(), None);
+    let a = h.bus.push(
+        "w1",
+        note(
+            Kind::Assign,
+            "w1",
+            31,
+            "[claude] Assign: demo#31 Thirty-one",
+        ),
+    );
+    eventually("turn running", || started.exists()).await;
+    eventually("the turn advertised", || turn().is_some()).await;
+    let t = turn().unwrap();
+    assert_eq!(
+        t.task,
+        Some(TaskKey {
+            repo: "demo".into(),
+            issue: 31
+        })
+    );
+    assert!(!t.review);
+    assert!(hgl_ai_proto::parse_stamp(&t.started_at).is_some(), "{t:?}");
+    std::fs::write(&release, "").unwrap();
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    eventually("idle again", || turn().is_none()).await;
+    stop(tx, j).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_seat_lease_stops_the_seat() {
     let h = harness();
@@ -1849,6 +1903,7 @@ async fn a_seat_another_hosts_bridge_serves_is_not_served() {
             runtime: Runtime::Codex,
             family: Family::Gpt,
             model: "gpt-6.1-sol".into(),
+            turn: None,
         }],
         memcap_gb: 64,
         work_root_free_gb: 500,
@@ -2311,6 +2366,7 @@ async fn a_failover_that_breaks_role_9_is_not_taken() {
             runtime: Runtime::Claude,
             family: Family::Claude,
             model: "claude-opus-5-5".into(),
+            turn: None,
         }],
         memcap_gb: 64,
         work_root_free_gb: 500,
