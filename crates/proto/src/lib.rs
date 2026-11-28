@@ -44,8 +44,14 @@ pub const VIEWER_INBOX: &str = "_INBOX_VIEWER";
 /// The `HGL_STATE` keys the console's page reads (`web/src/tables.ts`, `STATE_KEYS`);
 /// the `viewer` user may read no other.
 pub const VIEWER_STATE_KEYS: [&str; 6] = ["prs", "backlog", "landed.log", "tasks", "mode", "hold"];
-/// Owner words: `hgl.owner.thread.<id>`. Only the console's hub user publishes here (OWN-5).
+/// The Slack adapter's delivery state and thread mappings.
+pub const KV_SLACK: &str = "HGL_SLACK";
+/// Owner words (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
+/// One owner event per Slack workspace, channel and reply or action timestamp in a thread.
+pub const SLACK_OWNER_FILTER: &str = "hgl.owner.thread.*.slack.*.*.*";
+/// The Slack adapter's durable owner feed.
+pub const SLACK_FEED: &str = "slack";
 /// Agent traffic for the owner: `hgl.console.status`, `hgl.console.thread.<id>`.
 pub const CONSOLE_PREFIX: &str = "hgl.console";
 /// Owner notes to a seat travel on `hgl.notes.owner.<seat>`, which only the console's hub

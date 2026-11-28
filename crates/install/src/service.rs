@@ -13,15 +13,17 @@ pub enum Service {
     Bridge,
     Coord,
     Console,
+    Slack,
     Builder,
 }
 
 impl Service {
-    pub const ALL: [Service; 5] = [
+    pub const ALL: [Service; 6] = [
         Service::Hub,
         Service::Bridge,
         Service::Coord,
         Service::Console,
+        Service::Slack,
         Service::Builder,
     ];
 
@@ -31,6 +33,7 @@ impl Service {
             Service::Bridge => "bridge",
             Service::Coord => "coord",
             Service::Console => "console",
+            Service::Slack => "slack",
             Service::Builder => "builder",
         }
     }
@@ -48,6 +51,7 @@ impl Service {
             Service::Bridge => "hgl-ai bridge",
             Service::Coord => "hgl-ai coordinator",
             Service::Console => "hgl-ai owner console",
+            Service::Slack => "hgl-ai Slack Q&A adapter",
             Service::Builder => "hgl-ai builder",
         }
     }
@@ -85,6 +89,7 @@ impl Spec {
         let args = match service {
             Service::Coord => vec!["gh", "coord", "run"],
             Service::Console => vec!["console", "run"],
+            Service::Slack => vec!["slack", "run"],
             Service::Builder => vec!["builder", "run"],
             _ => vec!["bridge", "run"],
         };

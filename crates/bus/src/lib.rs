@@ -59,7 +59,7 @@ use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
     BROADCAST, CONSOLE_PREFIX, EndedRecord, HostRecord, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS,
-    KV_METRICS, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord, Note, OWNER_PREFIX,
+    KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord, Note, OWNER_PREFIX,
     STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey, TreeRecord,
     USAGE_PREFIX, ended_key, utc_now_stamp,
 };
@@ -246,6 +246,7 @@ pub struct Bus {
     threads: OnceCell<kv::Store>,
     metrics: OnceCell<kv::Store>,
     console: OnceCell<kv::Store>,
+    slack: OnceCell<kv::Store>,
     usage: OnceCell<kv::Store>,
     build: OnceCell<kv::Store>,
 }
@@ -329,6 +330,7 @@ impl Bus {
             threads: OnceCell::new(),
             metrics: OnceCell::new(),
             console: OnceCell::new(),
+            slack: OnceCell::new(),
             usage: OnceCell::new(),
             build: OnceCell::new(),
         })
@@ -516,6 +518,13 @@ impl Bus {
                 Duration::ZERO,
             ),
             (
+                KV_SLACK,
+                "hgl-ai Slack delivery state",
+                stream::StorageType::File,
+                1,
+                Duration::ZERO,
+            ),
+            (
                 KV_USAGE,
                 "hgl-ai subscription usage per login",
                 stream::StorageType::File,
@@ -545,6 +554,11 @@ impl Bus {
     /// or `hgl.notes.owner.<recipient>` for the owner's) with its message id, and wait for
     /// the hub's acknowledgement.
     pub async fn send(&self, note: &Note) -> Result<SendReceipt> {
+        self.send_with_id(note, &note.msg_id()).await
+    }
+
+    /// Send a note keyed by its source event when the note contents alone are not unique.
+    pub async fn send_with_id(&self, note: &Note, msg_id: &str) -> Result<SendReceipt> {
         note.validate()?;
         let subject = note.subject();
         let payload = serde_json::to_vec(note).map_err(|e| nats("encoding the note", e))?;
@@ -554,9 +568,7 @@ impl Bus {
                 payload.len()
             )));
         }
-        let publish = Publish::build()
-            .payload(payload.into())
-            .message_id(note.msg_id());
+        let publish = Publish::build().payload(payload.into()).message_id(msg_id);
         let ack = self
             .guarded(&subject, async {
                 self.js

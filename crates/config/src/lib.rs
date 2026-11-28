@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub mod builder;
 pub mod console;
 pub mod github;
+pub mod slack;
 pub use builder::{Builder, Remote};
 pub use console::{
     AppleOAuth, Console, GithubOAuth, GoogleOAuth, Identity, Ids, LinkedEntry, Member, Notify,
@@ -68,6 +69,9 @@ pub struct Config {
     /// The owner's console (hub host only; docs/owner.md).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console: Option<Console>,
+    /// The Slack Q&A adapter (server side only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slack: Option<slack::Slack>,
     /// On a hub host whose server side runs as its own OS user (the client's
     /// configuration): that user, for `server status` and `doctor`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -86,6 +90,9 @@ pub struct ServerUser {
     /// The console's origin, when the server side runs one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub console_url: Option<String>,
+    /// Whether this system install includes the Slack adapter.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub slack: bool,
     /// The OS user this host's client (bridge, agents) runs as, when not the installer.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_user: Option<String>,
@@ -549,6 +556,7 @@ impl Config {
             seats: Vec::new(),
             server: None,
             console: None,
+            slack: None,
             server_user: None,
             builder: Builder::default(),
         }
@@ -651,6 +659,9 @@ impl Config {
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
         if let Some(c) = &self.console {
             c.validate().map_err(ConfigError::Invalid)?;
+        }
+        if let Some(s) = &self.slack {
+            s.validate().map_err(ConfigError::Invalid)?;
         }
         builder::validate(&self.builder, &self.host).map_err(ConfigError::Invalid)?;
         for d in [
