@@ -7,7 +7,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-use hgl_ai_proto::{Family, HostRecord, Role, Runtime, Seat, SeatRecord};
+use hgl_ai_bus::{Bus, Credential, parse_credential};
+use hgl_ai_install::{
+    nats::{Auth, render_conf},
+    users::{Registry, Role as HubRole},
+};
+use hgl_ai_proto::{
+    Family, HostRecord, KEY_DECISIONS, KV_SCREEN, KV_STATE, Role, Runtime, Seat, SeatRecord,
+    screen::{ScreenAction, ScreenLog, ScreenMode, ScreenRule},
+};
 
 /// A scratch directory under cargo's target tmp dir, removed on drop.
 struct Scratch(PathBuf);
@@ -40,6 +48,19 @@ struct Hub {
 
 impl Hub {
     fn start(tag: &str) -> Option<Hub> {
+        let token = format!("cli{}", std::process::id());
+        Self::launch(tag, &token, |cmd, dir| {
+            cmd.args(["-js", "-a", "127.0.0.1", "-p", "-1", "--auth", &token])
+                .arg("-sd")
+                .arg(dir.join("store"));
+        })
+    }
+
+    fn launch(
+        tag: &str,
+        credential: &str,
+        configure: impl FnOnce(&mut Command, &Path),
+    ) -> Option<Hub> {
         let Some(bin) = std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|d| d.join("nats-server"))
             .find(|p| p.is_file())
@@ -48,18 +69,18 @@ impl Hub {
             return None;
         };
         let dir = Scratch::new(tag);
-        let token = format!("cli{}", std::process::id());
-        let child = Command::new(bin)
-            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--auth", &token])
-            .arg("-sd")
-            .arg(dir.0.join("store"))
+        let mut cmd = Command::new(bin);
+        configure(&mut cmd, &dir.0);
+        let log = dir.0.join("nats.log");
+        let stderr = dir.0.join("nats.stderr");
+        let mut child = cmd
             .arg("-l")
-            .arg(dir.0.join("nats.log"))
+            .arg(&log)
             .arg("--ports_file_dir")
             .arg(&dir.0)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(std::fs::File::create(&stderr).unwrap())
             .spawn()
             .expect("start nats-server");
         let ports = dir.0.join(format!("nats-server_{}.ports", child.id()));
@@ -72,14 +93,19 @@ impl Hub {
             if let Some(url) = found {
                 break url;
             }
-            assert!(
-                Instant::now() < deadline,
-                "nats-server did not report its port"
-            );
+            if child.try_wait().unwrap().is_some() || Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "nats-server did not report its port\n{}\n{}",
+                    std::fs::read_to_string(&stderr).unwrap_or_default(),
+                    std::fs::read_to_string(&log).unwrap_or_default(),
+                );
+            }
             std::thread::sleep(Duration::from_millis(50));
         };
         let token_file = dir.0.join("hub.token");
-        std::fs::write(&token_file, format!("{token}\n")).unwrap();
+        std::fs::write(&token_file, credential).unwrap();
         let config = dir.0.join("config.toml");
         let mut cfg = hgl_ai_config::Config::new("test-host");
         cfg.hub.url = url.clone();
@@ -102,7 +128,8 @@ impl Hub {
             .arg(&self.config)
             .args(args)
             .env_remove("HGL_AI_SEAT")
-            .env_remove("HGL_AI_CONFIG");
+            .env_remove("HGL_AI_CONFIG")
+            .env_remove("HGL_AI_HUB_CREDENTIAL");
         c
     }
 
@@ -689,4 +716,198 @@ fn usage_collect_show_label() {
     assert!(!ok(&hub.run(&["usage", "show"])).contains("team-gpt"));
     let bad = hub.run(&["usage", "label", "nothex", "x"]);
     assert_eq!(bad.status.code(), Some(1), "{}", err(&bad));
+}
+
+#[tokio::test]
+async fn screen_commands_audit_and_read_on_both_hub_layouts() {
+    for accounts in [false, true] {
+        let mut registry = Registry::default();
+        let admin = registry.issue("test-admin", HubRole::Admin, false).unwrap();
+        let rules = registry
+            .issue("test-rules", HubRole::ScreenRules, false)
+            .unwrap();
+        let screen = registry.issue("screen", HubRole::Screen, false).unwrap();
+        let seat = registry.issue("test-seat", HubRole::Seat, false).unwrap();
+        let auth = if accounts {
+            Auth::Accounts(&registry)
+        } else {
+            Auth::Users(&registry)
+        };
+        let Some(hub) = Hub::launch("screen", &rules, |cmd, dir| {
+            let conf = dir.join("nats.conf");
+            let store = dir.join("store");
+            std::fs::create_dir_all(&store).unwrap();
+            let text = render_conf("127.0.0.1", 0, &store, &auth);
+            std::fs::write(&conf, text.replace("port: 0\n", "port: -1\n")).unwrap();
+            cmd.arg("-c").arg(conf);
+        }) else {
+            return;
+        };
+        let admin_cred = hub.dir.0.join("admin.cred");
+        std::fs::write(&admin_cred, &admin).unwrap();
+        ok(&hub
+            .cmd(&["init"])
+            .env("HGL_AI_HUB_CREDENTIAL", &admin_cred)
+            .output()
+            .unwrap());
+
+        // A seat name and missing role label cannot override the broker's grants.
+        for (name, credential) in [("seat", &seat), ("screen", &screen)] {
+            let Some(Credential::Nkey { seed, .. }) = parse_credential(credential).unwrap() else {
+                panic!("expected an NKey");
+            };
+            let bare = hub.dir.0.join(format!("{name}.cred"));
+            std::fs::write(&bare, seed).unwrap();
+            let refused = hub
+                .cmd(&["screen", "rule", "list"])
+                .env("HGL_AI_HUB_CREDENTIAL", &bare)
+                .env("HGL_AI_SEAT", "controller")
+                .output()
+                .unwrap();
+            assert_eq!(refused.status.code(), Some(1));
+            assert!(
+                err(&refused).contains("may not publish"),
+                "{}",
+                err(&refused)
+            );
+        }
+
+        let admin_client = nats_for(&hub, &admin).await;
+        let state = admin_client.get_key_value(KV_STATE).await.unwrap();
+        let stored_rules = admin_client.get_key_value(KV_SCREEN).await.unwrap();
+        let screen = Bus::connect_with(&hub.url, parse_credential(&screen).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            ok(&hub.run(&["--json", "screen", "rule", "list"])).trim(),
+            "[]"
+        );
+        let rule = r#"{
+            "id":"progress", "kinds":["note"], "roles":["implementor"],
+            "when":"The note reports routine progress.", "action":"close",
+            "cites":"example#185", "expires":"29990101T000000Z"
+        }"#;
+        let act = rule.replace(r#""expires""#, r#""mode":"act", "expires""#);
+        let refused = hub.run_stdin(&["screen", "rule", "add", "-"], &act);
+        assert_eq!(refused.status.code(), Some(1));
+        assert!(err(&refused).contains("shadow"));
+        assert!(screen.screen_rules().await.unwrap().is_empty());
+
+        // Make the second write fail without affecting the rule stream. The retry must
+        // finish the missing decision and preserve a single record of each change.
+        state.put(KEY_DECISIONS, vec![0xff].into()).await.unwrap();
+        let failed = hub.run_stdin(&["screen", "rule", "add", "-"], rule);
+        assert_eq!(failed.status.code(), Some(1));
+        assert!(
+            err(&failed).contains("retry this command"),
+            "{}",
+            err(&failed)
+        );
+        let pending = screen.screen_rule_get("progress").await.unwrap().unwrap();
+        assert!(pending.decision_at.is_some());
+
+        let existing = "20260101T000000Z controller: Routine progress can close.";
+        state
+            .put(KEY_DECISIONS, format!("{existing}\n").into())
+            .await
+            .unwrap();
+        let add = ["--json", "screen", "rule", "add", "-"];
+        let added: ScreenRule = serde_json::from_str(&ok(&hub.run_stdin(&add, rule))).unwrap();
+        assert_eq!(added.mode, ScreenMode::Shadow);
+        assert_eq!(
+            ok(&hub.run_stdin(&add, rule)),
+            serde_json::to_string(&added).unwrap() + "\n"
+        );
+        let other = rule
+            .replace("progress", "other")
+            .replace("example#185", existing);
+        let rule_file = hub.dir.0.join("other.json");
+        std::fs::write(&rule_file, other).unwrap();
+        ok(&hub.run(&["screen", "rule", "add", rule_file.to_str().unwrap()]));
+        let shown = hub.run(&["--json", "screen", "rule", "show", "progress"]);
+        assert_eq!(
+            serde_json::from_str::<ScreenRule>(&ok(&shown)).unwrap(),
+            added
+        );
+
+        let retire = ["--json", "screen", "rule", "retire", "progress"];
+        let retired: ScreenRule = serde_json::from_str(&ok(&hub.run(&retire))).unwrap();
+        assert!(retired.retired_at.is_some());
+        assert_eq!(
+            ok(&hub.run(&retire)),
+            serde_json::to_string(&retired).unwrap() + "\n"
+        );
+        let listed = ok(&hub.run(&["--json", "screen", "rule", "list"]));
+        let listed: Vec<ScreenRule> = serde_json::from_str(&listed).unwrap();
+        assert_eq!(
+            listed.iter().map(|r| r.id.as_str()).collect::<Vec<_>>(),
+            ["other", "progress"]
+        );
+        assert_eq!(listed[1], retired);
+        assert_eq!(screen.screen_rules().await.unwrap(), listed);
+        let stream = stored_rules.stream;
+        let old = stream.get_raw_message(pending.revision).await.unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ScreenRule>(&old.payload).unwrap(),
+            added
+        );
+        let current = stream
+            .get_last_raw_message_by_subject("$KV.HGL_SCREEN.rule.progress")
+            .await
+            .unwrap();
+        assert_eq!(
+            serde_json::from_slice::<ScreenRule>(&current.payload).unwrap(),
+            retired
+        );
+
+        let lines = ok(&hub.run(&["decision", "tail"]));
+        let lines: Vec<_> = lines.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], existing);
+        assert!(lines[1].contains("screen rule add progress"));
+        assert!(lines[2].contains("screen rule add other"));
+        assert!(lines[3].contains("screen rule retire progress"));
+
+        for seq in [23, 2, 11, 23] {
+            screen
+                .screen_log_put(&ScreenLog {
+                    seq,
+                    rule: Some("progress".into()),
+                    action: ScreenAction::Close,
+                    reply: String::new(),
+                    mode: ScreenMode::Shadow,
+                    model: "fixture-model".into(),
+                })
+                .await
+                .unwrap();
+        }
+        let log = ok(&hub.run(&["--json", "screen", "log", "--since", "2"]));
+        let log: Vec<ScreenLog> = serde_json::from_str(&log).unwrap();
+        assert_eq!(
+            log.iter().map(|entry| entry.seq).collect::<Vec<_>>(),
+            [11, 23]
+        );
+        assert_eq!(
+            ok(&hub.run(&["--json", "screen", "log", "--since", "23"])).trim(),
+            "[]"
+        );
+        assert!(screen.screen_log(0).await.is_err());
+    }
+}
+
+async fn nats_for(hub: &Hub, credential: &str) -> async_nats::jetstream::Context {
+    let cred = parse_credential(credential).unwrap().unwrap();
+    let inbox = cred.inbox_prefix().unwrap();
+    let Credential::Nkey { seed, .. } = cred else {
+        panic!("expected an admin key");
+    };
+    async_nats::jetstream::new(
+        async_nats::ConnectOptions::new()
+            .nkey(seed)
+            .custom_inbox_prefix(inbox)
+            .connect(&hub.url)
+            .await
+            .unwrap(),
+    )
 }

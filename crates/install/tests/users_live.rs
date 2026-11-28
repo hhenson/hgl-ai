@@ -1826,23 +1826,34 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                                 .map(|m| String::from_utf8_lossy(&m.payload).into_owned())
                             }
                         };
-                        let (key, private) = if role == Role::Screen {
-                            ("rule.seed", "log.seed")
-                        } else if role == Role::ScreenRules {
-                            ("log.seed", "rule.seed")
-                        } else {
-                            ("links.a.b", "d.a.b.c")
+                        let (key, private) = match keys.as_str() {
+                            "rule.>" if role == Role::Screen => ("rule.seed", "log.seed"),
+                            "rule.>" => ("rule.seed", "other"),
+                            "log.>" => ("log.seed", "other"),
+                            "decisions.log" => ("decisions.log", "seed.a"),
+                            _ => ("links.a.b", "d.a.b.c"),
                         };
-                        assert_eq!(get(key).await.as_deref(), Some("seed"), "{what}");
+                        let value = if keys == "decisions.log" {
+                            "ok"
+                        } else {
+                            "seed"
+                        };
+                        assert_eq!(get(key).await.as_deref(), Some(value), "{what}");
                         assert_eq!(get(private).await, None, "{what}");
+                        let stream_info = role != Role::ScreenRules || bucket != KV_SCREEN;
+                        if stream_info {
+                            unanswered(
+                                &conn,
+                                vec![(
+                                    format!("{p}.STREAM.INFO.{s}"),
+                                    serde_json::json!({"subjects_filter": ">"}),
+                                )],
+                            )
+                            .await;
+                        }
                         unanswered(
                             &conn,
                             vec![
-                                (format!("{p}.STREAM.INFO.{s}"), serde_json::json!({})),
-                                (
-                                    format!("{p}.STREAM.INFO.{s}"),
-                                    serde_json::json!({"subjects_filter": ">"}),
-                                ),
                                 (format!("{p}.DIRECT.GET.{s}"), serde_json::json!({"seq": 1})),
                                 (
                                     format!("{p}.STREAM.MSG.GET.{s}"),
@@ -1943,13 +1954,18 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                             "{what}"
                         );
                     }
+                    Target::StreamInfo(name) => {
+                        js.get_stream(name).await.expect(&what);
+                    }
                     Target::Subjects(_) => unreachable!(),
                 }
             }
             if a.writes() {
                 let subject = sample(&write_pattern(&row.target).unwrap(), &format!("ok-{role}"));
                 match &row.target {
-                    Target::Keys { bucket, .. } if bucket != KV_SCREEN => {
+                    Target::Keys { bucket, keys }
+                        if bucket != KV_SCREEN && keys != "decisions.log" =>
+                    {
                         let key = subject.strip_prefix(&format!("$KV.{bucket}.")).unwrap();
                         js.get_key_value(bucket)
                             .await

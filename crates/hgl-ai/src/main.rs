@@ -58,6 +58,8 @@ enum Command {
     Status(cmd::owner::StatusArgs),
     /// The controller's decision log.
     Decision(cmd::owner::DecisionArgs),
+    /// Manage the controller screen's rules and inspect its decisions.
+    Screen(cmd::screen::Args),
     /// The owner's web console.
     Console(cmd::console::Args),
     /// The Slack Socket Mode adapter for owner questions.
@@ -103,6 +105,7 @@ async fn main() {
         Command::Thread(a) => cmd::owner::thread(&ctx, a).await,
         Command::Status(a) => cmd::owner::status(&ctx, a).await,
         Command::Decision(a) => cmd::owner::decision(&ctx, a).await,
+        Command::Screen(a) => cmd::screen::run(&ctx, a).await,
         Command::Console(a) => cmd::console::run(&ctx, a).await,
         Command::Slack(a) => cmd::slack::run(&ctx, a).await,
         Command::Usage(a) => cmd::usage::run(&ctx, a).await,

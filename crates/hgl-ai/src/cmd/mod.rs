@@ -12,6 +12,7 @@ pub mod doctor;
 pub mod gh;
 pub mod note;
 pub mod owner;
+pub mod screen;
 pub mod seat;
 pub mod server;
 pub mod slack;

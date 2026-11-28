@@ -14,10 +14,10 @@ use std::str::FromStr;
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SCREEN, KV_SLACK,
-    KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SCREEN_LOG_KEYS,
-    SCREEN_NOTES_PREFIX, SCREEN_RULE_KEYS, SLACK_FEED, SLACK_OWNER_FILTER, STREAM_NOTES,
-    STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, USAGE_PREFIX, VIEWER_INBOX,
+    CONSOLE_PREFIX, KEY_DECISIONS, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SCREEN,
+    KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX,
+    SCREEN_LOG_KEYS, SCREEN_NOTES_PREFIX, SCREEN_RULE_KEYS, SLACK_FEED, SLACK_OWNER_FILTER,
+    STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, USAGE_PREFIX, VIEWER_INBOX,
     VIEWER_STATE_KEYS,
 };
 use serde::{Deserialize, Serialize};
@@ -626,6 +626,8 @@ pub enum Target {
     ProvisionedFeed { stream: String, consumer: String },
     /// A stream read by sequence only, through no consumer.
     BySequence(String),
+    /// Stream metadata, including the subject names used to list the screen log.
+    StreamInfo(String),
     /// Publishing on `subject` (with wildcards), into whichever stream holds it.
     Subjects(String),
 }
@@ -714,7 +716,7 @@ pub fn access_table() -> Vec<Row> {
         ),
         row(all(KV_THREADS), [R, R, R, RW, No, No, No]),
         row(all(KV_STATE), [RW, RW, RW, R, No, R, No]),
-        row(keys(KV_STATE, "decisions.log"), [No, No, No, W, No, No, No]),
+        row(keys(KV_STATE, KEY_DECISIONS), [No, No, No, W, No, No, RW]),
         // The local build verdicts the merge gate reads (BUILD-15).
         row(all(KV_VERDICTS), [R, R, RW, R, No, No, No]),
         row(all(KV_HOSTS), [RW, RW, RW, R, No, No, No]),
@@ -738,9 +740,13 @@ pub fn access_table() -> Vec<Row> {
         row(all(KV_SLACK), [No, No, No, No, RW, No, No]),
         row(
             keys(KV_SCREEN, SCREEN_RULE_KEYS),
-            [No, No, No, No, No, R, W],
+            [No, No, No, No, No, R, RW],
         ),
         row(keys(KV_SCREEN, SCREEN_LOG_KEYS), [No, No, No, No, No, W, R]),
+        row(
+            Target::StreamInfo(kv(KV_SCREEN)),
+            [No, No, No, No, No, No, R],
+        ),
     ]
 }
 
@@ -814,6 +820,7 @@ impl Target {
                     out.push(api(&format!("STREAM.INFO.{s}")));
                     out.push(api(&format!("STREAM.MSG.GET.{s}")));
                 }
+                Target::StreamInfo(s) => out.push(api(&format!("STREAM.INFO.{s}"))),
                 Target::Subjects(_) => {}
             }
         }
@@ -1444,7 +1451,11 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "$JS.API.DIRECT.GET.KV_HGL_SCREEN.$KV.HGL_SCREEN.log.>",
+                "$JS.API.DIRECT.GET.KV_HGL_SCREEN.$KV.HGL_SCREEN.rule.>",
+                "$JS.API.DIRECT.GET.KV_HGL_STATE.$KV.HGL_STATE.decisions.log",
+                "$JS.API.STREAM.INFO.KV_HGL_SCREEN",
                 "$KV.HGL_SCREEN.rule.>",
+                "$KV.HGL_STATE.decisions.log",
             ]
         );
         // Seats read `HGL_OWNER` by sequence: no consumer, no feed, no ack.

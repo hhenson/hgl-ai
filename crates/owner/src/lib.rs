@@ -21,8 +21,7 @@ pub use model::{
     parse_issue,
 };
 
-/// The controller's decision log in `HGL_STATE` (OWN-8).
-pub const KEY_DECISIONS: &str = "decisions.log";
+pub use hgl_ai_proto::KEY_DECISIONS;
 /// Lines of `decisions.log` kept; the owning issues hold the full text.
 pub const DECISIONS_KEEP: usize = 2000;
 /// A `decisions.log` line at most (bytes): `decision add` refuses a longer one, and an
@@ -450,13 +449,13 @@ async fn append_decision(bus: &Bus, line: &str, once: bool) -> Result<()> {
     let line = line.replace(['\n', '\r'], " ");
     let line = line.trim();
     for _ in 0..64 {
-        let cur = bus.state_get(KEY_DECISIONS).await?;
+        let cur = bus.decision_get().await?;
         let (text, rev) = cur.map_or((String::new(), 0), |e| (e.value, e.revision));
         if once && text.lines().any(|l| l == line) {
             return Ok(());
         }
         let value = appended(&text, line);
-        match bus.state_update(KEY_DECISIONS, &value, rev).await {
+        match bus.decision_update(&value, rev).await {
             Err(BusError::Conflict { .. }) => {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
@@ -473,7 +472,7 @@ async fn append_decision(bus: &Bus, line: &str, once: bool) -> Result<()> {
 
 /// The newest `n` lines of `decisions.log`, oldest first.
 pub async fn decisions_tail(bus: &Bus, n: usize) -> Result<Vec<String>> {
-    let Some(e) = bus.state_get(KEY_DECISIONS).await? else {
+    let Some(e) = bus.decision_get().await? else {
         return Ok(Vec::new());
     };
     let lines: Vec<String> = e

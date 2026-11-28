@@ -40,6 +40,11 @@ The controller also uses:
 ```
 hgl-ai note wait SEAT [--timeout DUR]   block, print, ack
 hgl-ai note peek SEAT                   print what is not acked yet; takes nothing
+hgl-ai screen rule add FILE             add a shadow rule from JSON (or - for stdin)
+hgl-ai screen rule retire ID            retire a rule and keep its history
+hgl-ai screen rule list                 list active, expired and retired rules
+hgl-ai screen rule show ID              display one rule
+hgl-ai screen log [--since SEQ]         decisions after the original note sequence
 hgl-ai state put KEY VALUE|- [--if-revision N]
 hgl-ai state append KEY LINE|-
 hgl-ai gh approve|sendback REPO PR HEAD --body-file F   one GitHub comment, then the note
@@ -53,6 +58,10 @@ hgl-ai gh pins sync                     raise the wrapper's pins
 hgl-ai gh release watch SHA             every workflow run on SHA, under the landing lock
 hgl-ai gh tap release VERSION           the Homebrew bottle flow
 ```
+
+Run `screen` commands with the owner's `screen-rules` NKey through
+`HGL_AI_HUB_CREDENTIAL`. Add and retire each record the change in
+`decisions.log`. See docs/install.md, Hub users, for the rule fields.
 
 Every `gh` command takes `--dry-run`. `--json` gives machine output. Exit 3: a
 gate is not met, or `PARTIAL` (merged, a step after it not done: run the same
