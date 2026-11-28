@@ -389,6 +389,35 @@ impl Outcome {
             head: head.to_string(),
         }
     }
+    /// A step after the merge failed with `e`: `PARTIAL` (exit 3), naming the merge, what is
+    /// left (`left`, a phrase: "main and the landed notes are") and the error; the same
+    /// command finishes it. An unreachable hub stays the error (exit 10).
+    pub(crate) fn partial(
+        repo: &str,
+        number: u64,
+        head: &str,
+        merge: Option<&str>,
+        left: &str,
+        e: Error,
+    ) -> Result<Outcome> {
+        if matches!(e, Error::Bus(hgl_ai_bus::BusError::Unreachable { .. })) {
+            return Err(e);
+        }
+        let at = merge
+            .filter(|m| !m.is_empty())
+            .map(|m| format!(" at {}", short(m)))
+            .unwrap_or_default();
+        let mut o = Outcome::new(
+            Kind::Partial,
+            format!(
+                "{repo} #{number} is merged{at}, but {left} not done ({e}); run the same command again to finish PARTIAL"
+            ),
+            false,
+            head,
+        );
+        o.merge_commit = merge.filter(|m| !m.is_empty()).map(String::from);
+        Ok(o)
+    }
     pub fn to_json(&self) -> Value {
         serde_json::json!({
             "outcome": self.kind.word(),
@@ -851,6 +880,9 @@ async fn read_back<G: Gh>(
     Ok(pr)
 }
 
+/// What is left when the gate stops right after a merge: every step after it.
+const AFTER_MERGE: &str = "landed.log, main, the landed notes and the comment are";
+
 /// The head of `main` of a repository.
 pub async fn main_head<G: Gh>(gh: &G, s: &Settings, repo: &str) -> Result<String> {
     let v = exec::get(gh, &format!("repos/{}/git/ref/heads/main", s.full(repo))).await?;
@@ -1120,12 +1152,28 @@ pub async fn evaluate<G: Gh>(
                     merge::POLL_EVERY,
                 )
                 .await?;
-                let after = read_back(gh, s, repo, number, res == Merge::Merged).await?;
+                let after = match read_back(gh, s, repo, number, res == Merge::Merged).await {
+                    Ok(pr) => pr,
+                    // GitHub reported it merged: the read after is a step after the merge.
+                    Err(e) if res == Merge::Merged => {
+                        return Outcome::partial(repo, number, &f.pr.head, None, AFTER_MERGE, e);
+                    }
+                    Err(e) => return Err(e),
+                };
                 if after.merged {
                     let m = after.merge_commit.clone().unwrap_or_default();
                     if let Some(b) = bus {
                         let p = Progress::new(&f.pr.head, Some(m.clone()));
-                        progress::write(b, repo, number, &p).await?;
+                        if let Err(e) = progress::write(b, repo, number, &p).await {
+                            return Outcome::partial(
+                                repo,
+                                number,
+                                &f.pr.head,
+                                Some(&m),
+                                AFTER_MERGE,
+                                e,
+                            );
+                        }
                     }
                     let mut o = Outcome::new(
                         Kind::Merged,

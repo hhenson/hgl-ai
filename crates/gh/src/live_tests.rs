@@ -515,7 +515,12 @@ async fn a_lost_landing_lock_stops_the_landing() {
         merge_commit: Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed".into()),
         head: HEAD.into(),
     };
-    let r = land::after_merge(&gh, &s, &a, "alpha", 7, &merged, &o, &held, None).await;
+    let mut p = crate::progress::Progress::new(HEAD, None);
+    let mut lines = Vec::new();
+    let r = land::after_merge(
+        &gh, &s, &a, "alpha", 7, &merged, &o, &held, &mut p, &mut lines,
+    )
+    .await;
     match r {
         Err(Error::LeaseLost(m)) => assert!(
             m.ends_with(
@@ -852,10 +857,11 @@ async fn a_merge_still_pending_keeps_its_record() {
     );
 }
 
-/// Carbon's check 4 (hgl-ai#7): the read right after the merge fails (one HTTP 502). The
-/// retry finds the pull request merged and finishes its landing (`landed.log`, `main`, the
-/// notes, the comment) instead of reporting it merged with nothing recorded; a third run
-/// finds it landed and does nothing.
+/// Carbon's check 4 (hgl-ai#7): the read right after the merge fails (one HTTP 502):
+/// `PARTIAL`, naming every step after the merge as not done, not a bare error. The retry
+/// finds the pull request merged and finishes its landing (`landed.log`, `main`, the notes,
+/// the comment) instead of reporting it merged with nothing recorded; a third run finds it
+/// landed and does nothing.
 #[tokio::test]
 async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     let Some(h) = hub() else { return };
@@ -866,10 +872,19 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     s.pins = vec![];
     let o = land::LandOpts::default();
     let gh = landing_gh(|g| g.push_fail_once("pulls/7", "gh: Server Error (HTTP 502)"));
-    let e = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o)
-        .await
-        .unwrap_err();
-    assert!(e.to_string().contains("HTTP 502"), "{e}");
+    let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(l.outcome.kind, crate::gate::Kind::Partial);
+    assert!(!l.outcome.kind.satisfied(), "exit 3");
+    assert!(
+        l.outcome.line.starts_with(
+            "alpha #7 is merged, but landed.log, main, the landed notes and the comment are not done ("
+        ) && l.outcome.line.contains("HTTP 502")
+            && l.outcome
+                .line
+                .ends_with("; run the same command again to finish PARTIAL"),
+        "{}",
+        l.outcome.line
+    );
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "merged");
     let rec = crate::progress::read(&b, "alpha", 7)
         .await
@@ -927,9 +942,9 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     assert_eq!(landed_notes(&b).await.len(), 3);
 }
 
-/// `main` cannot be read after the merge (HTTP 502, three times): the landing fails rather
-/// than write a `main` without the repository; the retry finishes from where it stopped,
-/// without a second `landed.log` line.
+/// `main` cannot be read after the merge (HTTP 502, three times): `PARTIAL` rather than a
+/// `main` without the repository, naming the steps left; the retry finishes from where it
+/// stopped, without a second `landed.log` line.
 #[tokio::test]
 async fn a_landing_that_could_not_read_main_resumes_there() {
     let Some(h) = hub() else { return };
@@ -947,10 +962,18 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
             .push_fail_once("git/ref/heads/main", "gh: Server Error (HTTP 502)")
             .push_fail_once("git/ref/heads/main", "gh: Server Error (HTTP 502)")
     });
-    let e = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o)
-        .await
-        .unwrap_err();
-    assert!(e.to_string().contains("HTTP 502"), "{e}");
+    let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(l.outcome.kind, crate::gate::Kind::Partial);
+    assert_eq!(l.outcome.merge_commit.as_deref(), Some(MERGE));
+    assert!(
+        l.outcome.line.starts_with(&format!(
+            "alpha #7 is merged at {}, but main, the landed notes and the comment are not done (",
+            &MERGE[..8]
+        )) && l.outcome.line.contains("HTTP 502"),
+        "{}",
+        l.outcome.line
+    );
+    assert!(l.after.is_empty(), "{:?}", l.after);
     assert!(
         b.state_get(state::KEY_MAIN).await.unwrap().is_none(),
         "no partial main"
@@ -976,6 +999,91 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
     assert_eq!(landed_notes(&b).await.len(), 3);
     assert_eq!(posts(&gh, "issues/7/comments"), 1);
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1);
+}
+
+/// hgl-ai#7: the comment cannot be posted after the merge (one HTTP 502) under
+/// `merge-if-clean`: `PARTIAL`, naming only the comment, with the lines of the steps done;
+/// the record keeps them done. The same command posts the comment, and sends no note again.
+#[tokio::test]
+async fn a_landing_whose_comment_failed_is_partial_and_finished_by_its_retry() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into()];
+    s.pins = vec![];
+    let o = land::LandOpts::default();
+    let gh = landing_gh(|g| {
+        g.push_fail_once("issues/7/comments -f body", "gh: Server Error (HTTP 502)")
+    });
+    // Ahead of the rule that answers every comments call.
+    {
+        let mut rules = gh.rules.lock().unwrap();
+        let i = rules
+            .iter()
+            .position(|r| r.0 == "issues/7/comments -f body")
+            .unwrap();
+        let r = rules.remove(i);
+        rules.insert(0, r);
+    }
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(l.outcome.kind, crate::gate::Kind::Partial);
+    assert!(!l.outcome.kind.satisfied(), "exit 3");
+    assert_eq!(l.outcome.merge_commit.as_deref(), Some(MERGE));
+    assert!(
+        l.outcome.line.starts_with(&format!(
+            "alpha #7 is merged at {}, but the comment is not done (",
+            &MERGE[..8]
+        )) && l.outcome.line.contains("HTTP 502"),
+        "{}",
+        l.outcome.line
+    );
+    assert!(
+        l.after
+            .iter()
+            .any(|a| a.starts_with("sent landed for alpha-980 to w1")),
+        "{:?}",
+        l.after
+    );
+    let rec = crate::progress::read(&b, "alpha", 7)
+        .await
+        .unwrap()
+        .expect("the record is kept");
+    assert_eq!(
+        rec.done,
+        [
+            crate::progress::LANDED_LOG,
+            crate::progress::MAIN,
+            crate::progress::NOTES
+        ]
+    );
+    assert_eq!(landed_notes(&b).await.len(), 3);
+
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Resumed,
+        "{}",
+        l.outcome.line
+    );
+    assert_eq!(l.after, ["commented on alpha#7"]);
+    assert_eq!(
+        posts(&gh, "issues/7/comments"),
+        2,
+        "the failed post and one more"
+    );
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "not merged again");
+    assert_eq!(landed_notes(&b).await.len(), 3, "no note sent again");
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
