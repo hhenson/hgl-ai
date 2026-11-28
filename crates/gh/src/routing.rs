@@ -136,8 +136,16 @@ impl History {
             if n.sender != settings.controller && n.sender != settings.coord_seat {
                 return;
             }
+            // The note's task key selects a worktree. The coordinator's verdict
+            // heading names the PR even when its issue and task number differ.
+            let pr = (n.sender == settings.coord_seat)
+                .then(|| sendback_pr(n, &key.repo, &head))
+                .flatten();
             for p in pulls.iter().filter(|p| {
-                p.pr.row.repo == key.repo && (p.issue == n.issue || p.number() == n.issue)
+                p.pr.row.repo == key.repo
+                    && pr.map_or(p.issue == n.issue || p.number() == n.issue, |pr| {
+                        p.number() == pr
+                    })
             }) {
                 let key = TaskKey {
                     repo: key.repo.clone(),
@@ -229,6 +237,15 @@ impl History {
             })
             .sum()
     }
+}
+
+fn sendback_pr(note: &Note, repo: &str, head: &str) -> Option<u64> {
+    let prefix = format!("[{}] Sent back: {repo}#", note.sender);
+    let line = note.body.lines().next()?.strip_prefix(&prefix)?;
+    let (pr, named_head) = line.split_once(" at ")?;
+    (named_head == short(head))
+        .then(|| pr.parse().ok())
+        .flatten()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -721,10 +738,8 @@ async fn execute<G: Gh>(
             if branch.is_empty() {
                 return deliver(bus, lease, item.seq, None, forward(fallback, item)).await;
             }
-            let current =
-                |trees: &[TreeRecord]| state::current_seats(trees, repo, branch, *issue, &[], &[]);
-            let owners = current(&bus.trees().await?);
-            let [to] = owners.as_slice() else {
+            let trees = bus.trees().await?;
+            let Some(owner) = state::current_implementor(&trees, repo, branch, *issue) else {
                 return deliver(bus, lease, item.seq, None, forward(fallback, item)).await;
             };
             let receipt = state::routed_receipt(n).expect("sendback comes from a review receipt");
@@ -744,12 +759,14 @@ async fn execute<G: Gh>(
                 *pr,
                 head,
             );
-            let mut sendback = routed_note(to, n, Kind::Sendback, *issue, body);
+            let mut sendback = routed_note(&owner.seat, n, Kind::Sendback, owner.task.issue, body);
             if check_note(&sendback).is_ok()
                 && comment(gh, s, lease, item, *pr, &sendback.body).await?
-                && let [to] = current(&bus.trees().await?).as_slice()
+                && let Some(owner) =
+                    state::current_implementor(&bus.trees().await?, repo, branch, *issue)
             {
-                sendback.recipient.clone_from(to);
+                sendback.recipient.clone_from(&owner.seat);
+                sendback.issue = owner.task.issue;
                 line = Some(sendback_line(&sendback, *pr));
                 sendback
             } else {

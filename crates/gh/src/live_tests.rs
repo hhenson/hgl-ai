@@ -1803,7 +1803,7 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
     );
     let checkpoint = b.state_get("coord.routing").await.unwrap().unwrap().value;
     let mut moved = tree(&w2, first.seq + 10);
-    moved.task.issue = 7; // The new tree matches by branch, not by the original task number.
+    moved.task.issue = 981; // The new tree matches by branch, using its own task key.
     b.tree_put(&moved).await.unwrap();
 
     let recovered = FakeGh::default()
@@ -1833,13 +1833,16 @@ async fn coordinator_routes_first_findings_and_keeps_escalation_with_controller(
         .unwrap();
     assert_eq!(notes.len(), 2);
     let sendback = &notes[0].note;
-    assert_eq!(
-        (sendback.kind, &sendback.recipient, sendback.issue),
-        (Kind::Sendback, &w2, 980)
-    );
+    assert_eq!((sendback.kind, &sendback.recipient), (Kind::Sendback, &w2));
+    assert_eq!(sendback.task().as_ref(), Some(&moved.task));
     assert_eq!(sendback.head.as_deref(), Some(HEAD));
     assert_eq!(sendback.class, None);
-    assert!(notes[1].note.body.contains("sendback to w2"));
+    assert!(
+        notes[1]
+            .note
+            .body
+            .contains(&format!("alpha#7 at {HEAD} → sendback to w2"))
+    );
     assert_eq!(
         recovered.calls().len(),
         2,
