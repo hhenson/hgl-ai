@@ -9,7 +9,7 @@ use hgl_ai_gh::exec::{GhCli, ReadOnly};
 use hgl_ai_gh::gate::GateBuilds;
 use hgl_ai_gh::gate::{Kind, Opts};
 use hgl_ai_gh::land::{LandOpts, Landing};
-use hgl_ai_gh::{Settings, coord, land, pins, release, tap, verdict};
+use hgl_ai_gh::{Settings, coord, land, pins, release, tap, tier, verdict};
 use hgl_ai_proto::Seat;
 
 use super::{Ctx, EXIT_OK, NotReady};
@@ -32,6 +32,8 @@ enum Cmd {
         #[command(subcommand)]
         cmd: CoordCmd,
     },
+    /// Compute the minimum review tier and deciding paths for an exact pull request head.
+    Tier(TierArgs),
     /// Merge a pull request at HEAD if every gate holds (one attempt).
     MergeIfClean(GateArgs),
     /// Land a pull request: the gate until it decides, then `main`, `landed.log`, notes and pins.
@@ -56,6 +58,17 @@ enum Cmd {
     Approve(VerdictArgs),
     /// Send findings back on an exact head: one GitHub comment, then a `sendback` note.
     Sendback(VerdictArgs),
+}
+
+#[derive(clap::Args)]
+struct TierArgs {
+    repo: String,
+    pr: u64,
+    /// The full 40-character head to classify.
+    head: String,
+    /// Read-only, as with a regular tier check.
+    #[arg(long = "dry-run")]
+    _dry_run: bool,
 }
 
 #[derive(clap::Args)]
@@ -359,6 +372,23 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
         gh_client(&cfg).await?
     };
     match *args.cmd {
+        Cmd::Tier(a) => {
+            let r = tier::evaluate(&ReadOnly(gh), &s, &a.repo, a.pr, &a.head)
+                .await
+                .map_err(lift)?;
+            if ctx.json {
+                println!("{}", serde_json::to_string(&r)?);
+            } else {
+                println!("{} #{} at {} tier-{}", a.repo, a.pr, r.head, r.tier);
+                for path in r.paths {
+                    println!("  {path:?}");
+                }
+                if r.risk_high {
+                    println!("  risk-high on the PR or an associated issue");
+                }
+            }
+            Ok(EXIT_OK)
+        }
         Cmd::Coord {
             cmd:
                 CoordCmd::Run {

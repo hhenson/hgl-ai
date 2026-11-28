@@ -9,6 +9,7 @@
 //! | [`coord`] | `gh coord run`: the batched pull request table `HGL_STATE/prs`, `hold`, alerts |
 //! | [`backlog`] | `gh coord run`, every 15 min: the claimable queue `HGL_STATE/backlog`, daily `HGL_METRICS` |
 //! | `intake` | `gh coord run`, every 15 min: new and reopened issues and PRs for triage |
+//! | [`tier`] | `gh tier`: the minimum review tier for an exact pull request head |
 //! | [`gate`] | `gh merge-if-clean`: the merge gate |
 //! | [`builds`] | the gate builds that write the local build verdicts (BUILD-15) |
 //! | [`land`] | `gh land`: the gate in a loop, then `main`, `landed.log`, `landed` notes, pins |
@@ -36,6 +37,7 @@ pub mod store;
 pub mod table;
 pub mod tap;
 pub mod tasks;
+pub mod tier;
 pub mod verdict;
 
 use std::collections::BTreeMap;
@@ -101,6 +103,8 @@ pub struct GateRules {
     /// A clean review receipt from another family is required (ROLE-11).
     pub receipt: bool,
     pub global_paths: Vec<String>,
+    pub tier3_paths: Vec<String>,
+    pub tier3_new_exceptions: Vec<String>,
     pub verdicts: Vec<String>,
     /// Check names that must be present and passed (ROLE-20).
     pub required_checks: Vec<String>,
@@ -212,6 +216,10 @@ impl Settings {
         GateRules {
             receipt: r.review_receipt,
             global_paths,
+            tier3_paths: r
+                .tier3_paths
+                .unwrap_or_else(|| hgl_ai_config::github::default_tier3_paths(repo)),
+            tier3_new_exceptions: r.tier3_new_exceptions,
             verdicts: r.verdicts.clone(),
             required_checks: r.checks.clone(),
             // Checked in `from_config`.
@@ -314,6 +322,13 @@ mod tests {
         let other = s.gate_rules("hgl_spec");
         assert!(other.verdicts.is_empty() && !other.relax_configured());
         assert!(g.receipt && other.receipt, "required by default (ROLE-11)");
+        assert!(other.tier3_paths.is_empty());
+        assert!(
+            s.gate_rules("hgl-ai")
+                .tier3_paths
+                .iter()
+                .any(|path| path == "crates/gh/src/land.rs")
+        );
         assert_eq!(s.pin_sources(), ["hgl-compiler"]);
         assert_eq!(short("0123456789abcdef"), "01234567");
     }
