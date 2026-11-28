@@ -10,5 +10,5 @@ fn main() {
         ),
         Err(error) => format!("{tool}: {error}"),
     };
-    panic!("Node/npm probe: {}; {}", probe("node"), probe("npm"));
+    println!("cargo:rustc-env=NODE_PROBE={}; {}", probe("node"), probe("npm"));
 }
