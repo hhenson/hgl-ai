@@ -343,6 +343,23 @@ const P2_KEY: &str = "p2.pending";
 /// The key of the undelivered `p1` notifications in `HGL_CONSOLE`.
 const P1_KEY: &str = "p1.unsent";
 
+// Keep changes ordered: in particular, a later sign-out must not be followed by an
+// earlier failed session write. Do not discard a failed deletion.
+async fn retry_persist<F, Fut, E>(mut write: F, delay: Duration)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    loop {
+        match write().await {
+            Ok(()) => return,
+            Err(e) => tracing::warn!("keeping the console's state on the hub: {e}; retrying"),
+        }
+        tokio::time::sleep(delay).await;
+    }
+}
+
 /// Take the sessions and the pending `p2` batch kept on the hub, then keep them there.
 pub async fn restore(app: &Arc<App>, bus: &Arc<Bus>) {
     let stored = match bus.console_list::<crate::auth::Session>("session.").await {
@@ -391,17 +408,20 @@ pub async fn restore(app: &Arc<App>, bus: &Arc<Bus>) {
     tokio::spawn(async move {
         use crate::auth::Persist;
         while let Some(p) = rx.recv().await {
-            let res = match &p {
-                Persist::Put(k, s) => b.console_put(k, s).await,
-                Persist::Del(k) => b.console_del(k).await,
-                Persist::P2(v) if v.is_empty() => b.console_del(P2_KEY).await,
-                Persist::P2(v) => b.console_put(P2_KEY, v).await,
-                Persist::P1(v) if v.is_empty() => b.console_del(P1_KEY).await,
-                Persist::P1(v) => b.console_put(P1_KEY, v).await,
-            };
-            if let Err(e) = res {
-                tracing::warn!("keeping the console's state on the hub: {e}");
-            }
+            retry_persist(
+                || async {
+                    match &p {
+                        Persist::Put(k, s) => b.console_put(k, s).await,
+                        Persist::Del(k) => b.console_del(k).await,
+                        Persist::P2(v) if v.is_empty() => b.console_del(P2_KEY).await,
+                        Persist::P2(v) => b.console_put(P2_KEY, v).await,
+                        Persist::P1(v) if v.is_empty() => b.console_del(P1_KEY).await,
+                        Persist::P1(v) => b.console_put(P1_KEY, v).await,
+                    }
+                },
+                RECONNECT,
+            )
+            .await;
         }
     });
 }
@@ -503,6 +523,23 @@ pub async fn run(cfg: hgl_ai_config::Config) -> Result<(), Error> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn persistence_retries_until_the_hub_accepts_the_change() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        retry_persist(
+            || async {
+                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    Err("hub unavailable")
+                } else {
+                    Ok(())
+                }
+            },
+            Duration::from_millis(1),
+        )
+        .await;
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+    }
 
     /// One app's fold, for its own test: tests run at once, each on its own hub, and
     /// their sequences coincide, so nothing here is shared between apps.
