@@ -49,12 +49,18 @@ impl Hub {
 
     /// The hub with `edit` applied to its rendered `nats.conf`.
     fn start_with(edit: impl Fn(&Registry, String) -> String) -> Option<Hub> {
-        Hub::start_layout(false, edit)
+        Hub::start_layout(false, &[], edit)
     }
 
     /// The hub with one account per role (hgl-ai#141).
     fn accounts() -> Option<Hub> {
-        Hub::start_layout(true, |_, conf| conf)
+        Hub::start_layout(true, &[], |_, conf| conf)
+    }
+
+    /// [`Hub::accounts`] with the users `omit` not in the registry yet (their credentials
+    /// are issued): roles that have no user.
+    fn accounts_without(omit: &[&str]) -> Option<Hub> {
+        Hub::start_layout(true, omit, |_, conf| conf)
     }
 
     fn auth(accounts: bool, reg: &Registry) -> Auth<'_> {
@@ -65,7 +71,11 @@ impl Hub {
         }
     }
 
-    fn start_layout(accounts: bool, edit: impl Fn(&Registry, String) -> String) -> Option<Hub> {
+    fn start_layout(
+        accounts: bool,
+        omit: &[&str],
+        edit: impl Fn(&Registry, String) -> String,
+    ) -> Option<Hub> {
         let bin = std::env::split_paths(&std::env::var_os("PATH")?)
             .map(|d| d.join("nats-server"))
             .find(|p| p.is_file());
@@ -88,6 +98,9 @@ impl Hub {
         ] {
             let text = reg.issue(name, role, false).unwrap();
             creds.insert(name, hgl_ai_bus::parse_credential(&text).unwrap().unwrap());
+        }
+        for name in omit {
+            assert!(reg.remove(name), "{name}");
         }
         let port = free_port();
         let ws = Websocket {
@@ -1123,6 +1136,13 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                 assert!(stored(&admin, &subject).await, "{what}");
             }
         }
+        // `doctor`'s `telemetry consumers` check lists the telemetry streams' consumers
+        // (hgl-ai#105); Slack reads no telemetry.
+        if role != Role::Slack {
+            hgl_ai_install::hub::lasting_consumers(&js)
+                .await
+                .unwrap_or_else(|e| panic!("{who} ({role}): {e}"));
+        }
     }
 }
 
@@ -1365,6 +1385,48 @@ async fn accounts_ack_batch_and_leases_work_across_accounts() {
         assert!(!matches!(r, Ok(Ok(_))), "{who}: {r:?}");
         assert!(!refusals(&mut rx, 1).await.is_empty(), "{who}");
     }
+}
+
+/// The first user of a role that had none needs only the reload `server user add` does
+/// (r1 on #152): the role's account, its imports and `HUB`'s exports to it were rendered
+/// before it had a user.
+#[tokio::test]
+async fn accounts_the_first_user_of_a_role_needs_one_reload() {
+    let new = [("lab1-builder", Role::Builder), ("hub-slack", Role::Slack)];
+    let Some(hub) = Hub::accounts_without(&new.map(|n| n.0)) else {
+        return;
+    };
+    let admin = seeded(&hub).await;
+    {
+        let mut reg = hub.reg.lock().unwrap();
+        for (name, role) in new {
+            let nkey = nkeys::KeyPair::from_seed(&hub.seed(name))
+                .unwrap()
+                .public_key();
+            reg.register(name, role, &nkey, false).unwrap();
+        }
+    }
+    hub.reload();
+    let (_c, builder) = hub.js_of("lab1-builder").await;
+    assert!(builder.query_account().await.unwrap().streams > 0);
+    let verdicts = builder
+        .get_key_value(hgl_ai_install::users::KV_VERDICTS)
+        .await
+        .unwrap();
+    verdicts.put("first", "ok".into()).await.unwrap();
+    assert_eq!(verdicts.get("first").await.unwrap().unwrap(), "ok");
+    let (_c, slack) = hub.js_of("hub-slack").await;
+    let state = slack.get_key_value(hgl_ai_proto::KV_SLACK).await.unwrap();
+    state.put("d.a.b.c", "first".into()).await.unwrap();
+    assert_eq!(state.get("d.a.b.c").await.unwrap().unwrap(), "first");
+    let subject = sample(hgl_ai_proto::SLACK_OWNER_FILTER, "first");
+    slack
+        .publish(subject.clone(), "ok".into())
+        .await
+        .unwrap()
+        .await
+        .unwrap();
+    assert!(stored(&admin, &subject).await);
 }
 
 fn role_writes_locks(role: Role) -> bool {

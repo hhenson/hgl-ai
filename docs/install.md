@@ -152,7 +152,7 @@ The `viewer` reads only the telemetry, as above.
 
 Each user's replies go to its own inbox, `_INBOX.<public key>`, and that is all it may
 subscribe to: no user reads another's JetStream or KV replies (the console's sessions,
-threads, notes). A client before this used the shared `_INBOX.>`, which the hub then
+threads, notes). The `viewer`'s is `_INBOX_VIEWER`, which the page uses. A client before this used the shared `_INBOX.>`, which the hub then
 refuses. Upgrade the clients first (their inbox works on an older hub too), then rerun
 `hgl-ai server install`; until then `doctor` on the hub warns `hub inboxes`.
 

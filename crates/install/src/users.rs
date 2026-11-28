@@ -757,14 +757,20 @@ impl Target {
     }
 }
 
-/// Pull consumers on stream `s`: create (ephemeral, or by name with filters), state, pull.
-fn consumers(s: &str) -> [Service; 4] {
-    [
+/// Pull consumers on stream `s`: create (ephemeral, or by name with filters), state, pull,
+/// and the list `doctor` reads for consumers that outlive a page (`telemetry consumers`,
+/// hgl-ai#105). Not on `HGL_SLACK`, whose consumers' names are the adapter's.
+fn consumers(s: &str) -> Vec<Service> {
+    let mut out = vec![
         api(&format!("CONSUMER.CREATE.{s}")),
         api(&format!("CONSUMER.CREATE.{s}.>")),
         api(&format!("CONSUMER.INFO.{s}.*")),
         api_stream(&format!("CONSUMER.MSG.NEXT.{s}.*")),
-    ]
+    ];
+    if s != kv(KV_SLACK) {
+        out.push(api(&format!("CONSUMER.LIST.{s}")));
+    }
+    out
 }
 
 /// The subject a role's account imports `hub_subject` as: the JetStream API and bucket
@@ -789,14 +795,14 @@ pub fn role_services(role: Role) -> Vec<Service> {
     out.into_iter().collect()
 }
 
-/// What `HUB` exports to the accounts of `roles`: each service once, with the accounts it
-/// is for. A service no role in `roles` uses is not exported (an export naming no
-/// account would be open to every account).
-pub fn exports(roles: &std::collections::BTreeSet<Role>) -> BTreeMap<Service, Vec<Role>> {
+/// What `HUB` exports to the role accounts: each service once, with the accounts it is
+/// for. Every service names at least one account (an export naming none would be open to
+/// every account).
+pub fn exports() -> BTreeMap<Service, Vec<Role>> {
     let mut out: BTreeMap<Service, Vec<Role>> = BTreeMap::new();
-    for role in ACCOUNT_ROLES.iter().filter(|r| roles.contains(r)) {
-        for s in role_services(*role) {
-            out.entry(s).or_default().push(*role);
+    for role in ACCOUNT_ROLES {
+        for s in role_services(role) {
+            out.entry(s).or_default().push(role);
         }
     }
     out
@@ -804,8 +810,11 @@ pub fn exports(roles: &std::collections::BTreeSet<Role>) -> BTreeMap<Service, Ve
 
 /// `nats.conf` for one account per role (hgl-ai#141), in place of the `authorization`
 /// block: `HUB` with the admin users, JetStream and its service exports, and one account
-/// per role in use with its imports. Each user publishes only on what its account
-/// imports, and subscribes to its own inbox only (hgl-ai#111).
+/// per role with its imports. Every account, export and import is there whether or not
+/// the role has users yet, so the first user of a role needs only the reload that adds
+/// it (a reload that added the account left its imports unanswered: r1 on hgl-ai#152).
+/// Each user publishes only on what its account imports, and subscribes to its own inbox
+/// only (hgl-ai#111). Viewer users are not rendered: their account is hgl-ai#148.
 pub fn render_accounts(reg: &Registry) -> String {
     let used: std::collections::BTreeSet<Role> = reg.users.iter().map(|u| u.role).collect();
     let user_line = |u: &User, perms: Option<&str>| match perms {
@@ -840,7 +849,7 @@ pub fn render_accounts(reg: &Registry) -> String {
         s.push_str(&user_line(u, None));
     }
     s.push_str("    ]\n    exports: [\n");
-    for (svc, roles) in exports(&used) {
+    for (svc, roles) in exports() {
         let accounts: Vec<&str> = roles.iter().map(|r| r.account()).collect();
         s.push_str(&format!(
             "      {{ service: \"{}\", accounts: [{}]{} }}\n",
@@ -854,7 +863,7 @@ pub fn render_accounts(reg: &Registry) -> String {
         ));
     }
     s.push_str("    ]\n  }\n");
-    for role in ACCOUNT_ROLES.iter().filter(|r| used.contains(r)) {
+    for role in ACCOUNT_ROLES.iter() {
         let var = format!("{}_PUBLISH", role.account());
         s.push_str(&format!("  {} {{\n    users: [\n", role.account()));
         for u in reg.users.iter().filter(|u| u.role == *role) {
@@ -1391,47 +1400,86 @@ mod tests {
                     && !s.subject.contains("STREAM.INFO")),
         );
         assert_eq!(CONSOLE_FEED, hgl_ai_owner::FEED);
+        // Consumer lists only where consumer state is read, never of `HGL_OWNER`,
+        // `HGL_SLACK`, or, but for the console, `HGL_CONSOLE`; every role that reads the
+        // telemetry lists its consumers, as `doctor` does (hgl-ai#105).
+        for r in ACCOUNT_ROLES {
+            let svcs = role_services(r);
+            for s in svcs.iter().filter(|s| s.subject.contains("CONSUMER.LIST.")) {
+                let stream = s.subject.rsplit('.').next().unwrap();
+                assert!(
+                    has(r, &format!("$JS.API.CONSUMER.INFO.{stream}.*")),
+                    "{r}: {s:?}"
+                );
+                assert!(
+                    stream != "HGL_OWNER" && stream != "KV_HGL_SLACK",
+                    "{r}: {s:?}"
+                );
+                assert!(
+                    stream != "KV_HGL_CONSOLE" || r == Role::Console,
+                    "{r}: {s:?}"
+                );
+            }
+            if r != Role::Slack {
+                for b in VIEWER_BUCKETS {
+                    assert!(has(r, &format!("$JS.API.CONSUMER.LIST.KV_{b}")), "{r}: {b}");
+                }
+            }
+        }
     }
 
-    /// Only the roles in use have an account, and only they appear in an export.
+    /// Every role has its account, imports and exports, with users or without.
     #[test]
-    fn accounts_of_the_roles_in_use() {
+    fn accounts_of_every_role_with_or_without_users() {
+        let full = render_accounts(&every_role());
         let mut reg = Registry::default();
         reg.issue("hub", Role::Seat, false).unwrap();
         let conf = render_accounts(&reg);
-        let (exports, imports) = read_back(&conf);
-        assert_eq!(imports.keys().collect::<Vec<_>>(), ["SEAT"]);
-        assert!(exports.iter().all(|e| e.1 == ["SEAT"]), "{conf}");
-        assert_eq!(exports.len(), role_services(Role::Seat).len());
+        // The same accounts, exports and imports: the first user of a role is one reload.
+        assert_eq!(read_back(&conf), read_back(&full));
+        let (_, imports) = read_back(&conf);
+        let mut want: Vec<&str> = ACCOUNT_ROLES.iter().map(|r| r.account()).collect();
+        want.sort();
+        assert_eq!(imports.keys().collect::<Vec<_>>(), want);
         assert!(conf.contains("  HUB {\n    jetstream: enabled\n    users: [\n    ]\n"));
+        assert!(conf.contains("  COORD {\n    users: [\n    ]\n    imports: [\n"));
+        // A publish block only for the roles in use (`nats-server -t` warns of the others).
+        assert!(conf.contains("SEAT_PUBLISH = {"));
+        for r in [Role::Coord, Role::Builder, Role::Console, Role::Slack] {
+            assert!(!conf.contains(&format!("{}_PUBLISH", r.account())), "{r}");
+        }
     }
 
     /// The account layout is a valid `nats-server` configuration (when one is installed).
     #[test]
     fn accounts_parse_with_nats_server() {
-        let reg = every_role();
         let Some(bin) =
             crate::sys::which_in(&std::env::var("PATH").unwrap_or_default(), "nats-server")
         else {
             return;
         };
-        let d = tempfile::tempdir().unwrap();
-        let p = d.path().join("nats.conf");
-        let conf = crate::nats::render_conf(
-            "127.0.0.1",
-            4222,
-            &d.path().join("store"),
-            &crate::nats::Auth::Accounts(&reg),
-        );
-        std::fs::write(&p, &conf).unwrap();
-        let o = std::process::Command::new(bin)
-            .arg("-t")
-            .arg("-c")
-            .arg(&p)
-            .output()
-            .unwrap();
-        let err = String::from_utf8_lossy(&o.stderr);
-        assert!(o.status.success(), "{err}\n{conf}");
-        assert!(!err.contains("[WRN]") && !err.contains("[ERR]"), "{err}");
+        let mut one = Registry::default();
+        one.issue("hub", Role::Seat, false).unwrap();
+        // Every role, one role, and no user yet: each without a warning.
+        for reg in [every_role(), one, Registry::default()] {
+            let d = tempfile::tempdir().unwrap();
+            let p = d.path().join("nats.conf");
+            let conf = crate::nats::render_conf(
+                "127.0.0.1",
+                4222,
+                &d.path().join("store"),
+                &crate::nats::Auth::Accounts(&reg),
+            );
+            std::fs::write(&p, &conf).unwrap();
+            let o = std::process::Command::new(&bin)
+                .arg("-t")
+                .arg("-c")
+                .arg(&p)
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&o.stderr);
+            assert!(o.status.success(), "{err}\n{conf}");
+            assert!(!err.contains("[WRN]") && !err.contains("[ERR]"), "{err}");
+        }
     }
 }
