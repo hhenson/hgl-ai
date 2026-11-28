@@ -2027,7 +2027,6 @@ mod tests {
         // Required and `relax_required` checks passed; the optional macOS and Windows runs
         // still going.
         let mut checks = compiler_green();
-        checks.extend(["hgraph", "cpp"].map(|n| run(n, "completed", Some("success"))));
         checks.push(run("test (macos-latest)", "in_progress", None));
         checks.push(run("test (windows-latest)", "queued", None));
         f.checks = Some(checks.clone());
@@ -2053,15 +2052,33 @@ mod tests {
         c.push(run("extra", "in_progress", None));
         f.checks = Some(c);
         wait(&f, "checks-not-done: extra");
-        // A `relax_required` check missing: no relaxation, so the optional ones are waited for.
+        // A required check still running prevents relaxation and is itself waited for.
+        let mut c = checks.clone();
+        let required = c.iter_mut().find(|c| c.name == "cpp (plain, sdk)").unwrap();
+        required.status = "in_progress".into();
+        required.conclusion = None;
+        f.checks = Some(c);
+        wait(&f, "checks-not-done: cpp (plain, sdk)");
+        // A missing default relaxation check is also a missing required check.
         f.checks = Some(
             checks
                 .iter()
-                .filter(|c| c.name != "hgraph")
+                .filter(|c| c.name != "cpp (plain, sdk)")
                 .cloned()
                 .collect(),
         );
-        wait(&f, "checks-not-done: test (macos-latest)");
+        wait(&f, "required-checks-missing: cpp (plain, sdk)");
+        // An extra relaxation prerequisite can be missing without being required.
+        f.checks = Some(checks.clone());
+        let mut extra = r.clone();
+        extra.relax_required.push("extra prerequisite".into());
+        let o = outcome(&f, &extra, &Opts::default());
+        assert_eq!(o.kind, Kind::Wait, "{}", o.line);
+        assert!(
+            o.line.contains("checks-not-done: test (macos-latest)"),
+            "{}",
+            o.line
+        );
         // A file outside, or no files at all (r1, major 3): no relaxation.
         f.checks = Some(checks.clone());
         f.pr_files = Some(vec![PrFile {
