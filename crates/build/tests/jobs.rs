@@ -3,6 +3,9 @@
 //! notify address that may not get receipts, and an id already used for another request.
 //! Each is terminated before it touches a path or the hub, and the lane goes on.
 
+#[path = "support/short.rs"]
+mod short;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -208,13 +211,10 @@ impl Rig {
         git(&seed, &["push", "--quiet", "origin", "main"]);
         let recipe = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"test -f f.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
         store::recipe_put(&bus, recipe, None).await.unwrap();
-        let socket_tmp = tempfile::Builder::new()
-            .prefix("hbs")
-            .tempdir_in(".")
-            .unwrap();
+        let (socket_tmp, socket_path) = short::tempdir();
         let mut cfg = hgl_ai_config::Config::new("lab1");
         cfg.paths.work_root = root.join("work").display().to_string();
-        cfg.paths.data_dir = socket_tmp.path().join("data").display().to_string();
+        cfg.paths.data_dir = socket_path.join("data").display().to_string();
         cfg.builder.toolchains = vec!["git".into()];
         if o.remote {
             let state = root.join("winbox");

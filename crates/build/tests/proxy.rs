@@ -5,6 +5,9 @@
 //! is POSIX `sh`; that PowerShell runs the Windows scripts as intended is checked only
 //! against a real Windows host. The service tests need `nats-server` on `PATH`.
 
+#[path = "support/short.rs"]
+mod short;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -51,7 +54,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// proxy's directories. Short paths, for the control socket.
 struct World {
     _tmp: tempfile::TempDir,
-    socket_tmp: tempfile::TempDir,
+    _socket_tmp: tempfile::TempDir,
+    socket_path: PathBuf,
     root: PathBuf,
     origin: String,
     head: String,
@@ -78,13 +82,12 @@ impl World {
         let remote = root.join("remote");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::create_dir_all(&remote).unwrap();
+        let (socket_tmp, socket_path) = short::tempdir();
         World {
             origin: bare.display().to_string(),
             _tmp: tmp,
-            socket_tmp: tempfile::Builder::new()
-                .prefix("hbs")
-                .tempdir_in(".")
-                .unwrap(),
+            _socket_tmp: socket_tmp,
+            socket_path,
             root,
             head,
             state,
@@ -97,7 +100,7 @@ impl World {
             "win1",
             self.state.to_str().unwrap(),
             fake_ssh(),
-            &self.socket_tmp.path().join("ssh"),
+            &self.socket_path.join("ssh"),
             Dialect::Posix,
         )
         .unwrap()
@@ -520,7 +523,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
 
     let mut cfg = hgl_ai_config::Config::new("lab1");
     cfg.paths.work_root = w.root.join("work").display().to_string();
-    cfg.paths.data_dir = w.socket_tmp.path().join("data").display().to_string();
+    cfg.paths.data_dir = w.socket_path.join("data").display().to_string();
     cfg.builder.local = false;
     cfg.builder.remote.push(
         toml::from_str(&format!(
