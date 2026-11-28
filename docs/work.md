@@ -62,8 +62,10 @@ findings, and a `done` note.
   each after its gates on the `main` it merges onto (ROLE-10); ones that merge cleanly
   together may land as one batch. When `main` moves, merge it into each open branch it
   now conflicts with and rerun the checks; a pull request that conflicts is not Ready.
-  On hgl-ai a clean reviewer receipt carries through conflict-free merges of `main`
-  once the checks and review bot pass at the new head (ROLE-10, ROLE-11).
+  On hgl-ai a clean reviewer receipt carries through merges of `main` with no
+  conflict outside documentation files, once the checks and review bot pass at the
+  new head (ROLE-10, ROLE-11). Nobody re-reviews such a merge. A conflict resolved in
+  code or tests gets a review of the resolution only, not of the whole change.
 - **WORK-7 — One conflict once.** Two tasks that turn out to touch the same code: finish
   one, then merge it into the other.
 
