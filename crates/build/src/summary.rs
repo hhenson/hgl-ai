@@ -395,6 +395,7 @@ mod tests {
             repo: "demo".into(),
             head: Some("8a5c3d264c2edbbdaa61530d810bff276c3eebba".into()),
             base: None,
+            base_sha: None,
             dirty: false,
             host: "lab1".into(),
             platform: Platform::Linux,

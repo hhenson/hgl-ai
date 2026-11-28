@@ -101,6 +101,7 @@ fn every_configured_sdk_reaches_a_step() {
         tmp: tmp.path().display().to_string(),
         job: None,
         clone: None,
+        base_sha: None,
     };
     let logs = tmp.path().join("logs");
     let opts = Options {

@@ -29,17 +29,90 @@ enum Cmd {
     Resume { label: String },
 }
 
+/// GitHub's word on whether a pull request is merged or closed, which alone lets a builder
+/// purge its verdict keys (BUILD-15). `None` (keys go by age only) where `gh` cannot read
+/// GitHub here. Not asked while `HGL_STATE/hold` holds: it can wait.
+async fn pr_ended(
+    cfg: &hgl_ai_config::Config,
+    bus: Arc<Bus>,
+) -> Option<hgl_ai_build::store::PrEnded> {
+    let s = match hgl_ai_gh::Settings::from_config(cfg) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::warn!("GitHub settings ({e}): verdict keys go by age only");
+            return None;
+        }
+    };
+    let gh = match super::gh::gh_client(cfg).await {
+        Ok(g) => Arc::new(g),
+        Err(e) => {
+            tracing::warn!("`gh` cannot read GitHub here ({e}): verdict keys go by age only");
+            return None;
+        }
+    };
+    Some(Arc::new(move |repo: String, pr: u64| {
+        let (s, gh, bus) = (s.clone(), gh.clone(), bus.clone());
+        Box::pin(async move {
+            if let Ok(Some(h)) = bus.state_get("hold").await {
+                return Err(format!("GitHub on hold until {}", h.value.trim()));
+            }
+            let p = hgl_ai_gh::gate::fetch_pr(gh.as_ref(), &s, &repo, pr)
+                .await
+                .map_err(|e| e.to_string())?;
+            Ok(p.merged || p.state == "closed")
+        })
+    }))
+}
+
 pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     let cfg = ctx.load_config()?;
-    let bus = Bus::connect(&cfg).await?;
+    // The builder's own hub user, where it has one: it alone writes the verdicts.
+    let builder_cred =
+        match (&args.cmd, &cfg.builder.credential) {
+            (Cmd::Run, Some(p)) => {
+                let path = hgl_ai_config::expand(p)?;
+                Some(hgl_ai_bus::read_credential(&path)?.ok_or_else(|| {
+                    anyhow::anyhow!("[builder] credential {}: empty", path.display())
+                })?)
+            }
+            _ => None,
+        };
+    let bus = match &builder_cred {
+        Some(c) => Bus::connect_with(&cfg.hub.url, Some(c.clone())).await?,
+        None => Bus::connect(&cfg).await?,
+    };
     match args.cmd {
         Cmd::Run => {
+            // A `builder` hub user writes verdicts; so does any client of a hub with one
+            // shared token. A seat's user does not (docs/build.md BUILD-15). The hub, not
+            // the file, says which: a bare NKey seed names no role.
+            let token = match &builder_cred {
+                Some(c) => c.is_token(),
+                None => {
+                    hgl_ai_bus::read_credential(&cfg.token_file()?)?.is_some_and(|c| c.is_token())
+                }
+            };
+            let verdicts =
+                token || hgl_ai_build::store::may_write_verdicts(&bus, &cfg.host).await?;
+            if !verdicts {
+                tracing::warn!(
+                    "no builder hub user ([builder] credential): gate builds are reported not run"
+                );
+            }
             let lanes = service::lanes(&cfg, service::ssh_program())?;
             let github = cfg.github.clone();
+            let bus = Arc::new(bus);
+            let pr_ended = if verdicts {
+                pr_ended(&cfg, bus.clone()).await
+            } else {
+                None
+            };
             let settings = Settings {
                 clone_url: Arc::new(move |r: &str| github.clone_url_for(r)),
                 toolchains: cfg.builder.toolchains.clone(),
                 heartbeat: service::HEARTBEAT,
+                verdicts,
+                pr_ended,
             };
             let (tx, rx) = watch::channel(false);
             tokio::spawn(async move {
@@ -47,7 +120,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 tracing::info!("stopping: cancelling running builds");
                 let _ = tx.send(true);
             });
-            service::serve(Arc::new(bus), lanes, settings, rx).await?;
+            service::serve(bus, lanes, settings, rx).await?;
         }
         Cmd::List => {
             for b in bus.builders().await? {

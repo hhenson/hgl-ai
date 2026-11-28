@@ -181,6 +181,8 @@ pub struct SendReceipt {
 pub struct StateEntry {
     pub value: String,
     pub revision: u64,
+    /// Unix seconds of the write, by the hub's clock.
+    pub created: i64,
 }
 
 /// Inbox consumer settings. [`Default`] is the protocol's (§3); other values
@@ -752,6 +754,7 @@ impl Bus {
                 Ok(Some(StateEntry {
                     value,
                     revision: e.revision,
+                    created: e.created.unix_timestamp(),
                 }))
             }
             None => Ok(None),
@@ -789,16 +792,19 @@ impl Bus {
         }
         check_value_size(key, value.len())?;
         let store = self.store(&self.state, KV_STATE).await?;
-        store
-            .create(key, value.as_bytes().to_vec().into())
-            .await
-            .map_err(|e| match e.kind() {
-                kv::CreateErrorKind::AlreadyExists => BusError::Conflict {
-                    key: key.to_string(),
-                    expected: 0,
-                },
-                _ => nats(&format!("creating state {key}"), e),
-            })
+        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+            store
+                .create(key, value.as_bytes().to_vec().into())
+                .await
+                .map_err(|e| match e.kind() {
+                    kv::CreateErrorKind::AlreadyExists => BusError::Conflict {
+                        key: key.to_string(),
+                        expected: 0,
+                    },
+                    _ => nats(&format!("creating state {key}"), e),
+                })
+        })
+        .await
     }
 
     /// Replace `key` only if it is still at `expected_revision` (compare-and-set);
@@ -824,17 +830,20 @@ impl Bus {
             },
             _ => nats(&format!("writing state {key}"), e),
         };
-        if value.is_empty() {
+        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+            if value.is_empty() {
+                store
+                    .purge_expect_revision(key, Some(expected_revision))
+                    .await
+                    .map_err(conflict)?;
+                return Ok(0);
+            }
             store
-                .purge_expect_revision(key, Some(expected_revision))
+                .update(key, value.as_bytes().to_vec().into(), expected_revision)
                 .await
-                .map_err(conflict)?;
-            return Ok(0);
-        }
-        store
-            .update(key, value.as_bytes().to_vec().into(), expected_revision)
-            .await
-            .map_err(conflict)
+                .map_err(conflict)
+        })
+        .await
     }
 
     /// Append `line` and a newline to `key` (creating it if absent), retrying
@@ -871,10 +880,32 @@ impl Bus {
     pub async fn state_del(&self, key: &str) -> Result<()> {
         check_state_key(key)?;
         let store = self.store(&self.state, KV_STATE).await?;
-        store
-            .purge(key)
+        self.guarded(&format!("$KV.{KV_STATE}.{key}"), async {
+            store
+                .purge(key)
+                .await
+                .map_err(|e| nats(&format!("deleting state {key}"), e))
+        })
+        .await
+    }
+
+    /// The live keys of `HGL_STATE` that start with `prefix`, sorted.
+    pub async fn state_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let store = self.store(&self.state, KV_STATE).await?;
+        let mut keys = store
+            .keys()
             .await
-            .map_err(|e| nats(&format!("deleting state {key}"), e))
+            .map_err(|e| nats("listing state keys", e))?;
+        let mut out = Vec::new();
+        while let Some(k) = keys.next().await {
+            let k = k.map_err(|e| nats("listing state keys", e))?;
+            if k.starts_with(prefix) {
+                out.push(k);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
     }
 
     /// Write `HGL_HOSTS/<host>`; it expires [`HOSTS_TTL`] after the last write.
@@ -915,6 +946,55 @@ impl Bus {
     pub async fn tree_put(&self, rec: &TreeRecord) -> Result<()> {
         let store = self.store(&self.trees, KV_TREES).await?;
         put_json(store, &rec.key(), rec).await
+    }
+
+    /// Register `rec` without losing a fresher record a concurrent writer put under its key
+    /// (hgl-ai#51): a compare-and-set of `rec` merged with the record held
+    /// ([`TreeRecord::merge_held`]), retried on a lost race. Returns the record now held.
+    pub async fn tree_merge(&self, rec: &TreeRecord) -> Result<TreeRecord> {
+        let key = rec.key();
+        check_kv_key(&key)?;
+        let store = self.store(&self.trees, KV_TREES).await?;
+        for attempt in 0..APPEND_ATTEMPTS {
+            let entry = live_entry(store, &key).await?;
+            let held = entry
+                .as_ref()
+                .and_then(|e| serde_json::from_slice::<TreeRecord>(&e.value).ok());
+            let mut merged = rec.clone();
+            if let Some(h) = &held {
+                merged.merge_held(h);
+                if &merged == h {
+                    return Ok(merged);
+                }
+            }
+            let value: bytes::Bytes = serde_json::to_vec(&merged)
+                .map_err(|e| nats(&format!("encoding tree {key}"), e))?
+                .into();
+            let done = match &entry {
+                Some(e) => store
+                    .update(&key, value, e.revision)
+                    .await
+                    .map(drop)
+                    .map_err(|e| {
+                        (
+                            e.kind() == kv::UpdateErrorKind::WrongLastRevision,
+                            e.to_string(),
+                        )
+                    }),
+                None => store.create(&key, value).await.map(drop).map_err(|e| {
+                    (
+                        e.kind() == kv::CreateErrorKind::AlreadyExists,
+                        e.to_string(),
+                    )
+                }),
+            };
+            match done {
+                Ok(()) => return Ok(merged),
+                Err((true, _)) => tokio::time::sleep(backoff(attempt)).await,
+                Err((false, e)) => return Err(nats(&format!("writing tree {key}"), e)),
+            }
+        }
+        Err(BusError::Conflict { key, expected: 0 })
     }
 
     /// Deregister a tree by its key ([`TreeRecord::key`]). Deleting a missing key succeeds.

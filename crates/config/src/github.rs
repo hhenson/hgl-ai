@@ -18,8 +18,10 @@ pub struct RepoGate {
     /// Path prefixes added to `github.global_paths` for this repository.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub global_paths: Vec<String>,
-    /// Names of the local build verdicts a merge needs for the head on the present
-    /// `main` (state keys `verdict.<repo>.<pr>.<name>`, value `<head> <main> pass|fail ...`).
+    /// Names of the local build verdicts a merge needs for the head on the present `main`
+    /// under the current recipe, each a platform (`mac` for macOS): state keys
+    /// `verdict.<repo>.<pr>.<name>.<pair>`, value `<head> <main> pass|fail ...`
+    /// (docs/build.md BUILD-15).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub verdicts: Vec<String>,
     /// The checks a merge needs (docs/roles.md ROLE-20): check-run names or commit-status

@@ -44,6 +44,9 @@ pub struct LandOpts {
     /// Extra lines for a pin commit and pull request (attribution).
     pub trailer: Option<String>,
     pub footer: Option<String>,
+    /// Ask builders for the local build verdicts the gate lacks (BUILD-15); `None`: only
+    /// read them.
+    pub builds: Option<std::sync::Arc<gate::GateBuilds>>,
 }
 
 impl Default for LandOpts {
@@ -61,6 +64,7 @@ impl Default for LandOpts {
             sync_pins: true,
             trailer: None,
             footer: None,
+            builds: None,
         }
     }
 }
@@ -250,6 +254,7 @@ async fn land_locked<G: Gh>(
             &gate_opts,
             true,
             Some(lock),
+            o.builds.as_deref(),
         )
         .await
         {
@@ -430,6 +435,7 @@ pub(crate) async fn merge_locked<G: Gh>(
                     &gate_opts,
                     true,
                     Some(lock),
+                    o.builds.as_deref(),
                 )
                 .await?;
                 settle(gh, s, bus, repo, number, outcome, o, lock).await?
@@ -616,7 +622,8 @@ pub async fn plan<G: Gh>(
     head: &str,
     o: &LandOpts,
 ) -> Result<Landing> {
-    let outcome = gate::evaluate(gh, s, bus, repo, number, head, &o.gate, false, None).await?;
+    let outcome =
+        gate::evaluate(gh, s, bus, repo, number, head, &o.gate, false, None, None).await?;
     let mut after = Vec::new();
     if outcome.kind == Kind::AlreadyMerged
         && let Some(b) = bus

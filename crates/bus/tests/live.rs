@@ -564,6 +564,41 @@ async fn hosts_and_trees_round_trip() {
     bus.tree_del(&b.key()).await.unwrap();
     assert_eq!(bus.trees().await.unwrap(), vec![a.clone()]);
     bus.tree_del(&b.key()).await.unwrap();
+
+    // hgl-ai#51: a merge of a stale listing keeps the fresher record's fields.
+    let mut fresh = a.clone();
+    fresh.handoff_seq = Some(9);
+    fresh.families = vec![Family::Claude];
+    bus.tree_put(&fresh).await.unwrap();
+    let mut stale = a.clone();
+    stale.handoff_seq = Some(3);
+    stale.families = vec![Family::Gpt];
+    stale.size_bytes = 50;
+    let held = bus.tree_merge(&stale).await.unwrap();
+    assert_eq!(held.handoff_seq, Some(9));
+    assert_eq!(held.families, [Family::Gpt, Family::Claude]);
+    assert_eq!(held.size_bytes, 50);
+    assert_eq!(bus.trees().await.unwrap(), vec![held.clone()]);
+    // r3 on #57: a stale snapshot of an older tree at this key writes nothing over the
+    // newer tree's record.
+    let mut newer = held.clone();
+    newer.seq = Some(20);
+    newer.created_at = "20261127T090000Z".into();
+    newer.families = vec![Family::Gemini];
+    bus.tree_put(&newer).await.unwrap();
+    let mut old = a.clone();
+    old.seq = Some(1);
+    assert_eq!(bus.tree_merge(&old).await.unwrap(), newer);
+    assert_eq!(bus.trees().await.unwrap(), vec![newer.clone()]);
+    // A newer tree's listing replaces an older tree's record.
+    let mut newest = a.clone();
+    newest.seq = Some(30);
+    assert_eq!(bus.tree_merge(&newest).await.unwrap(), newest);
+    assert_eq!(bus.trees().await.unwrap(), vec![newest.clone()]);
+    // Absent: the merge creates it.
+    bus.tree_del(&a.key()).await.unwrap();
+    assert_eq!(bus.tree_merge(&a).await.unwrap(), a);
+    assert_eq!(bus.trees().await.unwrap(), vec![a.clone()]);
 }
 
 #[tokio::test]
@@ -640,6 +675,50 @@ async fn compare_and_set() {
     assert_eq!(bus.state_get("main").await.unwrap(), None);
     let r = bus.state_update("main", "fresh", 0).await.unwrap();
     assert_eq!(bus.state_get("main").await.unwrap().unwrap().revision, r);
+}
+
+#[tokio::test]
+async fn concurrent_tree_merges_lose_nothing() {
+    let Some(hub) = Hub::start() else { return };
+    hub.ready().await;
+    let rec = TreeRecord {
+        host: "build-1".into(),
+        seat: Seat::new("w1").unwrap(),
+        task: TaskKey {
+            repo: "hgl-compiler".into(),
+            issue: 51,
+        },
+        review: false,
+        path: "work/w1/hgl-compiler-51".into(),
+        branch: Some("codex/q51-x".into()),
+        created_at: "20261127T083000Z".into(),
+        size_bytes: 1,
+        families: Vec::new(),
+        class: None,
+        class_seq: None,
+        seq: Some(1),
+        handoff_seq: None,
+    };
+    let mut tasks = Vec::new();
+    for (i, f) in [Family::Gemini, Family::Gpt, Family::Claude, Family::Gpt]
+        .into_iter()
+        .enumerate()
+    {
+        let bus = hub.bus().await;
+        let mut r = rec.clone();
+        r.families = vec![f];
+        r.handoff_seq = Some(i as u64 + 1);
+        tasks.push(tokio::spawn(
+            async move { bus.tree_merge(&r).await.unwrap() },
+        ));
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+    let bus = hub.bus().await;
+    let got = &bus.trees().await.unwrap()[0];
+    assert_eq!(got.handoff_seq, Some(4), "the newest handoff");
+    assert_eq!(got.families.len(), 3, "{:?}", got.families);
 }
 
 #[tokio::test]

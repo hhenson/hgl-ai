@@ -14,11 +14,11 @@ use hgl_ai_build::recipe::{Recipe, sdk_var};
 use hgl_ai_build::{store, summary};
 use hgl_ai_bus::Bus;
 use hgl_ai_config::Config;
+use hgl_ai_proto::Seat;
 use hgl_ai_proto::build::{
-    BUILD_VERSION, BuildJob, BuildStatus, BuilderRecord, Platform, Summary, Tests, check_build_id,
-    new_build_id, reply_seat,
+    BUILD_VERSION, BuildJob, BuildStatus, Platform, Summary, check_build_id, new_build_id,
+    reply_seat,
 };
-use hgl_ai_proto::{Kind, Note, Seat, utc_now_stamp};
 use hgl_ai_tree::Git;
 
 use super::note::{duration, read_bounded};
@@ -76,6 +76,19 @@ enum Cmd {
     Shell(ShellArgs),
     /// Show, edit, import or export a repository's recipe on the hub.
     Recipe(RecipeArgs),
+    /// The local build verdicts a pull request needs for its head on the present main,
+    /// asking builders for those not judged (BUILD-15), as `gh land` does. Exit 0 all
+    /// pass, 1 one failed or did not run, 3 still building or missing.
+    Gate {
+        repo: String,
+        pr: u64,
+        /// Wait until every verdict is judged or did not run.
+        #[arg(long)]
+        wait: bool,
+        /// With --wait: give up after this long (the builds go on).
+        #[arg(long, value_name = "DUR", value_parser = duration, default_value = "2h")]
+        timeout: Duration,
+    },
 }
 
 #[derive(clap::Args)]
@@ -205,6 +218,12 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
         } => log(ctx, &id, step, bytes, log_dir),
         Cmd::Shell(a) => shell(ctx, a).await,
         Cmd::Recipe(a) => recipe(ctx, a).await,
+        Cmd::Gate {
+            repo,
+            pr,
+            wait,
+            timeout,
+        } => gate(ctx, &repo, pr, wait, timeout).await,
     }
 }
 
@@ -454,6 +473,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         tmp: std::env::temp_dir().display().to_string(),
         job: None,
         clone: None,
+        base_sha: None,
     };
     let work_root = cfg
         .as_ref()
@@ -471,6 +491,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         repo: repo.clone(),
         head,
         base: None,
+        base_sha: None,
         dirty,
         host: host_label(cfg.as_ref()),
         proxy: None,
@@ -530,32 +551,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
     Ok(s.status.exit_code())
 }
 
-/// The builder of `platform` to send to: `label` if given, else a ready one (the least
-/// busy), else a reachable one, else any active one (the job waits for it).
-pub fn choose(
-    builders: &[BuilderRecord],
-    platform: Platform,
-    label: Option<&str>,
-) -> Option<BuilderRecord> {
-    let mut c: Vec<&BuilderRecord> = builders
-        .iter()
-        .filter(|b| b.platform == platform && b.state != "retired")
-        .filter(|b| label.is_none_or(|l| b.label == l))
-        .collect();
-    if label.is_some() {
-        return c.first().map(|b| (*b).clone());
-    }
-    c.retain(|b| b.state == "active");
-    c.sort_by_key(|b| {
-        (
-            !b.ready(),
-            !b.reachable,
-            b.busy * 1000 / b.slots.max(1),
-            b.label.clone(),
-        )
-    });
-    c.first().map(|b| (*b).clone())
-}
+pub use hgl_ai_build::request::choose;
 
 async fn run_remote(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
     let platform = a.platform.expect("checked");
@@ -616,48 +612,12 @@ async fn run_remote(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         steps: a.steps.clone(),
         recipe_rev: None,
         keep_going: a.keep_going,
+        verdict: None,
         reply_to: reply.clone(),
         notify: a.notify.clone(),
         requester: requester(Some(&cfg)),
     };
-    let queued = Summary {
-        v: BUILD_VERSION,
-        id: id.clone(),
-        repo: repo.clone(),
-        head: Some(head.clone()),
-        base: a.base.clone(),
-        dirty: false,
-        host: b.label.clone(),
-        platform,
-        executor: b.executor.clone(),
-        proxy: b.proxy.clone(),
-        requester: Some(job.requester.clone()),
-        status: BuildStatus::Queued,
-        reason: None,
-        recipe_rev: None,
-        started_at: utc_now_stamp(),
-        ended_at: None,
-        wall_ms: 0,
-        log_dir: String::new(),
-        steps: Vec::new(),
-        errors: Vec::new(),
-        errors_total: 0,
-        tests: Tests::default(),
-        warnings_total: 0,
-        warnings: Default::default(),
-    };
-    store::run_put(&bus, &queued).await?;
-    let mut n = Note::new(
-        sender(&cfg)?,
-        b.inbox.clone(),
-        Kind::Build,
-        serde_json::to_string(&job)?,
-    );
-    n.repo = Some(repo);
-    n.head = Some(head);
-    n.base = a.base.clone();
-    n.issue = issue;
-    bus.send(&n).await?;
+    hgl_ai_build::request::send(&bus, sender(&cfg)?, &b, &job).await?;
     if a.detach {
         if ctx.json {
             println!("{}", serde_json::json!({ "id": id, "builder": b.label }));
@@ -728,6 +688,72 @@ async fn wait_remote(
                 );
             }
         }
+    }
+}
+
+async fn gate(
+    ctx: &Ctx,
+    repo: &str,
+    pr: u64,
+    wait: bool,
+    timeout: Duration,
+) -> anyhow::Result<i32> {
+    use hgl_ai_gh::gate::VerdictState;
+    let (cfg, bus) = connect(ctx).await?;
+    let s = hgl_ai_gh::Settings::from_config(&cfg)?;
+    let gh = super::gh::gh_client(&cfg).await?;
+    let builds = super::gh::gate_builds(&cfg)?;
+    // A lost build (its builder gone, past its bound) is asked again on a live builder by
+    // each round, as `gh land` does.
+    let deadline = Instant::now() + timeout;
+    let mut shown = String::new();
+    loop {
+        let (head, main, states) = hgl_ai_gh::builds::gate(&gh, &s, &bus, &builds, repo, pr)
+            .await
+            .map_err(super::gh::lift)?;
+        let mut lines = format!(
+            "{repo} #{pr} head {} on main {}\n",
+            &head[..12],
+            &main[..12]
+        );
+        for (n, st) in &states {
+            let l = match st {
+                VerdictState::Pass(v) => format!("{n} pass: {v}"),
+                VerdictState::Fail(v) => format!("{n} FAIL: {v}"),
+                VerdictState::NotRun(w) => format!("{n} NOT RUN: {w}"),
+                VerdictState::Building(w) => format!("{n} building: {w}"),
+                VerdictState::Missing(w) => {
+                    format!("{n} missing: {}", w.as_deref().unwrap_or("none"))
+                }
+            };
+            lines.push_str(&l);
+            lines.push('\n');
+        }
+        if lines != shown {
+            print!("{lines}");
+            shown = lines;
+        }
+        let failed = states
+            .iter()
+            .any(|(_, st)| matches!(st, VerdictState::Fail(_) | VerdictState::NotRun(_)));
+        let open = states
+            .iter()
+            .any(|(_, st)| matches!(st, VerdictState::Building(_)));
+        if failed {
+            return Ok(EXIT_FAIL);
+        }
+        if states
+            .iter()
+            .all(|(_, st)| matches!(st, VerdictState::Pass(_)))
+        {
+            return Ok(EXIT_OK);
+        }
+        if !wait || !open || Instant::now() >= deadline {
+            return Err(
+                NotReady(format!("{repo} #{pr}: local build verdicts not all judged")).into(),
+            );
+        }
+        tokio::time::sleep(Duration::from_secs(30)).await;
     }
 }
 
@@ -1154,6 +1180,8 @@ fn tempfile_dir(cfg: &Config) -> anyhow::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use hgl_ai_proto::build::BuilderRecord;
 
     fn rec(label: &str, platform: Platform, reachable: bool, busy: u32) -> BuilderRecord {
         BuilderRecord {
