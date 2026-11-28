@@ -192,7 +192,7 @@ impl Web {
         let now = chrono::Utc::now().timestamp().to_string();
         self.history(channel, None, &now, None, "")
             .await
-            .context("checking the private Slack Q&A channel")?;
+            .context("checking access to the private Slack channel")?;
         Ok(())
     }
 

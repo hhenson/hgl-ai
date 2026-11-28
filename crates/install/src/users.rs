@@ -16,9 +16,9 @@ use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SCREEN, KV_SLACK,
     KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SCREEN_LOG_KEYS,
-    SCREEN_NOTES_PREFIX, SCREEN_RULE_KEYS, SLACK_FEED, SLACK_OWNER_FILTER, STREAM_NOTES,
-    STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, USAGE_PREFIX, VIEWER_INBOX,
-    VIEWER_STATE_KEYS,
+    SCREEN_NOTES_PREFIX, SCREEN_RULE_KEYS, SLACK_DIGEST_PREFIX, SLACK_FEED, SLACK_OWNER_FILTER,
+    SLACK_STATUS_FEED, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat,
+    USAGE_PREFIX, VIEWER_INBOX, VIEWER_STATE_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -347,20 +347,25 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     }
     let slack_bucket = kv(KV_SLACK);
     if role == Role::Slack {
+        let mut publish_allow = vec![
+            SLACK_OWNER_FILTER.into(),
+            format!("$KV.{KV_SLACK}.>"),
+            format!("$JS.API.STREAM.INFO.{slack_bucket}"),
+            format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
+            format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
+            format!("$JS.API.STREAM.INFO.{STREAM_OWNER}"),
+            format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"),
+        ];
+        for feed in [SLACK_FEED, SLACK_STATUS_FEED] {
+            publish_allow.extend([
+                format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}.{feed}"),
+                format!("$JS.API.CONSUMER.INFO.{STREAM_OWNER}.{feed}"),
+                format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{feed}"),
+                format!("$JS.ACK.{STREAM_OWNER}.{feed}.>"),
+            ]);
+        }
         return Some(Permissions {
-            publish_allow: vec![
-                SLACK_OWNER_FILTER.into(),
-                format!("$KV.{KV_SLACK}.>"),
-                format!("$JS.API.STREAM.INFO.{slack_bucket}"),
-                format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
-                format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
-                format!("$JS.API.STREAM.INFO.{STREAM_OWNER}"),
-                format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"),
-                format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}.{SLACK_FEED}"),
-                format!("$JS.API.CONSUMER.INFO.{STREAM_OWNER}.{SLACK_FEED}"),
-                format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_FEED}"),
-                format!("$JS.ACK.{STREAM_OWNER}.{SLACK_FEED}.>"),
-            ],
+            publish_allow,
             publish_deny: Vec::new(),
         });
     }
@@ -445,6 +450,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$JS.API.CONSUMER.DURABLE.CREATE.{STREAM_OWNER}.*"),
                 format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.console"),
                 format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_FEED}"),
+                format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_STATUS_FEED}"),
                 format!("$JS.ACK.{STREAM_OWNER}.>"),
             ]);
             // The console's own state (sessions) is not for agents to read.
@@ -463,6 +469,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             allow.push(format!("{SUBJECT_PREFIX}.*"));
             allow.extend([
                 format!("{OWNER_PREFIX}.thread.*"),
+                format!("{SLACK_DIGEST_PREFIX}.*.*"),
                 format!("{OWNER_NOTES_PREFIX}.>"),
                 format!("$KV.{KV_THREADS}.>"),
             ]);
@@ -693,6 +700,10 @@ pub fn access_table() -> Vec<Row> {
             subj(format!("{OWNER_PREFIX}.thread.*")),
             [No, No, No, W, No, No, No],
         ),
+        row(
+            subj(format!("{SLACK_DIGEST_PREFIX}.*.*")),
+            [No, No, No, W, No, No, No],
+        ),
         row(subj(SLACK_OWNER_FILTER.into()), [No, No, No, No, W, No, No]),
         row(
             Target::BySequence(STREAM_OWNER.into()),
@@ -709,6 +720,13 @@ pub fn access_table() -> Vec<Row> {
             Target::Feed {
                 stream: STREAM_OWNER.into(),
                 consumer: SLACK_FEED.into(),
+            },
+            [No, No, No, No, R, No, No],
+        ),
+        row(
+            Target::Feed {
+                stream: STREAM_OWNER.into(),
+                consumer: SLACK_STATUS_FEED.into(),
             },
             [No, No, No, No, R, No, No],
         ),
@@ -1429,6 +1447,7 @@ mod tests {
                 "$KV.HGL_THREADS.>",
                 "hgl.notes.*",
                 "hgl.notes.owner.*",
+                "hgl.owner.digest.*.*",
                 "hgl.owner.thread.*",
             ]
         );
@@ -1477,6 +1496,10 @@ mod tests {
         assert!(has(
             Role::Slack,
             "$JS.API.CONSUMER.MSG.NEXT.HGL_OWNER.slack"
+        ));
+        assert!(has(
+            Role::Slack,
+            "$JS.API.CONSUMER.MSG.NEXT.HGL_OWNER.slack-status"
         ));
         assert!(!has(
             Role::Slack,

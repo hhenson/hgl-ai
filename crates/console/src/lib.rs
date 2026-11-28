@@ -11,6 +11,7 @@
 
 pub mod api;
 pub mod auth;
+mod digest;
 mod html;
 pub mod jwt;
 mod pages;

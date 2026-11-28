@@ -153,13 +153,15 @@ pub async fn status(State(app): AppState, h: HeaderMap) -> Response {
     let mut banner = None;
     if let Some(b) = app.hub() {
         let since = chrono::Utc::now() - chrono::Duration::days(30);
-        match owner::statuses(b, since, 50).await {
+        let (reports, decisions) =
+            tokio::join!(owner::statuses(b, since, 50), owner::decisions_tail(b, 25));
+        match reports {
             Ok(v) if v.is_empty() => body.push_str("<p>No status report in the last 30 days.</p>"),
             Ok(v) => {
-                for (_, st) in v {
+                for (seq, st) in v {
                     let _ = write!(
                         body,
-                        "<article class=\"report\"><h2>{} from {}</h2>{}</article>",
+                        "<article id=\"status-{seq}\" class=\"report\"><h2>{} from {}</h2>{}</article>",
                         time(&st.at),
                         esc(st.sender.as_str()),
                         text_block(&st.body)
@@ -167,6 +169,15 @@ pub async fn status(State(app): AppState, h: HeaderMap) -> Response {
                 }
             }
             Err(e) => banner = Some(format!("Reading the status reports: {e}")),
+        }
+        match decisions {
+            Ok(lines) if !lines.is_empty() => {
+                body.push_str("<details id=\"decisions\"><summary>Recent decisions</summary>");
+                body.push_str(&text_block(&lines.join("\n")));
+                body.push_str("</details>");
+            }
+            Err(e) if banner.is_none() => banner = Some(format!("Reading the decision log: {e}")),
+            _ => {}
         }
     }
     framed(&app, &s, "/", "Status", &body, banner).await

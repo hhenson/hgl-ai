@@ -86,7 +86,7 @@ before disabling the interim `hgl-intakewatch` timer.
 The server user's own commands run with `sudo -u hgl-ai env HOME=/var/lib/hgl-ai
 hgl-ai ...` (`server user add`, `doctor`).
 
-### Slack Q&A
+### Slack Q&A and status
 
 Use the existing Slack app with Socket Mode, `chat:write`, `groups:history`,
 `app_mentions:read`, and the `message.groups` and `app_mention` bot events.
@@ -117,6 +117,12 @@ The script provisions the Slack hub user and starts `hgl-ai-slack` as the server
 user alongside the console. The adapter opens outbound HTTPS and WebSocket
 connections. `server status` shows its service state and log location.
 
+For hourly digests, invite the same app to private `#hgl-status` and set
+`status_channel = "C12345679"` under `[slack]`. Run the steps printed by
+`hgl-ai server install --slack --keep-token --print-root-steps` to apply the hub
+permissions and restart the console and adapter. The provisioned app scopes and
+tokens already cover the status channel.
+
 ### Upgrading an install from before hgl-ai#63
 
 Its units append to `<data_dir>/logs/*.log` in the server user's home, opened by
@@ -141,7 +147,7 @@ hgl-ai server user ...`).
 | `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`, `HGL_BUILD/run.*`, `HGL_USAGE`, `hgl.usage.>`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, recipes (`HGL_BUILD/recipe.*`), verdicts (`HGL_STATE/verdict.*`), stream changes |
 | `coord` | a seat's, and `HGL_METRICS` |
 | `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
-| `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
+| `console` | `hgl.owner.thread.<id>`, `hgl.owner.digest.<team>.<channel>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
 | `screen` | publishes `hgl.notes.screen.<seat>` and `HGL_SCREEN/log.>`; pulls and acknowledges `inbox-screen`; reads `HGL_STATE`, `HGL_TREES` and `HGL_SCREEN/rule.>` |
 | `screen-rules` | writes `HGL_SCREEN/rule.>` and reads `HGL_SCREEN/log.>` by key |
@@ -149,7 +155,7 @@ hgl-ai server user ...`).
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
 The console keeps session state in `HGL_CONSOLE`. The Slack adapter reads its own
-delivery state, its durable `HGL_OWNER` feed and opening events by sequence.
+delivery state, its durable `HGL_OWNER` feeds and opening events by sequence.
 The controller uses `screen-rules` for rule writes and log reads. The `SCREEN`
 and `SCREEN_RULES` accounts isolate JetStream replies on the role-account layout.
 The console can read the Slack permalink index.

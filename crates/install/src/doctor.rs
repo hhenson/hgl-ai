@@ -1924,6 +1924,7 @@ mod tests {
         cfg.slack = Some(hgl_ai_config::slack::Slack {
             team: "TTEST".into(),
             channel: "CTEST".into(),
+            status_channel: None,
             user: "UTEST".into(),
             handle: "Owner".into(),
         });

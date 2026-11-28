@@ -7,6 +7,7 @@
 //!   (the owner) use. Agents publish on `hgl.console.>`. The console folds its own and
 //!   Slack's owner events and is the only writer of `HGL_THREADS` (OWN-5).
 
+pub mod digest;
 pub mod event;
 pub mod model;
 
@@ -218,12 +219,23 @@ async fn whole_for(bus: &Bus, rec: &Thread, ev: &Event) -> Result<Option<Thread>
 /// before, every word kept; `None` if the stream has none of them.
 async fn refold(bus: &Bus, rec: &Thread, upto: u64) -> Result<Option<Thread>> {
     let controller = Seat::new(rec.seat.clone()).map_err(|e| invalid(e.to_string()))?;
+    thread_at(bus, &controller, &rec.id, upto).await
+}
+
+/// Reconstruct a thread from its accepted events through the given stream sequence.
+pub async fn thread_at(
+    bus: &Bus,
+    controller: &Seat,
+    id: &str,
+    upto: u64,
+) -> Result<Option<Thread>> {
+    check_id(id).map_err(Error::Invalid)?;
     let msgs = bus
         .history_filtered(
             STREAM_OWNER,
             vec![
-                format!("hgl.*.thread.{}", rec.id),
-                format!("{}.slack.>", event::owner_subject(&rec.id)),
+                format!("hgl.*.thread.{id}"),
+                format!("{}.slack.>", event::owner_subject(id)),
             ],
             chrono::DateTime::UNIX_EPOCH,
             100_000,
@@ -234,7 +246,7 @@ async fn refold(bus: &Bus, rec: &Thread, upto: u64) -> Result<Option<Thread>> {
         let Ok(ev) = serde_json::from_slice::<Event>(&m.payload) else {
             continue;
         };
-        if let Ok((next, _)) = fold(t.as_ref(), &m.subject, m.seq, &ev, &controller) {
+        if let Ok((next, _)) = fold(t.as_ref(), &m.subject, m.seq, &ev, controller) {
             t = Some(next);
         }
     }
@@ -335,7 +347,7 @@ pub enum Applied {
 /// log. A failure leaves the message for redelivery; a refold makes the same notes,
 /// which the hub drops as duplicates.
 pub async fn apply(bus: &Bus, controller: &Seat, msg: &StreamMsg) -> Result<Applied> {
-    if msg.subject == event::status_subject() {
+    if msg.subject == event::status_subject() || digest::is_subject(&msg.subject) {
         return Ok(Applied::Status);
     }
     let Some((_, id)) = event::parse_subject(&msg.subject) else {
