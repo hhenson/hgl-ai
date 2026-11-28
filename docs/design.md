@@ -373,7 +373,8 @@ What subjects cannot stop:
   fleet makes one on the telemetry streams, so `doctor` on the hub's host lists any
   durable or idle for over an hour (`telemetry consumers`). It also lists every consumer
   delivering to `_INBOX_VIEWER.` on `HGL_TREES`, which the viewer read until hgl-ai#173;
-  `hgl-ai server install` deletes those.
+  `hgl-ai server install` and `hgl-ai init` (the system installer's upgrade) delete
+  those, and fail if they cannot.
 - `deliver_subject` may be any subject: the consumer delivers only the allowed keys'
   values, and only to a subject with interest.
 - `STREAM.INFO` with `subjects_filter` lists `HGL_STATE`'s key names, not their values.

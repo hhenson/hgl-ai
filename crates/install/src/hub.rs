@@ -115,6 +115,12 @@ pub async fn retire_viewer_consumers(
     Ok(gone)
 }
 
+/// [`retire_viewer_consumers`] as `cfg`'s hub user (the admin, when provisioning): every
+/// path that provisions the hub runs it, `server install` and `hgl-ai init` alike.
+pub async fn retire_viewer_consumers_as(cfg: &Config) -> Result<Vec<String>, String> {
+    retire_viewer_consumers(&jetstream_of(cfg).await?).await
+}
+
 /// The hub's JetStream as `cfg`'s credential, plainly (no bus, which would create).
 async fn jetstream_of(cfg: &Config) -> Result<async_nats::jetstream::Context, String> {
     let path = cfg.token_file().map_err(|e| e.to_string())?;
@@ -148,16 +154,14 @@ impl Hub for BusHub {
     }
 
     /// Then retire the viewer's consumers on the buckets it no longer reads; a failure
-    /// there is reported, and `doctor` finds what is left.
+    /// there fails the provisioning.
     async fn provision(&self, cfg: &Config) -> Result<(), BusError> {
         Bus::connect(cfg).await?.provision().await?;
-        match jetstream_of(cfg).await {
-            Ok(js) => match retire_viewer_consumers(&js).await {
-                Ok(gone) if gone.is_empty() => {}
-                Ok(gone) => eprintln!("retired the viewer's consumers: {}", gone.join(", ")),
-                Err(e) => eprintln!("warning: retiring the viewer's consumers: {e}"),
-            },
-            Err(e) => eprintln!("warning: retiring the viewer's consumers: {e}"),
+        let gone = retire_viewer_consumers_as(cfg)
+            .await
+            .map_err(|e| BusError::Nats(format!("retiring the viewer's consumers: {e}")))?;
+        if !gone.is_empty() {
+            eprintln!("retired the viewer's consumers: {}", gone.join(", "));
         }
         Ok(())
     }

@@ -157,6 +157,64 @@ fn ok(o: &Output) -> String {
     out(o)
 }
 
+/// `hgl-ai init`, the system installer's upgrade step, retires the viewer's consumers on
+/// `HGL_TREES`, which it no longer reads (hgl-ai#173), and leaves the fleet's alone.
+#[test]
+fn init_retires_the_viewers_tree_consumers() {
+    let Some(hub) = Hub::start("retire") else {
+        return;
+    };
+    ok(&hub.run(&["init"]));
+    let token = std::fs::read_to_string(hub.dir.0.join("hub.token")).unwrap();
+    let url = hub.url.clone();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // Which of the two consumers are there.
+    let there = |js: &async_nats::jetstream::Context| {
+        rt.block_on(async {
+            let s = js.get_stream("KV_HGL_TREES").await.unwrap();
+            let mut out = Vec::new();
+            for n in ["fleet", "page"] {
+                if s.consumer_info(n).await.is_ok() {
+                    out.push(n);
+                }
+            }
+            out
+        })
+    };
+    let js = rt.block_on(async {
+        let c = async_nats::ConnectOptions::with_token(token.trim().into())
+            .connect(url.as_str())
+            .await
+            .unwrap();
+        let js = async_nats::jetstream::new(c);
+        let s = js.get_stream("KV_HGL_TREES").await.unwrap();
+        for (name, deliver) in [
+            ("page", format!("{}.p", hgl_ai_proto::VIEWER_INBOX)),
+            ("fleet", "_INBOX.build-1.w".to_string()),
+        ] {
+            s.create_consumer(async_nats::jetstream::consumer::push::Config {
+                name: Some(name.into()),
+                durable_name: (name == "page").then(|| name.into()),
+                deliver_subject: deliver,
+                inactive_threshold: Duration::from_secs(60),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        }
+        js
+    });
+    assert_eq!(there(&js), ["fleet", "page"]);
+    let o = hub.run(&["init"]);
+    ok(&o);
+    assert!(
+        err(&o).contains("retired the viewer's consumers: KV_HGL_TREES/page"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(there(&js), ["fleet"]);
+}
+
 #[test]
 fn notes_send_wait_peek() {
     let Some(hub) = Hub::start("notes") else {

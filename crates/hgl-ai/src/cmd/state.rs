@@ -117,7 +117,8 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
 }
 
 pub async fn init(ctx: &Ctx) -> anyhow::Result<i32> {
-    let bus = connect(ctx).await?;
+    let cfg = ctx.load_config()?;
+    let bus = Bus::connect(&cfg).await?;
     let who = bus.who().to_string();
     bus.provision().await.with_context(|| {
         if who.ends_with("(admin)") || who == "shared token" {
@@ -129,6 +130,15 @@ pub async fn init(ctx: &Ctx) -> anyhow::Result<i32> {
             )
         }
     })?;
+    // What an upgrade must undo too: the viewer's consumers on a bucket it no longer reads
+    // (hgl-ai#173). The system installer's upgrade runs `init`; `server install` retires
+    // through `BusHub::provision`.
+    let gone = hgl_ai_install::hub::retire_viewer_consumers_as(&cfg)
+        .await
+        .map_err(|e| anyhow::anyhow!("retiring the viewer's consumers: {e}"))?;
+    if !gone.is_empty() {
+        eprintln!("retired the viewer's consumers: {}", gone.join(", "));
+    }
     let names = [
         STREAM_NOTES,
         STREAM_OWNER,

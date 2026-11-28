@@ -130,11 +130,13 @@ listener, at `<console url>/nats` on the console's own origin, as the hub user
 `viewer`. `viewer` reads five buckets, `HGL_HOSTS`, `HGL_STATE` (only the keys the page
 shows), `HGL_METRICS`, `HGL_BUILD` and `HGL_USAGE`, and nothing else (not `HGL_TREES`:
 its records hold paths), and sees no other client's replies. Titles in those keys come
-redacted (an email, an absolute path, quoted or not, a secret's assignment in shell, YAML
-or JSON form, or a token shape replaced; the whole title, before it is cut to 200
-characters),
-and the header names the user by handle only. Its subject permissions
-are read-only, but replies are not enforced until hgl-ai#141 (docs/install.md,
+redacted, failing closed (over-redaction rather than a leak; `backlog::page_title`):
+emails, token shapes and any word of 32 key characters or more go; after a sensitive key
+word (password, secret, token, key, auth, bearer, basic, credential, cookie, session,
+seed; any case, inside a longer word too) the rest of the title goes; every word with
+`/`, `\`, `~` or `file:` goes, with the rest of a quote it opens. All of it over the
+whole title, before it is cut to 200 characters. The header names the user by handle
+only. Its subject permissions are read-only, but replies are not enforced until hgl-ai#141 (docs/install.md,
 docs/design.md §9). The console hands its credential to a signed-in page
 (`GET /api/viewer`), which keeps it in memory only. A tab per area; the selected tab
 is the URL fragment (`/telemetry#prs`):
