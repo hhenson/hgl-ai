@@ -214,48 +214,34 @@ mod tests {
         assert_eq!(std::fs::metadata(&t).unwrap().len(), 0, "emptied again");
     }
 
-    /// A forked child holding copies of this process's descriptors until it is told to
-    /// exit: what a child forked by another thread is until its exec.
+    /// A forked child holding copies of this process's descriptors until it is killed:
+    /// what a child forked by another thread is until its exec.
     #[cfg(unix)]
-    struct Forked {
-        pid: libc::pid_t,
-        go: libc::c_int,
-    }
+    struct Forked(libc::pid_t);
 
     #[cfg(unix)]
     impl Forked {
         fn spawn() -> Forked {
-            let mut p = [0 as libc::c_int; 2];
-            // SAFETY: pipe2(2) into a two-element array; close-on-exec, so no other
-            // test's exec'd child keeps it.
-            assert_eq!(unsafe { libc::pipe2(p.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-            // SAFETY: the child calls only async-signal-safe functions (close, read,
-            // _exit) before it exits.
+            // SAFETY: the child calls only the async-signal-safe pause(2) until killed.
             let pid = unsafe { libc::fork() };
             assert!(pid >= 0, "fork");
             if pid == 0 {
-                let mut b = 0u8;
-                // SAFETY: the child's copies of the pipe; read blocks until the parent
-                // closes its end.
-                unsafe {
-                    libc::close(p[1]);
-                    libc::read(p[0], (&raw mut b).cast(), 1);
-                    libc::_exit(0);
+                loop {
+                    // SAFETY: no arguments; waits for the parent's SIGKILL.
+                    unsafe { libc::pause() };
                 }
             }
-            // SAFETY: the parent's read end, not used by it.
-            unsafe { libc::close(p[0]) };
-            Forked { pid, go: p[1] }
+            Forked(pid)
         }
 
         fn finish(self) {
             let mut st = 0;
-            // SAFETY: our write end, then the child forked above.
+            // SAFETY: the child forked above, killed and reaped here.
             unsafe {
-                libc::close(self.go);
-                assert_eq!(libc::waitpid(self.pid, &mut st, 0), self.pid);
+                assert_eq!(libc::kill(self.0, libc::SIGKILL), 0);
+                assert_eq!(libc::waitpid(self.0, &mut st, 0), self.0);
             }
-            assert!(libc::WIFEXITED(st) && libc::WEXITSTATUS(st) == 0);
+            assert!(libc::WIFSIGNALED(st));
         }
     }
 
