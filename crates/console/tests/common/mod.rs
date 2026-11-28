@@ -4,17 +4,22 @@
 #![allow(dead_code)]
 
 use std::collections::BTreeMap;
-use std::net::SocketAddr;
+use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::{Form, State};
 use axum::http::HeaderMap;
 use axum::routing::{get, post};
 use base64::Engine as _;
+use hgl_ai_bus::Credential;
 use hgl_ai_config::{AppleOAuth, Config, Console, GithubOAuth, GoogleOAuth, Person, User};
 use hgl_ai_console::App;
+use hgl_ai_install::nats::{Auth, Websocket, render_conf_ws};
+use hgl_ai_install::users::{Registry, Role};
 use webauthn_authenticator_rs::WebauthnAuthenticator as _;
 use webauthn_authenticator_rs::softpasskey::SoftPasskey;
 use webauthn_rs::prelude::{CreationChallengeResponse, RequestChallengeResponse, Url};
@@ -494,4 +499,118 @@ pub async fn signed_in(base: &str) -> (Browser, SoftPasskey) {
 
 pub fn path(p: &Path) -> PathBuf {
     p.to_path_buf()
+}
+
+/// A `nats-server` of the test's own, stopped when dropped.
+pub struct Server(Child);
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+pub struct Hub {
+    _server: Server,
+    _dir: tempfile::TempDir,
+    pub url: String,
+    pub creds: std::collections::BTreeMap<&'static str, Credential>,
+    /// Each user's credential file, as `server install` writes it.
+    pub cred_files: std::collections::BTreeMap<&'static str, PathBuf>,
+    /// The WebSocket listener's port, if the hub has one.
+    pub ws_port: Option<u16>,
+}
+
+fn free_port() -> u16 {
+    TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
+/// A hub on loopback with the `hub` (seat), `console`, `viewer` and `hub-admin` users;
+/// `None` (the test skips) without `nats-server` on `PATH`.
+pub fn start_hub() -> Option<Hub> {
+    start_hub_with(None)
+}
+
+/// [`start_hub`] with a WebSocket listener for pages of `ws_origin`.
+pub fn start_hub_with(ws_origin: Option<&str>) -> Option<Hub> {
+    let bin = std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|d| d.join("nats-server"))
+        .find(|p| p.is_file());
+    let Some(bin) = bin else {
+        eprintln!("skipped: nats-server is not on PATH");
+        return None;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let mut reg = Registry::default();
+    let mut creds = std::collections::BTreeMap::new();
+    let mut cred_files = std::collections::BTreeMap::new();
+    for (n, r) in [
+        ("hub", Role::Seat),
+        ("console", Role::Console),
+        ("viewer", Role::Viewer),
+        ("hub-admin", Role::Admin),
+    ] {
+        let t = reg.issue(n, r, false).unwrap();
+        creds.insert(n, hgl_ai_bus::parse_credential(&t).unwrap().unwrap());
+        let f = dir.path().join(format!("{n}.cred"));
+        write_secret(&f, &t);
+        cred_files.insert(n, f);
+    }
+    let port = free_port();
+    let ws = ws_origin.map(|o| Websocket {
+        port: free_port(),
+        origins: vec![o.to_string()],
+    });
+    let conf = dir.path().join("nats.conf");
+    std::fs::create_dir_all(dir.path().join("store")).unwrap();
+    std::fs::write(
+        &conf,
+        render_conf_ws(
+            "127.0.0.1",
+            port,
+            &dir.path().join("store"),
+            &Auth::Users(&reg),
+            ws.as_ref(),
+        ),
+    )
+    .unwrap();
+    let child = Command::new(bin)
+        .arg("-c")
+        .arg(&conf)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let server = Server(child);
+    let up = (0..200).any(|_| {
+        std::thread::sleep(Duration::from_millis(50));
+        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
+    });
+    assert!(up, "nats-server did not start");
+    Some(Hub {
+        _server: server,
+        _dir: dir,
+        url: format!("nats://127.0.0.1:{port}"),
+        creds,
+        cred_files,
+        ws_port: ws.map(|w| w.port),
+    })
+}
+
+/// `f`'s value, polled for up to 10 s.
+pub async fn until<T, F: std::future::Future<Output = Option<T>>>(
+    what: &str,
+    mut f: impl FnMut() -> F,
+) -> T {
+    for _ in 0..100 {
+        if let Some(v) = f().await {
+            return v;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    panic!("timed out waiting for {what}");
 }

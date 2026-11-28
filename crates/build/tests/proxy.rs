@@ -5,6 +5,9 @@
 //! is POSIX `sh`; that PowerShell runs the Windows scripts as intended is checked only
 //! against a real Windows host. The service tests need `nats-server` on `PATH`.
 
+#[path = "support/short.rs"]
+mod short;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -51,6 +54,8 @@ fn git(dir: &Path, args: &[&str]) -> String {
 /// proxy's directories. Short paths, for the control socket.
 struct World {
     _tmp: tempfile::TempDir,
+    _socket_tmp: tempfile::TempDir,
+    socket_path: PathBuf,
     root: PathBuf,
     origin: String,
     head: String,
@@ -77,9 +82,12 @@ impl World {
         let remote = root.join("remote");
         std::fs::create_dir_all(&state).unwrap();
         std::fs::create_dir_all(&remote).unwrap();
+        let (socket_tmp, socket_path) = short::tempdir();
         World {
             origin: bare.display().to_string(),
             _tmp: tmp,
+            _socket_tmp: socket_tmp,
+            socket_path,
             root,
             head,
             state,
@@ -87,15 +95,29 @@ impl World {
         }
     }
 
-    fn conn(&self) -> Arc<Conn> {
-        Conn::new(
-            "win1",
-            self.state.to_str().unwrap(),
-            fake_ssh(),
-            &self.root.join("ssh"),
-            Dialect::Posix,
+    fn conn(&self) -> Option<Arc<Conn>> {
+        if !short::fits(&self.socket_path, "win1") {
+            let conn = Conn::direct(
+                "win1",
+                self.state.to_str().unwrap(),
+                fake_ssh(),
+                &self.socket_path,
+                Dialect::Posix,
+            )
+            .unwrap();
+            assert!(conn.opts().iter().any(|o| o == "ControlPath=none"));
+            return None;
+        }
+        Some(
+            Conn::new(
+                "win1",
+                self.state.to_str().unwrap(),
+                fake_ssh(),
+                &self.socket_path,
+                Dialect::Posix,
+            )
+            .unwrap(),
         )
-        .unwrap()
     }
 
     fn checkout(&self, id: &str) -> Checkout {
@@ -154,7 +176,7 @@ fn step(name: &str, script: &str, time: Duration) -> StepSpec {
 #[test]
 fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
     let w = World::new();
-    let conn = w.conn();
+    let Some(conn) = w.conn() else { return };
     conn.connect().unwrap();
     assert!(
         w.state.join("master").is_file(),
@@ -386,7 +408,7 @@ fn ssh_executor_checks_out_runs_streams_kills_and_cleans_up() {
 #[test]
 fn a_drop_during_a_step_is_not_a_build_failure() {
     let w = World::new();
-    let conn = w.conn();
+    let Some(conn) = w.conn() else { return };
     conn.connect().unwrap();
     let ex = Ssh::new(
         Platform::Windows,
@@ -514,6 +536,9 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     let bus = Arc::new(Bus::connect_url(&n.2, Some(n.3.clone())).await.unwrap());
     bus.provision().await.unwrap();
     let w = World::new();
+    if w.conn().is_none() {
+        return;
+    }
     let recipe = "repo = \"demo\"\n[[step]]\nname = \"build\"\nrun = \"test -f main.c && sleep ${HOLD:-0}\"\ntime = \"2m\"\n";
     store::recipe_put(&bus, recipe, None).await.unwrap();
 
@@ -530,7 +555,10 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         .unwrap(),
     );
     cfg.validate().unwrap();
-    let lanes = service::lanes(&cfg, fake_ssh()).unwrap();
+    let lanes = service::lanes_with(&cfg, fake_ssh(), |label, alias, program, _, dialect| {
+        Conn::new(label, alias, program, &w.socket_path, dialect)
+    })
+    .unwrap();
     let origin = w.origin.clone();
     let settings = Settings {
         clone_url: Arc::new(move |_| origin.clone()),
@@ -798,7 +826,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
 #[test]
 fn a_session_lost_with_its_master_is_a_drop_after_a_quick_reconnect() {
     let w = World::new();
-    let conn = w.conn();
+    let Some(conn) = w.conn() else { return };
     conn.connect().unwrap();
     let ex = Ssh::new(
         Platform::Windows,
@@ -841,7 +869,7 @@ fn a_session_lost_with_its_master_is_a_drop_after_a_quick_reconnect() {
 #[test]
 fn remote_checkouts_take_turns_across_processes() {
     let w = World::new();
-    let conn = w.conn();
+    let Some(conn) = w.conn() else { return };
     conn.connect().unwrap();
     // Two executors with no state in common but the ssh directory, as two processes are.
     let a = Arc::new(Ssh::new(

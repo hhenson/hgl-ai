@@ -38,6 +38,7 @@ struct Inner {
     hosts: Mutex<Vec<HostRecord>>,
     deleted_hosts: Mutex<Vec<String>>,
     trees: Mutex<BTreeMap<String, TreeRecord>>,
+    tree_put_down: AtomicBool,
     /// While set, each `tree_merge` waits for a permit ([`FakeBus::hold_tree_merges`]).
     merge_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// `tree_merge` calls waiting at the gate.
@@ -176,6 +177,10 @@ impl FakeBus {
         g(&self.0.state).insert(k.into(), v.into());
     }
 
+    pub fn set_tree_put_down(&self, down: bool) {
+        self.0.tree_put_down.store(down, Ordering::SeqCst);
+    }
+
     pub fn trees(&self) -> BTreeMap<String, TreeRecord> {
         g(&self.0.trees).clone()
     }
@@ -274,6 +279,9 @@ impl FakeBus {
 
 impl Registry for FakeBus {
     async fn tree_put(&self, rec: &TreeRecord) -> Result<()> {
+        if self.0.tree_put_down.load(Ordering::SeqCst) {
+            return Err(no_responders());
+        }
         g(&self.0.trees).insert(rec.key(), rec.clone());
         Ok(())
     }

@@ -1106,7 +1106,8 @@ impl<B: BusApi> Bridge<B> {
         for (d, p) in st.pending.iter().zip(&plans) {
             let new_tree = match &p.target {
                 Target::Tree { task, review } => {
-                    p.create.is_some() && self.trees.existing(seat.name(), task, *review).is_none()
+                    p.create.is_some()
+                        && (*review || self.trees.existing(seat.name(), task, *review).is_none())
                 }
                 Target::Inbox => false,
             };

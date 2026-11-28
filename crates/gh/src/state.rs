@@ -14,6 +14,8 @@ pub const KEY_PRS: &str = "prs";
 pub const KEY_HOLD: &str = "hold";
 /// The claimable queue and open issues by label (`backlog::Backlog`).
 pub const KEY_BACKLOG: &str = "backlog";
+/// The last note of each task with a worktree (`tasks`).
+pub const KEY_TASKS: &str = "tasks";
 /// Lines of `landed.log` kept: far below the bus's 1 MiB value limit; GitHub holds the rest.
 pub const LANDED_KEEP: usize = 2000;
 
