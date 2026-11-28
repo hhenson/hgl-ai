@@ -1,0 +1,2 @@
+# The telemetry page's build output (crates/console/web): generated, not diffed line by line.
+crates/console/web/dist/** linguist-generated -diff
