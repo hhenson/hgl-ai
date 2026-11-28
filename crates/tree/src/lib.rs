@@ -317,8 +317,8 @@ impl Trees {
         issue_title: &dyn Fn() -> Option<String>,
     ) -> Result<Created> {
         let review = matches!(what, Create::Review { .. });
-        let _guard = self.lock_clone(&task.repo)?;
         let dir = self.layout.task_dir(seat, task, review)?;
+        let _guard = self.lock_clone(&task.repo)?;
         if dir.join(TASK_FILE).is_file() {
             if review {
                 return Err(TreeError::Exists(dir));
@@ -617,8 +617,12 @@ impl Trees {
     /// Remove the task's tree (PROTO-14): salvage, worktree, branch, directory. The caller
     /// deregisters `Removed::key`. `None` when there is no such tree.
     pub fn remove(&self, seat: &Seat, task: &TaskKey, review: bool) -> Result<Option<Removed>> {
-        let _guard = self.lock_clone(&task.repo)?;
         let dir = self.layout.task_dir(seat, task, review)?;
+        if std::fs::symlink_metadata(&dir).is_err() {
+            return Ok(None);
+        }
+        self.layout.confine_existing(&dir)?;
+        let _guard = self.lock_clone(&task.repo)?;
         if std::fs::symlink_metadata(&dir).is_err() {
             return Ok(None);
         }
@@ -630,7 +634,7 @@ impl Trees {
             .layout
             .clone_dir(&task.repo)
             .ok()
-            .filter(|c| c.is_dir());
+            .filter(|c| c.join("HEAD").is_file());
         let mut salvage = None;
         if src.join(".git").exists() {
             // A git killed with the turn may have left its lock; salvage reads through an
@@ -896,15 +900,25 @@ impl Trees {
     /// Lock a clone before inspecting or changing it, including its initialization.
     fn lock_clone(&self, repo: &str) -> Result<CloneLock> {
         let clone = self.layout.clone_dir(repo)?;
-        mkdir(&clone)?;
-        let path = clone.join("hgl-ai.lock");
+        let locks = self.layout.root().join("clones").join(".locks");
+        mkdir(&locks)?;
+        let path = locks.join(format!(
+            "{}.lock",
+            clone.file_name().unwrap().to_string_lossy()
+        ));
         let file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(false)
             .write(true)
             .open(&path)
             .map_err(|e| TreeError::io(&path, e))?;
-        file.lock().map_err(|e| TreeError::io(&path, e))?;
+        loop {
+            match file.lock() {
+                Ok(()) => break,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(TreeError::io(&path, e)),
+            }
+        }
         Ok(CloneLock(file))
     }
 

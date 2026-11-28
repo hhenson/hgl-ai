@@ -62,11 +62,15 @@ impl Git {
         S: AsRef<OsStr>,
     {
         let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        let cwd_real = cwd.canonicalize().map_err(|e| TreeError::io(cwd, e))?;
+        let ceiling = cwd_real.parent().unwrap_or(&cwd_real);
         let out = Command::new(&self.program)
             .args(&args)
             .current_dir(cwd)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .envs(env.iter().map(|(k, v)| (k, v)))
+            .env_remove("GIT_DIR")
+            .env("GIT_CEILING_DIRECTORIES", ceiling)
             .env("GIT_TERMINAL_PROMPT", "0")
             .env("LC_ALL", "C")
             .stdin(Stdio::null())

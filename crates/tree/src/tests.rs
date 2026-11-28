@@ -811,16 +811,62 @@ fn clone_lock_child() {
 }
 
 #[test]
+fn removal_without_clone_does_not_touch_enclosing_repository() {
+    let e = env();
+    e.git.run(&e.seed, ["branch", "keep-me"]).unwrap();
+    let root = e.seed.join("nested-work");
+    let trees = Trees::with(
+        Layout::new(&root).unwrap(),
+        "host",
+        &Github::default(),
+        e.git.clone(),
+    );
+    assert!(
+        trees
+            .remove(&seat("w1"), &task(12), false)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!root.join("clones").exists(), "no-op must not lock");
+    let dir = trees
+        .layout
+        .task_dir(&seat("w1"), &task(12), false)
+        .unwrap();
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(TASK_FILE), r#"{"seat":"w1","repo":"demo","issue":12,"branch":"keep-me","base":"main","start":"x","created_at":"now"}"#).unwrap();
+    let clone = trees.layout.clone_dir("demo").unwrap();
+    std::fs::create_dir_all(&clone).unwrap();
+    assert!(!e.git.check(&clone, ["rev-parse", "--git-dir"]).unwrap());
+    let before = e
+        .git
+        .run(&e.seed, ["worktree", "list", "--porcelain"])
+        .unwrap();
+    trees
+        .remove(&seat("w1"), &task(12), false)
+        .unwrap()
+        .unwrap();
+    assert!(
+        e.git
+            .check(
+                &e.seed,
+                ["show-ref", "--verify", "--quiet", "refs/heads/keep-me"]
+            )
+            .unwrap()
+    );
+    assert_eq!(
+        before,
+        e.git
+            .run(&e.seed, ["worktree", "list", "--porcelain"])
+            .unwrap()
+    );
+}
+
+#[test]
 fn clone_lock_serializes_processes_and_unlocks_inherited_descriptors() {
     let e = env();
     let guard = e.trees.lock_clone("demo").unwrap();
     let inherited = guard.0.try_clone().unwrap();
-    let path = e
-        .trees
-        .layout
-        .clone_dir("demo")
-        .unwrap()
-        .join("hgl-ai.lock");
+    let path = e.trees.layout.root().join("clones/.locks/demo.lock");
     let child = |expect: bool| {
         let mut cmd = std::process::Command::new(std::env::current_exe().unwrap());
         cmd.args(["--exact", "tests::clone_lock_child"])
