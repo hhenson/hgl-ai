@@ -174,11 +174,13 @@ function Key({ def }: { def: TableDef }) {
 }
 
 function Detail({ def, row, onClose }: { def: TableDef; row: Row; onClose: () => void }) {
-  const first = def.columns[0];
+  // Named by its first column that is not a time, and its title.
+  const first = def.columns.find((c) => c.kind !== "stamp") ?? def.columns[0];
+  const name = `${String(row[first.field] ?? row.id)}${row.title ? ` ${String(row.title)}` : ""}`;
   return (
-    <section className="detail" aria-label={`Detail of ${String(row[first.field] ?? row.id)}`}>
+    <section className="detail" aria-label={`Detail of ${name}`}>
       <div className="flex items-center justify-between gap-2">
-        <p className="m-0 font-semibold">{String(row[first.field] ?? row.id)}</p>
+        <p className="m-0 font-semibold">{name}</p>
         <button type="button" className="btn-quiet" onClick={onClose}>
           Close
         </button>
