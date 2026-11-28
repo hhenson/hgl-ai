@@ -170,19 +170,14 @@ impl<B: BusApi> Bridge<B> {
         for t in list.iter().filter(|t| t.file.is_some()) {
             let key = t.record.key();
             let _reg = self.registry_lock(&key).await;
-            let _file_lock = match self.cfg.data_dir() {
-                Ok(dir) => match crate::lock::FileLock::registry(&dir, &key).await {
+            let _file_lock =
+                match crate::lock::FileLock::registry(self.trees.layout().root(), &key).await {
                     Ok(held) => held,
                     Err(e) => {
                         tracing::warn!(%key, "locking registry: {e}");
                         continue;
                     }
-                },
-                Err(e) => {
-                    tracing::warn!(%key, "registry lock directory: {e}");
-                    continue;
-                }
-            };
+                };
             if !still_there(t) {
                 tracing::info!(key = %t.record.key(), "removed since the listing; not registered");
                 continue;

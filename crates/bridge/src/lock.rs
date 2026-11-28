@@ -66,10 +66,12 @@ impl FileLock {
 
     /// Serialize host-local registry operations across processes. Lock files are stable:
     /// they must not be removed while another process may have one open.
-    pub async fn registry(data_dir: &Path, key: &str) -> std::io::Result<FileLock> {
+    pub async fn registry(work_root: &Path, key: &str) -> std::io::Result<FileLock> {
         use sha2::{Digest, Sha256};
         let name = hex::encode(Sha256::digest(key.as_bytes()));
-        let path = data_dir.join("tree-registry-locks").join(name);
+        let path = work_root
+            .join("clones/.locks")
+            .join(format!("registry-{name}.lock"));
         loop {
             if let Some(held) = Self::try_exclusive(&path)? {
                 return Ok(held);

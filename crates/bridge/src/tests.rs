@@ -637,8 +637,12 @@ async fn cli_removal_waits_for_report_before_deregistering() {
     h.bus.hold_tree_merges();
     let (tx, j) = h.start(&["w1"]);
     eventually("report holds its write", || h.bus.tree_merges_held() == 1).await;
-    let data = h.cfg.data_dir().unwrap();
-    let mut cli = tokio::spawn(async move { FileLock::registry(&data, key).await.unwrap() });
+    let mut cli_cfg = h.cfg.clone();
+    cli_cfg.paths.data_dir = h.root.join("other-data").display().to_string();
+    assert_ne!(cli_cfg.data_dir().unwrap(), h.cfg.data_dir().unwrap());
+    let cli_trees = Trees::new(&cli_cfg, h.git.clone()).unwrap();
+    let root = cli_trees.layout().root().to_path_buf();
+    let mut cli = tokio::spawn(async move { FileLock::registry(&root, key).await.unwrap() });
     assert!(
         tokio::time::timeout(Duration::from_millis(200), &mut cli)
             .await
@@ -649,12 +653,14 @@ async fn cli_removal_waits_for_report_before_deregistering() {
         .await
         .unwrap()
         .unwrap();
-    let trees = Trees::new(&h.cfg, h.git.clone()).unwrap();
     let task = TaskKey {
         repo: "demo".into(),
         issue: 41,
     };
-    trees.remove(&seat("w1"), &task, false).unwrap().unwrap();
+    cli_trees
+        .remove(&seat("w1"), &task, false)
+        .unwrap()
+        .unwrap();
     h.bus.tree_del(key).await.unwrap();
     drop(held);
     assert!(!h.bus.trees().contains_key(key));
@@ -690,7 +696,7 @@ async fn report_checks_tree_after_taking_registry_file_lock() {
     let second = listed.iter().find(|t| t.record.key() == key).unwrap();
     h.bus.tree_merge(&second.record).await.unwrap();
     assert!(h.bus.trees().contains_key(key));
-    let held = FileLock::registry(&h.cfg.data_dir().unwrap(), key)
+    let held = FileLock::registry(trees.layout().root(), key)
         .await
         .unwrap();
     let deps = Deps {

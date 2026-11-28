@@ -144,7 +144,7 @@ async fn remove(ctx: &Ctx, a: RemoveArgs) -> anyhow::Result<i32> {
         None
     };
     let key = hgl_ai_proto::tree_key(&cfg.host, &a.seat, &task, a.review);
-    let _registry = FileLock::registry(&cfg.data_dir()?, &key).await?;
+    let _registry = FileLock::registry(trees.layout().root(), &key).await?;
     let (t2, seat, review) = (trees.clone(), a.seat.clone(), a.review);
     let removed = tokio::task::spawn_blocking(move || t2.remove(&seat, &task, review)).await??;
     let Some(rm) = removed else {
