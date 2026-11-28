@@ -15,8 +15,9 @@ use hgl_ai_bus::Credential;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE,
-    KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
-    SLACK_OWNER_FILTER, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, USAGE_PREFIX,
+    KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_DIGEST_PREFIX,
+    SLACK_FEED, SLACK_OWNER_FILTER, SLACK_STATUS_FEED, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
+    SUBJECT_PREFIX, USAGE_PREFIX,
 };
 use serde::{Deserialize, Serialize};
 
@@ -258,20 +259,25 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     }
     let slack_bucket = kv(KV_SLACK);
     if role == Role::Slack {
+        let mut publish_allow = vec![
+            SLACK_OWNER_FILTER.into(),
+            format!("$KV.{KV_SLACK}.>"),
+            format!("$JS.API.STREAM.INFO.{slack_bucket}"),
+            format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
+            format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
+            format!("$JS.API.STREAM.INFO.{STREAM_OWNER}"),
+            format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"),
+        ];
+        for feed in [SLACK_FEED, SLACK_STATUS_FEED] {
+            publish_allow.extend([
+                format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}.{feed}"),
+                format!("$JS.API.CONSUMER.INFO.{STREAM_OWNER}.{feed}"),
+                format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{feed}"),
+                format!("$JS.ACK.{STREAM_OWNER}.{feed}.>"),
+            ]);
+        }
         return Some(Permissions {
-            publish_allow: vec![
-                SLACK_OWNER_FILTER.into(),
-                format!("$KV.{KV_SLACK}.>"),
-                format!("$JS.API.STREAM.INFO.{slack_bucket}"),
-                format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
-                format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
-                format!("$JS.API.STREAM.INFO.{STREAM_OWNER}"),
-                format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"),
-                format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}.{SLACK_FEED}"),
-                format!("$JS.API.CONSUMER.INFO.{STREAM_OWNER}.{SLACK_FEED}"),
-                format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_FEED}"),
-                format!("$JS.ACK.{STREAM_OWNER}.{SLACK_FEED}.>"),
-            ],
+            publish_allow,
             publish_deny: Vec::new(),
             subscribe_allow: vec!["_INBOX.>".into()],
         });
@@ -355,6 +361,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$JS.API.CONSUMER.DURABLE.CREATE.{STREAM_OWNER}.*"),
                 format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.console"),
                 format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_FEED}"),
+                format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_STATUS_FEED}"),
                 format!("$JS.ACK.{STREAM_OWNER}.>"),
             ]);
             // The console's own state (sessions) is not for agents to read.
@@ -373,6 +380,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             allow.push(format!("{SUBJECT_PREFIX}.*"));
             allow.extend([
                 format!("{OWNER_PREFIX}.thread.*"),
+                format!("{SLACK_DIGEST_PREFIX}.*.*"),
                 format!("{OWNER_NOTES_PREFIX}.>"),
                 format!("$KV.{KV_THREADS}.>"),
             ]);

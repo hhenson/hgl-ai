@@ -359,7 +359,7 @@ async fn ask_answer_converse_and_refuse_forgery() {
     assert!(page.contains("1 found") && page.contains("Release timing"));
 
     // A status report shows on the front page.
-    owner::status_post(&seat_bus, &claude, "**Landed** hgl-compiler#980.")
+    let report_seq = owner::status_post(&seat_bus, &claude, "**Landed** hgl-compiler#980.")
         .await
         .unwrap();
     let mut page = String::new();
@@ -372,6 +372,8 @@ async fn ask_answer_converse_and_refuse_forgery() {
     }
     assert!(page.contains("**Landed** hgl-compiler#980."), "{page}");
     assert!(page.contains("from claude"));
+    assert!(page.contains(&format!("id=\"status-{report_seq}\"")));
+    assert!(page.contains("id=\"decisions\""));
 
     // Telemetry reads the hub as the console's user.
     // The first reading may predate the questions; the next comes within 10 s.

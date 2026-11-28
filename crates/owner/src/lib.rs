@@ -7,6 +7,7 @@
 //!   (the owner) use. Agents publish on `hgl.console.>`. The console folds its own and
 //!   Slack's owner events and is the only writer of `HGL_THREADS` (OWN-5).
 
+pub mod digest;
 pub mod event;
 pub mod model;
 
@@ -331,7 +332,7 @@ pub enum Applied {
 /// log. A failure leaves the message for redelivery; a refold makes the same notes,
 /// which the hub drops as duplicates.
 pub async fn apply(bus: &Bus, controller: &Seat, msg: &StreamMsg) -> Result<Applied> {
-    if msg.subject == event::status_subject() {
+    if msg.subject == event::status_subject() || digest::is_subject(&msg.subject) {
         return Ok(Applied::Status);
     }
     let Some((_, id)) = event::parse_subject(&msg.subject) else {

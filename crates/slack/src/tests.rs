@@ -26,6 +26,7 @@ fn settings() -> Slack {
     Slack {
         team: "TQA".into(),
         channel: "CQA".into(),
+        status_channel: None,
         user: "UOWNER".into(),
         handle: "The Owner".into(),
     }
@@ -249,7 +250,8 @@ impl FakeSlack {
                      headers: HeaderMap,
                      Json(mut body): Json<Value>| async move {
                         assert_eq!(headers["authorization"], "Bearer xoxb-test");
-                        assert_eq!(body["channel"], "CQA");
+                        let channel = body["channel"].as_str().unwrap().to_owned();
+                        assert!(["CQA", "CSTATUS"].contains(&channel.as_str()));
                         assert_eq!(body["mrkdwn"], false);
                         let mut posts = state.posts.lock().unwrap();
                         let timestamp = Utc::now().timestamp() + std::mem::take(&mut posts.next_post_skew);
@@ -260,7 +262,7 @@ impl FakeSlack {
                         if std::mem::take(&mut posts.lose_response) {
                             return StatusCode::BAD_GATEWAY.into_response();
                         }
-                        Json(json!({ "ok":true, "ts":ts, "channel":"CQA" })).into_response()
+                        Json(json!({ "ok":true, "ts":ts, "channel":channel })).into_response()
                     },
                 ),
             )
@@ -365,7 +367,7 @@ async fn history(
     Query(query): Query<BTreeMap<String, String>>,
 ) -> Json<Value> {
     assert_eq!(headers["authorization"], "Bearer xoxb-test");
-    assert_eq!(query["channel"], "CQA");
+    assert!(["CQA", "CSTATUS"].contains(&query["channel"].as_str()));
     assert_eq!(query["include_all_metadata"], "true");
     let mut posts = state.posts.lock().unwrap();
     posts.history_calls += 1;
@@ -379,7 +381,8 @@ async fn history(
         .items
         .iter()
         .filter(|item| {
-            item["thread_ts"].as_str() == query.get("ts").map(String::as_str)
+            item["channel"] == query["channel"].as_str()
+                && item["thread_ts"].as_str() == query.get("ts").map(String::as_str)
                 && item["ts"]
                     .as_str()
                     .and_then(slack_timestamp)
@@ -1316,4 +1319,146 @@ async fn socket_mode_retries_quick_disconnects_with_growing_delays() {
         result = timeout(Duration::from_secs(12), disconnects) => result.unwrap(),
         () = adapter.socket_loop() => panic!("Slack socket loop exited"),
     }
+}
+
+#[tokio::test]
+async fn status_feed_recovers_a_post_without_blocking_qa() {
+    use hgl_ai_owner::digest::{self, Digest, Question, Report};
+
+    if Command::new("nats-server")
+        .arg("--version")
+        .output()
+        .is_err()
+    {
+        eprintln!("skipped: nats-server is unavailable");
+        return;
+    }
+    let hub = Hub::new();
+    let fake = FakeSlack::start().await;
+    let subject = digest::subject("TQA", "CSTATUS");
+    let through = Utc::now().timestamp();
+    let key = format!("TQA.CSTATUS.digest.{through}");
+    let batch = Digest {
+        v: event::EVENT_VERSION,
+        through,
+        decision_tip: None,
+        reports: vec![Report {
+            seq: 7,
+            at: hgl_ai_proto::utc_now_stamp(),
+            body: "Landed repo#1. Running repo#2. Blocked on repo#3.".into(),
+        }],
+        decisions: vec!["20261128T100000Z seat: Proceed with repo#1".into()],
+        questions: vec![Question {
+            id: "q-00000001".into(),
+            title: "Check the result".into(),
+        }],
+        more_reports: 0,
+        more_decisions: 0,
+        more_questions: 0,
+    };
+    let payload = serde_json::to_vec(&batch).unwrap();
+    {
+        let _server = hub.start().await;
+        hub.bus("admin").await.provision().await.unwrap();
+        let slack = hub.bus("slack").await;
+        let seat_bus = hub.bus("seat").await;
+        let adapter = fake.adapter(&slack).await;
+        adapter.web.verify_channel("CSTATUS").await.unwrap();
+        for bus in [&slack, &seat_bus] {
+            assert!(matches!(
+                bus.publish_event_after(&subject, &payload, 0).await,
+                Err(BusError::Denied { .. })
+            ));
+        }
+        let mut status = adapter.open_status_feed("CSTATUS").await.unwrap();
+        let mut qa = adapter.open_feed().await.unwrap();
+        let console = hub.bus("console").await;
+        console
+            .publish_event_after(&subject, &payload, 0)
+            .await
+            .unwrap();
+        console
+            .publish_event_after(&digest::subject("TQA", "COTHER"), &payload, 0)
+            .await
+            .unwrap();
+        fake.lose_next_response();
+        let digest = next(&mut status).await;
+        assert!(adapter.deliver_digest("CSTATUS", &digest).await.is_err());
+        digest.nak(Duration::from_millis(10)).await.unwrap();
+
+        hgl_ai_owner::ask(
+            &seat_bus,
+            &adapter.controller,
+            Ask {
+                title: "Q&A still available".into(),
+                priority: Priority::P3,
+                issue: None,
+                context: String::new(),
+                question: "Still running?".into(),
+                options: vec![],
+                suggested: None,
+            },
+        )
+        .await
+        .unwrap();
+        deliver_next(&adapter, &mut qa).await;
+        assert_eq!(fake.items().len(), 2);
+    }
+
+    let _server = hub.start().await;
+    let slack = hub.bus("slack").await;
+    let adapter = fake.adapter(&slack).await;
+    let mut status = adapter.open_status_feed("CSTATUS").await.unwrap();
+    let persisted = next(&mut status).await;
+    elapse_recovery(&adapter, &key).await;
+    adapter.deliver_digest("CSTATUS", &persisted).await.unwrap();
+    persisted.ack().await.unwrap();
+    assert!(
+        status
+            .next(Duration::from_millis(200))
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let posts = fake.items();
+    assert_eq!(
+        posts.len(),
+        2,
+        "a lost status receipt does not duplicate the post"
+    );
+    assert_eq!(posts[0]["channel"], "CSTATUS");
+    assert!(posts[0].get("thread_ts").is_none());
+    assert_eq!(posts[1]["channel"], "CQA");
+    let body = posts[0]["text"].as_str().unwrap();
+    for want in [
+        "Landed repo#1",
+        "Running repo#2",
+        "Blocked on repo#3",
+        "Proceed with repo#1",
+        "Check the result",
+    ] {
+        assert!(body.contains(want), "{want}");
+    }
+    let blocks = posts[0]["blocks"].to_string();
+    assert!(blocks.contains("https://console.example.com/#status-7"));
+    assert!(blocks.contains("https://console.example.com/t/q-00000001"));
+    let ts = posts[0]["ts"].as_str().unwrap();
+    let secs = ts.split_once('.').unwrap().0;
+    fake.send(
+        &adapter,
+        vec![replace(
+            reply("status-reply", ts, &format!("{secs}.100001")),
+            "/payload/event/channel",
+            json!("CSTATUS"),
+        )],
+    )
+    .await;
+    assert!(
+        hub.bus("admin")
+            .await
+            .history(STREAM_OWNER, SLACK_OWNER_FILTER, DateTime::UNIX_EPOCH, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

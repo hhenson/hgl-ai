@@ -7,6 +7,7 @@
 //! drives the passkey ceremonies, live telemetry (server-sent events) and the answer form.
 
 pub mod auth;
+mod digest;
 mod html;
 pub mod jwt;
 mod pages;

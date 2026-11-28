@@ -3,12 +3,14 @@ use serde::{Deserialize, Serialize};
 pub const BOT_TOKEN_FILE: &str = "slack-bot.token";
 pub const APP_TOKEN_FILE: &str = "slack-app.token";
 
-/// Stage 1 permits one private Q&A channel in one workspace and one owner account.
+/// One workspace, an owner account for Q&A and an optional bot-only status channel.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Slack {
     pub team: String,
     pub channel: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status_channel: Option<String>,
     pub user: String,
     pub handle: String,
 }
@@ -23,7 +25,13 @@ impl Slack {
             ("team", self.team.as_str(), "T"),
             ("channel", self.channel.as_str(), "CG"),
             ("user", self.user.as_str(), "UW"),
-        ] {
+        ]
+        .into_iter()
+        .chain(
+            self.status_channel
+                .as_deref()
+                .map(|id| ("status_channel", id, "CG")),
+        ) {
             let bytes = value.as_bytes();
             if !(2..=32).contains(&bytes.len())
                 || !prefixes.as_bytes().contains(&bytes[0])
@@ -33,6 +41,9 @@ impl Slack {
             {
                 return Err(format!("[slack] {field} must be a Slack ID"));
             }
+        }
+        if self.status_channel.as_ref() == Some(&self.channel) {
+            return Err("[slack] status_channel must differ from the Q&A channel".into());
         }
         hgl_ai_proto::check_handle(&self.handle).map_err(|e| format!("[slack] handle: {e}"))
     }

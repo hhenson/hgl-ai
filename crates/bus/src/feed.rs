@@ -9,6 +9,8 @@ use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
 use async_nats::jetstream::{
     self, AckKind,
     context::{Publish, PublishErrorKind},
+    message::StreamMessage as RawMessage,
+    stream::LastRawMessageErrorKind,
 };
 use futures::StreamExt;
 use hgl_ai_proto::{
@@ -83,6 +85,20 @@ fn to_msg(m: jetstream::Message, keep: bool) -> Result<StreamMsg> {
     })
 }
 
+fn from_raw(message: RawMessage) -> StreamMsg {
+    StreamMsg {
+        seq: message.sequence,
+        subject: message.subject.to_string(),
+        time: chrono::DateTime::from_timestamp(
+            message.time.unix_timestamp(),
+            message.time.nanosecond(),
+        )
+        .unwrap_or(chrono::DateTime::UNIX_EPOCH),
+        payload: message.payload.to_vec(),
+        handle: None,
+    }
+}
+
 /// A durable consumer of `HGL_OWNER` (the console's): every event once, in order, one
 /// in flight at a time.
 pub struct Feed {
@@ -126,17 +142,24 @@ impl Bus {
                     .map_err(|e| nats("reading an owner event", e))
             })
             .await?;
-        Ok(StreamMsg {
-            seq,
-            subject: message.subject.to_string(),
-            time: chrono::DateTime::from_timestamp(
-                message.time.unix_timestamp(),
-                message.time.nanosecond(),
-            )
-            .unwrap_or(chrono::DateTime::UNIX_EPOCH),
-            payload: message.payload.to_vec(),
-            handle: None,
+        Ok(from_raw(message))
+    }
+
+    /// Read the last event on a subject from the owner stream leader.
+    pub async fn owner_event_last(&self, subject: &str) -> Result<Option<StreamMsg>> {
+        let stream = self
+            .js
+            .get_stream_no_info(STREAM_OWNER)
+            .await
+            .map_err(|e| nats("opening the owner stream", e))?;
+        self.guarded(&format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"), async {
+            match stream.get_last_raw_message_by_subject(subject).await {
+                Ok(message) => Ok(Some(from_raw(message))),
+                Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => Ok(None),
+                Err(e) => Err(nats("reading the last owner event", e)),
+            }
         })
+        .await
     }
 
     /// Publish one owner-channel event to `subject` (under `hgl.owner.` or `hgl.console.`)
@@ -148,25 +171,43 @@ impl Bus {
         payload: &[u8],
         msg_id: &str,
     ) -> Result<SendReceipt> {
-        self.publish_owner_event(subject, payload, Some(msg_id))
+        self.publish_owner_event(subject, payload, Publish::build().message_id(msg_id), None)
             .await
     }
 
     /// Publish an owner event once on a subject unique to its source reply or action.
     /// Returns false if the subject has already been used, even after the dedup window.
     pub async fn publish_slack_event(&self, subject: &str, payload: &[u8]) -> Result<bool> {
-        match self.publish_owner_event(subject, payload, None).await {
+        match self.publish_event_after(subject, payload, 0).await {
             Ok(_) => Ok(true),
             Err(BusError::Conflict { .. }) => Ok(false),
             Err(e) => Err(e),
         }
     }
 
+    /// Compare-and-append an owner event with the previous sequence on its subject.
+    /// Use zero when creating the first event on the subject.
+    pub async fn publish_event_after(
+        &self,
+        subject: &str,
+        payload: &[u8],
+        previous: u64,
+    ) -> Result<SendReceipt> {
+        self.publish_owner_event(
+            subject,
+            payload,
+            Publish::build().expected_last_subject_sequence(previous),
+            Some(previous),
+        )
+        .await
+    }
+
     async fn publish_owner_event(
         &self,
         subject: &str,
         payload: &[u8],
-        msg_id: Option<&str>,
+        publish: Publish,
+        previous: Option<u64>,
     ) -> Result<SendReceipt> {
         let ok = [OWNER_PREFIX, CONSOLE_PREFIX]
             .iter()
@@ -182,11 +223,7 @@ impl Bus {
                 payload.len()
             )));
         }
-        let publish = Publish::build().payload(payload.to_vec().into());
-        let publish = match msg_id {
-            Some(id) => publish.message_id(id),
-            None => publish.expected_last_subject_sequence(0),
-        };
+        let publish = publish.payload(payload.to_vec().into());
         let ack = self
             .guarded(subject, async {
                 self.js
@@ -195,10 +232,12 @@ impl Bus {
                     .map_err(|e| publish_error(subject, e))?
                     .await
                     .map_err(|e| {
-                        if msg_id.is_none() && e.kind() == PublishErrorKind::WrongLastSequence {
+                        if let Some(expected) = previous
+                            && e.kind() == PublishErrorKind::WrongLastSequence
+                        {
                             return BusError::Conflict {
                                 key: subject.into(),
-                                expected: 0,
+                                expected,
                             };
                         }
                         publish_error(subject, e)
@@ -258,6 +297,46 @@ impl Bus {
         since: chrono::DateTime<chrono::Utc>,
         max: usize,
     ) -> Result<Vec<StreamMsg>> {
+        let mut out = std::collections::VecDeque::new();
+        self.scan_history(stream, filters, since, |message| {
+            out.push_back(message);
+            if out.len() > max {
+                out.pop_front();
+            }
+            true
+        })
+        .await?;
+        Ok(out.into())
+    }
+
+    /// Visit owner events stored in `[since, before)` in sequence order, without
+    /// holding the full event history in memory.
+    pub async fn owner_window(
+        &self,
+        filters: Vec<String>,
+        since: chrono::DateTime<chrono::Utc>,
+        before: chrono::DateTime<chrono::Utc>,
+        mut visit: impl FnMut(StreamMsg),
+    ) -> Result<()> {
+        self.scan_history(STREAM_OWNER, filters, since, |message| {
+            if message.time >= before {
+                return false;
+            }
+            if message.time >= since {
+                visit(message);
+            }
+            true
+        })
+        .await
+    }
+
+    async fn scan_history(
+        &self,
+        stream: &str,
+        filters: Vec<String>,
+        since: chrono::DateTime<chrono::Utc>,
+        mut visit: impl FnMut(StreamMsg) -> bool,
+    ) -> Result<()> {
         let s = self
             .js
             .get_stream(stream)
@@ -280,7 +359,6 @@ impl Bus {
             .create_consumer(config)
             .await
             .map_err(|e| nats(&format!("reading {stream}"), e))?;
-        let mut out: std::collections::VecDeque<StreamMsg> = std::collections::VecDeque::new();
         loop {
             let mut batch = consumer
                 .fetch()
@@ -295,16 +373,15 @@ impl Bus {
                 let m = m.map_err(|e| nats(&format!("reading {stream}"), e))?;
                 pending = m.info().map(|i| i.pending).unwrap_or(0);
                 got += 1;
-                out.push_back(to_msg(m, false)?);
-                if out.len() > max {
-                    out.pop_front();
+                if !visit(to_msg(m, false)?) {
+                    return Ok(());
                 }
             }
             if got == 0 || pending == 0 {
                 break;
             }
         }
-        Ok(out.into())
+        Ok(())
     }
 
     /// One thread record and its revision.

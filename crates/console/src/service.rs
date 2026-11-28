@@ -57,7 +57,7 @@ pub fn on_new_question(app: &App, t: &Thread) -> Option<Notification> {
             priority: NPriority::Urgent,
             link: app.thread_link(&t.id),
         }),
-        Some(Priority::P2) => {
+        Some(Priority::P2) if status_channel(app).is_none() => {
             let mut p = app.pending_p2.lock().expect("pending");
             p.push((t.id.clone(), t.title.clone()));
             app.auth.persist(crate::auth::Persist::P2(p.clone()));
@@ -311,6 +311,9 @@ async fn tick_loop(app: Arc<App>, bus: Arc<Bus>) {
 /// One hourly batch: the questions still open, sent; cleared only once a channel took
 /// it, else kept for the next hour. Whether anything was sent.
 pub async fn p2_round(app: &App, bus: Option<&Bus>) -> bool {
+    if status_channel(app).is_some() {
+        return false;
+    }
     if let Some(b) = bus {
         p2_prune(app, b).await;
     }
@@ -333,12 +336,21 @@ pub async fn p2_round(app: &App, bus: Option<&Bus>) -> bool {
 }
 
 async fn batch_loop(app: Arc<App>, bus: Arc<Bus>) {
+    if let Some((team, channel)) = status_channel(&app) {
+        crate::digest::run(&app, &bus, &hgl_ai_owner::digest::subject(team, channel)).await;
+        return;
+    }
     let mut every = tokio::time::interval(P2_BATCH);
     every.tick().await;
     loop {
         every.tick().await;
         p2_round(&app, Some(&bus)).await;
     }
+}
+
+fn status_channel(app: &App) -> Option<(&str, &str)> {
+    let slack = app.cfg.slack.as_ref()?;
+    Some((&slack.team, slack.status_channel.as_deref()?))
 }
 
 async fn telemetry_loop(app: Arc<App>, bus: Arc<Bus>) {
@@ -1160,5 +1172,128 @@ pub(crate) mod tests {
             tick_note(&Seat::new("claude").unwrap(), t).msg_id()
         );
         n.validate().unwrap();
+    }
+
+    #[tokio::test]
+    async fn slack_digest_batches_reports_decisions_and_open_p2_once() {
+        use hgl_ai_owner::digest::{self, Digest};
+
+        let Some((_srv, url, token)) = hub() else {
+            eprintln!("skipped: nats-server is not on PATH");
+            return;
+        };
+        let bus = Bus::connect_url(&url, Some(token)).await.unwrap();
+        bus.provision().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app(dir.path());
+        app.cfg.slack = Some(hgl_ai_config::slack::Slack {
+            team: "TTEST".into(),
+            channel: "CQA".into(),
+            status_channel: Some("CSTATUS".into()),
+            user: "UTEST".into(),
+            handle: "Owner".into(),
+        });
+        let subject = digest::subject("TTEST", "CSTATUS");
+        let report = owner::status_post(
+            &bus,
+            &app.controller,
+            "Landed repo#1. Running repo#2. Blocked on repo#3.",
+        )
+        .await
+        .unwrap();
+        owner::status_post(
+            &bus,
+            &Seat::new("other").unwrap(),
+            "Not from the controller",
+        )
+        .await
+        .unwrap();
+        let decision = format!("{} controller: Proceed", hgl_ai_proto::utc_now_stamp());
+        owner::decision_append(&bus, &decision).await.unwrap();
+        let ask = |title: &str, priority| owner::Ask {
+            title: title.into(),
+            priority,
+            issue: None,
+            context: "Private question context".into(),
+            question: "What should happen?".into(),
+            options: vec![],
+            suggested: None,
+        };
+        let open = owner::ask(&bus, &app.controller, ask("Open", Priority::P2))
+            .await
+            .unwrap();
+        let closed = owner::ask(&bus, &app.controller, ask("Withdrawn", Priority::P2))
+            .await
+            .unwrap();
+        owner::withdraw(&bus, &app.controller, &closed, "superseded")
+            .await
+            .unwrap();
+        owner::ask(&bus, &app.controller, ask("Interrupt", Priority::P1))
+            .await
+            .unwrap();
+        let mut feed = bus
+            .owner_feed(
+                owner::FEED,
+                vec![format!("{CONSOLE_PREFIX}.>"), format!("{OWNER_PREFIX}.>")],
+            )
+            .await
+            .unwrap();
+        for _ in 0..6 {
+            fold_batch(&app, &bus, &mut feed, Duration::from_millis(500))
+                .await
+                .unwrap();
+        }
+        assert!(p2_batch(&app).is_none());
+        let p1 = on_new_question(&app, &q("q-00000001", Priority::P1)).unwrap();
+        assert!(matches!(p1.priority, NPriority::Urgent));
+
+        // The previous console may already have queued this question for notification.
+        app.pending_p2
+            .lock()
+            .unwrap()
+            .push((open.clone(), "Open".into()));
+        assert!(!p2_round(&app, Some(&bus)).await);
+        let through = DateTime::from_timestamp(Utc::now().timestamp() + 2, 0).unwrap();
+        let (first, second) = tokio::join!(
+            crate::digest::round(&app, &bus, &subject, through),
+            crate::digest::round(&app, &bus, &subject, through),
+        );
+        assert_ne!(
+            first.unwrap(),
+            second.unwrap(),
+            "one digest wins the compare-and-append"
+        );
+        assert!(p2_batch(&app).is_none());
+        let stored = bus.owner_event_last(&subject).await.unwrap().unwrap();
+        let batch: Digest = serde_json::from_slice(&stored.payload).unwrap();
+        assert_eq!(batch.reports.len(), 1);
+        assert_eq!(batch.reports[0].seq, report);
+        assert_eq!(batch.decisions, [decision]);
+        assert_eq!(batch.questions.len(), 1);
+        assert_eq!(batch.questions[0].id, open);
+        assert_eq!(batch.questions[0].title, "Open");
+        assert!(
+            !String::from_utf8(stored.payload)
+                .unwrap()
+                .contains("Private question context")
+        );
+
+        // A ruling appended late still appears once, even with an older source time.
+        let late = "20261127T000000Z controller: Late ruling";
+        owner::decision_append(&bus, late).await.unwrap();
+        assert!(
+            crate::digest::round(&app, &bus, &subject, through + P2_BATCH)
+                .await
+                .unwrap()
+        );
+        let stored = bus.owner_event_last(&subject).await.unwrap().unwrap();
+        let batch: Digest = serde_json::from_slice(&stored.payload).unwrap();
+        assert_eq!(batch.decisions, [late]);
+        assert!(batch.reports.is_empty() && batch.questions.is_empty());
+        assert!(
+            !crate::digest::round(&app, &bus, &subject, through + P2_BATCH * 2)
+                .await
+                .unwrap()
+        );
     }
 }

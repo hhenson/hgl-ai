@@ -45,6 +45,10 @@ pub const OWNER_PREFIX: &str = "hgl.owner";
 pub const SLACK_OWNER_FILTER: &str = "hgl.owner.thread.*.slack.*.*.*";
 /// The Slack adapter's durable owner feed.
 pub const SLACK_FEED: &str = "slack";
+/// Console-generated Slack batches, scoped to a workspace and private channel.
+pub const SLACK_DIGEST_PREFIX: &str = "hgl.owner.digest";
+/// Independent Slack delivery for status digests.
+pub const SLACK_STATUS_FEED: &str = "slack-status";
 /// Agent traffic for the owner: `hgl.console.status`, `hgl.console.thread.<id>`.
 pub const CONSOLE_PREFIX: &str = "hgl.console";
 /// Owner notes to a seat travel on `hgl.notes.owner.<seat>`, which only the console's hub

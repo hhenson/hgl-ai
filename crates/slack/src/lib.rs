@@ -1,6 +1,7 @@
-//! Stage 1 of the Slack adapter (docs/owner.md). The hub keeps the event log,
+//! The Slack adapter (docs/owner.md). The hub keeps the event log,
 //! delivery state, and thread mappings for questions and conversations.
 
+mod digest;
 mod interaction;
 mod retry;
 mod web;
@@ -218,7 +219,11 @@ pub async fn run(
             Err(e) => pause(&mut slack_retry, Some(e), "Slack adapter startup").await,
         }
     };
-    tokio::join!(adapter.outbound_loop(), adapter.socket_loop());
+    tokio::join!(
+        adapter.outbound_loop(None),
+        adapter.socket_loop(),
+        adapter.status_loop()
+    );
     Ok(())
 }
 
@@ -237,6 +242,13 @@ struct Adapter<'a> {
     console_origin: String,
     bot: Bot,
     web: Web,
+}
+
+struct Post<'a> {
+    channel: &'a str,
+    parent: Option<&'a str>,
+    text: &'a str,
+    blocks: &'a [Value],
 }
 
 #[derive(Serialize, Deserialize)]
@@ -519,11 +531,11 @@ impl<'a> Adapter<'a> {
         Ok(())
     }
 
-    async fn outbound_loop(&self) {
+    async fn outbound_loop(&self, status_channel: Option<&str>) {
         let mut retries = Backoff::default();
         loop {
             let started = Instant::now();
-            let result = self.drain_feed().await;
+            let result = self.drain_feed(status_channel).await;
             if started.elapsed() >= HEALTHY {
                 retries = Backoff::default();
             }
@@ -531,14 +543,23 @@ impl<'a> Adapter<'a> {
         }
     }
 
-    async fn drain_feed(&self) -> Result<()> {
-        let mut feed = self.open_feed().await?;
+    async fn drain_feed(&self, status_channel: Option<&str>) -> Result<()> {
+        let mut feed = match status_channel {
+            Some(channel) => self.open_status_feed(channel).await?,
+            None => self.open_feed().await?,
+        };
         let mut retries = Backoff::default();
         loop {
             let Some(message) = feed.next(FEED_POLL).await? else {
                 continue;
             };
-            let delivery = timeout(DELIVERY_TIMEOUT, self.deliver(&message))
+            let deliver = async {
+                match status_channel {
+                    Some(channel) => self.deliver_digest(channel, &message).await,
+                    None => self.deliver(&message).await,
+                }
+            };
+            let delivery = timeout(DELIVERY_TIMEOUT, deliver)
                 .await
                 .context("Slack delivery timed out")
                 .and_then(|result| result);
@@ -609,10 +630,13 @@ impl<'a> Adapter<'a> {
                 let ts = self
                     .post_once(
                         &root_key,
-                        parent.as_deref(),
                         marker,
-                        &text,
-                        &blocks,
+                        Post {
+                            channel: &self.cfg.channel,
+                            parent: parent.as_deref(),
+                            text: &text,
+                            blocks: &blocks,
+                        },
                         Some(message.seq),
                     )
                     .await?;
@@ -635,8 +659,18 @@ impl<'a> Adapter<'a> {
                 let mut blocks = interaction::text_blocks(&text);
                 blocks.push(interaction::console_link(&link));
                 let key = self.key("out", &event_id);
-                self.post_once(&key, Some(parent), marker, &text, &blocks, None)
-                    .await?;
+                self.post_once(
+                    &key,
+                    marker,
+                    Post {
+                        channel: &self.cfg.channel,
+                        parent: Some(parent),
+                        text: &text,
+                        blocks: &blocks,
+                    },
+                    None,
+                )
+                .await?;
             }
             Body::Answer { .. } | Body::Close | Body::Withdraw { .. } => {
                 self.edit_state(message, &ev, &event_id, &link, source)
@@ -774,10 +808,8 @@ impl<'a> Adapter<'a> {
     async fn post_once(
         &self,
         key: &str,
-        parent: Option<&str>,
         marker: Marker,
-        text: &str,
-        blocks: &[Value],
+        post: Post<'_>,
         opening_seq: Option<u64>,
     ) -> Result<String> {
         let (mut delivery, revision) = match self.bus.slack_get::<Delivery>(key).await? {
@@ -793,7 +825,7 @@ impl<'a> Adapter<'a> {
                 let oldest = (delivery.started - CLOCK_SKEW).to_string();
                 if let Some(ts) = self
                     .web
-                    .find(&self.cfg.channel, parent, &oldest, &marker.event, &self.bot)
+                    .find(post.channel, post.parent, &oldest, &marker.event, &self.bot)
                     .await?
                 {
                     return self.record_post(key, revision, delivery, ts).await;
@@ -803,16 +835,16 @@ impl<'a> Adapter<'a> {
             None => (Delivery::pending(&marker.event, opening_seq), 0),
         };
         delivery.attempted = Utc::now().timestamp();
-        delivery.parent = parent.map(str::to_string);
+        delivery.parent = post.parent.map(str::to_string);
         let claim = self.bus.slack_put(key, &delivery, revision).await?;
         let ts = self
             .web
             .post(
-                &self.cfg.channel,
-                parent,
+                post.channel,
+                post.parent,
                 marker,
-                &escaped_text(text, SLACK_TEXT_LIMIT),
-                blocks,
+                &escaped_text(post.text, SLACK_TEXT_LIMIT),
+                post.blocks,
             )
             .await?;
         self.record_post(key, claim, delivery, ts).await

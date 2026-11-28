@@ -4,7 +4,8 @@ Status: the console is implemented. Slack question and conversation parity is in
 
 The controller runs headless, like every other seat. The owner talks to it through a
 web console served beside the hub: status reports, questions, conversations, and
-live telemetry. Slack also carries questions and conversations. GitHub stays the record (PROTO-1).
+live telemetry. Slack also carries questions, conversations and status digests.
+GitHub stays the record (PROTO-1).
 
 ## 1. Interactions
 
@@ -71,14 +72,15 @@ live telemetry. Slack also carries questions and conversations. GitHub stays the
   - The OAuth flow cookie is `SameSite=None` (Apple returns by a cross-site form post)
     and only names a pending flow.
   - Passkeys: `<data_dir>/console/passkeys.json` (mode 0600), with the cookie key.
-- **OWN-9 — Notifications.** A new `p1` question notifies at once; `p2` questions are
-  batched into one notification per hour; `p3` questions and status reports show only
-  in the console. Channels are tried in the configured order and the first that
+- **OWN-9 — Notifications.** A new `p1` question notifies at once. Open `p2` questions
+  join the hourly Slack status digest when enabled. Otherwise they are batched into one
+  notification per hour. `p3` questions have no separate notification. Notification
+  channels are tried in the configured order and the first that
   accepts is used: a phone push (an ntfy topic) or a Slack incoming webhook, then
   email as the last resort. A notification carries the title, priority and a link to
   the thread, never the context. An email channel without `to` goes to every user's
-  `email`. The pending `p2` batch is kept in `HGL_CONSOLE` across restarts and cleared
-  once a channel took it. A `p1` that no channel took is kept there too, shown on every
+  `email`. Without Slack status, `HGL_CONSOLE` keeps the pending `p2` batch across
+  restarts until a channel takes it. A `p1` that no channel took is kept there, shown on every
   console page as not delivered, and retried from 30 s, doubling to 30 min, until one
   takes it or the question closes.
 - **OWN-10 — Handles.** Each user signs the owner's words with a handle of their own
@@ -122,6 +124,20 @@ adapter waits before checking Slack for its own matching message. Recovery
 uses Slack's visible message history. The initial replay is paced and retries
 honour Slack's rate limits.
 
+### Slack status (#42)
+
+Set `[slack] status_channel` for the private, bot-only `#hgl-status` channel.
+At the top of each hour the console batches the controller's status reports,
+including milestone reports, recent decision log entries and newly opened `p2`
+questions that are still open. The first batch reads the previous hour and takes
+over any pending `p2` notifications. The digest includes previews and links to the
+console's status reports, decisions and questions.
+
+The console stores each nonempty batch in `HGL_OWNER` before delivery. The last
+batch checkpoints the sources across restarts. The Slack adapter keeps its
+status delivery receipts in `HGL_SLACK` and delivers status independently of Q&A.
+Messages in the status channel have no owner effect.
+
 ## 3. Telemetry
 
 One page, live (server-sent events), from the hub and the coordinator, read every
@@ -154,7 +170,7 @@ repository per day.
 
 | Primitive | Name | Content |
 | --- | --- | --- |
-| Stream | `HGL_OWNER`, subjects `hgl.owner.>`, `hgl.console.>` | status reports, thread events; no age limit; dedup 24 h |
+| Stream | `HGL_OWNER`, subjects `hgl.owner.>`, `hgl.console.>` | status reports, Slack digests and thread events; no age limit; dedup 24 h |
 | KV | `HGL_THREADS` | one record per thread: id, kind, title, issue, priority, state, times, options, suggested, answer, messages |
 | KV | `HGL_METRICS` | daily samples per repository |
 | KV | `HGL_CONSOLE` | the console's sessions, pending `p2` batch and undelivered `p1`s; the console's user only |
@@ -163,6 +179,7 @@ repository per day.
 | Subject | Publisher | Event |
 | --- | --- | --- |
 | `hgl.console.status` | controller | a status report |
+| `hgl.owner.digest.<team>.<channel>` | console | hourly Slack digest (OWN-1, OWN-9) |
 | `hgl.console.thread.<id>` | agents | `ask`, `message`, `withdraw` |
 | `hgl.owner.thread.<id>` | console | `answer`, `owner_message`, `start`, `close`, with the signed-in user |
 | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` | Slack | `start`, `owner_message`, `answer`, `close`, with the allowlisted user and configured handle |
