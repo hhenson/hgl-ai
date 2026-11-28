@@ -7,9 +7,9 @@ use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_config::Config;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    CANARY_PROBE, HUB_API_PREFIX, HostRecord, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS,
-    KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, STREAM_NOTES, STREAM_OWNER,
-    STREAM_USAGE,
+    CANARY_CONTROL, CANARY_PROBE, HUB_API_PREFIX, HostRecord, KV_CANARY, KV_CONSOLE, KV_ENDED,
+    KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE,
+    STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
 };
 
 use crate::users::{KV_VERDICTS, Role};
@@ -218,6 +218,162 @@ pub struct Boundary {
     pub wrote: Vec<&'static str>,
 }
 
+/// How long a control write stays in `HGL_CANARY`.
+const CONTROL_TTL: Duration = Duration::from_secs(3600);
+
+/// One try of `hub boundary` and its evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Try {
+    /// A publish on `subject`: an error sending it, the hub's refusal naming it, and the
+    /// key read back.
+    Direct {
+        subject: String,
+        sent: Option<String>,
+        refused: bool,
+        stored: Result<bool, String>,
+    },
+    /// The acknowledgement with the key as its reply: taken by the hub, the control write
+    /// after it landed in the canary (its sequence there), and the key read back.
+    Reply {
+        served: Result<(), String>,
+        control: Result<u64, String>,
+        stored: Result<bool, String>,
+    },
+}
+
+/// The verdict of `hub boundary` from its tries (r6 on #192):
+/// - a write: some key read back present. It stands whatever else failed.
+/// - none (a pass): each direct publish refused by name, and the acknowledgement taken,
+///   the control write after it landed, and its key read back absent.
+/// - else an error, which `doctor` shows as "cannot test".
+fn judge(accounts: bool, tries: &[Try]) -> Result<Option<Boundary>, String> {
+    let mut wrote: Vec<&'static str> = Vec::new();
+    let mut unproved = Vec::new();
+    for t in tries {
+        let (route, stored) = match t {
+            Try::Direct { stored, .. } => ("directly", stored),
+            Try::Reply { stored, .. } => ("by the reply route", stored),
+        };
+        if stored == &Ok(true) {
+            if !wrote.contains(&route) {
+                wrote.push(route);
+            }
+            continue;
+        }
+        let why = match (t, stored) {
+            (_, Err(e)) => Some(e.clone()),
+            (Try::Direct { sent: Some(e), .. }, _) => Some(format!("publishing: {e}")),
+            (
+                Try::Direct {
+                    refused: false,
+                    subject,
+                    ..
+                },
+                _,
+            ) => Some(format!("the hub neither refused nor stored {subject}")),
+            (Try::Direct { .. }, _) => None,
+            (Try::Reply { served: Err(e), .. }, _) => Some(format!("the reply route: {e}")),
+            (
+                Try::Reply {
+                    control: Err(e), ..
+                },
+                _,
+            ) => Some(format!("no control write landed in {KV_CANARY}: {e}")),
+            (Try::Reply { .. }, _) => None,
+        };
+        unproved.extend(why);
+    }
+    if wrote.is_empty() && !unproved.is_empty() {
+        return Err(unproved.join("; "));
+    }
+    Ok(Some(Boundary { accounts, wrote }))
+}
+
+/// The reply route's setup: a consumer of this run's own, filtered to the probe, its
+/// message pulled and acknowledged with `reply` as the acknowledgement's reply subject.
+async fn reply_route(
+    c: &Plain,
+    tag: &str,
+    reply: &str,
+) -> Result<async_nats::jetstream::consumer::PullConsumer, String> {
+    use async_nats::jetstream::consumer;
+    use futures::StreamExt as _;
+    let stream =
+        c.js.get_stream(format!("KV_{KV_CANARY}"))
+            .await
+            .map_err(|e| format!("no bucket {KV_CANARY}: {e}"))?;
+    let pull = stream
+        .create_consumer(consumer::pull::Config {
+            name: Some(format!("doctor-{tag}")),
+            filter_subject: format!("$KV.{KV_CANARY}.{CANARY_PROBE}"),
+            deliver_policy: consumer::DeliverPolicy::LastPerSubject,
+            ack_policy: consumer::AckPolicy::Explicit,
+            inactive_threshold: Duration::from_secs(30),
+            ..Default::default()
+        })
+        .await
+        .map_err(|e| format!("a consumer of {KV_CANARY}: {e}"))?;
+    let probe = pull
+        .fetch()
+        .max_messages(1)
+        .expires(Duration::from_secs(2))
+        .messages()
+        .await
+        .map_err(|e| format!("pulling {KV_CANARY}/{CANARY_PROBE}: {e}"))?
+        .next()
+        .await
+        .transpose()
+        .map_err(|e| format!("pulling {KV_CANARY}/{CANARY_PROBE}: {e}"))?
+        .ok_or_else(|| {
+            format!("no {KV_CANARY}/{CANARY_PROBE} to pull (`hgl-ai init` writes it)")
+        })?;
+    let ack = probe
+        .message
+        .reply
+        .clone()
+        .ok_or_else(|| format!("{KV_CANARY}/{CANARY_PROBE} came without its ack"))?;
+    c.client
+        .publish_with_reply(ack, reply.to_string(), "".into())
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(pull)
+}
+
+/// Wait (3 s) for the consumer's acknowledgement floor to show the hub took the ack.
+async fn acked(mut pull: async_nats::jetstream::consumer::PullConsumer) -> Result<(), String> {
+    for _ in 0..30 {
+        if let Ok(i) = pull.info().await
+            && i.ack_floor.consumer_sequence >= 1
+        {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    Err("the hub did not take the acknowledgement".into())
+}
+
+/// The control write: a key of this run's own, `control.<random>`, so a full store refuses
+/// it as it would a new reply key (r6 on #192); acknowledged by the canary's stream; its
+/// sequence. It expires ([`CONTROL_TTL`]); the probe, without a TTL, does not.
+async fn control_write(c: &Plain, subject: String) -> Result<u64, String> {
+    use async_nats::jetstream::context::Publish;
+    let ack =
+        c.js.send_publish(
+            subject,
+            Publish::build()
+                .payload("hgl-ai doctor".into())
+                .ttl(CONTROL_TTL),
+        )
+        .await
+        .map_err(|e| e.to_string())?
+        .await
+        .map_err(|e| e.to_string())?;
+    if ack.stream != format!("KV_{KV_CANARY}") {
+        return Err(format!("stored in {}, not the canary", ack.stream));
+    }
+    Ok(ack.sequence)
+}
+
 /// The real hub, through `hgl-ai-bus`.
 pub struct BusHub;
 
@@ -315,22 +471,22 @@ impl Hub for BusHub {
         lasting_consumers(&jetstream_of(cfg).await?).await
     }
 
-    /// Four writes, each at a key of its own under `doctor.<pid><nanos>`, on
-    /// `$KV.HGL_CANARY.<k>` and on its name under the hub API prefix:
-    /// - directly: proved refused by the hub's permissions violation naming the subject;
+    /// Three tries at keys of this run's own, `doctor.<random>.<route>`, which no role may
+    /// write, each read back whatever else fails ([`judge`] for what each verdict needs):
+    /// - directly, on `$KV.HGL_CANARY.<k>` and on its name under the hub API prefix;
     /// - by the reply route: the canary's probe message ([`CANARY_PROBE`]) is pulled
-    ///   through an ephemeral consumer of its own and acknowledged with the key as the
+    ///   through a consumer of this run's own and acknowledged with the key as the
     ///   acknowledgement's reply subject, which one account lets JetStream answer onto
-    ///   (hgl-ai#141). The consumer's acknowledgement floor proves the hub served it.
-    ///   The answer is empty: what it stores carries no hub metadata (r6 on #192). (A
-    ///   pull's own delivery is never stored, and an API answer, such as `STREAM.INFO`,
+    ///   (hgl-ai#141). The answer is empty: what it can store carries no hub metadata.
+    ///   (A pull's own delivery is never stored; an API answer, such as `STREAM.INFO`,
     ///   carries the stream's configuration and state.)
     ///
-    /// A key read back present is a write. A write seen stands whatever else fails; with
-    /// none, any try without its proof is an error, never a pass (r6 on #192).
+    /// Once the floor shows the hub took the acknowledgement, a control write to a new key,
+    /// `HGL_CANARY/control.<random>`, which every role may make, must be acknowledged by
+    /// the canary itself: the store takes new keys, and its ingest has passed anything
+    /// sent before.
+    /// Only then does an absent reply key count as proof (r6 on #192).
     async fn boundary(&self, cfg: &Config) -> Result<Option<Boundary>, String> {
-        use async_nats::jetstream::consumer;
-        use futures::StreamExt as _;
         let mut c = connect(cfg).await?;
         match c.who {
             Who::Role(Role::Admin) => return Ok(None),
@@ -345,11 +501,10 @@ impl Hub for BusHub {
             }
             _ => {}
         }
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_or(0, |d| d.as_nanos());
-        let tag = format!("{}{n}", std::process::id());
-        let subject = |k: &str, under: bool| {
+        // Unguessable: a consumer's name is its only guard against another user's pulls
+        // and acknowledgements (r6 on #192).
+        let tag = crate::token::generate().map_err(|e| e.to_string())?[..24].to_string();
+        let local = |k: &str, under: bool| {
             let s = format!("$KV.{KV_CANARY}.{k}");
             if under {
                 format!("{HUB_API_PREFIX}.{s}")
@@ -360,141 +515,82 @@ impl Hub for BusHub {
         let canary =
             c.js.get_key_value(KV_CANARY)
                 .await
-                .map_err(|e| format!("no bucket {KV_CANARY}: {e}"))?;
-        let stream =
-            c.js.get_stream(format!("KV_{KV_CANARY}"))
-                .await
-                .map_err(|e| format!("no bucket {KV_CANARY}: {e}"))?;
-        let err = |e: &dyn std::fmt::Display| e.to_string();
+                .map_err(|e| e.to_string());
 
-        // Directly.
+        // Directly: both names, refused or not.
         let mut direct = Vec::new();
         for under in [false, true] {
             let k = format!("doctor.{tag}.direct{}", if under { "-api" } else { "" });
-            let s = subject(&k, under);
-            c.client
-                .publish(s.clone(), "hgl-ai doctor".into())
+            let subject = local(&k, under);
+            let sent = c
+                .client
+                .publish(subject.clone(), "hgl-ai doctor".into())
                 .await
-                .map_err(|e| err(&e))?;
-            direct.push((k, s));
+                .map_err(|e| e.to_string());
+            direct.push((k, subject, sent));
         }
-        // By the reply route: one consumer per acknowledgement, each with the probe.
-        let mut acks = Vec::new();
-        for under in [false, true] {
-            let k = format!("doctor.{tag}.reply{}", if under { "-api" } else { "" });
-            let name = format!("doctor-{tag}-{}", if under { "api" } else { "plain" });
-            let pull = stream
-                .create_consumer(consumer::pull::Config {
-                    name: Some(name),
-                    filter_subject: format!("$KV.{KV_CANARY}.{CANARY_PROBE}"),
-                    deliver_policy: consumer::DeliverPolicy::LastPerSubject,
-                    ack_policy: consumer::AckPolicy::Explicit,
-                    inactive_threshold: Duration::from_secs(30),
-                    ..Default::default()
-                })
-                .await
-                .map_err(|e| format!("a consumer of {KV_CANARY}: {e}"))?;
-            let probe = pull
-                .fetch()
-                .max_messages(1)
-                .expires(Duration::from_secs(2))
-                .messages()
-                .await
-                .map_err(|e| format!("pulling {KV_CANARY}/{CANARY_PROBE}: {e}"))?
-                .next()
-                .await
-                .transpose()
-                .map_err(|e| format!("pulling {KV_CANARY}/{CANARY_PROBE}: {e}"))?
-                .ok_or_else(|| {
-                    format!("no {KV_CANARY}/{CANARY_PROBE} to pull (`hgl-ai init` writes it)")
-                })?;
-            let ack = probe
-                .message
-                .reply
-                .clone()
-                .ok_or_else(|| format!("{KV_CANARY}/{CANARY_PROBE} came without its ack"))?;
-            c.client
-                .publish_with_reply(ack, subject(&k, under), "".into())
-                .await
-                .map_err(|e| err(&e))?;
-            acks.push((k, pull));
-        }
-        c.client.flush().await.map_err(|e| err(&e))?;
+        // By the reply route.
+        let reply_key = format!("doctor.{tag}.reply");
+        let reply = reply_route(&c, &tag, &local(&reply_key, false)).await;
+        let _ = c.client.flush().await;
 
-        let mut wrote: Vec<&'static str> = Vec::new();
-        let mut unproved: Vec<String> = Vec::new();
-        let stored = |k: String| {
-            let canary = canary.clone();
-            async move { canary.entry(k.as_str()).await.map(|e| e.is_some()) }
-        };
-        // Each direct publish: refused, or else stored.
-        let mut pending: Vec<String> = direct.iter().map(|(_, s)| format!("\"{s}\"")).collect();
+        // The hub's refusals of the direct publishes.
+        let mut unrefused: Vec<String> = direct
+            .iter()
+            .filter(|(_, _, sent)| sent.is_ok())
+            .map(|(_, s, _)| format!("\"{s}\""))
+            .collect();
         let _ = tokio::time::timeout(Duration::from_secs(2), async {
-            while !pending.is_empty() {
+            while !unrefused.is_empty() {
                 let Some(m) = c.refused.recv().await else {
                     break;
                 };
-                pending.retain(|q| !m.contains(q.as_str()));
+                unrefused.retain(|q| !m.contains(q.as_str()));
             }
         })
         .await;
-        for (k, s) in direct {
-            if !pending.contains(&format!("\"{s}\"")) {
-                continue;
+        // The acknowledgement taken, then the control write.
+        let served = match &reply {
+            Ok(pull) => acked(pull.clone()).await,
+            Err(e) => Err(e.clone()),
+        };
+        let control = match &served {
+            Ok(()) => {
+                let k = format!("{CANARY_CONTROL}.{tag}");
+                control_write(&c, local(&k, c.accounts)).await
             }
-            match stored(k).await {
-                Ok(true) => {
-                    if !wrote.contains(&"directly") {
-                        wrote.push("directly");
-                    }
+            Err(_) => Err("no acknowledgement to follow".into()),
+        };
+        // Every key read back, whatever failed before.
+        let read = |k: String| {
+            let canary = canary.clone();
+            async move {
+                match canary {
+                    Ok(store) => store
+                        .entry(k.as_str())
+                        .await
+                        .map(|e| e.is_some())
+                        .map_err(|e| format!("reading {KV_CANARY}: {e}")),
+                    Err(e) => Err(format!("no bucket {KV_CANARY}: {e}")),
                 }
-                Ok(false) => unproved.push(format!("no refusal of {s}")),
-                Err(e) => unproved.push(format!("reading {KV_CANARY}: {e}")),
             }
+        };
+        let mut tries = Vec::new();
+        for (k, subject, sent) in direct {
+            let refused = sent.is_ok() && !unrefused.contains(&format!("\"{subject}\""));
+            tries.push(Try::Direct {
+                subject,
+                sent: sent.err(),
+                refused,
+                stored: read(k).await,
+            });
         }
-        // Each acknowledgement: served (the floor moved), then its key read back.
-        for (k, mut pull) in acks {
-            let mut served = false;
-            for _ in 0..30 {
-                if let Ok(i) = pull.info().await
-                    && i.ack_floor.consumer_sequence >= 1
-                {
-                    served = true;
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            // An answer onto the canary lands through the hub's ingest: a moment later.
-            let mut found = Ok(false);
-            for _ in 0..10 {
-                found = stored(k.clone()).await;
-                if !matches!(found, Ok(false)) {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            match (found, served) {
-                (Ok(true), _) => {
-                    if !wrote.contains(&"by the reply route") {
-                        wrote.push("by the reply route");
-                    }
-                }
-                (Ok(false), true) => {}
-                (Ok(false), false) => unproved.push(format!(
-                    "the hub did not take the acknowledgement on {KV_CANARY}"
-                )),
-                (Err(e), _) => unproved.push(format!("reading {KV_CANARY}: {e}")),
-            }
-        }
-        if wrote.is_empty()
-            && let Some(why) = unproved.into_iter().next()
-        {
-            return Err(why);
-        }
-        Ok(Some(Boundary {
-            accounts: c.accounts,
-            wrote,
-        }))
+        tries.push(Try::Reply {
+            served,
+            control,
+            stored: read(reply_key).await,
+        });
+        judge(c.accounts, &tries)
     }
 
     async fn hosts(&self, cfg: &Config) -> Result<Vec<HostRecord>, String> {
@@ -591,6 +687,117 @@ pub(crate) mod fake {
                 .map(|()| self.hosts.clone())
                 .map_err(|e| e.to_string())
         }
+    }
+}
+
+/// `hub boundary`'s verdicts, each from its evidence only (r6 on #192).
+#[cfg(test)]
+mod verdicts {
+    use super::*;
+
+    fn direct(refused: bool, stored: Result<bool, String>) -> Try {
+        Try::Direct {
+            subject: "$KV.HGL_CANARY.doctor.t.direct".into(),
+            sent: None,
+            refused,
+            stored,
+        }
+    }
+
+    fn reply(
+        served: Result<(), String>,
+        control: Result<u64, String>,
+        stored: Result<bool, String>,
+    ) -> Try {
+        Try::Reply {
+            served,
+            control,
+            stored,
+        }
+    }
+
+    /// Every proof present: both direct publishes refused and absent, the
+    /// acknowledgement taken, the control write landed and the reply key absent.
+    fn proved() -> Vec<Try> {
+        vec![
+            direct(true, Ok(false)),
+            direct(true, Ok(false)),
+            reply(Ok(()), Ok(7), Ok(false)),
+        ]
+    }
+
+    fn clean(accounts: bool) -> Result<Option<Boundary>, String> {
+        Ok(Some(Boundary {
+            accounts,
+            wrote: Vec::new(),
+        }))
+    }
+
+    #[test]
+    fn a_pass_needs_every_proof() {
+        assert_eq!(judge(true, &proved()), clean(true));
+        // Each proof taken away in turn: an error, never a pass.
+        let e = || Err::<(), String>("x".into());
+        let without: Vec<(usize, Try)> = vec![
+            (0, direct(false, Ok(false))),
+            (0, direct(true, Err("read".into()))),
+            (
+                1,
+                Try::Direct {
+                    subject: "s".into(),
+                    sent: Some("closed".into()),
+                    refused: false,
+                    stored: Ok(false),
+                },
+            ),
+            (2, reply(e(), Ok(7), Ok(false))),
+            (
+                2,
+                reply(Ok(()), Err("maximum messages exceeded".into()), Ok(false)),
+            ),
+            (2, reply(Ok(()), Ok(7), Err("read".into()))),
+        ];
+        for (i, t) in without {
+            let mut tries = proved();
+            tries[i] = t.clone();
+            assert!(judge(true, &tries).is_err(), "{t:?}");
+        }
+    }
+
+    #[test]
+    fn a_write_seen_stands_whatever_else_failed() {
+        // The direct key stored while the reply route could not even start (r6, 1).
+        let tries = vec![
+            direct(false, Ok(true)),
+            direct(false, Err("read".into())),
+            reply(
+                Err("no HGL_CANARY/probe to pull".into()),
+                Err("no acknowledgement to follow".into()),
+                Ok(false),
+            ),
+        ];
+        for accounts in [true, false] {
+            assert_eq!(
+                judge(accounts, &tries),
+                Ok(Some(Boundary {
+                    accounts,
+                    wrote: vec!["directly"],
+                }))
+            );
+        }
+        // The reply key stored: a write, though no control write landed.
+        let tries = vec![
+            direct(true, Ok(false)),
+            direct(true, Ok(false)),
+            reply(Ok(()), Err("x".into()), Ok(true)),
+        ];
+        assert_eq!(
+            judge(false, &tries).unwrap().unwrap().wrote,
+            ["by the reply route"]
+        );
+        // Refused and yet stored: stored wins.
+        let tries = vec![direct(true, Ok(true))];
+        assert_eq!(judge(true, &tries).unwrap().unwrap().wrote, ["directly"]);
     }
 }
 

@@ -14,10 +14,10 @@ use std::str::FromStr;
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    CONSOLE_PREFIX, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK,
-    KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
-    SLACK_OWNER_FILTER, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, USAGE_PREFIX,
-    VIEWER_INBOX, VIEWER_STATE_KEYS,
+    CANARY_CONTROL, CANARY_PROBE, CONSOLE_PREFIX, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS,
+    KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX,
+    OWNER_PREFIX, SLACK_FEED, SLACK_OWNER_FILTER, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
+    SUBJECT_PREFIX, USAGE_PREFIX, VIEWER_INBOX, VIEWER_STATE_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -323,6 +323,22 @@ fn viewer() -> Permissions {
     }
 }
 
+/// What `hub boundary` needs of `HGL_CANARY` on one account, as on role accounts
+/// ([`Target::Probe`]): its state, its keys by direct get, a consumer filtered to the probe
+/// only (no durable form, no list), pulls and acknowledgements, and the control write.
+fn canary_legacy() -> Vec<String> {
+    let s = kv(KV_CANARY);
+    vec![
+        format!("$JS.API.STREAM.INFO.{s}"),
+        format!("$JS.API.DIRECT.GET.{s}.$KV.{KV_CANARY}.>"),
+        format!("$JS.API.CONSUMER.CREATE.{s}.*.$KV.{KV_CANARY}.{CANARY_PROBE}"),
+        format!("$JS.API.CONSUMER.INFO.{s}.*"),
+        format!("$JS.API.CONSUMER.MSG.NEXT.{s}.*"),
+        format!("$JS.ACK.{s}.*.>"),
+        format!("$KV.{KV_CANARY}.{CANARY_CONTROL}.*"),
+    ]
+}
+
 pub fn permissions(role: Role) -> Option<Permissions> {
     match role {
         Role::Admin => return None,
@@ -345,13 +361,10 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_FEED}"),
                 format!("$JS.ACK.{STREAM_OWNER}.{SLACK_FEED}.>"),
                 // The role boundary canary (`doctor`, `hub boundary`).
-                format!("$JS.API.STREAM.INFO.{}", kv(KV_CANARY)),
-                format!("$JS.API.DIRECT.GET.{}.>", kv(KV_CANARY)),
-                format!("$JS.API.CONSUMER.CREATE.{}.>", kv(KV_CANARY)),
-                format!("$JS.API.CONSUMER.INFO.{}.*", kv(KV_CANARY)),
-                format!("$JS.API.CONSUMER.MSG.NEXT.{}.*", kv(KV_CANARY)),
-                format!("$JS.ACK.{}.>", kv(KV_CANARY)),
-            ],
+            ]
+            .into_iter()
+            .chain(canary_legacy())
+            .collect(),
             publish_deny: Vec::new(),
         });
     }
@@ -386,9 +399,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{}.*", kv(b)));
     }
     // The role boundary canary's probe, pulled through a consumer (`hub boundary`).
-    allow.extend(consumers_on(&kv(KV_CANARY)));
-    allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{}.*", kv(KV_CANARY)));
-    allow.push(format!("$JS.ACK.{}.>", kv(KV_CANARY)));
+    allow.extend(canary_legacy());
     // `doctor` lists the consumers on the telemetry streams (durables the viewer made).
     allow.extend(VIEWER_BUCKETS.map(|b| format!("$JS.API.CONSUMER.LIST.{}", kv(b))));
     allow.extend(pull_from(STREAM_NOTES));
@@ -611,6 +622,9 @@ pub enum Target {
     BySequence(String),
     /// Publishing on `subject` (with wildcards), into whichever stream holds it.
     Subjects(String),
+    /// `hub boundary`'s probe: `bucket`'s state and keys by direct get, and consumers
+    /// filtered to `key` only, each pulled and acknowledged by its (unlisted) name.
+    Probe { bucket: String, key: String },
 }
 
 /// One row: a target and each role's access to it, in [`ACCOUNT_ROLES`] order.
@@ -690,10 +704,19 @@ pub fn access_table() -> Vec<Row> {
         // The console reads the permalink index; delivery state is the adapter's.
         row(keys(KV_SLACK, "links.*.*"), [No, No, No, R, No]),
         row(all(KV_SLACK), [No, No, No, No, RW]),
-        // Every role reads the canary and none writes it (`doctor`, `hub boundary`).
-        row(all(KV_CANARY), [R, R, R, R, R]),
-        // And acknowledges its probe through a consumer of its own.
-        row(Target::Stream(kv(KV_CANARY)), [R, R, R, R, R]),
+        // `hub boundary`: every role reads the canary and acknowledges its probe; its
+        // `doctor.*` keys none writes; its control key all do.
+        row(
+            Target::Probe {
+                bucket: KV_CANARY.into(),
+                key: CANARY_PROBE.into(),
+            },
+            [R, R, R, R, R],
+        ),
+        row(
+            keys(KV_CANARY, &format!("{CANARY_CONTROL}.*")),
+            [W, W, W, W, W],
+        ),
     ]
 }
 
@@ -765,6 +788,15 @@ impl Target {
                 Target::BySequence(s) => {
                     out.push(api(&format!("STREAM.INFO.{s}")));
                     out.push(api(&format!("STREAM.MSG.GET.{s}")));
+                }
+                Target::Probe { bucket, key } => {
+                    let s = kv(bucket);
+                    out.push(api(&format!("STREAM.INFO.{s}")));
+                    out.push(api_stream(&format!("DIRECT.GET.{s}.$KV.{bucket}.>")));
+                    out.push(api(&format!("CONSUMER.CREATE.{s}.*.$KV.{bucket}.{key}")));
+                    out.push(api(&format!("CONSUMER.INFO.{s}.*")));
+                    out.push(api_stream(&format!("CONSUMER.MSG.NEXT.{s}.*")));
+                    out.push(plain(format!("$JS.ACK.{s}.*.>")));
                 }
                 Target::Subjects(_) => {}
             }
@@ -1500,6 +1532,7 @@ mod tests {
             writes(Role::Seat),
             [
                 "$KV.HGL_BUILD.run.>",
+                "$KV.HGL_CANARY.control.*",
                 "$KV.HGL_ENDED.>",
                 "$KV.HGL_HOSTS.>",
                 "$KV.HGL_LOCKS.>",
@@ -1512,14 +1545,15 @@ mod tests {
             ]
         );
         let mut coord = writes(Role::Seat);
-        coord.insert(4, "$KV.HGL_METRICS.>".into());
+        coord.insert(5, "$KV.HGL_METRICS.>".into());
         assert_eq!(writes(Role::Coord), coord);
         let mut builder = writes(Role::Seat);
-        builder.insert(7, "$KV.HGL_VERDICTS.>".into());
+        builder.insert(8, "$KV.HGL_VERDICTS.>".into());
         assert_eq!(writes(Role::Builder), builder);
         assert_eq!(
             writes(Role::Console),
             [
+                "$KV.HGL_CANARY.control.*",
                 "$KV.HGL_CONSOLE.>",
                 "$KV.HGL_STATE.decisions.log",
                 "$KV.HGL_THREADS.>",
@@ -1528,7 +1562,14 @@ mod tests {
                 "hgl.owner.thread.*",
             ]
         );
-        assert_eq!(writes(Role::Slack), ["$KV.HGL_SLACK.>", SLACK_OWNER_FILTER]);
+        assert_eq!(
+            writes(Role::Slack),
+            [
+                "$KV.HGL_CANARY.control.*",
+                "$KV.HGL_SLACK.>",
+                SLACK_OWNER_FILTER
+            ]
+        );
         // Seats read `HGL_OWNER` by sequence: no consumer, no feed, no ack.
         for r in [Role::Seat, Role::Coord, Role::Builder] {
             assert!(has(r, "$JS.API.STREAM.MSG.GET.HGL_OWNER"));

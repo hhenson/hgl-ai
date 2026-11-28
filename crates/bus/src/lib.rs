@@ -576,9 +576,9 @@ impl Bus {
                 Duration::ZERO,
             ),
             build::BUCKET,
-            // Holds only its probe while the hub enforces role boundaries (`doctor`,
-            // `hub boundary`). No age limit: the probe must not expire. A write that
-            // arrives (one account, about 100 bytes a doctor run) stays until purged.
+            // `hub boundary`: no age limit, so the probe never expires; control writes
+            // expire by their own TTL. A forbidden write that arrives (one account, about
+            // 100 bytes a doctor run) stays until purged.
             (
                 KV_CANARY,
                 "hgl-ai role boundary canary; no role writes it",
@@ -600,6 +600,23 @@ impl Bus {
                 })
                 .await
                 .map_err(|e| nats(&format!("provisioning bucket {bucket}"), e))?;
+        }
+        // `hub boundary`'s control writes carry a TTL (`Nats-TTL`); the probe has none.
+        let canary = format!("KV_{KV_CANARY}");
+        let mut config = self
+            .js
+            .get_stream(&canary)
+            .await
+            .map_err(|e| missing(&format!("stream {canary}"), e))?
+            .cached_info()
+            .config
+            .clone();
+        if !config.allow_message_ttl {
+            config.allow_message_ttl = true;
+            self.js
+                .update_stream(config)
+                .await
+                .map_err(|e| nats(&format!("provisioning bucket {KV_CANARY}"), e))?;
         }
         // The canary's fixed probe message (`doctor`, `hub boundary`).
         self.js

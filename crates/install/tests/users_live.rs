@@ -1486,6 +1486,8 @@ fn write_pattern(t: &Target) -> Option<String> {
     match t {
         Target::Keys { bucket, keys } => Some(format!("$KV.{bucket}.{keys}")),
         Target::Subjects(s) => Some(s.clone()),
+        // Its keys are written by none but the control key.
+        Target::Probe { bucket, .. } => Some(format!("$KV.{bucket}.>")),
         _ => None,
     }
 }
@@ -1671,6 +1673,46 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                                 .expect(&what);
                             assert_eq!(pull(&c, 2).await.len(), 2, "a batch: {what}");
                         }
+                    }
+                    Target::Probe { bucket, key } => {
+                        // Keys by direct get; a consumer filtered to the probe, pulled
+                        // and acknowledged; no other consumer, durable or listing.
+                        let store = js.get_key_value(bucket).await.expect(&what);
+                        assert_eq!(store.get(key).await.expect(&what).unwrap(), "hgl-ai canary");
+                        let s = js.get_stream(format!("KV_{bucket}")).await.unwrap();
+                        let c = s
+                            .create_consumer(consumer::pull::Config {
+                                name: Some(format!("probe-{role}")),
+                                ack_policy: consumer::AckPolicy::Explicit,
+                                filter_subject: format!("$KV.{bucket}.{key}"),
+                                ..Default::default()
+                            })
+                            .await
+                            .expect(&what);
+                        let got = pull(&c, 1).await;
+                        assert_eq!(got.len(), 1, "{what}");
+                        got[0].double_ack().await.expect(&what);
+                        let p = hgl_ai_proto::HUB_API_PREFIX;
+                        let sn = format!("KV_{bucket}");
+                        unanswered(
+                            &conn,
+                            vec![
+                                (
+                                    format!("{p}.CONSUMER.CREATE.{sn}"),
+                                    serde_json::json!({"stream_name": sn, "config": {}}),
+                                ),
+                                (
+                                    format!("{p}.CONSUMER.CREATE.{sn}.x.$KV.{bucket}.seed.a"),
+                                    serde_json::json!({"stream_name": sn, "config": {"name": "x", "filter_subject": format!("$KV.{bucket}.seed.a")}}),
+                                ),
+                                (
+                                    format!("{p}.CONSUMER.DURABLE.CREATE.{sn}.d"),
+                                    serde_json::json!({"stream_name": sn, "config": {"durable_name": "d"}}),
+                                ),
+                                (format!("{p}.CONSUMER.LIST.{sn}"), serde_json::json!({})),
+                            ],
+                        )
+                        .await;
                     }
                     Target::Stream(name)
                     | Target::BySequence(name)
@@ -2104,9 +2146,17 @@ async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
         let Some(hub) = hub else { return };
         let admin = seeded(&hub).await;
         let canary = format!("KV_{}", hgl_ai_proto::KV_CANARY);
+        // The canary's messages but the control writes.
         let count = || async {
             let mut s = admin.get_stream(&canary).await.unwrap();
-            s.info().await.unwrap().state.messages
+            let all = s.info().await.unwrap().state.messages;
+            let control = s
+                .info_with_subjects(format!("$KV.{}.control.*", hgl_ai_proto::KV_CANARY))
+                .await
+                .unwrap()
+                .count()
+                .await;
+            all - control as u64
         };
         let before = count().await;
         // The probe never ages out of the canary (bot on #192).
@@ -2130,7 +2180,7 @@ async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
         }
         let after = count().await;
         if accounts {
-            assert_eq!(after, before, "the canary stays empty");
+            assert_eq!(after, before, "nothing but the control write arrived");
         } else {
             assert_eq!(after, before + ROLE_USERS.len() as u64);
         }
@@ -2149,6 +2199,23 @@ async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
         let r = BusHub.boundary(&bare_admin).await;
         assert!(matches!(&r, Err(e) if e.contains("names no role")), "{r:?}");
         assert_eq!(count().await, after, "no untried credential wrote");
+
+        // A canary that refuses writes: the control write cannot land, so an absent reply
+        // key proves nothing, and no verdict is a pass (r6 on #192).
+        {
+            let mut stream = admin.get_stream(&canary).await.unwrap();
+            let mut config = stream.info().await.unwrap().config.clone();
+            config.max_messages = stream.info().await.unwrap().state.messages as i64;
+            config.discard = jetstream::stream::DiscardPolicy::New;
+            admin.update_stream(config.clone()).await.unwrap();
+            let r = BusHub.boundary(&hub.host_cfg("build-1")).await;
+            assert!(
+                matches!(&r, Err(e) if e.contains("no control write landed")),
+                "accounts {accounts}: {r:?}"
+            );
+            config.max_messages = -1;
+            admin.update_stream(config).await.unwrap();
+        }
 
         let rec = |host: &str, accounts_capable| hgl_ai_proto::HostRecord {
             host: host.into(),
