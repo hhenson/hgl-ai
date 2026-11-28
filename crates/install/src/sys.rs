@@ -552,6 +552,7 @@ pub(crate) mod fake {
             arch: "x86_64".into(),
             exe: home.join(".cargo/bin/hgl-ai"),
             in_tmux: false,
+            runtime_root: None,
         }
     }
 

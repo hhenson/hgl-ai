@@ -239,33 +239,84 @@ pub fn render_launchd_daemon(spec: &Spec, user: &str, home: &Path) -> String {
     )
 }
 
-/// The OS user an installed system service runs as (`User=`, `UserName`), read without
+/// The OS user an installed system service runs as (`User=`, `UserName`) and the
+/// `HOME` it gives it (`Environment=HOME=`, `EnvironmentVariables.HOME`), read without
 /// privilege; `None` when it is not installed or names no user.
-pub fn system_user(sys: &dyn System, s: Service) -> Option<String> {
+pub fn system_account(sys: &dyn System, s: Service) -> Option<(String, Option<PathBuf>)> {
     let os = sys.env().os;
-    let o = match os {
+    let query = |c: Cmd| {
+        sys.query(&c)
+            .ok()
+            .filter(|o| o.ok())
+            .map(|o| o.stdout.trim().to_string())
+    };
+    let (user, home) = match os {
         Os::Linux => {
-            sys.query(&Cmd::new("systemctl").args(["show", "-p", "LoadState,User", &s.unit()]))
-        }
-        Os::MacOs => sys.query(
-            &Cmd::new("plutil")
-                .args(["-extract", "UserName", "raw", "-o", "-"])
-                .arg(system_unit_path(os, s).display().to_string()),
-        ),
-    }
-    .ok()
-    .filter(|o| o.ok())?;
-    let user = match os {
-        Os::Linux => {
-            let mut lines = o.stdout.lines().map(str::trim);
-            if !lines.clone().any(|l| l == "LoadState=loaded") {
+            let out = query(Cmd::new("systemctl").args([
+                "show",
+                "-p",
+                "LoadState,User,Environment",
+                &s.unit(),
+            ]))?;
+            let field = |k: &str| {
+                out.lines()
+                    .find_map(|l| l.trim().strip_prefix(k))
+                    .map(str::to_string)
+            };
+            if field("LoadState=").as_deref() != Some("loaded") {
                 return None;
             }
-            lines.find_map(|l| l.strip_prefix("User="))?
+            let home = field("Environment=").and_then(|e| {
+                e.split_whitespace()
+                    .find_map(|w| w.strip_prefix("HOME="))
+                    .map(str::to_string)
+            });
+            (field("User=")?, home)
         }
-        Os::MacOs => o.stdout.trim(),
+        Os::MacOs => {
+            let plist = system_unit_path(os, s).display().to_string();
+            let key = |k: &str| {
+                query(
+                    Cmd::new("plutil")
+                        .args(["-extract", k, "raw", "-o", "-"])
+                        .arg(plist.clone()),
+                )
+            };
+            (key("UserName")?, key("EnvironmentVariables.HOME"))
+        }
     };
-    (!user.is_empty()).then(|| user.to_string())
+    let home = home.filter(|h| h.starts_with('/')).map(PathBuf::from);
+    (!user.is_empty()).then_some((user, home))
+}
+
+/// The `PATH` a user service's unit or agent records (the install-time `PATH`: agent
+/// CLIs, `git`, `gh`); `None` when it is not installed or records none.
+pub fn recorded_path(sys: &dyn System, s: Service) -> Option<String> {
+    let env = sys.env();
+    let text = sys.read_to_string(&unit_path(env, s)).ok()?;
+    let path = match env.os {
+        Os::Linux => text.lines().find_map(|l| {
+            l.trim()
+                .strip_prefix("Environment=\"PATH=")
+                .and_then(|r| r.strip_suffix('"'))
+                .map(str::to_string)
+        }),
+        Os::MacOs => {
+            let mut lines = text.lines().map(str::trim);
+            lines.find(|l| *l == "<key>PATH</key>")?;
+            lines.next().and_then(|l| {
+                l.strip_prefix("<string>")
+                    .and_then(|r| r.strip_suffix("</string>"))
+                    .map(|v| {
+                        v.replace("&quot;", "\"")
+                            .replace("&gt;", ">")
+                            .replace("&lt;", "<")
+                            .replace("&amp;", "&")
+                    })
+            })
+        }
+    };
+    path.filter(|p| !p.is_empty())
 }
 
 /// A system service's state, read without privilege.
@@ -421,6 +472,27 @@ fn systemctl(args: &[&str]) -> Cmd {
     Cmd::new("systemctl")
         .arg("--user")
         .args(args.iter().copied())
+}
+
+/// `systemctl --user` for a query. Without `XDG_RUNTIME_DIR` and
+/// `DBUS_SESSION_BUS_ADDRESS` (a plain `sudo -u NAME`) it cannot find the user's manager:
+/// point it at `<runtime_root>/<uid>` when that exists.
+fn user_systemctl(sys: &dyn System, args: &[&str]) -> Cmd {
+    let cmd = systemctl(args);
+    let dir = sys
+        .env()
+        .runtime_root
+        .as_ref()
+        .and_then(|root| uid(sys).ok().map(|u| root.join(u)))
+        .filter(|d| sys.exists(d));
+    match dir {
+        Some(d) => {
+            let d = d.display().to_string();
+            cmd.env("DBUS_SESSION_BUS_ADDRESS", format!("unix:path={d}/bus"))
+                .env("XDG_RUNTIME_DIR", d)
+        }
+        None => cmd,
+    }
 }
 
 /// The user's numeric id, for launchd domains and `loginctl`.
@@ -591,7 +663,7 @@ pub fn state(sys: &dyn System, s: Service) -> State {
     }
     let running = match sys.env().os {
         Os::Linux => sys
-            .query(&systemctl(&["is-active", &s.unit()]))
+            .query(&user_systemctl(sys, &["is-active", &s.unit()]))
             .is_ok_and(|o| o.stdout.trim() == "active"),
         Os::MacOs => match launchd_target(sys, s) {
             Ok((_, target)) => sys
@@ -926,33 +998,115 @@ WantedBy=default.target
         assert_eq!(linger(&m, true).unwrap(), None);
     }
 
-    /// The user a system service runs as, read without privilege on either OS.
+    /// The user a system service runs as, and its `HOME`, read without privilege on
+    /// either OS.
     #[test]
-    fn a_system_service_user() {
+    fn a_system_service_account() {
         let d = tempfile::tempdir().unwrap();
         let f = Fake::new(d.path(), Os::Linux);
         f.on(|c| match c.args.last().map(String::as_str) {
-            Some("hgl-ai-hub.service") => Output::success("LoadState=loaded\nUser=hgl-ai\n"),
-            Some("hgl-ai-coord.service") => Output::success("LoadState=loaded\nUser=\n"),
+            Some("hgl-ai-hub.service") => Output::success(
+                "LoadState=loaded\nEnvironment=HOME=/srv/hgl PATH=/usr/bin:/bin\nUser=hgl-ai\n",
+            ),
+            Some("hgl-ai-coord.service") => {
+                Output::success("LoadState=loaded\nEnvironment=\nUser=agents\n")
+            }
+            Some("hgl-ai-console.service") => Output::success("LoadState=loaded\nUser=\n"),
             _ => Output::success("LoadState=not-found\nUser=\n"),
         });
-        assert_eq!(system_user(&f, Service::Hub).as_deref(), Some("hgl-ai"));
-        assert_eq!(system_user(&f, Service::Coord), None, "no User=");
-        assert_eq!(system_user(&f, Service::Console), None, "not installed");
+        assert_eq!(
+            system_account(&f, Service::Hub),
+            Some(("hgl-ai".into(), Some("/srv/hgl".into())))
+        );
+        assert_eq!(
+            system_account(&f, Service::Coord),
+            Some(("agents".into(), None)),
+            "no HOME="
+        );
+        assert_eq!(system_account(&f, Service::Console), None, "no User=");
+        assert_eq!(system_account(&f, Service::Bridge), None, "not installed");
         let m = Fake::new(d.path(), Os::MacOs);
         m.on(|c| {
             let a: Vec<&str> = c.args.iter().map(String::as_str).collect();
+            let hub = "/Library/LaunchDaemons/io.github.hhenson.hgl-ai.hub.plist";
             match a.as_slice() {
-                ["-extract", "UserName", "raw", "-o", "-", p]
-                    if *p == "/Library/LaunchDaemons/io.github.hhenson.hgl-ai.hub.plist" =>
-                {
+                ["-extract", "UserName", "raw", "-o", "-", p] if *p == hub => {
                     Output::success("hgl-ai\n")
+                }
+                ["-extract", "EnvironmentVariables.HOME", "raw", "-o", "-", p] if *p == hub => {
+                    Output::success("/Library/hgl-ai\n")
                 }
                 _ => Output::failure(1, "No value at that key path or invalid key path"),
             }
         });
-        assert_eq!(system_user(&m, Service::Hub).as_deref(), Some("hgl-ai"));
-        assert_eq!(system_user(&m, Service::Coord), None);
+        assert_eq!(
+            system_account(&m, Service::Hub),
+            Some(("hgl-ai".into(), Some("/Library/hgl-ai".into())))
+        );
+        assert_eq!(system_account(&m, Service::Coord), None);
         assert!(f.runs().is_empty() && m.runs().is_empty());
+    }
+
+    /// The `PATH` the bridge's unit or agent records, as `install_service` writes it.
+    #[test]
+    fn a_recorded_path() {
+        let d = tempfile::tempdir().unwrap();
+        for os in [Os::Linux, Os::MacOs] {
+            let f = Fake::new(&d.path().join(format!("{os:?}")), os);
+            assert_eq!(recorded_path(&f, Service::Bridge), None, "not installed");
+            let mut spec = Spec::hgl_ai(Service::Bridge, &f, &f.env.home.join("data"));
+            spec.env[0].1 = "/opt/a&b/bin:/usr/bin".into();
+            let text = match os {
+                Os::Linux => render_systemd(&spec),
+                Os::MacOs => render_launchd(&spec),
+            };
+            let p = unit_path(&f.env, Service::Bridge);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, text).unwrap();
+            assert_eq!(
+                recorded_path(&f, Service::Bridge).as_deref(),
+                Some("/opt/a&b/bin:/usr/bin"),
+                "{os:?}"
+            );
+        }
+    }
+
+    /// A plain `sudo -u NAME` leaves `XDG_RUNTIME_DIR` unset: `systemctl --user` is
+    /// pointed at `/run/user/<uid>` when it exists, and left alone otherwise.
+    #[test]
+    fn user_state_without_a_session() {
+        let d = tempfile::tempdir().unwrap();
+        let mut f = Fake::new(d.path(), Os::Linux);
+        let unit = unit_path(&f.env, Service::Bridge);
+        std::fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        std::fs::write(&unit, "").unwrap();
+        let run = d.path().join("run/user");
+        f.env.runtime_root = Some(run.clone());
+        f.on(|c| match c.program.as_str() {
+            "id" => Output::success("1000\n"),
+            _ if c.env.iter().any(|(k, _)| k == "XDG_RUNTIME_DIR") => Output::success("active\n"),
+            _ => Output::failure(3, "Failed to connect to bus: No medium found"),
+        });
+        assert_eq!(
+            state(&f, Service::Bridge),
+            State::Stopped,
+            "no /run/user/1000"
+        );
+        std::fs::create_dir_all(run.join("1000")).unwrap();
+        assert_eq!(state(&f, Service::Bridge), State::Running);
+        let q = f.cmds.borrow();
+        let (_, c) = q.iter().rfind(|(_, c)| c.program == "systemctl").unwrap();
+        let dir = run.join("1000").display().to_string();
+        assert!(
+            c.env.contains(&("XDG_RUNTIME_DIR".into(), dir.clone())),
+            "{c:?}"
+        );
+        assert!(
+            c.env.contains(&(
+                "DBUS_SESSION_BUS_ADDRESS".into(),
+                format!("unix:path={dir}/bus")
+            )),
+            "{c:?}"
+        );
     }
 }
