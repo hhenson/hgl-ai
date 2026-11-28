@@ -1,6 +1,8 @@
 /* The telemetry page: Tailwind, with the console's palette in light and dark (the
    server-rendered pages use the same colours, crates/console/assets/style.css). */
-@import "tailwindcss";
+/* Class names come from src/ only: never from the build output in dist/. */
+@import "tailwindcss" source(none);
+@source ".";
 
 :root {
   --bg: #ffffff;
