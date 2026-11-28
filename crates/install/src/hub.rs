@@ -253,8 +253,9 @@ pub(crate) mod fake {
                 .map(|()| self.missing.clone())
                 .map_err(|e| e.to_string())
         }
-        async fn shared_inbox(&self, _cfg: &Config) -> Option<bool> {
-            self.shared_inbox.filter(|_| self.reachable)
+        async fn shared_inbox(&self, cfg: &Config) -> Option<bool> {
+            self.answer("shared_inbox", cfg).ok()?;
+            self.shared_inbox
         }
         async fn durables(&self, cfg: &Config) -> Result<Vec<String>, String> {
             self.answer("durables", cfg)
