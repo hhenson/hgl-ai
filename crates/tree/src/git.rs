@@ -161,13 +161,15 @@ impl TreeGit {
             }
             dir
         };
-        let mut argv = vec![OsString::from("--git-dir"), git_dir.into_os_string()];
-        argv.extend(args.into_iter().map(|a| a.as_ref().to_owned()));
+        let mut argv = Vec::new();
         let mut vars: Vec<_> = env
             .iter()
             .map(|(k, v)| ((*k).to_string(), (*v).to_owned()))
             .collect();
-        if !bare {
+        if bare {
+            argv.extend([OsString::from("--git-dir"), git_dir.into_os_string()]);
+        } else {
+            vars.push(("GIT_DIR".into(), git_dir.into_os_string()));
             vars.push((
                 "GIT_WORK_TREE".into(),
                 cwd.canonicalize()
@@ -175,6 +177,7 @@ impl TreeGit {
                     .into_os_string(),
             ));
         }
+        argv.extend(args.into_iter().map(|a| a.as_ref().to_owned()));
         Ok((argv, vars))
     }
 
