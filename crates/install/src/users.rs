@@ -21,6 +21,9 @@ use hgl_ai_proto::{
 use serde::{Deserialize, Serialize};
 
 use crate::sys::System;
+
+/// The prefix of the local build verdict keys in `HGL_STATE`.
+const VERDICT_PREFIX: &str = "verdict.";
 use crate::{Result, io_at, other, token};
 
 /// What a hub user may do.
@@ -32,6 +35,9 @@ pub enum Role {
     Seat,
     /// The coordinator service: a seat's rights and `HGL_METRICS`.
     Coord,
+    /// A builder service (`builder run`, docs/build.md BUILD-15): a seat's rights and the
+    /// local build verdicts (`HGL_STATE/verdict.*`), which no seat may write.
+    Builder,
     /// The owner's console: the owner's subjects, `HGL_THREADS`, `tick` notes.
     Console,
     /// Everything: provisioning the stream and buckets (`hgl-ai init`, `server install`).
@@ -39,12 +45,19 @@ pub enum Role {
 }
 
 impl Role {
-    pub const ALL: [Role; 4] = [Role::Seat, Role::Coord, Role::Console, Role::Admin];
+    pub const ALL: [Role; 5] = [
+        Role::Seat,
+        Role::Coord,
+        Role::Builder,
+        Role::Console,
+        Role::Admin,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
             Role::Seat => "seat",
             Role::Coord => "coord",
+            Role::Builder => "builder",
             Role::Console => "console",
             Role::Admin => "admin",
         }
@@ -63,7 +76,9 @@ impl FromStr for Role {
         Role::ALL
             .into_iter()
             .find(|r| r.as_str() == s)
-            .ok_or_else(|| format!("unknown hub role {s:?}: seat, coord, console or admin"))
+            .ok_or_else(|| {
+                format!("unknown hub role {s:?}: seat, coord, builder, console or admin")
+            })
     }
 }
 
@@ -274,7 +289,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     ];
     let mut deny = Vec::new();
     match role {
-        Role::Seat | Role::Coord => {
+        Role::Seat | Role::Coord | Role::Builder => {
             allow.push(format!("{SUBJECT_PREFIX}.*"));
             allow.push(format!("{CONSOLE_PREFIX}.>"));
             for b in [KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_USAGE] {
@@ -289,11 +304,17 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             if role == Role::Coord {
                 allow.push(format!("$KV.{KV_METRICS}.>"));
             }
+            // The local build verdicts the merge gate reads: only a builder's user writes
+            // them, from the builds it ran (BUILD-15); a seat's is refused (hgl-ai#16).
+            let verdicts = format!("$KV.{KV_STATE}.{VERDICT_PREFIX}>");
             // Read `HGL_OWNER` (`status list`) through short-lived consumers, which take no
             // acknowledgement; the console's durable feed stays the console's.
             allow.push(format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}"));
             allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.*"));
             deny = owner;
+            if role != Role::Builder {
+                deny.push(verdicts);
+            }
             deny.extend(
                 [
                     "$JS.API.STREAM.CREATE.>",
@@ -460,6 +481,18 @@ mod tests {
         for s in ["$KV.HGL_USAGE.>", "hgl.usage.>"] {
             assert!(seat.publish_allow.iter().any(|a| a == s), "{s}");
         }
+        // The local build verdicts: a builder's user only (BUILD-15).
+        let builder = permissions(Role::Builder).unwrap();
+        for p in [&seat, &coord] {
+            assert!(
+                p.publish_deny
+                    .iter()
+                    .any(|d| d == "$KV.HGL_STATE.verdict.>")
+            );
+        }
+        assert!(!builder.publish_deny.iter().any(|d| d.contains("verdict")));
+        assert!(builder.publish_deny.iter().any(|d| d == "hgl.owner.>"));
+        assert!(builder.publish_allow.iter().any(|a| a == "$KV.HGL_STATE.>"));
         let console = permissions(Role::Console).unwrap();
         for s in ["hgl.owner.>", "hgl.notes.owner.>", "$KV.HGL_THREADS.>"] {
             assert!(console.publish_allow.iter().any(|a| a == s), "{s}");

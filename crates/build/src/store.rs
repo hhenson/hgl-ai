@@ -4,7 +4,9 @@
 use std::path::Path;
 
 use hgl_ai_bus::{Bus, BusError};
-use hgl_ai_proto::build::{Summary, recipe_key, run_key};
+use hgl_ai_proto::build::{
+    BuildJob, Summary, VerdictValue, VerdictWord, recipe_key, run_key, verdict_key, verdict_prefix,
+};
 use hgl_ai_proto::{Kind, Note, Seat};
 
 use crate::recipe::{Recipe, RecipeError};
@@ -98,6 +100,163 @@ pub async fn run_put(bus: &Bus, s: &Summary) -> Result<(), StoreError> {
         trim(bus, RUN_RETENTION).await?;
     }
     Ok(())
+}
+
+/// Write a gate build's verdict (BUILD-15) from its summary, or `running` (bounded by
+/// `until`) while it builds, in the key of what it judges: its head, the `main` commit it
+/// was asked to merge onto, and the recipe revision it runs ([`verdict_key`]). In that key
+/// `pass` and `fail` are final: a later build of the same pair replaces only `running` or
+/// `not-run` (compare-and-set on the revision); `Ok(false)` when the key was final. Nothing
+/// for a job that is no gate build, or a build that never read its recipe (the gate reads
+/// why from the run).
+pub async fn verdict_put(
+    bus: &Bus,
+    job: &BuildJob,
+    s: &Summary,
+    running_until: Option<String>,
+) -> Result<bool, StoreError> {
+    let (Some(name), Some(base), Some(recipe)) = (&job.verdict, &job.base, s.recipe_rev) else {
+        return Ok(true);
+    };
+    if s.base_sha.as_ref().is_some_and(|m| m != base) {
+        return Err(StoreError::Other(format!(
+            "{}: merged onto {} for a verdict on {base}; not written",
+            s.id,
+            s.base_sha.as_deref().unwrap_or_default()
+        )));
+    }
+    let mut v = match running_until {
+        Some(until) => VerdictValue {
+            head: job.head.clone(),
+            main: base.clone(),
+            word: VerdictWord::Running,
+            id: Some(s.id.clone()),
+            builder: Some(s.host.clone()),
+            recipe: Some(recipe),
+            until: Some(until),
+            reason: None,
+        },
+        None => match VerdictValue::of(s) {
+            Some(v) => v,
+            None => return Ok(true),
+        },
+    };
+    // A build that stopped before its merge still judged nothing about this pair: say so
+    // in its key.
+    v.main = base.clone();
+    let key = verdict_key(&job.repo, job.issue, name, &job.head, base, recipe);
+    let text = v.render();
+    for _ in 0..16 {
+        let cur = bus.state_get(&key).await?;
+        let old = cur.as_ref().and_then(|e| VerdictValue::parse(&e.value));
+        if old
+            .as_ref()
+            .is_some_and(|o| o.judged() && o.is_for(&job.head, base))
+        {
+            return Ok(false);
+        }
+        match bus
+            .state_update(&key, &text, cur.map(|e| e.revision).unwrap_or(0))
+            .await
+        {
+            Ok(_) => return Ok(true),
+            Err(BusError::Conflict { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(StoreError::Other(format!(
+        "{key} kept changing; not written"
+    )))
+}
+
+/// Whether pull request `repo#pr` is merged or closed, as GitHub says (BUILD-15): `Err`
+/// when that could not be told (GitHub unreachable, a `hold`, no such pull request).
+/// Verdict keys are purged on this fact only, never on a note's word.
+pub type PrEnded = std::sync::Arc<
+    dyn Fn(
+            String,
+            u64,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<bool, String>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// The pull request a verdict key belongs to: `verdict.<repo>.<pr>.<name>.<pair>` read from
+/// the right, since a repository's name may hold dots.
+pub fn verdict_pr(key: &str) -> Option<(String, u64)> {
+    let rest = key.strip_prefix("verdict.")?;
+    let mut w = rest.rsplitn(4, '.');
+    let (_pair, _name, pr, repo) = (w.next()?, w.next()?, w.next()?, w.next()?);
+    Some((repo.to_string(), pr.parse().ok()?))
+}
+
+/// Delete every verdict key of `repo#pr`, if GitHub says it is merged or closed. Returns
+/// how many went; `Ok(None)` when it is open or that could not be told (nothing went).
+pub async fn verdicts_purge(
+    bus: &Bus,
+    ended: &PrEnded,
+    repo: &str,
+    pr: u64,
+) -> Result<Option<usize>, StoreError> {
+    match ended(repo.to_string(), pr).await {
+        Ok(true) => {}
+        Ok(false) => return Ok(None),
+        Err(e) => {
+            tracing::info!("{repo} #{pr}: its state not read ({e}); its verdicts kept");
+            return Ok(None);
+        }
+    }
+    let keys = bus.state_keys(&verdict_prefix(repo, pr)).await?;
+    for k in &keys {
+        bus.state_del(k).await?;
+    }
+    Ok(Some(keys.len()))
+}
+
+/// Sweep the verdict keys: those the hub wrote more than `max_age` seconds before `now`
+/// (Unix seconds, the hub's clock; never a requester's build id), and, with `ended`, those
+/// of pull requests GitHub reports merged or closed. Returns how many went.
+pub async fn verdicts_sweep(
+    bus: &Bus,
+    now: i64,
+    max_age: i64,
+    ended: Option<&PrEnded>,
+) -> Result<usize, StoreError> {
+    let mut n = 0;
+    let mut prs = std::collections::BTreeSet::new();
+    for k in bus.state_keys("verdict.").await? {
+        let Some(e) = bus.state_get(&k).await? else {
+            continue;
+        };
+        if now - e.created > max_age {
+            bus.state_del(&k).await?;
+            n += 1;
+        } else if let Some(p) = verdict_pr(&k) {
+            prs.insert(p);
+        }
+    }
+    if let Some(ended) = ended {
+        for (repo, pr) in prs {
+            n += verdicts_purge(bus, ended, &repo, pr).await?.unwrap_or(0);
+        }
+    }
+    Ok(n)
+}
+
+/// Whether this connection's hub user may write the local build verdicts (BUILD-15), as
+/// the hub's permissions say, not a credential file (a bare NKey seed names no role): a
+/// probe key `verdict._probe.0.<host>`, no repository's, written and deleted.
+pub async fn may_write_verdicts(bus: &Bus, host: &str) -> Result<bool, StoreError> {
+    let key = format!("verdict._probe.0.{host}");
+    match bus.state_put(&key, "probe").await {
+        Ok(_) => {
+            bus.state_del(&key).await?;
+            Ok(true)
+        }
+        Err(BusError::Denied { .. }) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Delete the oldest runs beyond `keep`. Returns how many went.

@@ -11,7 +11,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hgl_ai_bus::Bus;
-use hgl_ai_proto::build::{BuildJob, BuildStatus, BuilderRecord, StepStatus, Summary};
+use hgl_ai_proto::build::{
+    BuildJob, BuildStatus, BuilderRecord, StepStatus, Summary, verdict_platform,
+};
 use hgl_ai_proto::{Kind, Seat, utc_now_stamp};
 use tokio::sync::{Notify, watch};
 
@@ -19,6 +21,14 @@ use crate::driver::{self, Meta, Options};
 use crate::exec::{Cancel, Checkout, Executor, Prep, Probe, Workspace, ssh};
 use crate::store;
 
+/// Added to a gate build's step time limits to bound its `running` verdict.
+const RUNNING_MARGIN: Duration = Duration::from_secs(15 * 60);
+/// Heartbeats between sweeps of the verdict keys of pull requests that closed without a
+/// `landed` note (about an hour).
+const VERDICT_SWEEP_EVERY: u32 = 120;
+/// Verdict keys the hub wrote longer ago than this are swept (the notes' history and a
+/// day).
+const VERDICT_KEEP_DAYS: i64 = 15;
 /// How often a lane writes its record and checks its gate.
 pub const HEARTBEAT: Duration = Duration::from_secs(30);
 const KEEPALIVE: Duration = Duration::from_secs(60);
@@ -170,6 +180,12 @@ pub struct Settings {
     pub clone_url: Arc<dyn Fn(&str) -> String + Send + Sync>,
     pub toolchains: Vec<String>,
     pub heartbeat: Duration,
+    /// This service's hub user may write the local build verdicts (a `builder` user, or
+    /// a hub with one shared token); else gate builds are not run (BUILD-15).
+    pub verdicts: bool,
+    /// Asks GitHub whether a pull request is merged or closed, so its verdict keys may go;
+    /// `None`: they go only by age.
+    pub pr_ended: Option<store::PrEnded>,
 }
 
 /// Run the lanes until `shutdown` turns true; then cancel running builds (their remote
@@ -396,6 +412,17 @@ async fn lane_loop(
                         *lane.probe.lock().unwrap_or_else(|e| e.into_inner()) = p;
                     }
                 }
+                if settings.verdicts && beat.is_multiple_of(VERDICT_SWEEP_EVERY) {
+                    let now = chrono::Utc::now().timestamp();
+                    let age = VERDICT_KEEP_DAYS * 86_400;
+                    match store::verdicts_sweep(&bus, now, age, settings.pr_ended.as_ref()).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::info!(builder = %lane.label, "{n} verdict keys swept"),
+                        Err(e) => {
+                            tracing::warn!(builder = %lane.label, "sweeping verdict keys: {e}")
+                        }
+                    }
+                }
                 was_reachable = reachable;
                 beat = beat.wrapping_add(1);
                 if lost.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
@@ -459,6 +486,23 @@ async fn lane_loop(
         };
         for d in deliveries {
             if d.note.kind != Kind::Build {
+                // `landed` or `closed`: a hint, never proof (notes are not authenticated,
+                // hgl-ai#16). Its verdicts go only if GitHub says the pull request ended.
+                if d.note.kind.ends_task()
+                    && settings.verdicts
+                    && let (Some(ended), Some(repo)) = (&settings.pr_ended, d.note.repo.as_deref())
+                    && d.note.issue > 0
+                {
+                    match store::verdicts_purge(&bus, ended, repo, d.note.issue).await {
+                        Ok(None | Some(0)) => {}
+                        Ok(Some(n)) => {
+                            tracing::info!(builder = %lane.label, "{repo} #{}: ended on GitHub; {n} verdict keys purged", d.note.issue)
+                        }
+                        Err(e) => {
+                            tracing::warn!(builder = %lane.label, "purging the verdicts of {repo} #{}: {e}", d.note.issue)
+                        }
+                    }
+                }
                 let _ = d.ack().await;
                 continue;
             }
@@ -471,7 +515,10 @@ async fn lane_loop(
                 }
             };
             // Before anything touches a path or the hub with it.
-            let claimed = job.check(&d.note).and_then(|()| claim(&lane, &job));
+            let claimed = job
+                .check(&d.note)
+                .and_then(|()| check_verdict(&lane, &job))
+                .and_then(|()| claim(&lane, &job));
             let claim = match claimed {
                 Ok(c) => c,
                 Err(e) => {
@@ -513,7 +560,7 @@ async fn lane_loop(
                 // Acknowledged only once the result is published; until then the job
                 // stays ours (kept alive), and a crash redelivers it.
                 let published = match &out {
-                    Some(s) => finish(&bus, &lane, &job, s, &cancel).await,
+                    Some(s) => finish(&bus, &lane, &job, s, &cancel, settings.verdicts).await,
                     None => false,
                 };
                 keep.abort();
@@ -645,6 +692,7 @@ async fn run_job(
         repo: job.repo.clone(),
         head: Some(job.head.clone()),
         base: job.base.clone(),
+        base_sha: None,
         dirty: false,
         host: lane.label.clone(),
         proxy: lane.proxy.clone(),
@@ -654,6 +702,13 @@ async fn run_job(
     let log_dir = lane.logs.join(&job.id);
     let mut s0 = driver::start(&meta, lane.exec.as_ref(), &log_dir, BuildStatus::Running);
     let _ = store::run_put(bus, &s0).await;
+    if job.verdict.is_some() && !settings.verdicts {
+        return Some(driver::not_run(
+            s0,
+            "a gate build needs a builder hub user: this builder connects as a seat \
+             ([builder] credential, docs/install.md)",
+        ));
+    }
     let stored = match store::recipe_get(bus, &job.repo, job.recipe_rev).await {
         Ok(Some(r)) => r,
         Ok(None) => {
@@ -727,6 +782,35 @@ async fn run_job(
                 }
             })
         };
+        // What the head was merged onto: the verdict binds it (BUILD-15).
+        let meta = Meta {
+            base_sha: ws.base_sha.clone(),
+            ..meta.clone()
+        };
+        if job.verdict.is_some() {
+            let mut s = s0.clone();
+            s.base_sha = ws.base_sha.clone();
+            // Bounded: every step's time limit and a margin. A builder not done by then
+            // is presumed gone, and the gate asks another (BUILD-15).
+            let budget: Duration = stored
+                .recipe
+                .plan(lane.exec.platform(), None)
+                .map(|p| p.iter().map(|st| st.time_limit()).sum::<Duration>())
+                .unwrap_or_default()
+                + RUNNING_MARGIN;
+            let until = hgl_ai_proto::utc_stamp(
+                chrono::Utc::now() + chrono::Duration::from_std(budget).unwrap_or_default(),
+            );
+            match store::verdict_put(bus, job, &s, Some(until)).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    tracing::info!(builder = %lane.label, "{}: a later gate build holds the verdict", job.id)
+                }
+                Err(e) => {
+                    tracing::warn!(builder = %lane.label, "writing the verdict of {}: {e}", job.id)
+                }
+            }
+        }
         let opts = Options {
             only: job.steps.clone(),
             keep_going: job.keep_going,
@@ -796,6 +880,19 @@ async fn run_job(
     }
 }
 
+/// A gate build only on a builder of the platform its verdict names: no builder speaks
+/// for another platform.
+fn check_verdict(lane: &Lane, job: &BuildJob) -> Result<(), String> {
+    let Some(v) = &job.verdict else {
+        return Ok(());
+    };
+    let p = lane.exec.platform();
+    if verdict_platform(v) != Some(p) {
+        return Err(format!("verdict {v} is not this builder's platform ({p})"));
+    }
+    Ok(())
+}
+
 /// The request a log directory belongs to: the job as it came.
 const REQUEST_FILE: &str = "request.json";
 
@@ -858,20 +955,47 @@ fn saved_result(lane: &Lane, id: &str) -> Option<Summary> {
         .filter(|s| s.id == id && s.status.is_final())
 }
 
-/// Keep the summary (log directory first, then the hub) and send the receipts, retrying
-/// what fails until it is all published (`true`) or `cancel` (`false`: the job is
-/// redelivered and its saved result published then).
-async fn finish(bus: &Bus, lane: &Lane, job: &BuildJob, s: &Summary, cancel: &Cancel) -> bool {
+/// Keep the summary (log directory first, then a gate build's verdict, then the hub) and
+/// send the receipts, retrying what fails until it is all published (`true`) or `cancel`
+/// (`false`: the job is redelivered and its saved result published then).
+async fn finish(
+    bus: &Bus,
+    lane: &Lane,
+    job: &BuildJob,
+    s: &Summary,
+    cancel: &Cancel,
+    verdicts: bool,
+) -> bool {
     let dir = lane.logs.join(&job.id);
     if let Err(e) = store::write_final(&dir, s) {
         tracing::warn!("writing {}: {e}", dir.display());
     }
     let mut run_kept = false;
+    // A hub user that may not write verdicts does not try (the run says why).
+    let mut verdict_kept = job.verdict.is_none() || !verdicts;
     let mut to = vec![job.reply_to.clone()];
     to.extend(job.notify.clone());
     let mut pause = Duration::from_secs(1);
     loop {
-        if !run_kept {
+        // The verdict before the final run: a requester that sees the run ended finds its
+        // verdict written (or refused).
+        if !verdict_kept {
+            match store::verdict_put(bus, job, s, None).await {
+                Ok(true) => verdict_kept = true,
+                Ok(false) => {
+                    tracing::info!("{}: a later gate build holds the verdict", s.id);
+                    verdict_kept = true;
+                }
+                Err(e) if transient(&e) => {
+                    tracing::warn!("writing the verdict of {}: {e}; retrying", s.id)
+                }
+                Err(e) => {
+                    tracing::error!("writing the verdict of {}: {e}; not retried", s.id);
+                    verdict_kept = true;
+                }
+            }
+        }
+        if !run_kept && verdict_kept {
             match store::run_put(bus, s).await {
                 Ok(()) => run_kept = true,
                 Err(e) if transient(&e) => tracing::warn!("writing run {}: {e}; retrying", s.id),
@@ -894,7 +1018,7 @@ async fn finish(bus: &Bus, lane: &Lane, job: &BuildJob, s: &Summary, cancel: &Ca
             }
         }
         to = left;
-        if run_kept && to.is_empty() {
+        if run_kept && verdict_kept && to.is_empty() {
             prune_logs(&lane.logs, LOGS_KEPT);
             return true;
         }

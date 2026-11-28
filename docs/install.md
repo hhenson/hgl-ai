@@ -101,8 +101,9 @@ hgl-ai server user ...`).
 
 | Role | May publish |
 | --- | --- |
-| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`, `HGL_BUILD/run.*`, `HGL_USAGE`, `hgl.usage.>`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, recipes (`HGL_BUILD/recipe.*`), stream changes |
+| `seat` | `hgl.notes.<seat>`, `hgl.console.>`, `HGL_STATE`, `HGL_HOSTS`, `HGL_TREES`, `HGL_LOCKS`, `HGL_ENDED`, `HGL_BUILD/run.*`, `HGL_USAGE`, `hgl.usage.>`; never `hgl.owner.>`, `hgl.notes.owner.>`, `HGL_THREADS`, recipes (`HGL_BUILD/recipe.*`), verdicts (`HGL_STATE/verdict.*`), stream changes |
 | `coord` | a seat's, and `HGL_METRICS` |
+| `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
 | `console` | `hgl.owner.>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
@@ -113,6 +114,7 @@ touch the console's durable feed.
 ```sh
 hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred
 hgl-ai server user add build-2 --role seat --nkey U...   # a host's own key; no secret here
+hgl-ai server user add lab1-builder --role builder # its builder: [builder] credential
 hgl-ai server user list
 hgl-ai server user remove build-1                  # the hub refuses it from then on
 ```
