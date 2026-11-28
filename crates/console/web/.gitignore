@@ -1,0 +1,4 @@
+node_modules/
+tsconfig.tsbuildinfo
+# dist/ is checked in: building the binary needs no Node (docs/design.md).
+!dist/

@@ -225,7 +225,12 @@ fn default_gates() -> BTreeMap<String, RepoGate> {
         ("hgl-compiler".to_string(), compiler),
         (
             "hgl-ai".to_string(),
-            checks(&["lint", "test (ubuntu-latest)", "test (macos-latest)"]),
+            checks(&[
+                "lint",
+                "lint (macos-latest)",
+                "test (ubuntu-latest)",
+                "test (macos-latest)",
+            ]),
         ),
         (
             "hgl-project".to_string(),
@@ -306,7 +311,12 @@ mod tests {
         let of = |r: &str| all.get(r).map(|g| g.checks.clone()).unwrap_or_default();
         assert_eq!(
             of("hgl-ai"),
-            ["lint", "test (ubuntu-latest)", "test (macos-latest)"]
+            [
+                "lint",
+                "lint (macos-latest)",
+                "test (ubuntu-latest)",
+                "test (macos-latest)"
+            ]
         );
         assert_eq!(of("hgl-project"), ["docs/readthedocs.org:hgl-project"]);
         assert_eq!(of("homebrew-hgraph"), ["linux-formula"]);
