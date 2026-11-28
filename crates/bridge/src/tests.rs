@@ -618,6 +618,49 @@ async fn a_report_writing_a_tree_as_cleanup_removes_it_leaves_no_record() {
     stop(tx, j).await;
 }
 
+/// A separate CLI removal waits for a report already inside its registry write.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cli_removal_waits_for_report_before_deregistering() {
+    use hgl_ai_tree::Registry;
+
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+
+    let key = "build-1.w1.demo-41";
+    h.bus.hold_tree_merges();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("report holds its write", || h.bus.tree_merges_held() == 1).await;
+    let data = h.cfg.data_dir().unwrap();
+    let mut cli = tokio::spawn(async move { FileLock::registry(&data, key).await.unwrap() });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), &mut cli)
+            .await
+            .is_err()
+    );
+    h.bus.release_tree_merges();
+    let held = tokio::time::timeout(Duration::from_secs(5), cli)
+        .await
+        .unwrap()
+        .unwrap();
+    let trees = Trees::new(&h.cfg, h.git.clone()).unwrap();
+    let task = TaskKey {
+        repo: "demo".into(),
+        issue: 41,
+    };
+    trees.remove(&seat("w1"), &task, false).unwrap().unwrap();
+    h.bus.tree_del(key).await.unwrap();
+    drop(held);
+    assert!(!h.bus.trees().contains_key(key));
+    stop(tx, j).await;
+}
+
 /// hgl-ai#58: the report lists two trees; while it writes the first, `closed` removes the
 /// second. The report, checking before each write, does not register the second again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

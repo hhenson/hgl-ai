@@ -168,7 +168,21 @@ impl<B: BusApi> Bridge<B> {
         // written under its registry lock: a removal since the listing has deregistered
         // it, or does after this write (hgl-ai#58).
         for t in list.iter().filter(|t| t.file.is_some()) {
-            let _reg = self.registry_lock(&t.record.key()).await;
+            let key = t.record.key();
+            let _reg = self.registry_lock(&key).await;
+            let _file_lock = match self.cfg.data_dir() {
+                Ok(dir) => match crate::lock::FileLock::registry(&dir, &key).await {
+                    Ok(held) => held,
+                    Err(e) => {
+                        tracing::warn!(%key, "locking registry: {e}");
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(%key, "registry lock directory: {e}");
+                    continue;
+                }
+            };
             if !still_there(t) {
                 tracing::info!(key = %t.record.key(), "removed since the listing; not registered");
                 continue;
