@@ -58,6 +58,10 @@ pub const VIEWER_INBOX: &str = "_INBOX_VIEWER";
 pub const VIEWER_STATE_KEYS: [&str; 6] = ["prs", "backlog", "landed.log", "tasks", "mode", "hold"];
 /// The Slack adapter's delivery state and thread mappings.
 pub const KV_SLACK: &str = "HGL_SLACK";
+/// Rules and decision records for the screen.
+pub const KV_SCREEN: &str = "HGL_SCREEN";
+pub const SCREEN_RULE_KEYS: &str = "rule.>";
+pub const SCREEN_LOG_KEYS: &str = "log.>";
 /// Owner words (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
 /// One owner event per Slack workspace, channel and reply or action timestamp in a thread.
@@ -69,12 +73,16 @@ pub const CONSOLE_PREFIX: &str = "hgl.console";
 /// Owner notes to a seat travel on `hgl.notes.owner.<seat>`, which only the console's hub
 /// user may publish; a note with sender `owner` is valid only there (OWN-5).
 pub const OWNER_NOTES_PREFIX: &str = "hgl.notes.owner";
+/// Screen replies and digests (PROTO-20).
+pub const SCREEN_NOTES_PREFIX: &str = "hgl.notes.screen";
+/// The screen's sender name and intake address.
+pub const SCREEN: &str = "screen";
 /// The sender of the owner's words; never a seat.
 pub const OWNER: &str = "owner";
 /// The sender of the console's own notes (`tick`); never a seat.
 pub const CONSOLE: &str = "console";
 /// Names no configured seat may take.
-pub const RESERVED_SEATS: [&str; 3] = [BROADCAST, OWNER, CONSOLE];
+pub const RESERVED_SEATS: [&str; 4] = [BROADCAST, OWNER, CONSOLE, SCREEN];
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProtoError {
@@ -129,7 +137,13 @@ impl Seat {
     pub fn is_owner(&self) -> bool {
         self.0 == OWNER
     }
-    /// `all`, `owner` or `console`: an address or sender, never a configured seat.
+    pub fn screen() -> Self {
+        Seat(SCREEN.to_string())
+    }
+    pub fn is_screen(&self) -> bool {
+        self.0 == SCREEN
+    }
+    /// `all`, `owner`, `console` or `screen`: an address or sender reserved by the protocol.
     pub fn is_reserved(&self) -> bool {
         RESERVED_SEATS.contains(&self.0.as_str())
     }
@@ -140,6 +154,10 @@ impl Seat {
     /// `hgl.notes.owner.<seat>`: the owner's notes to this seat (OWN-5).
     pub fn owner_subject(&self) -> String {
         format!("{OWNER_NOTES_PREFIX}.{}", self.0)
+    }
+    /// `hgl.notes.screen.<seat>`: the screen's replies and digests (PROTO-20).
+    pub fn screen_subject(&self) -> String {
+        format!("{SCREEN_NOTES_PREFIX}.{}", self.0)
     }
     /// Durable consumer name `inbox-<seat>`.
     pub fn consumer(&self) -> String {
@@ -415,6 +433,13 @@ impl Note {
                 "owner notes go to one seat, not `all`".into(),
             ));
         }
+        if self.sender.is_screen()
+            && (self.recipient.is_broadcast() || !matches!(self.kind, Kind::Answer | Kind::Note))
+        {
+            return Err(ProtoError::Note(
+                "screen notes must be an answer or note to one seat".into(),
+            ));
+        }
         if let Some(h) = &self.head {
             check_head(h)?;
         } else if self.kind.needs_head() {
@@ -451,11 +476,12 @@ impl Note {
         Ok(())
     }
 
-    /// The subject the note travels on: `hgl.notes.<recipient>`, or for a note from the
-    /// owner `hgl.notes.owner.<recipient>`, which only the console may publish (OWN-5).
+    /// The ordinary recipient subject or a dedicated owner or screen subject (PROTO-20).
     pub fn subject(&self) -> String {
         if self.sender.is_owner() {
             self.recipient.owner_subject()
+        } else if self.sender.is_screen() {
+            self.recipient.screen_subject()
         } else {
             self.recipient.subject()
         }
