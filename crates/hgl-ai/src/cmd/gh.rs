@@ -162,6 +162,7 @@ impl GateArgs {
                 closes: self.closes,
                 tool_made: false,
                 merge_until: None,
+                ready_at_head: false,
             },
             closes: self.closes,
             what: self.what.clone(),

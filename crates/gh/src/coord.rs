@@ -401,7 +401,6 @@ pub async fn run<G: Gh>(
                         }
                     }
                 }
-                let text = t.render();
                 prev = t.rows;
                 last_rate = Some(rate);
                 match change {
@@ -414,17 +413,7 @@ pub async fn run<G: Gh>(
                         .as_deref()
                         .is_some_and(|h| table::hold_active(h, Utc::now()))
                 {
-                    let r = lands.round(gh, s, b, &infos, &text).await;
-                    // Before the result: a landing done ahead of a later failure is still
-                    // reported.
-                    let notes = lands.take_reports();
-                    if !notes.is_empty() {
-                        queue(&mut unsent, notes);
-                        if let Err(e) = send_unsent(b, &mut unsent, &mut stored).await {
-                            tracing::warn!("reporting a landing: {e}");
-                        }
-                    }
-                    match r {
+                    match lands.round(gh, s, b, &infos).await {
                         Ok(()) => {}
                         Err(Error::RateLimited(m)) => {
                             hold = Some(

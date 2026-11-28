@@ -1630,12 +1630,11 @@ async fn ready_notes_are_read_from_the_controllers_notes() {
 }
 
 /// `alpha#7` at `HEAD` as one coordinator round reads it: Ready (its `Ready` comment), the
-/// table fresh and clean; and `alpha` opted in to coordinator landing.
-fn ready_round() -> (crate::Settings, Vec<crate::table::PrInfo>, String) {
+/// row clean; and `alpha` opted in to coordinator landing.
+fn ready_round() -> (crate::Settings, Vec<crate::table::PrInfo>) {
     let mut s = crate::testutil::with_coordinator_lands(settings(), &["alpha"], true);
     s.repos = vec!["alpha".into()];
     s.pins = vec![];
-    let now = hgl_ai_proto::utc_now_stamp();
     let row = crate::table::Row {
         repo: "alpha".into(),
         number: 7,
@@ -1644,25 +1643,47 @@ fn ready_round() -> (crate::Settings, Vec<crate::table::PrInfo>, String) {
         bot: crate::bot::BotState::Clean,
         unresolved: 0,
         checks: crate::table::Checks::Pass,
-        updated: now.clone(),
+        updated: hgl_ai_proto::utc_now_stamp(),
     };
     let info = crate::table::PrInfo {
-        row: row.clone(),
+        row,
         note: Some(crate::bot::NoteState::Ready),
         ready_at: Some("2026-11-28T10:00:00Z".into()),
         ready_cleared: None,
         url: "https://github.com/o/alpha/pull/7".into(),
         review_url: None,
     };
-    let t = Table {
-        read: now,
-        rate: None,
-        rows: vec![row],
-    };
-    (s, vec![info], t.render())
+    (s, vec![info])
 }
 
-/// The coordinator's landing reports to the controller (a `note`) and to `decisions.log`.
+/// The pull request's comments with `extra` note comments added: the clean fixture has the
+/// bot's clean review and `Approved at 1f461fa7`, no `Ready`.
+fn comments_with(extra: &[(&str, &str)]) -> String {
+    let mut v: Vec<serde_json::Value> =
+        serde_json::from_str(&fixture("comments-clean.json")).unwrap();
+    for (body, at) in extra {
+        v.push(serde_json::json!({
+            "user": {"login": "octo"}, "body": body, "created_at": at, "updated_at": at
+        }));
+    }
+    serde_json::to_string(&v).unwrap()
+}
+
+/// [`landing_gh`] with the comments the gate reads holding a `Ready` at `HEAD` before the
+/// approval, and `extra` after it.
+fn coord_gh(extra: &[(&str, &str)], after: impl FnOnce(FakeGh) -> FakeGh) -> FakeGh {
+    let mut notes = vec![(
+        "[claude] Ready: alpha#7 at 1f461fa7",
+        "2026-01-01T05:50:00Z",
+    )];
+    notes.extend_from_slice(extra);
+    let gh = landing_gh(after).on("issues/7/comments", &comments_with(&notes));
+    // First: ahead of the clean fixture's rule.
+    gh.rules.lock().unwrap().rotate_right(1);
+    gh
+}
+
+/// The coordinator's reports: its notes to the controller and `decisions.log`.
 async fn coord_reports(b: &Bus) -> (Vec<String>, Vec<String>) {
     let notes = b
         .read_notes(&[Seat::new("controller").unwrap()], 1, 100, Duration::ZERO)
@@ -1677,32 +1698,18 @@ async fn coord_reports(b: &Bus) -> (Vec<String>, Vec<String>) {
 }
 
 /// hgl-ai#123: a round lands the Ready candidate of an opted-in repository through the
-/// gate, then reports it once; the next round, with the pull request gone from the open
-/// ones, does nothing more.
+/// gate and reports it once, to the controller and `decisions.log`, before the record goes;
+/// the next round, the pull request gone from the open ones, does nothing more.
 #[tokio::test]
 async fn the_coordinator_lands_a_ready_pull_request() {
     let Some(h) = hub() else { return };
     let b = bus(&h).await;
     authored_and_reviewed(&b).await;
-    let (s, infos, table) = ready_round();
-    let gh = landing_gh(|g| g);
+    let (s, infos) = ready_round();
+    let gh = coord_gh(&[], |g| g);
     let mut a = crate::autoland::AutoLand::new(&s);
-    a.round(&gh, &s, &b, &infos, &table).await.unwrap();
-    let notes = a.take_reports();
+    a.round(&gh, &s, &b, &infos).await.unwrap();
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "merged");
-    assert_eq!(notes.len(), 1, "{notes:?}");
-    assert!(
-        notes[0].body.starts_with(&format!(
-            "[coord] Landed: alpha#7 at 1f461fa7 as {}",
-            &MERGE[..8]
-        )),
-        "{}",
-        notes[0].body
-    );
-    assert_eq!(notes[0].recipient.as_str(), "controller");
-    for n in &notes {
-        b.send(n).await.unwrap();
-    }
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert!(
         log.trim_end().ends_with(&format!("alpha #7 {MERGE}")),
@@ -1718,6 +1725,14 @@ async fn the_coordinator_lands_a_ready_pull_request() {
     );
     let (sent, decisions) = coord_reports(&b).await;
     assert_eq!(sent.len(), 1, "{sent:?}");
+    assert!(
+        sent[0].starts_with(&format!(
+            "[coord] Landed: alpha#7 at 1f461fa7 as {}\n",
+            &MERGE[..8]
+        )),
+        "{}",
+        sent[0]
+    );
     assert_eq!(decisions.len(), 1, "{decisions:?}");
     assert!(
         decisions[0].ends_with(&format!(
@@ -1734,53 +1749,81 @@ async fn the_coordinator_lands_a_ready_pull_request() {
     );
 
     let calls = gh.calls().len();
-    a.round(&gh, &s, &b, &[], &table).await.unwrap();
-    let notes = a.take_reports();
-    assert!(notes.is_empty(), "{notes:?}");
+    a.round(&gh, &s, &b, &[]).await.unwrap();
     assert_eq!(gh.calls().len(), calls, "no GitHub call");
+    assert_eq!(coord_reports(&b).await.0.len(), 1);
     assert_eq!(hgl_ai_owner::decisions_tail(&b, 10).await.unwrap().len(), 1);
 }
 
+/// Review (r6): Ready is confirmed at the moment of the attempt. Sent back after the round
+/// read it Ready: the gate refuses, nothing is merged and nothing is reported.
+#[tokio::test]
+async fn a_candidate_sent_back_since_the_read_is_not_merged() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let (s, infos) = ready_round();
+    let gh = coord_gh(
+        &[(
+            "[codex] (controller) Sent back at 1f461fa7",
+            "2026-01-01T06:10:00Z",
+        )],
+        |g| g,
+    );
+    let mut a = crate::autoland::AutoLand::new(&s);
+    a.round(&gh, &s, &b, &infos).await.unwrap();
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 0, "not merged");
+    assert!(b.state_get(state::KEY_LANDED).await.unwrap().is_none());
+    assert_eq!(coord_reports(&b).await, (vec![], vec![]));
+}
+
 /// hgl-ai#123 with hgl-ai#7: the coordinator is cut off right after the merge (the read
-/// back fails); the next round finds the landing's record, its pull request no longer
-/// open, and finishes it once, reported as finishing an earlier attempt.
+/// back fails), the record holding only the intent. A restarted coordinator, the pull
+/// request gone from the open ones, asks GitHub, finds it merged, and finishes it once.
 #[tokio::test]
 async fn a_coordinator_landing_cut_off_after_the_merge_resumes_next_round() {
     let Some(h) = hub() else { return };
     let b = bus(&h).await;
     authored_and_reviewed(&b).await;
-    let (s, infos, table) = ready_round();
-    let gh = landing_gh(|g| g.push_fail_once("pulls/7", "gh: Server Error (HTTP 502)"));
+    let (s, infos) = ready_round();
+    let gh = coord_gh(&[], |g| {
+        g.push_fail_once("pulls/7", "gh: Server Error (HTTP 502)")
+    });
     let mut a = crate::autoland::AutoLand::new(&s);
-    a.round(&gh, &s, &b, &infos, &table).await.unwrap();
-    let first = a.take_reports();
+    a.round(&gh, &s, &b, &infos).await.unwrap();
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "merged");
-    assert!(
-        first.iter().all(|n| !n.body.starts_with("[coord] Landed")),
-        "{first:?}"
-    );
     assert!(b.state_get(state::KEY_LANDED).await.unwrap().is_none());
+    let rec = crate::progress::read(&b, "alpha", 7)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(rec.merge, None, "the intent only");
     assert!(
-        crate::progress::read(&b, "alpha", 7)
+        coord_reports(&b)
             .await
-            .unwrap()
-            .is_some()
+            .0
+            .iter()
+            .all(|n| !n.starts_with("[coord] Landed"))
     );
 
-    // A new coordinator (a restart): the pull request is merged, so not among the open.
     let mut a = crate::autoland::AutoLand::new(&s);
-    a.round(&gh, &s, &b, &[], &table).await.unwrap();
-    let notes = a.take_reports();
+    a.round(&gh, &s, &b, &[]).await.unwrap();
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "not merged again");
-    assert_eq!(notes.len(), 1, "{notes:?}");
+    let (sent, decisions) = coord_reports(&b).await;
+    let landed: Vec<&String> = sent
+        .iter()
+        .filter(|n| n.starts_with("[coord] Landed"))
+        .collect();
+    assert_eq!(landed.len(), 1, "{sent:?}");
     assert!(
-        notes[0].body.starts_with(&format!(
+        landed[0].starts_with(&format!(
             "[coord] Landed: alpha#7 at 1f461fa7 as {}, finishing an earlier attempt",
             &MERGE[..8]
         )),
         "{}",
-        notes[0].body
+        landed[0]
     );
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
     let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
     assert_eq!(log.lines().count(), 1, "{log}");
     assert_eq!(landed_notes(&b).await.len(), 3);
@@ -1791,11 +1834,101 @@ async fn a_coordinator_landing_cut_off_after_the_merge_resumes_next_round() {
             .unwrap()
             .is_none()
     );
-    assert_eq!(hgl_ai_owner::decisions_tail(&b, 10).await.unwrap().len(), 1);
 
-    a.round(&gh, &s, &b, &[], &table).await.unwrap();
-    let notes = a.take_reports();
-    assert!(notes.is_empty(), "{notes:?}");
+    a.round(&gh, &s, &b, &[]).await.unwrap();
+    assert_eq!(coord_reports(&b).await.1.len(), 1);
+}
+
+/// Review (codex P1, r6): a record with no merge whose pull request is not among the open
+/// ones read is not taken as closed. Still open on GitHub: left to the candidates, nothing
+/// merged. Closed without a merge: left, and not asked about again.
+#[tokio::test]
+async fn an_unmerged_record_is_finished_only_when_github_shows_it_merged() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let (s, _) = ready_round();
+    let intent = serde_json::to_string(&crate::progress::Progress::new(HEAD, None)).unwrap();
+    store::put_latest(&b, &crate::progress::key("alpha", 7), &intent)
+        .await
+        .unwrap();
+    let gh = FakeGh::default().on("pulls/7", &fixture("pr-open.json"));
+    let mut a = crate::autoland::AutoLand::new(&s);
+    a.round(&gh, &s, &b, &[]).await.unwrap();
+    a.round(&gh, &s, &b, &[]).await.unwrap();
+    assert_eq!(gh.calls().len(), 2, "asked each round: {:?}", gh.calls());
+    assert!(
+        gh.calls().iter().all(|c| !c.contains("merge")),
+        "{:?}",
+        gh.calls()
+    );
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    let closed = fixture("pr-open.json").replace("\"state\": \"open\"", "\"state\": \"closed\"");
+    assert!(
+        closed.contains("\"state\": \"closed\""),
+        "the fixture's form"
+    );
+    let gh = FakeGh::default().on("pulls/7", &closed);
+    let mut a = crate::autoland::AutoLand::new(&s);
+    a.round(&gh, &s, &b, &[]).await.unwrap();
+    a.round(&gh, &s, &b, &[]).await.unwrap();
+    assert_eq!(gh.calls().len(), 1, "asked once: {:?}", gh.calls());
+    assert_eq!(coord_reports(&b).await, (vec![], vec![]));
+}
+
+/// Review (r6): both reports are steps of the landing's record. A record whose landing
+/// steps and controller note are done, its `decisions.log` line not: the next round writes
+/// only the line, then deletes the record.
+#[tokio::test]
+async fn a_report_left_undone_is_finished_from_the_record() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let (s, _) = ready_round();
+    let mut p = crate::progress::Progress::new(HEAD, Some(MERGE.into()));
+    for step in [
+        crate::progress::LANDED_LOG,
+        crate::progress::MAIN,
+        crate::progress::NOTES,
+        crate::progress::COMMENT,
+        crate::autoland::STEP_NOTE,
+    ] {
+        p.mark(step);
+    }
+    p.notes_at = Some("20261128T120000Z".into());
+    store::put_latest(
+        &b,
+        &crate::progress::key("alpha", 7),
+        &serde_json::to_string(&p).unwrap(),
+    )
+    .await
+    .unwrap();
+    let gh = coord_gh(&[], |g| g);
+    let mut a = crate::autoland::AutoLand::new(&s);
+    a.round(&gh, &s, &b, &[]).await.unwrap();
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 0);
+    assert_eq!(posts(&gh, "issues/7/comments"), 0);
+    let (sent, decisions) = coord_reports(&b).await;
+    assert!(sent.is_empty(), "{sent:?}");
+    assert_eq!(
+        decisions,
+        [format!(
+            "20261128T120000Z coord: landed alpha#7 at 1f461fa7 as {}",
+            &MERGE[..8]
+        )]
+    );
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// No repository opts in (the default): Ready pull requests and landing records are left
@@ -1805,8 +1938,8 @@ async fn without_opt_in_the_coordinator_lands_nothing() {
     let Some(h) = hub() else { return };
     let b = bus(&h).await;
     authored_and_reviewed(&b).await;
-    let (mut s, infos, table) = ready_round();
-    s = crate::testutil::with_coordinator_lands(s, &["alpha"], false);
+    let (s, infos) = ready_round();
+    let s = crate::testutil::with_coordinator_lands(s, &["alpha"], false);
     store::put_latest(
         &b,
         &crate::progress::key("alpha", 7),
@@ -1814,10 +1947,9 @@ async fn without_opt_in_the_coordinator_lands_nothing() {
     )
     .await
     .unwrap();
-    let gh = landing_gh(|g| g);
+    let gh = coord_gh(&[], |g| g);
     let mut a = crate::autoland::AutoLand::new(&s);
-    a.round(&gh, &s, &b, &infos, &table).await.unwrap();
-    assert!(a.take_reports().is_empty());
+    a.round(&gh, &s, &b, &infos).await.unwrap();
     assert!(gh.calls().is_empty(), "{:?}", gh.calls());
     assert!(
         crate::progress::read(&b, "alpha", 7)
@@ -1827,63 +1959,52 @@ async fn without_opt_in_the_coordinator_lands_nothing() {
     );
 }
 
-/// The table says not yet (a failed check): no gate call this round.
+/// The row says a check failed: no gate call this round.
 #[tokio::test]
-async fn a_candidate_the_table_holds_back_costs_no_github_call() {
+async fn a_candidate_the_row_holds_back_costs_no_github_call() {
     let Some(h) = hub() else { return };
     let b = bus(&h).await;
-    let (s, infos, _) = ready_round();
-    let mut row = infos[0].row.clone();
-    row.checks = crate::table::Checks::Fail;
-    let table = Table {
-        read: hgl_ai_proto::utc_now_stamp(),
-        rate: None,
-        rows: vec![row],
-    }
-    .render();
-    let gh = landing_gh(|g| g);
+    let (s, mut infos) = ready_round();
+    infos[0].row.checks = crate::table::Checks::Fail;
+    let gh = coord_gh(&[], |g| g);
     let mut a = crate::autoland::AutoLand::new(&s);
-    a.round(&gh, &s, &b, &infos, &table).await.unwrap();
-    assert!(a.take_reports().is_empty());
+    a.round(&gh, &s, &b, &infos).await.unwrap();
     assert!(gh.calls().is_empty(), "{:?}", gh.calls());
 }
 
-/// hgl-ai#123, review: a candidate lands, then the next in Ready order hits GitHub's rate
-/// limit. The round fails, and the landing done before it is still reported and logged.
+/// Review (codex P2): a candidate lands, then the next in Ready order hits GitHub's rate
+/// limit. The round fails; the landing before it is reported and logged all the same.
 #[tokio::test]
 async fn a_landing_before_a_rate_limit_is_still_reported() {
     let Some(h) = hub() else { return };
     let b = bus(&h).await;
     authored_and_reviewed(&b).await;
-    let (s, mut infos, _) = ready_round();
+    let (s, mut infos) = ready_round();
     let mut eight = infos[0].clone();
     eight.row.number = 8;
     eight.ready_at = Some("2026-11-28T11:00:00Z".into());
     infos.push(eight);
-    let table = Table {
-        read: hgl_ai_proto::utc_now_stamp(),
-        rate: None,
-        rows: infos.iter().map(|i| i.row.clone()).collect(),
-    }
-    .render();
-    let gh = landing_gh(|g| g.fail("/8", "gh: API rate limit exceeded (HTTP 403)"));
-    gh.rules.lock().unwrap().rotate_right(1);
+    let gh = coord_gh(&[], |g| {
+        g.fail("/8", "gh: API rate limit exceeded (HTTP 403)")
+    });
     let mut a = crate::autoland::AutoLand::new(&s);
-    let e = a.round(&gh, &s, &b, &infos, &table).await.unwrap_err();
+    let e = a.round(&gh, &s, &b, &infos).await.unwrap_err();
     assert!(matches!(e, Error::RateLimited(_)), "{e}");
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "#7 merged");
-    let notes = a.take_reports();
-    assert_eq!(notes.len(), 1, "{notes:?}");
+    let (sent, decisions) = coord_reports(&b).await;
+    assert_eq!(sent.len(), 1, "{sent:?}");
     assert!(
-        notes[0]
-            .body
-            .starts_with("[coord] Landed: alpha#7 at 1f461fa7"),
+        sent[0].starts_with("[coord] Landed: alpha#7 at 1f461fa7"),
         "{}",
-        notes[0].body
+        sent[0]
     );
-    assert!(a.take_reports().is_empty(), "taken once");
-    let log = hgl_ai_owner::decisions_tail(&b, 10).await.unwrap();
-    assert_eq!(log.len(), 1, "{log:?}");
+    assert_eq!(decisions.len(), 1, "{decisions:?}");
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 /// `tasks` with no task is never written empty (an empty create fails every round), and

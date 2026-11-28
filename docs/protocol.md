@@ -300,7 +300,7 @@ before hub users takes one shared token until it moves.
 | `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
 | `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted. Read from the notes stream every 10 s; written when it changes. |
 | `decisions.log` | controller, console, coordinator service | The controller's decision log (OWN-8): newest 2000 lines. |
-| `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean`, coordinator service | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
+| `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean`, coordinator service | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done (the coordinator's `coord.note` and `coord.decision` included). |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
 | `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
@@ -335,15 +335,20 @@ read is tried three times, then the landing fails; a repository with no `main`
 (HTTP 404) is left out with a warning.
 
 Where `[github.gate.<repo>] coordinator_lands` opts in, the coordinator service
-lands too, after each table round and not under `hold`: first every
-`landing.<repo>.<pr>` of such a repository whose merge is recorded or whose pull
-request is no longer open, then each Ready candidate (docs/work.md WORK-6) the
-table does not hold back, oldest first; one `gh merge-if-clean` attempt each,
-the landing lock not waited for, a missing local build verdict asked of a builder
-and read in a later round. Each landing it does or finishes goes to the
-controller as a `note` (`[coord] Landed: <repo>#<pr> at <head> as <merge>`, kept
-in `coord.alerts` until sent) and to `decisions.log`; a `PARTIAL` goes to the
-controller once. The wrapper's pins stay the controller's.
+lands too, after each table round and not under `hold`. First it takes every
+`landing.<repo>.<pr>` of such a repository whose merge is confirmed: recorded, or
+GitHub reports the pull request merged. Absence from the round's read is not
+taken as closed, and a record closed without a merge is left. Then it takes each
+Ready candidate (docs/work.md WORK-6), oldest first, unless its row shows a failed
+check, an unresolved thread, bot findings or the bot's limit. Each gets one gate
+attempt under the landing lock, which it does not wait for. The gate also requires
+Ready at the head asked for, from the comments it reads. A missing local build
+verdict is asked of a builder and read in a later round. A landing it does or
+finishes has two more steps in its record, done under the lock before the record
+is deleted: `coord.note`, a `note` to the controller (`[coord] Landed: <repo>#<pr>
+at <head> as <merge>`, carrying the `landed` notes' `created_at`), then
+`coord.decision`, its `decisions.log` line. A `PARTIAL` goes to the controller
+once. The wrapper's pins stay the controller's.
 
 `HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream
 sequence of the note that ended the task for the seat. A later end replaces an

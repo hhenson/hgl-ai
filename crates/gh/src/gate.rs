@@ -260,6 +260,8 @@ pub struct Facts {
     /// How many commits `main` has that the head does not.
     pub behind: Option<u64>,
     pub bot: Option<BotView>,
+    /// The pull request's comments, read with the bot's ([`Need::BotComments`]).
+    pub comments: Option<Vec<Comment>>,
     pub bot_reviews: Option<Vec<Review>>,
     /// Parents of the pull request's head.
     pub parents: Option<Vec<String>>,
@@ -315,6 +317,10 @@ pub struct Opts {
     /// than the landing lock's lease from the merge; else [`crate::merge::POLL_LIMIT`]
     /// from the merge ([`crate::merge::until`]).
     pub merge_until: Option<tokio::time::Instant>,
+    /// Merge only while the pull request is Ready at the head asked for, by its note
+    /// comments (WORK-6, [`crate::bot::ready_mark`]): the coordinator's landings, which
+    /// chose it by that.
+    pub ready_at_head: bool,
 }
 
 /// The last word of a gate line.
@@ -448,6 +454,22 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
                 short(head),
                 short(asked),
                 short(main)
+            );
+            return done(Kind::Blocked, line, false);
+        }
+    }
+    if opts.ready_at_head {
+        let comments = need!(f.comments, Need::BotComments);
+        let note = crate::bot::note_state(comments);
+        let standing = matches!(
+            note,
+            Some(crate::bot::NoteState::Ready | crate::bot::NoteState::Approved)
+        ) && crate::bot::ready_mark(comments, asked).at.is_some();
+        if !standing {
+            let latest = note.map_or("none".to_string(), |n| format!("{n:?}"));
+            let line = format!(
+                "{prefix} not Ready at {} (latest note: {latest}) BLOCKED",
+                short(asked)
             );
             return done(Kind::Blocked, line, false);
         }
@@ -938,6 +960,7 @@ async fn fill<G: Gh>(
                 exec::get_list(gh, &format!("repos/{r}/issues/{n}/comments?per_page=100")).await?;
             let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
             f.bot = Some(BotView::of(&s.review_bot, &comments, &[]));
+            f.comments = Some(comments);
         }
         Need::BotReviews => {
             let list =
@@ -1201,6 +1224,7 @@ mod tests {
             unresolved: Some(0),
             behind: Some(0),
             bot: Some(bot_clean()),
+            comments: None,
             bot_reviews: None,
             parents: Some(vec!["p".repeat(40)]),
             verdicts: None,
@@ -1229,6 +1253,75 @@ mod tests {
 
     fn rules() -> GateRules {
         settings().gate_rules(REPO)
+    }
+
+    fn note(body: &str, at: &str) -> Comment {
+        Comment {
+            author: "hhenson-hgl-bot".into(),
+            body: body.into(),
+            created_at: at.into(),
+            updated_at: at.into(),
+        }
+    }
+
+    /// The coordinator's landings (hgl-ai#123): Ready at the head asked for, by the note
+    /// comments the gate reads with the bot's, at the moment of the attempt.
+    #[test]
+    fn ready_at_the_head_asked_for() {
+        let opts = Opts {
+            ready_at_head: true,
+            ..Opts::default()
+        };
+        let mut f = allowed();
+        let merges = |f: &Facts| matches!(decide(f, REPO, HEAD, &rules(), &opts), Step::Merge(_));
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &rules(), &opts),
+            Step::Need(Need::BotComments)
+        ));
+        let ready = note(
+            "[claude] Ready: alpha#7 at 1f461fa7",
+            "2026-11-28T10:00:00Z",
+        );
+        f.comments = Some(vec![ready.clone()]);
+        assert!(merges(&f));
+        let approved = note("[codex] (controller) Approved", "2026-11-28T10:05:00Z");
+        f.comments = Some(vec![ready.clone(), approved.clone()]);
+        assert!(merges(&f));
+        // Sent back after Ready, or Ready at another head only: refused, saying why.
+        for later in [
+            note(
+                "[codex] (controller) Sent back at 1f461fa7",
+                "2026-11-28T10:10:00Z",
+            ),
+            note("[claude] Blocked: alpha#7", "2026-11-28T10:10:00Z"),
+        ] {
+            f.comments = Some(vec![ready.clone(), approved.clone(), later]);
+            let o = outcome(&f, &rules(), &opts);
+            assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+            assert!(o.line.contains("not Ready at 1f461fa7"), "{}", o.line);
+            assert!(!o.retry);
+        }
+        f.comments = Some(vec![note(
+            "[claude] Ready: alpha#7 at 2222aaaa",
+            "2026-11-28T10:00:00Z",
+        )]);
+        assert!(
+            outcome(&f, &rules(), &opts)
+                .line
+                .contains("latest note: Ready")
+        );
+        f.comments = Some(vec![]);
+        assert!(
+            outcome(&f, &rules(), &opts)
+                .line
+                .contains("latest note: none")
+        );
+        // Off (the controller's commands): the note comments are not the gate's to judge.
+        f.comments = Some(vec![]);
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &rules(), &Opts::default()),
+            Step::Merge(_)
+        ));
     }
 
     fn outcome(f: &Facts, rules: &GateRules, opts: &Opts) -> Outcome {

@@ -47,6 +47,9 @@ pub struct LandOpts {
     /// Ask builders for the local build verdicts the gate lacks (BUILD-15); `None`: only
     /// read them.
     pub builds: Option<std::sync::Arc<gate::GateBuilds>>,
+    /// `merge_locked`: keep the landing record once its steps are done, for a caller with
+    /// steps of its own that deletes it after them (the coordinator's reports).
+    pub keep_record: bool,
 }
 
 impl Default for LandOpts {
@@ -65,6 +68,7 @@ impl Default for LandOpts {
             trailer: None,
             footer: None,
             builds: None,
+            keep_record: false,
         }
     }
 }
@@ -448,7 +452,9 @@ pub(crate) async fn merge_locked<G: Gh>(
                 s.wrapper
             ));
         }
-        progress::delete(bus, repo, number).await?;
+        if !o.keep_record {
+            progress::delete(bus, repo, number).await?;
+        }
     }
     Ok(Landing { outcome, after })
 }
