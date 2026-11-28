@@ -5,7 +5,8 @@
 //! check between rounds. The previous table (from the bus at start, then from memory) is
 //! what a round is compared with. After the pull request round, every
 //! [`backlog::BACKLOG_EVERY`], the backlog round: `HGL_STATE/backlog` and the day's
-//! `HGL_METRICS` samples, under the same `hold`.
+//! `HGL_METRICS` samples, under the same `hold`. After each pull request round, not under
+//! `hold`, the landings of repositories that opt in ([`autoland`]).
 //!
 //! An alert is kept until its send succeeds: in memory and on the hub
 //! (`HGL_STATE/coord.alerts`, the notes not sent yet), and sent again each round, so a hub
@@ -19,6 +20,7 @@ use hgl_ai_bus::Bus;
 use hgl_ai_proto::{Kind, Note, utc_now_stamp};
 use serde_json::Value;
 
+use crate::autoland::{self, AutoLand};
 use crate::backlog::{self, BACKLOG_EVERY};
 use crate::exec::{self, Gh};
 use crate::table::{self, Alert, HoldChange, PrInfo, RateLimit, Row, Table};
@@ -280,6 +282,7 @@ pub async fn run<G: Gh>(
     }
     let mut last_rate: Option<RateLimit> = None;
     let mut last_backlog: Option<Instant> = None;
+    let mut lands = AutoLand::new(s);
     loop {
         let now = Utc::now();
         let mut hold = match bus {
@@ -324,6 +327,7 @@ pub async fn run<G: Gh>(
                         for a in &alerts {
                             let _ = write!(out, "would alert {}: {}", s.controller, a.body());
                         }
+                        autoland::dry_run(s, &infos, out);
                         let _ = out.flush();
                     }
                     Some(b) => {
@@ -353,12 +357,40 @@ pub async fn run<G: Gh>(
                         }
                     }
                 }
+                let text = t.render();
                 prev = t.rows;
                 last_rate = Some(rate);
                 match change {
                     HoldChange::Set(v) => hold = Some(v),
                     HoldChange::Clear => hold = None,
                     HoldChange::Keep => {}
+                }
+                if let Some(b) = bus
+                    && !hold
+                        .as_deref()
+                        .is_some_and(|h| table::hold_active(h, Utc::now()))
+                {
+                    match lands.round(gh, s, b, &infos, &text).await {
+                        Ok(notes) if notes.is_empty() => {}
+                        Ok(notes) => {
+                            queue(&mut unsent, notes);
+                            if let Err(e) = send_unsent(b, &mut unsent, &mut stored).await {
+                                tracing::warn!("reporting a landing: {e}");
+                            }
+                        }
+                        Err(Error::RateLimited(m)) => {
+                            hold = Some(
+                                on_rate_limit(gh, bus, last_rate.as_ref(), &m, Utc::now(), out)
+                                    .await,
+                            );
+                            if o.once {
+                                return Err(Error::RateLimited(m));
+                            }
+                        }
+                        Err(e @ Error::Auth(_)) => return Err(e),
+                        Err(e) if o.once => return Err(e),
+                        Err(e) => tracing::warn!("coordinator landings: {e}"),
+                    }
                 }
             }
             Err(Error::RateLimited(m)) => {

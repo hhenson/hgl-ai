@@ -290,14 +290,14 @@ before hub users takes one shared token until it moves.
 
 | Key | Writer | Content |
 | --- | --- | --- |
-| `main` | controller | `updated <UTC>`, then `<repo> main <sha>` lines and the wrapper's pins. Rewritten after each merge. |
+| `main` | controller, coordinator service | `updated <UTC>`, then `<repo> main <sha>` lines and the wrapper's pins. Rewritten after each merge. |
 | `prs` | coordinator service | `# read <UTC>`, `# cost <n> remaining <n> resetAt <ISO>`, then rows `REPO NUMBER HEAD draft\|open BOT UNRESOLVED CHECKS UPDATED`. At most every 5 min; stale after 15 min. |
-| `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha>` per merge. |
+| `landed.log` | controller, coordinator service | `<UTC> <repo> #<pr> <merge sha>` per merge. |
 | `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
 | `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
-| `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
-| `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
+| `decisions.log` | controller, console, coordinator service | The controller's decision log (OWN-8): newest 2000 lines. |
+| `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean`, coordinator service | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
@@ -320,6 +320,17 @@ give `PARTIAL` (exit 3). A pull request found merged with neither a record nor a
 `landed.log` line has every step done then. `main` is written only whole: a failed
 read is tried three times, then the landing fails; a repository with no `main`
 (HTTP 404) is left out with a warning.
+
+Where `[github.gate.<repo>] coordinator_lands` opts in, the coordinator service
+lands too, after each table round and not under `hold`: first every
+`landing.<repo>.<pr>` of such a repository whose merge is recorded or whose pull
+request is no longer open, then each Ready candidate (docs/work.md WORK-6) the
+table does not hold back, oldest first; one `gh merge-if-clean` attempt each,
+the landing lock not waited for, a missing local build verdict asked of a builder
+and read in a later round. Each landing it does or finishes goes to the
+controller as a `note` (`[coord] Landed: <repo>#<pr> at <head> as <merge>`, kept
+in `coord.alerts` until sent) and to `decisions.log`; a `PARTIAL` goes to the
+controller once. The wrapper's pins stay the controller's.
 
 `HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream
 sequence of the note that ended the task for the seat. A later end replaces an

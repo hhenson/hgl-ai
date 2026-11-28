@@ -18,6 +18,7 @@
 //! | [`tap`] | `gh tap release`, `gh tap formula`: the Homebrew tap |
 //! | [`verdict`] | `gh approve`, `gh sendback`: the controller's verdict on an exact head |
 
+pub mod autoland;
 pub mod backlog;
 pub mod bot;
 pub mod builds;
