@@ -823,7 +823,7 @@ async fn run_job(
                 Ok(ws) => (Ok(ws), lease),
                 Err(e) => {
                     if let Some(lease) = lease {
-                        lease.checkout_failed();
+                        lease.checkout_failed(ex.as_ref());
                     }
                     (Err(e), None)
                 }

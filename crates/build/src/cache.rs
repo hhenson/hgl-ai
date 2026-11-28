@@ -185,16 +185,36 @@ impl Cache {
     /// Serialize pruning passes, but allow leases to be reserved and released while
     /// deletion runs. Each selection uses the current set of idle slots.
     pub fn prune(&self, ex: &dyn Executor) -> Result<(), HostError> {
+        self.prune_idle(false, |slot| {
+            ex.remove_cargo_cache(&ex.cargo_cache_path(slot))
+        })
+    }
+
+    fn prune_idle(
+        &self,
+        over_limit_only: bool,
+        remove: impl Fn(&str) -> Result<(), HostError>,
+    ) -> Result<(), HostError> {
         let _pruning = self.pruning.lock().unwrap_or_else(|e| e.into_inner());
-        let result = self.evict(|slot| ex.remove_cargo_cache(&ex.cargo_cache_path(slot)));
-        self.retry.store(result.is_err(), Ordering::Relaxed);
+        let result = self.evict(over_limit_only, remove);
+        // A budget-only pass can leave abandoned slots for a pending full retry.
+        if !over_limit_only || result.is_err() {
+            self.retry.store(result.is_err(), Ordering::Relaxed);
+        }
         result
     }
 
-    fn evict(&self, remove: impl Fn(&str) -> Result<(), HostError>) -> Result<(), HostError> {
+    fn evict(
+        &self,
+        over_limit_only: bool,
+        remove: impl Fn(&str) -> Result<(), HostError>,
+    ) -> Result<(), HostError> {
         let mut failed = BTreeSet::new();
         let mut error = None;
-        while let Some(id) = self.next_eviction(&failed).map_err(index_error)? {
+        while let Some(id) = self
+            .next_eviction(&failed, over_limit_only)
+            .map_err(index_error)?
+        {
             let slot = self.slot_name(&id);
             let result = remove(&slot).and_then(|()| {
                 let _live = self.live.lock().unwrap_or_else(|e| e.into_inner());
@@ -213,7 +233,11 @@ impl Cache {
         error.map_or(Ok(()), Err)
     }
 
-    fn next_eviction(&self, failed: &BTreeSet<String>) -> io::Result<Option<String>> {
+    fn next_eviction(
+        &self,
+        failed: &BTreeSet<String>,
+        over_limit_only: bool,
+    ) -> io::Result<Option<String>> {
         let live = self.live.lock().unwrap_or_else(|e| e.into_inner());
         let entries = self.entries()?;
         let idle = entries.iter().filter(|e| !live.contains(&e.id));
@@ -221,6 +245,9 @@ impl Cache {
             .clone()
             .filter_map(|e| e.record.as_ref()?.bytes)
             .fold(0u64, u64::saturating_add);
+        if over_limit_only && used <= self.limit {
+            return Ok(None);
+        }
         let mut candidates = idle.filter(|e| !failed.contains(&e.id));
         let mut candidate = candidates
             .clone()
@@ -268,8 +295,15 @@ impl Lease {
     }
 
     /// Checkout failed before any recipe step could touch the Cargo directory.
-    pub fn checkout_failed(mut self) {
+    pub fn checkout_failed(mut self, ex: &dyn Executor) {
         self.release(self.previous_bytes, true);
+        if self.previous_bytes.is_some()
+            && let Err(e) = self.cache.prune_idle(true, |slot| {
+                ex.remove_cargo_cache(&ex.cargo_cache_path(slot))
+            })
+        {
+            tracing::warn!("pruning the Cargo cache after checkout failed: {e:?}");
+        }
     }
 
     fn release(&mut self, bytes: Option<u64>, reusable: bool) {
@@ -401,12 +435,13 @@ mod tests {
         }
         let first = cache.slot_name(ids[0]);
         assert!(matches!(
-            cache.evict(|slot| {
+            cache.prune_idle(true, |slot| {
                 assert_eq!(slot, first);
                 Err(HostError::Unreachable("disconnected".into()))
             }),
             Err(HostError::Unreachable(_))
         ));
+        assert!(cache.needs_retry());
         let record = |id| -> Record {
             serde_json::from_slice(&fs::read(cache.record_path(id)).unwrap()).unwrap()
         };
@@ -416,7 +451,7 @@ mod tests {
         assert!(record(ids[2]).reusable());
 
         assert!(matches!(
-            cache.evict(|slot| {
+            cache.prune_idle(false, |slot| {
                 assert!(
                     cache.live.try_lock().is_ok(),
                     "deletion holds the live lock"
@@ -435,6 +470,12 @@ mod tests {
             "stuck bytes count toward the cap"
         );
         assert!(record(ids[2]).reusable());
+        cache
+            .prune_idle(true, |_| panic!("idle bytes are within the cap"))
+            .unwrap();
+        assert!(cache.needs_retry(), "an abandoned slot still needs cleanup");
+        cache.prune(&ex).unwrap();
+        assert!(!cache.needs_retry());
     }
 
     #[test]
@@ -449,12 +490,53 @@ mod tests {
 
         let failed = cache.reserve("demo", &ex).unwrap().unwrap();
         assert_eq!(failed.path, path);
-        failed.checkout_failed();
+        let abandoned = cache.reserve("abandoned", &ex).unwrap().unwrap();
+        fill(&abandoned, 1);
+        let abandoned_path = abandoned.path.clone();
+        drop(abandoned);
+        failed.checkout_failed(&ex);
+        assert!(
+            Path::new(&abandoned_path).exists(),
+            "idle bytes are within the cap"
+        );
         assert_eq!(cache.reserve("demo", &ex).unwrap().unwrap().path, path);
         let cold = cache.reserve("other", &ex).unwrap().unwrap();
         let cold_record = cache.record_path(&cold.id);
-        cold.checkout_failed();
+        cold.checkout_failed(&ex);
         assert!(!cold_record.exists());
+    }
+
+    #[test]
+    fn failed_checkout_prunes_newly_idle_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ex = executor(dir.path());
+        let mut cache = Cache::new(dir.path(), "index".into(), 1);
+        cache.limit = 10;
+        let cache = Arc::new(cache);
+        let warm = cache.reserve("demo", &ex).unwrap().unwrap();
+        fill(&warm, 6);
+        let warm_path = warm.path.clone();
+        warm.finish(&ex, true);
+        let checkout = cache.reserve("demo", &ex).unwrap().unwrap();
+        assert_eq!(checkout.path, warm_path);
+
+        let parallel = cache.reserve("demo", &ex).unwrap().unwrap();
+        fill(&parallel, 6);
+        let parallel_path = parallel.path.clone();
+        let parallel_record = cache.record_path(&parallel.id);
+        parallel.finish(&ex, true);
+        fs::File::open(parallel_record)
+            .unwrap()
+            .set_modified(SystemTime::UNIX_EPOCH)
+            .unwrap();
+        assert!(Path::new(&parallel_path).exists(), "one slot is still live");
+
+        checkout.checkout_failed(&ex);
+        assert!(Path::new(&warm_path).exists());
+        assert!(
+            !Path::new(&parallel_path).exists(),
+            "idle bytes exceeded the cap"
+        );
     }
 
     #[test]
