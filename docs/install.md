@@ -106,7 +106,7 @@ hgl-ai server user ...`).
 | `coord` | a seat's, and `HGL_METRICS` |
 | `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
 | `console` | `hgl.owner.>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
-| `viewer` | nothing: reads and watches `HGL_HOSTS`, `HGL_TREES`, `HGL_STATE`, `HGL_METRICS`, `HGL_BUILD`, `HGL_USAGE` only (the console's page, docs/owner.md §3); no other stream or bucket, no consumer delete |
+| `viewer` | nothing: reads and watches `HGL_HOSTS`, `HGL_TREES`, `HGL_METRICS`, `HGL_BUILD`, `HGL_USAGE`, and of `HGL_STATE` only `prs`, `backlog`, `landed.log`, `tasks`, `mode`, `hold` (the console's page, docs/owner.md §3); consumers only in the filtered create form; subscribes to `_INBOX_VIEWER.>` only; no other stream or bucket, no consumer delete (docs/design.md §9) |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
 Every role but `viewer` reads every stream and bucket but `HGL_CONSOLE` (the console's own); seat
@@ -195,7 +195,8 @@ own hub user `console`.
    ```
 
    The page reads as hub user `viewer`, whose credential `server install` writes and
-   names in `[console] viewer_credential`.
+   names in `[console] viewer_credential`. A system install (`--server-user`) prints
+   the same step, with `--print-root-steps` as a comment.
 2. **Users.** `[console] users`, one entry per person, keyed by email:
 
    ```toml

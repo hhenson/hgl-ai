@@ -37,6 +37,13 @@ pub const KV_METRICS: &str = "HGL_METRICS";
 /// The console's own state (sign-in sessions, the pending `p2` batch); only the console
 /// reads or writes it.
 pub const KV_CONSOLE: &str = "HGL_CONSOLE";
+/// The inbox prefix of the `viewer` hub user (the console's page, docs/owner.md §3): its
+/// replies and deliveries come here, the only subjects it may subscribe to, so it never
+/// sees another client's replies on `_INBOX.>`. The page uses the same (`web/src/hub.ts`).
+pub const VIEWER_INBOX: &str = "_INBOX_VIEWER";
+/// The `HGL_STATE` keys the console's page reads (`web/src/tables.ts`, `STATE_KEYS`);
+/// the `viewer` user may read no other.
+pub const VIEWER_STATE_KEYS: [&str; 6] = ["prs", "backlog", "landed.log", "tasks", "mode", "hold"];
 /// Owner words: `hgl.owner.thread.<id>`. Only the console's hub user publishes here (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
 /// Agent traffic for the owner: `hgl.console.status`, `hgl.console.thread.<id>`.

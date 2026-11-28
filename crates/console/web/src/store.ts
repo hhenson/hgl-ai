@@ -3,7 +3,7 @@
 // becomes, per table, one transaction of the rows that changed (by row id).
 
 import { diffRows, isEmpty, type Row, type Transaction } from "./diff";
-import { type Bucket, type Context, derive, emptyRaw, notes, type Raw, TABLES, TABS } from "./tables";
+import { type Bucket, type Context, derive, emptyRaw, notes, type Raw, type Source, TABLES, TABS } from "./tables";
 
 export type Connection = "connecting" | "connected" | "reconnecting" | "disconnected" | "failed";
 
@@ -19,14 +19,20 @@ export interface Meta {
 
 type Listener = (t: Transaction) => void;
 
+/** A watch's id: its bucket, or `bucket/key` for one key. */
+function sourceId(s: Source): string {
+  return s.key === undefined ? s.bucket : `${s.bucket}/${s.key}`;
+}
+
 export class Store {
   private raw: Raw = emptyRaw();
   private rows_: Record<string, Row[]> = Object.fromEntries(TABLES.map((t) => [t.id, []]));
   private listeners = new Map<string, Set<Listener>>();
   private metaListeners = new Set<() => void>();
   private timer: ReturnType<typeof setTimeout> | null = null;
-  /** Keys seen since a bucket's watch (re)started; the rest go when it has caught up. */
-  private syncing = new Map<Bucket, Set<string>>();
+  /** Keys seen since a watch (re)started, by `sourceId`; the rest of what it covers go
+   *  when it has caught up. */
+  private syncing = new Map<string, { source: Source; seen: Set<string> }>();
   /** When each `HGL_HOSTS` key was written, on the hub's clock. */
   private hostsWritten = new Map<string, number>();
   /** This page's clock minus the hub's, as live writes show it (the smallest gap seen). */
@@ -55,21 +61,25 @@ export class Store {
         else this.hostsWritten.set(key, written);
       }
     }
-    this.syncing.get(bucket)?.add(key);
+    this.syncing.get(bucket)?.seen.add(key);
+    this.syncing.get(sourceId({ bucket, key }))?.seen.add(key);
     this.meta = { ...this.meta, updated: this.now() };
     this.schedule();
   }
 
-  /** A bucket's watch starts (again): what it does not deliver before `synced` is gone. */
-  resync(bucket: Bucket): void {
-    this.syncing.set(bucket, new Set());
+  /** A watch starts (again): what it covers but does not deliver before `synced` is gone. */
+  resync(source: Source): void {
+    this.syncing.set(sourceId(source), { source, seen: new Set() });
   }
 
-  synced(bucket: Bucket): void {
-    const seen = this.syncing.get(bucket);
-    if (!seen) return;
-    this.syncing.delete(bucket);
-    for (const k of [...this.raw[bucket].keys()]) if (!seen.has(k)) this.raw[bucket].delete(k);
+  synced(source: Source): void {
+    const id = sourceId(source);
+    const s = this.syncing.get(id);
+    if (!s) return;
+    this.syncing.delete(id);
+    const raw = this.raw[source.bucket];
+    const covered = source.key === undefined ? [...raw.keys()] : raw.has(source.key) ? [source.key] : [];
+    for (const k of covered) if (!s.seen.has(k)) raw.delete(k);
     this.schedule();
   }
 

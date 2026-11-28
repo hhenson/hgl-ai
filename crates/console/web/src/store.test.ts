@@ -63,11 +63,30 @@ describe("Store", () => {
     s.put("HGL_TREES", "b", tree("w2", 8));
     s.flush();
     // The watch starts again and delivers only `b`: `a` went while it was away.
-    s.resync("HGL_TREES");
+    s.resync({ bucket: "HGL_TREES" });
     s.put("HGL_TREES", "b", tree("w2", 8));
-    s.synced("HGL_TREES");
+    s.synced({ bucket: "HGL_TREES" });
     s.flush();
     expect(seen.tasks[1]).toEqual({ add: [], update: [], remove: [expect.objectContaining({ id: "a" })] });
+  });
+
+  it("resynchronises one key of HGL_STATE without touching the others", () => {
+    const { s } = store();
+    s.put("HGL_STATE", "mode", "drain");
+    s.put("HGL_STATE", "hold", "landing");
+    s.flush();
+    // `hold`'s watch starts again and delivers nothing: `hold` went; `mode` stays.
+    s.resync({ bucket: "HGL_STATE", key: "hold" });
+    s.synced({ bucket: "HGL_STATE", key: "hold" });
+    s.flush();
+    const fleet = Object.fromEntries(s.rows("fleet").map((r) => [r.id, r.value]));
+    expect(fleet).toMatchObject({ mode: "drain", hold: "none" });
+  });
+
+  it("watches HGL_STATE key by key, the keys the hub's viewer may read", async () => {
+    const { SOURCES, STATE_KEYS } = await import("./tables");
+    expect(SOURCES.filter((x) => x.bucket === "HGL_STATE").map((x) => x.key)).toEqual([...STATE_KEYS]);
+    expect(SOURCES.filter((x) => x.bucket !== "HGL_STATE").every((x) => x.key === undefined)).toBe(true);
   });
 
   it("derives every table with unique ids", () => {

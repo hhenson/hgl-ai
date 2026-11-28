@@ -1,11 +1,12 @@
 // Reading the hub over WebSocket as the `viewer` user (docs/owner.md §3): one watch per
-// telemetry bucket, fed into the store. A first connection that fails is tried again and a made
-// one reconnects, both on one backoff; a watch that ends is started again and its bucket resynchronised.
+// telemetry bucket (per key of `HGL_STATE`), fed into the store. A first connection that fails
+// is tried again and a made one reconnects, both on one backoff; a watch that ends is started
+// again and what it covers resynchronised.
 
 import { Kvm } from "@nats-io/kv";
 import { type NatsConnection, nkeyAuthenticator, wsconnect } from "@nats-io/nats-core";
 import type { Store } from "./store";
-import { BUCKETS, type Bucket } from "./tables";
+import { SOURCES, type Source } from "./tables";
 
 export interface Viewer {
   user: string;
@@ -19,24 +20,29 @@ export function hubUrl(loc: Pick<Location, "protocol" | "host">, path: string): 
 }
 
 const RETRY_MS = 3000;
+/** The `viewer` user may subscribe here only (`VIEWER_INBOX` in crates/proto). */
+export const INBOX_PREFIX = "_INBOX_VIEWER";
 
-async function watch(nc: NatsConnection, store: Store, bucket: Bucket, stopped: () => boolean): Promise<void> {
+export async function watch(nc: NatsConnection, store: Store, source: Source, stopped: () => boolean): Promise<void> {
+  const { bucket, key } = source;
   while (!stopped() && !nc.isClosed()) {
     try {
       const kv = await new Kvm(nc).open(bucket);
-      store.resync(bucket);
-      const iter = await kv.watch();
-      // Nothing to catch up on: the bucket is empty, or its values have all come.
-      let quiet = setTimeout(() => store.synced(bucket), 1500);
+      store.resync(source);
+      // One key or the whole bucket: either way one filter, so the client asks for the
+      // consumer in the filtered form, the only one the viewer may use.
+      const iter = await kv.watch(key === undefined ? {} : { key });
+      // Nothing to catch up on: nothing there, or its values have all come.
+      let quiet = setTimeout(() => store.synced(source), 1500);
       for await (const e of iter) {
         store.put(bucket, e.key, e.operation === "PUT" ? e.string() : null, e.created.getTime(), e.isUpdate);
         clearTimeout(quiet);
-        if (e.isUpdate) store.synced(bucket);
-        else quiet = setTimeout(() => store.synced(bucket), 1500);
+        if (e.isUpdate) store.synced(source);
+        else quiet = setTimeout(() => store.synced(source), 1500);
         if (stopped()) iter.stop();
       }
     } catch (err) {
-      console.warn(`watching ${bucket}:`, err);
+      console.warn(`watching ${key === undefined ? bucket : `${bucket}/${key}`}:`, err);
     }
     if (!stopped()) await new Promise((r) => setTimeout(r, RETRY_MS));
   }
@@ -100,6 +106,7 @@ export function start(viewer: Viewer, store: Store): () => Promise<void> {
           servers: hubUrl(window.location, viewer.path),
           authenticator: nkeyAuthenticator(new TextEncoder().encode(viewer.seed)),
           name: "hgl-ai console page",
+          inboxPrefix: INBOX_PREFIX,
           maxReconnectAttempts: -1,
           reconnectDelayHandler: () => backoff.next(),
         }),
@@ -124,7 +131,7 @@ export function start(viewer: Viewer, store: Store): () => Promise<void> {
     void c.closed().then((err) => {
       if (!stop) store.setConnection("disconnected", err ? String(err) : "");
     });
-    for (const b of BUCKETS) void watch(c, store, b, () => stop);
+    for (const src of SOURCES) void watch(c, store, src, () => stop);
   })();
   return async () => {
     stop = true;

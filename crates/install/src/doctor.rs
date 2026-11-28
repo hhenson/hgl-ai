@@ -675,7 +675,9 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 },
             )
         });
-        out.push(match hub.health(c).await {
+        let health = hub.health(c).await;
+        let reached = health.is_ok();
+        out.push(match health {
             Err(e) => Check::fail(
                 "hub",
                 format!("unreachable at {}: {e}", c.hub.url),
@@ -688,6 +690,30 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             ),
             Ok(_) => Check::ok("hub", format!("{} (stream and buckets present)", c.hub.url)),
         });
+        // On the hub's host: consumers on the telemetry streams that outlive a page. No
+        // fleet part makes one; the `viewer` user can (docs/design.md §9).
+        if reached && (c.server.is_some() || c.server_user.is_some()) {
+            out.push(match hub.durables(c).await {
+                Ok(d) if d.is_empty() => {
+                    Check::ok("telemetry consumers", "none that outlives its page")
+                }
+                Ok(d) => Check::warn(
+                    "telemetry consumers",
+                    format!(
+                        "consumers no fleet part makes, durable or long-lived: {} (the \
+                         console page's `viewer` hub user can create them)",
+                        d.join(", ")
+                    ),
+                    "delete each as the admin hub user (`nats consumer rm <stream> <name>`); \
+                     if they come back, reissue the viewer's credential",
+                ),
+                Err(e) => Check::warn(
+                    "telemetry consumers",
+                    format!("cannot list them: {e}"),
+                    "rerun `hgl-ai server install`, which lets hub users list them",
+                ),
+            });
+        }
     }
 
     // The server user (a system install) runs no agents: no CLIs, skills, work_root
@@ -1588,6 +1614,37 @@ mod tests {
             !cs.iter()
                 .any(|c| c.name == "console credential" && c.level == Level::Warn)
         );
+    }
+
+    /// On the hub's host only: consumers on the telemetry streams that outlive a page.
+    #[tokio::test]
+    async fn lasting_telemetry_consumers() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(
+            !cs.iter().any(|c| c.name == "telemetry consumers"),
+            "not the hub's host"
+        );
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.server = Some(hgl_ai_config::Server::default());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let get = |cs: &[Check]| cs.iter().find(|c| c.name == "telemetry consumers").cloned();
+        let ok = get(&run(&f, &FakeHub::up()).await).unwrap();
+        assert_eq!(ok.level, Level::Ok);
+        let hub = FakeHub {
+            durables: vec!["KV_HGL_HOSTS/kept".into()],
+            ..FakeHub::up()
+        };
+        let w = get(&run(&f, &hub).await).unwrap();
+        assert_eq!(w.level, Level::Warn);
+        assert!(w.detail.contains("KV_HGL_HOSTS/kept"), "{}", w.detail);
+        assert!(
+            w.fix.as_deref().unwrap().contains("nats consumer rm"),
+            "{w:?}"
+        );
+        // Unreachable: the hub check says so; no second warning.
+        assert!(get(&run(&f, &FakeHub::down()).await).is_none());
     }
 
     #[tokio::test]

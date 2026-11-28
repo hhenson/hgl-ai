@@ -97,8 +97,9 @@ live telemetry. GitHub stays the record (PROTO-1).
 `/telemetry`, a page of its own (React, TypeScript, AG Grid; docs/design.md §1) that
 reads the hub itself: it watches the telemetry buckets over the hub's WebSocket
 listener, at `<console url>/nats` on the console's own origin, as the hub user
-`viewer`. `viewer` reads those six buckets and nothing else, and writes nothing
-(docs/install.md). The console hands its credential to a signed-in page
+`viewer`. `viewer` reads those six buckets (of `HGL_STATE`, only the keys the page
+shows) and nothing else, writes nothing, and sees no other client's replies
+(docs/install.md, docs/design.md §9). The console hands its credential to a signed-in page
 (`GET /api/viewer`), which keeps it in memory only. A tab per area; the selected tab
 is the URL fragment (`/telemetry#prs`):
 

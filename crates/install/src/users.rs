@@ -16,7 +16,7 @@ use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_STATE, KV_THREADS,
     KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
-    SUBJECT_PREFIX, USAGE_PREFIX,
+    SUBJECT_PREFIX, USAGE_PREFIX, VIEWER_INBOX, VIEWER_STATE_KEYS,
 };
 use serde::{Deserialize, Serialize};
 
@@ -257,27 +257,48 @@ fn pull_from(stream: &str) -> [String; 2] {
 pub const VIEWER_BUCKETS: [&str; 6] =
     [KV_HOSTS, KV_TREES, KV_STATE, KV_METRICS, KV_BUILD, KV_USAGE];
 
-/// The viewer's publishes: what reading and watching [`VIEWER_BUCKETS`] needs (bucket
-/// status, direct gets, the ordered push consumer a watch makes and its flow control),
-/// on those buckets' streams only. No consumer delete, no durable, no other stream.
+/// The viewer's publishes: what reading and watching [`VIEWER_BUCKETS`] needs, on those
+/// buckets' streams only, and of `HGL_STATE` only [`VIEWER_STATE_KEYS`]: bucket status,
+/// direct gets, the ordered push consumer a watch makes and its flow control. A consumer
+/// only in the filtered create form, `CONSUMER.CREATE.<stream>.<name>.<filter>`, whose
+/// filter the server holds the body to (one filter, the subject's); never the bare or
+/// durable form. What subjects cannot stop (a `durable_name` in the body, any
+/// `deliver_subject`, an `inactive_threshold`) `doctor` reports (docs/design.md §9). Subscribes
+/// to [`VIEWER_INBOX`] only: no other client's replies.
 fn viewer() -> Permissions {
     let mut allow = vec!["$JS.API.INFO".to_string(), "$JS.FC.>".to_string()];
+    let mut deny = Vec::new();
     for b in VIEWER_BUCKETS {
         let s = kv(b);
         allow.extend([
             format!("$JS.API.STREAM.INFO.{s}"),
-            format!("$JS.API.DIRECT.GET.{s}"),
-            format!("$JS.API.DIRECT.GET.{s}.>"),
-            format!("$JS.API.STREAM.MSG.GET.{s}"),
-            format!("$JS.API.CONSUMER.CREATE.{s}"),
-            format!("$JS.API.CONSUMER.CREATE.{s}.>"),
             format!("$JS.API.CONSUMER.INFO.{s}.*"),
+        ]);
+        if b == KV_STATE {
+            for k in VIEWER_STATE_KEYS {
+                allow.extend([
+                    format!("$JS.API.DIRECT.GET.{s}.$KV.{b}.{k}"),
+                    format!("$JS.API.CONSUMER.CREATE.{s}.*.$KV.{b}.{k}"),
+                ]);
+            }
+        } else {
+            allow.extend([
+                format!("$JS.API.DIRECT.GET.{s}"),
+                format!("$JS.API.DIRECT.GET.{s}.>"),
+                format!("$JS.API.STREAM.MSG.GET.{s}"),
+                format!("$JS.API.CONSUMER.CREATE.{s}.*.$KV.{b}.>"),
+            ]);
+        }
+        deny.extend([
+            format!("$JS.API.CONSUMER.CREATE.{s}"),
+            format!("$JS.API.CONSUMER.CREATE.{s}.*"),
+            format!("$JS.API.CONSUMER.DURABLE.CREATE.{s}.>"),
         ]);
     }
     Permissions {
         publish_allow: allow,
-        publish_deny: Vec::new(),
-        subscribe_allow: vec!["_INBOX.>".into()],
+        publish_deny: deny,
+        subscribe_allow: vec![format!("{VIEWER_INBOX}.>")],
     }
 }
 
@@ -314,6 +335,8 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     for s in &streams {
         allow.extend(consumers_on(s));
     }
+    // `doctor` lists the consumers on the telemetry streams (durables the viewer made).
+    allow.extend(VIEWER_BUCKETS.map(|b| format!("$JS.API.CONSUMER.LIST.{}", kv(b))));
     allow.extend(pull_from(STREAM_NOTES));
     allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_USAGE}.*"));
     // The owner's subjects; denied to every client but the console.
@@ -534,6 +557,69 @@ mod tests {
         }
         assert!(console.publish_deny.is_empty());
         assert!(permissions(Role::Admin).is_none());
+    }
+
+    #[test]
+    fn the_viewer_reads_the_page_keys_through_its_own_inbox() {
+        let p = permissions(Role::Viewer).unwrap();
+        assert_eq!(p.subscribe_allow, ["_INBOX_VIEWER.>"]);
+        let allow = |s: &str| p.publish_allow.iter().any(|a| a == s);
+        // `HGL_STATE`: the page's keys by subject, never a request naming one in its body.
+        assert!(allow(
+            "$JS.API.DIRECT.GET.KV_HGL_STATE.$KV.HGL_STATE.landed.log"
+        ));
+        assert!(allow(
+            "$JS.API.CONSUMER.CREATE.KV_HGL_STATE.*.$KV.HGL_STATE.prs"
+        ));
+        assert!(!allow("$JS.API.DIRECT.GET.KV_HGL_STATE"));
+        assert!(!allow("$JS.API.STREAM.MSG.GET.KV_HGL_STATE"));
+        assert!(
+            p.publish_allow
+                .iter()
+                .filter(|a| a.contains("$KV.HGL_STATE."))
+                .all(|a| VIEWER_STATE_KEYS
+                    .iter()
+                    .any(|k| a.ends_with(&format!(".{k}")))),
+            "{:?}",
+            p.publish_allow
+        );
+        // Consumers only in the filtered form; the bare and durable forms denied outright.
+        assert!(
+            p.publish_allow
+                .iter()
+                .filter(|a| a.contains("CONSUMER.CREATE") || a.contains("DURABLE"))
+                .all(|a| a.contains(".*.$KV.")),
+            "{:?}",
+            p.publish_allow
+        );
+        for b in VIEWER_BUCKETS {
+            for d in [
+                format!("$JS.API.CONSUMER.CREATE.KV_{b}"),
+                format!("$JS.API.CONSUMER.CREATE.KV_{b}.*"),
+                format!("$JS.API.CONSUMER.DURABLE.CREATE.KV_{b}.>"),
+            ] {
+                assert!(p.publish_deny.contains(&d), "{d}");
+            }
+        }
+    }
+
+    /// The page (`crates/console/web`) uses the same inbox prefix and `HGL_STATE` keys.
+    #[test]
+    fn the_page_matches_the_viewer() {
+        let hub = include_str!("../../console/web/src/hub.ts");
+        assert!(
+            hub.contains(&format!("INBOX_PREFIX = \"{VIEWER_INBOX}\"")),
+            "hub.ts"
+        );
+        let tables = include_str!("../../console/web/src/tables.ts");
+        let keys: Vec<String> = VIEWER_STATE_KEYS
+            .iter()
+            .map(|k| format!("\"{k}\""))
+            .collect();
+        assert!(
+            tables.contains(&format!("STATE_KEYS = [{}] as const", keys.join(", "))),
+            "tables.ts"
+        );
     }
 
     #[test]

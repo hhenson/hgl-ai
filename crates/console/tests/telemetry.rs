@@ -210,7 +210,8 @@ async fn the_hub_takes_the_consoles_pages_and_the_viewer_credential_works() {
     let cred = hgl_ai_bus::Credential::Nkey {
         seed: v["seed"].as_str().unwrap().to_string(),
         user: None,
-        role: None,
+        // The viewer's role gives the bus its inbox prefix, its only subscriptions.
+        role: Some("viewer".into()),
     };
     let admin = hgl_ai_bus::Bus::connect_with(&hub.url, Some(hub.creds["hub-admin"].clone()))
         .await

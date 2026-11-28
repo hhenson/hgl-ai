@@ -7,6 +7,18 @@ import { age, parseBacklog, parseLanded, parsePrs, parseTasks, stage, stampMs, w
 
 export const BUCKETS = ["HGL_HOSTS", "HGL_TREES", "HGL_STATE", "HGL_METRICS", "HGL_BUILD", "HGL_USAGE"] as const;
 export type Bucket = (typeof BUCKETS)[number];
+/** The `HGL_STATE` keys the page reads, each watched on its own: the hub's `viewer` user
+ *  may read no other (`VIEWER_STATE_KEYS` in crates/proto). */
+export const STATE_KEYS = ["prs", "backlog", "landed.log", "tasks", "mode", "hold"] as const;
+/** What one watch covers: a whole bucket, or one key of it. */
+export interface Source {
+  bucket: Bucket;
+  key?: string;
+}
+/** The page's watches: every bucket whole, but `HGL_STATE` key by key. */
+export const SOURCES: Source[] = BUCKETS.flatMap((bucket): Source[] =>
+  bucket === "HGL_STATE" ? STATE_KEYS.map((key) => ({ bucket, key })) : [{ bucket }],
+);
 /** Each bucket's current values, by key. */
 export type Raw = Record<Bucket, Map<string, string>>;
 

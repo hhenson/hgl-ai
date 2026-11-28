@@ -343,3 +343,33 @@ use. `client install` copies it to each installed CLI:
 A tag `vX.Y.Z` builds the four targets in GitHub Actions, attaches
 `hgl-ai-X.Y.Z-<target>.tar.gz` and its `.sha256` to the release, and opens a
 pull request on `hhenson/homebrew-hgraph` updating `Formula/hgl-ai.rb`.
+
+## 9. The console's page
+
+The page holds the `viewer` hub user's credential in a browser, so `viewer` is
+granted what the page's own watches need and no more (`users::permissions`):
+
+- Its inbox prefix is `_INBOX_VIEWER`, the only subjects it may subscribe to: it never
+  sees another client's replies on `_INBOX.>` (the console's reads of sessions and
+  threads). Every other role still shares `_INBOX.>` (hgl-ai#111).
+- Of `HGL_STATE`, only `prs`, `backlog`, `landed.log`, `tasks`, `mode` and `hold`, by
+  subject: direct gets `DIRECT.GET.<stream>.<subject>`, never the forms whose body names
+  the key (`DIRECT.GET.<stream>`, `STREAM.MSG.GET`). No `verdict.*`, `decisions.log` or
+  `coord.alerts`. The page watches each key on its own.
+- Consumers only in the filtered create form,
+  `CONSUMER.CREATE.<stream>.<name>.<filter>`, for an allowed key subject: the server
+  refuses a body whose filter is not the subject's. The bare and durable forms are
+  denied.
+
+What subjects cannot stop:
+
+- A `durable_name` in a filtered create's body makes a durable consumer, and a long
+  `inactive_threshold` one that lasts as long; either outlives the page. No part of the
+  fleet makes one on the telemetry streams, so `doctor` on the hub's host lists any
+  durable or idle for over an hour (`telemetry consumers`).
+- `deliver_subject` may be any subject: the consumer delivers only the allowed keys'
+  values, and only to a subject with interest.
+- `STREAM.INFO` with `subjects_filter` lists `HGL_STATE`'s key names, not their values.
+- `viewer` may make many consumers at once; each without a durable name ends once
+  idle for its threshold (5 s unless the body says otherwise).
+
