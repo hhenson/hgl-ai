@@ -16,7 +16,8 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
 use crate::bot::{
-    BotState, BotView, Comment, NoteState, Review, is_note_author, note_state, ready_mark_across,
+    BotState, BotView, Comment, NoteState, Review, by_note_authors, note_state_across,
+    ready_mark_across,
 };
 use crate::{Error, Result, short};
 
@@ -320,12 +321,9 @@ fn pr_info(
         .collect();
     let view = BotView::of(bot, &comments, &reviews);
     // Only the fleet's own comments change a note state (anyone can comment).
-    let notes: Vec<Comment> = comments
-        .iter()
-        .filter(|c| is_note_author(&c.author, note_authors))
-        .cloned()
-        .collect();
-    let mark = ready_mark_across(&notes, &head, unread_gap(p, comments.len()).as_deref());
+    let notes = by_note_authors(&comments, note_authors);
+    let gap = unread_gap(p, comments.len());
+    let mark = ready_mark_across(&notes, &head, gap.as_deref());
     let rollup = nodes(p, &["commits"])
         .first()
         .and_then(|c| c.get("commit"))
@@ -344,7 +342,7 @@ fn pr_info(
             updated: read.to_string(),
             head: head.clone(),
         },
-        note: note_state(&notes),
+        note: note_state_across(&notes, gap.as_deref()),
         ready_at: mark.at,
         ready_cleared: mark.cleared,
         url: p
@@ -650,11 +648,16 @@ mod tests {
         // More comments than were read: the first late comment starts after a gap.
         let gapped = alpha11_total(Some(n + 1), &[]);
         assert_eq!(gapped.ready_at, None);
+        assert_eq!(gapped.note, None, "the latest note may be in the gap");
         let first_late = "2026-01-05T09:01:00Z";
         assert_eq!(gapped.ready_cleared.as_deref(), Some(first_late));
         // An approval after the gap does not bring the early Ready back; a Ready does.
         let approved = [("octo", "[claude] Approved.", "2026-01-05T10:00:00Z")];
-        assert_eq!(alpha11_total(Some(99), &approved).ready_at, None);
+        let after = alpha11_total(Some(99), &approved);
+        assert_eq!(
+            (after.note, after.ready_at),
+            (Some(NoteState::Approved), None)
+        );
         let ready = [(
             "octo",
             "[codex] Ready: alpha#11 at 11111111",
