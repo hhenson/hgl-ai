@@ -18,6 +18,10 @@ pub trait Hub {
     fn provision(&self, cfg: &Config) -> impl Future<Output = Result<(), BusError>>;
     /// Doctor: `Err` when unreachable, else the stream and buckets that are missing.
     fn health(&self, cfg: &Config) -> impl Future<Output = Result<Vec<String>, String>>;
+    /// Doctor: `Some(true)` when the hub lets this host's hub user subscribe to `_INBOX.>`,
+    /// every client's replies (a `nats.conf` from before hgl-ai#111). `None`: cannot tell
+    /// (unreachable, the shared token, or a credential that is or may be the admin's).
+    fn shared_inbox(&self, cfg: &Config) -> impl Future<Output = Option<bool>>;
 }
 
 /// The real hub, through `hgl-ai-bus`.
@@ -70,6 +74,43 @@ impl Hub for BusHub {
         }
         Ok(missing)
     }
+
+    /// Subscribes to `_INBOX.>` and flushes: an upgraded hub answers with a permissions
+    /// violation before the flush's `PONG`; the wait after it covers the event's delivery.
+    async fn shared_inbox(&self, cfg: &Config) -> Option<bool> {
+        let path = cfg.token_file().ok()?;
+        let cred = hgl_ai_bus::read_credential(&path).ok()??;
+        let inbox = cred.inbox_prefix()?;
+        let hgl_ai_bus::Credential::Nkey { seed, role, .. } = cred else {
+            return None;
+        };
+        // The admin may subscribe to anything; a bare seed's role is unknown.
+        if role.as_deref().is_none_or(|r| r == "admin") {
+            return None;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        let client = async_nats::ConnectOptions::with_nkey(seed)
+            .custom_inbox_prefix(inbox)
+            .connection_timeout(Duration::from_secs(5))
+            .event_callback(move |e| {
+                let tx = tx.clone();
+                async move {
+                    let s = e.to_string().to_ascii_lowercase();
+                    if s.contains("permissions violation") && s.contains("\"_inbox.>\"") {
+                        let _ = tx.send(());
+                    }
+                }
+            })
+            .connect(cfg.hub.url.as_str())
+            .await
+            .ok()?;
+        let _sub = client.subscribe("_INBOX.>").await.ok()?;
+        client.flush().await.ok()?;
+        let refused = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .is_ok_and(|r| r.is_some());
+        Some(!refused)
+    }
 }
 
 #[cfg(test)]
@@ -85,6 +126,8 @@ pub(crate) mod fake {
         pub calls: RefCell<Vec<&'static str>>,
         /// The credential file each call connected with.
         pub creds: RefCell<Vec<String>>,
+        /// What [`Hub::shared_inbox`] answers when reachable.
+        pub shared_inbox: Option<bool>,
     }
 
     impl FakeHub {
@@ -94,6 +137,7 @@ pub(crate) mod fake {
                 missing: Vec::new(),
                 calls: RefCell::new(Vec::new()),
                 creds: RefCell::new(Vec::new()),
+                shared_inbox: None,
             }
         }
         pub fn down() -> Self {
@@ -127,6 +171,9 @@ pub(crate) mod fake {
             self.answer("health", cfg)
                 .map(|()| self.missing.clone())
                 .map_err(|e| e.to_string())
+        }
+        async fn shared_inbox(&self, _cfg: &Config) -> Option<bool> {
+            self.shared_inbox.filter(|_| self.reachable)
         }
     }
 }
