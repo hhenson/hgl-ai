@@ -34,6 +34,9 @@ pub struct Builder {
     /// Hosts this one drives over ssh as a proxy builder.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub remote: Vec<Remote>,
+    /// OS user running a separate builder service, when different from the client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     /// The hub credential of this host's builder user (role `builder`), which alone may
     /// write the local build verdicts (docs/build.md BUILD-15); default: the host's own.
     /// Readable only by the OS user that runs `builder run`, never by the agents'.
@@ -50,6 +53,7 @@ impl Default for Builder {
             toolchains: default_toolchains(),
             remote: Vec::new(),
             credential: None,
+            user: None,
         }
     }
 }
@@ -118,6 +122,15 @@ fn label_ok(l: &str) -> bool {
 
 /// Check `[builder]` for host `host`.
 pub fn validate(b: &Builder, host: &str) -> Result<(), String> {
+    if b.user.as_ref().is_some_and(|u| {
+        u.is_empty()
+            || u.starts_with('-')
+            || !u
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    }) {
+        return Err("builder.user must be an OS user name".into());
+    }
     if b.concurrency == 0 {
         return Err("builder.concurrency must be at least 1".into());
     }

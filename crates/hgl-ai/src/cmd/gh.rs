@@ -305,14 +305,18 @@ async fn dry_run_bus(cfg: &hgl_ai_config::Config, unread: &str) -> Option<Bus> {
 /// `gh` with the coordinator's token where configured, checked signed in: every command
 /// that uses it reads GitHub, so say so clearly when `gh` cannot.
 pub(crate) async fn gh_client(cfg: &hgl_ai_config::Config) -> anyhow::Result<GhCli> {
-    let gh = match &cfg.github.token_file {
+    let gh = configured_gh(cfg)?;
+    hgl_ai_gh::exec::check_auth(&gh).await.map_err(lift)?;
+    Ok(gh)
+}
+
+fn configured_gh(cfg: &hgl_ai_config::Config) -> anyhow::Result<GhCli> {
+    Ok(match &cfg.github.token_file {
         Some(p) => GhCli::default()
             .with_token_file(&hgl_ai_config::expand(p)?)
             .map_err(lift)?,
         None => GhCli::default(),
-    };
-    hgl_ai_gh::exec::check_auth(&gh).await.map_err(lift)?;
-    Ok(gh)
+    })
 }
 
 /// The gate builds a landing asks for (BUILD-15), sent as this seat (the controller), else
@@ -361,7 +365,12 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     }
     let cfg = ctx.load_config()?;
     let s = Settings::from_config(&cfg)?;
-    let gh = gh_client(&cfg).await?;
+    let gh = if matches!(*args.cmd, Cmd::Coord { .. }) {
+        // The coordinator can deliver durable alerts even when GitHub auth fails.
+        configured_gh(&cfg)?
+    } else {
+        gh_client(&cfg).await?
+    };
     match *args.cmd {
         Cmd::Tier(a) => {
             let r = tier::evaluate(&ReadOnly(gh), &s, &a.repo, a.pr, &a.head)

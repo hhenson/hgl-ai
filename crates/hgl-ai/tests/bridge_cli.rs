@@ -264,6 +264,53 @@ fn trees_are_listed_and_removed_on_this_host() {
     drop(lock);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn tree_remove_waits_for_the_registry_lock() {
+    let d = Scratch::new("tree-registry-lock");
+    let g = git(&d.0);
+    remote(&g, &d.0, "demo");
+    let (cfg, p) = config(&d.0, "nats://127.0.0.1:1", &d.0.join("none.token"));
+    let trees = Trees::new(&cfg, g).unwrap();
+    let seat = Seat::new("w1").unwrap();
+    let task = TaskKey {
+        repo: "demo".into(),
+        issue: 3,
+    };
+    let tree = trees
+        .create(
+            &seat,
+            &task,
+            &Create::Implement {
+                title: "Three".into(),
+                base: None,
+            },
+        )
+        .unwrap();
+    let key = hgl_ai_proto::tree_key(&cfg.host, &seat, &task, false);
+    let held = hgl_ai_bridge::lock::FileLock::registry(trees.layout().root(), &key)
+        .await
+        .unwrap();
+    let mut command = hgl(&p, &["tree", "remove", "w1", "demo", "3"]);
+    isolate(&mut command, &d.0);
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let waiting = child.try_wait().unwrap().is_none() && tree.dir.exists();
+    drop(held);
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        waiting,
+        "tree removal proceeded while the registry lock was held: {}",
+        err(&output)
+    );
+    assert!(output.status.success(), "{}", err(&output));
+    assert!(!tree.dir.exists());
+}
+
 struct Hub {
     child: Child,
     url: String,

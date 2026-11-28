@@ -70,21 +70,29 @@ Open decisions are issues in this repository.
 ## 2. Gates
 
 - **ROLE-9 — Exact head.** Every receipt and verdict binds one 40-character
-  head. A new commit voids them.
+  head. A new commit requires fresh verdicts and a fresh receipt unless ROLE-11
+  carries the receipt.
 - **Review routing for hgl-ai.** The controller runs `hgl-ai gh tier REPO PR HEAD`,
   sets one of `tier-1`, `tier-2` or `tier-3` at or above the computed tier, and
   names the deciding paths in its routing comment. A Ready line can suggest a
   tier. Anyone may add `risk-high`. Only the owner removes it.
 - **ROLE-10 — Current main.** A change lands only after its gates ran on the
   `main` it merges onto. When `main` moves, the next candidate is revalidated. A
-  branch the gate brings up to date keeps its parent's review only where `main`
+  branch the gate brings up to date keeps its parent's bot review only where `main`
   moved in files it does not touch and in no global path; otherwise the review
-  bot reviews the new head.
+  bot reviews the new head. Receipt carry requires the bot and checks to pass
+  at the merge head.
 - **ROLE-11 — Independence.** A merge needs a clean review receipt (PROTO-19) for
   its exact head whose model family differs from every family that worked on the
   task (the families the bridges record in its implementor trees, `HGL_TREES`);
   `gh land` and `gh merge-if-clean` enforce it unless `[github.gate.<repo>]
-  review_receipt = false`. A pull request the tool makes (the wrapper's pins) has
+  review_receipt = false`. For hgl-ai a receipt carries from a first-parent
+  ancestor when every intervening commit merges a first-parent commit of `main`
+  with an empty remerge-diff and no conflicts. A conflict or intervening
+  non-merge commit requires a fresh receipt. A findings receipt at any merge
+  in the chain requires a clean other-family receipt at that commit to carry.
+  The proof uses each merge's first-parent `.gitattributes` and Git 2.43 or later.
+  A pull request the tool makes (the wrapper's pins) has
   no author and needs none. An agent never reviews work it wrote, paired on or
   coordinated. When no other family is available, nothing lands: same-family
   review is never a fallback, and failover never moves a task to a family that
