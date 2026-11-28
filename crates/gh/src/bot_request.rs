@@ -142,6 +142,39 @@ pub async fn request<G: Gh>(
     result
 }
 
+/// One pass over the coordinator's persisted table. Each candidate uses the same
+/// identity, lease and exact-head checks as the individual request command.
+pub async fn pass<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: &Bus,
+    dry_run: bool,
+) -> Result<Vec<(String, u64, String, Result<Request>)>> {
+    use crate::{bot::BotState, state, table::Table};
+    let entry = bus
+        .state_get(state::KEY_PRS)
+        .await?
+        .ok_or_else(|| invalid("no coordinator PR table; wait for a coordinator round"))?;
+    let table = Table::parse(&entry.value);
+    let mut outcomes = Vec::new();
+    for row in table
+        .rows
+        .into_iter()
+        .filter(|r| !r.draft && r.bot == BotState::None && s.repos.contains(&r.repo))
+    {
+        let result = if dry_run {
+            match verify_owner(gh, s).await {
+                Ok(()) => check(gh, s, &row.repo, row.number, &row.head).await,
+                Err(e) => Err(e),
+            }
+        } else {
+            request(gh, s, bus, &row.repo, row.number, &row.head).await
+        };
+        outcomes.push((row.repo, row.number, row.head, result));
+    }
+    Ok(outcomes)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,37 +256,4 @@ mod tests {
             Request::Already
         );
     }
-}
-
-/// One pass over the coordinator's persisted table. Each candidate uses the same
-/// identity, lease and exact-head checks as the individual request command.
-pub async fn pass<G: Gh>(
-    gh: &G,
-    s: &Settings,
-    bus: &Bus,
-    dry_run: bool,
-) -> Result<Vec<(String, u64, String, Result<Request>)>> {
-    use crate::{bot::BotState, state, table::Table};
-    let entry = bus
-        .state_get(state::KEY_PRS)
-        .await?
-        .ok_or_else(|| invalid("no coordinator PR table; wait for a coordinator round"))?;
-    let table = Table::parse(&entry.value);
-    let mut outcomes = Vec::new();
-    for row in table
-        .rows
-        .into_iter()
-        .filter(|r| !r.draft && r.bot == BotState::None && s.repos.contains(&r.repo))
-    {
-        let result = if dry_run {
-            match verify_owner(gh, s).await {
-                Ok(()) => check(gh, s, &row.repo, row.number, &row.head).await,
-                Err(e) => Err(e),
-            }
-        } else {
-            request(gh, s, bus, &row.repo, row.number, &row.head).await
-        };
-        outcomes.push((row.repo, row.number, row.head, result));
-    }
-    Ok(outcomes)
 }
