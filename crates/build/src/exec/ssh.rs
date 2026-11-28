@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use hgl_ai_proto::build::Platform;
+use sha2::{Digest, Sha256};
 
 use super::{
     ARTIFACT_FILES, ARTIFACT_LIMIT, Cancel, Checkout, Executor, HostError, HostOps, Out, Prep,
@@ -376,6 +377,7 @@ pub struct Conn {
     alias: String,
     program: PathBuf,
     socket: PathBuf,
+    dir: PathBuf,
     log: PathBuf,
     dialect: Dialect,
     /// `false` for a borrower (`build shell`): it uses the proxy's master when there is
@@ -389,7 +391,7 @@ pub struct Conn {
 }
 
 impl Conn {
-    /// `dir` holds the control socket and the master's log; it is made with mode 0700.
+    /// `dir` holds the master's log and, when short enough, its control socket.
     pub fn new(
         label: &str,
         alias: &str,
@@ -397,16 +399,39 @@ impl Conn {
         dir: &Path,
         dialect: Dialect,
     ) -> std::io::Result<Arc<Conn>> {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        Self::make(
+            label,
+            alias,
+            program,
+            dir,
+            dialect,
+            true,
+            runtime.as_deref().map(Path::new),
+        )
+    }
+
+    fn make(
+        label: &str,
+        alias: &str,
+        program: PathBuf,
+        dir: &Path,
+        dialect: Dialect,
+        owned: bool,
+        runtime: Option<&Path>,
+    ) -> std::io::Result<Arc<Conn>> {
         std::fs::create_dir_all(dir)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        let socket = dir.join(format!("{label}.sock"));
-        if socket.as_os_str().len() > 100 {
-            return Err(std::io::Error::other(format!(
-                "the control socket path {} is too long for a Unix socket",
-                socket.display()
-            )));
-        }
+        let runtime = runtime.filter(|p| !p.as_os_str().is_empty());
+        let socket = if !owned
+            && runtime.is_none()
+            && dir.join(format!("{label}.sock")).as_os_str().len() > socket_limit()
+        {
+            PathBuf::new()
+        } else {
+            control_socket(dir, label, runtime)?
+        };
         let (tx, _) = tokio::sync::watch::channel(false);
         Ok(Arc::new(Conn {
             label: label.to_string(),
@@ -414,8 +439,9 @@ impl Conn {
             program,
             log: dir.join(format!("{label}.log")),
             socket,
+            dir: dir.to_path_buf(),
             dialect,
-            owned: true,
+            owned,
             generation: std::sync::atomic::AtomicU64::new(0),
             state: Mutex::new(ConnState {
                 master: None,
@@ -438,10 +464,31 @@ impl Conn {
         dir: &Path,
         dialect: Dialect,
     ) -> std::io::Result<Arc<Conn>> {
-        let c = Conn::new(label, alias, program, dir, dialect)?;
-        let mut c = Arc::into_inner(c).expect("not shared yet");
-        c.owned = false;
-        Ok(Arc::new(c))
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR");
+        Self::make(
+            label,
+            alias,
+            program,
+            dir,
+            dialect,
+            false,
+            runtime.as_deref().map(Path::new),
+        )
+    }
+
+    /// A direct connection, without a control socket or runtime-directory lookup.
+    pub fn direct(
+        label: &str,
+        alias: &str,
+        program: PathBuf,
+        dir: &Path,
+        dialect: Dialect,
+    ) -> std::io::Result<Arc<Conn>> {
+        let mut conn = Self::make(label, alias, program, dir, dialect, false, None)?;
+        Arc::get_mut(&mut conn)
+            .expect("new connection is unshared")
+            .socket = PathBuf::new();
+        Ok(conn)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ConnState> {
@@ -666,6 +713,68 @@ impl Conn {
         self.stop_master();
         self.set(false, Some("closed".into()));
     }
+}
+
+fn control_socket(dir: &Path, label: &str, runtime: Option<&Path>) -> std::io::Result<PathBuf> {
+    let socket = dir.join(format!("{label}.sock"));
+    if socket.as_os_str().len() <= socket_limit() {
+        return Ok(socket);
+    }
+    let runtime = runtime.filter(|p| p.is_absolute()).ok_or_else(|| {
+        std::io::Error::other("control socket path is too long and XDG_RUNTIME_DIR is unavailable")
+    })?;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = std::fs::metadata(runtime)?;
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::other(
+            "XDG_RUNTIME_DIR must be a private directory owned by the current user",
+        ));
+    }
+    let sockets = runtime.join("hgl-ai");
+    let mut builder = std::fs::DirBuilder::new();
+    use std::os::unix::fs::DirBuilderExt;
+    builder.mode(0o700);
+    match builder.create(&sockets) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(e) => return Err(e),
+    }
+    let metadata = std::fs::symlink_metadata(&sockets)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::other(
+            "control socket directory is not private",
+        ));
+    }
+    let socket = fallback_socket(&sockets, &std::fs::canonicalize(dir)?, label);
+    if socket.as_os_str().len() > socket_limit() {
+        return Err(std::io::Error::other(
+            "XDG_RUNTIME_DIR is too long for a control socket",
+        ));
+    }
+    Ok(socket)
+}
+
+fn socket_limit() -> usize {
+    // OpenSSH appends a dot and 16 random characters before bind, plus NUL.
+    // SAFETY: zero is a valid sockaddr_un value; only the array length is read.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    address.sun_path.len() - 18
+}
+
+fn fallback_socket(sockets: &Path, dir: &Path, label: &str) -> PathBuf {
+    let mut hash = Sha256::new();
+    use std::os::unix::ffi::OsStrExt;
+    hash.update(dir.as_os_str().as_bytes());
+    hash.update([0]);
+    hash.update(label.as_bytes());
+    sockets.join(format!("{}.sock", hex::encode(&hash.finalize()[..16])))
 }
 
 impl Drop for Conn {
@@ -931,17 +1040,14 @@ impl Ssh {
 }
 
 impl HostOps for Ssh {
-    /// A `flock` on this host, beside the remote's control socket: the proxy's builder
+    /// A `flock` on this host in the configured data directory: the proxy's builder
     /// and its `build shell`s, in their own processes, take turns on the remote clone.
     fn lock_clone(&self, clone: &str) -> Result<super::CloneGuard, HostError> {
         let repo = clone.rsplit(['/', '\\']).next().unwrap_or(clone);
-        let dir = self
+        let path = self
             .conn
-            .socket()
-            .parent()
-            .map(Path::to_path_buf)
-            .unwrap_or_default();
-        let path = dir.join(format!("{}.clone.{repo}.lock", self.conn.label));
+            .dir
+            .join(format!("{}.clone.{repo}.lock", self.conn.label));
         let l = crate::lock::FileLock::lock(&path)
             .map_err(|e| HostError::Failed(format!("locking {}: {e}", path.display())))?;
         Ok(Box::new(l))
@@ -1315,7 +1421,68 @@ fn copy(mut r: impl Read, file: &Mutex<std::fs::File>) {
 
 #[cfg(test)]
 mod tests {
+    mod short {
+        include!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/short.rs"
+        ));
+    }
+
     use super::*;
+
+    #[test]
+    fn socket_limit_reserves_openssh_suffix() {
+        let label = "r";
+        let dir = PathBuf::from("x".repeat(socket_limit() - "/r.sock".len()));
+        assert_eq!(
+            control_socket(&dir, label, None).unwrap().as_os_str().len(),
+            socket_limit()
+        );
+        let too_long = PathBuf::from("x".repeat(socket_limit() - "/r.sock".len() + 1));
+        assert!(control_socket(&too_long, label, None).is_err());
+    }
+
+    #[test]
+    fn borrowed_long_path_without_runtime_connects_directly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("d".repeat(120));
+        for runtime in [None, Some(Path::new(""))] {
+            let conn = Conn::make(
+                "r",
+                "host",
+                "ssh".into(),
+                &dir,
+                Dialect::Posix,
+                false,
+                runtime,
+            )
+            .unwrap();
+            assert!(conn.opts().iter().any(|o| o == "ControlPath=none"));
+        }
+    }
+
+    #[test]
+    fn clone_locks_stay_in_each_configured_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runtime = tmp.path().join("runtime");
+        std::fs::create_dir(&runtime).unwrap();
+        for name in ["one", "two"] {
+            let dir = tmp.path().join(name);
+            let conn = Conn::direct("r", "host", "ssh".into(), &dir, Dialect::Posix).unwrap();
+            let mut conn = Arc::into_inner(conn).unwrap_or_else(|| panic!("unexpected sharing"));
+            conn.socket = runtime.join("fallback.sock");
+            let ex = Ssh::new(
+                Platform::Linux,
+                Dialect::Posix,
+                "/work",
+                BTreeMap::new(),
+                Arc::new(conn),
+            );
+            let _guard = ex.lock_clone("/work/repo").unwrap();
+            assert!(dir.join("r.clone.repo.lock").exists());
+        }
+        assert!(std::fs::read_dir(runtime).unwrap().next().is_none());
+    }
 
     // What only a real Windows host checks: that PowerShell runs these scripts as
     // intended. Here: their text.
@@ -1373,22 +1540,66 @@ mod tests {
         assert!(sh.contains("$1 * 1024"));
     }
 
+    #[test]
+    fn long_control_socket_uses_private_runtime_and_is_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = tmp.path().canonicalize().unwrap();
+        let dir = tmp.path().join("d".repeat(120));
+        std::fs::create_dir(&dir).unwrap();
+        if fallback_socket(&runtime.join("hgl-ai"), &dir, "remote")
+            .as_os_str()
+            .len()
+            > socket_limit()
+        {
+            assert!(control_socket(&dir, "remote", Some(&runtime)).is_err());
+            return;
+        }
+        let first = control_socket(&dir, "remote", Some(&runtime)).unwrap();
+        assert!(first.as_os_str().len() <= socket_limit());
+        assert_eq!(
+            first,
+            control_socket(&dir, "remote", Some(&runtime)).unwrap()
+        );
+        assert_ne!(
+            first,
+            control_socket(&dir, "other", Some(&runtime)).unwrap()
+        );
+        assert!(control_socket(&dir, "remote", None).is_err());
+        std::os::unix::net::UnixListener::bind(&first).unwrap();
+    }
+
     /// A transfer that stalls (a FIFO no one writes) ends at its deadline, or at a cancel,
     /// with the session killed.
     #[test]
     fn a_stalled_artifact_transfer_ends() {
         let tmp = tempfile::Builder::new().prefix("hbf").tempdir().unwrap();
+        let (_socket_tmp, socket_path) = short::tempdir();
         let state = tmp.path().join("remote");
         std::fs::create_dir_all(&state).unwrap();
         let fake = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ssh");
-        let conn = Conn::new(
-            "r1",
-            state.to_str().unwrap(),
-            fake,
-            &tmp.path().join("ssh"),
-            Dialect::Posix,
-        )
+        let conn = if short::fits(&socket_path, "r1") {
+            Conn::new(
+                "r1",
+                state.to_str().unwrap(),
+                fake,
+                &socket_path,
+                Dialect::Posix,
+            )
+        } else {
+            Conn::direct(
+                "r1",
+                state.to_str().unwrap(),
+                fake,
+                &socket_path,
+                Dialect::Posix,
+            )
+        }
         .unwrap();
+        if !short::fits(&socket_path, "r1") {
+            assert!(conn.opts().iter().any(|o| o == "ControlPath=none"));
+        }
         conn.connect().unwrap();
         let ex = Ssh::new(
             Platform::Linux,

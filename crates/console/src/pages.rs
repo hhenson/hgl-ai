@@ -7,9 +7,9 @@ use std::time::Duration;
 use axum::Json;
 use axum::extract::{Form, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
-use axum::response::sse::{Event as SseEvent, KeepAlive, Sse};
+
 use axum::response::{Html, IntoResponse, Redirect, Response};
-use futures::stream::Stream;
+
 use hgl_ai_owner::{self as owner, Body, Choice, Priority, Thread, ThreadKind, ThreadState};
 use serde::Deserialize;
 use webauthn_rs::prelude::{PublicKeyCredential, RegisterPublicKeyCredential};
@@ -638,52 +638,6 @@ pub async fn close(
         Err(r) => return r,
     };
     send_owner(&app, &s, &id, Body::Close).await
-}
-
-pub async fn telemetry(State(app): AppState, h: HeaderMap) -> Response {
-    let s = match viewer(&app, &h) {
-        Ok(s) => s,
-        Err(r) => return r,
-    };
-    let snap = app.telemetry.borrow().clone();
-    let body = format!(
-        "<p id=\"live\" class=\"meta\" aria-live=\"polite\">Live updates start when the page has loaded.</p>\
-         <div id=\"panels\" data-sse=\"/telemetry/events\">{}</div>",
-        crate::telemetry::render(&snap)
-    );
-    framed(&app, &s, "/telemetry", "Telemetry", &body, None).await
-}
-
-pub async fn telemetry_json(State(app): AppState, h: HeaderMap) -> Response {
-    if app.auth.session(cookies(&h)).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    let snap = app.telemetry.borrow().clone();
-    Json(&*snap).into_response()
-}
-
-pub async fn telemetry_events(State(app): AppState, h: HeaderMap) -> Response {
-    if app.auth.session(cookies(&h)).is_none() {
-        return StatusCode::UNAUTHORIZED.into_response();
-    }
-    Sse::new(snapshots(app.telemetry.subscribe()))
-        .keep_alive(KeepAlive::new().interval(Duration::from_secs(20)))
-        .into_response()
-}
-
-fn snapshots(
-    rx: tokio::sync::watch::Receiver<Arc<crate::telemetry::Snapshot>>,
-) -> impl Stream<Item = Result<SseEvent, std::convert::Infallible>> {
-    futures::stream::unfold((rx, true), |(mut rx, first)| async move {
-        if !first && rx.changed().await.is_err() {
-            return None;
-        }
-        let snap = rx.borrow_and_update().clone();
-        let ev = SseEvent::default()
-            .event("snapshot")
-            .data(crate::telemetry::render(&snap));
-        Some((Ok(ev), (rx, false)))
-    })
 }
 
 // ---- sign-in ----

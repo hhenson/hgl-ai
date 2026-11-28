@@ -3,6 +3,9 @@
 //! notify address that may not get receipts, and an id already used for another request.
 //! Each is terminated before it touches a path or the hub, and the lane goes on.
 
+#[path = "support/short.rs"]
+mod short;
+
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
@@ -82,6 +85,7 @@ fn git(dir: &Path, args: &[&str]) -> String {
 struct Rig {
     _nats: Nats,
     _tmp: tempfile::TempDir,
+    _socket_tmp: tempfile::TempDir,
     root: PathBuf,
     bus: Arc<Bus>,
     heads: [String; 2],
@@ -208,6 +212,7 @@ impl Rig {
         git(&seed, &["push", "--quiet", "origin", "main"]);
         let recipe = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"test -f f.txt\"\nmemcap_gb = 1\ntime = \"2m\"\n";
         store::recipe_put(&bus, recipe, None).await.unwrap();
+        let (socket_tmp, socket_path) = short::tempdir();
         let mut cfg = hgl_ai_config::Config::new("lab1");
         cfg.paths.work_root = root.join("work").display().to_string();
         cfg.paths.data_dir = root.join("data").display().to_string();
@@ -230,7 +235,17 @@ impl Rig {
         if let Some(f) = &o.before {
             f(&bus, &n.2, &n.3).await;
         }
-        let lanes = service::lanes(&cfg, fake_ssh()).unwrap();
+        let lanes = service::lanes_with(&cfg, fake_ssh(), |label, alias, program, _, dialect| {
+            use hgl_ai_build::exec::ssh::Conn;
+            if short::fits(&socket_path, label) {
+                Conn::new(label, alias, program, &socket_path, dialect)
+            } else {
+                let conn = Conn::direct(label, alias, program, &socket_path, dialect)?;
+                assert!(conn.opts().iter().any(|o| o == "ControlPath=none"));
+                Ok(conn)
+            }
+        })
+        .unwrap();
         let origin = bare.display().to_string();
         let settings = Settings {
             clone_url: Arc::new(move |_| origin.clone()),
@@ -253,6 +268,7 @@ impl Rig {
             settings,
             _nats: n,
             _tmp: tmp,
+            _socket_tmp: socket_tmp,
             root,
             bus,
             heads: [heads[0].clone(), heads[1].clone()],
@@ -934,7 +950,7 @@ async fn the_hub_lease_names_the_builder() {
     assert!(err.contains("served by lab9 pid 4242 (builder)"), "{err}");
     assert!(other.release().await.unwrap());
     // A builder of this host that died left its lease: taken over.
-    let id = hgl_ai_bridge::holder::host_id(&r.root.join("data"));
+    let id = hgl_ai_bridge::holder::host_id(&r.cfg.data_dir().unwrap());
     let _gone = r
         .bus
         .lock_acquire(
@@ -1153,4 +1169,93 @@ async fn a_partitioned_builder_stops_before_its_lease_expires() {
         "{:?}",
         cut_at.elapsed()
     );
+}
+
+async fn log_fixture() -> Option<(Rig, hgl_ai_proto::build::Summary)> {
+    let r = Rig::start().await?;
+    let recipe = "repo = \"demo\"\n[[step]]\nname = \"check\"\nrun = \"printf abcdef; printf report > report.xml\"\nartifacts = [\"report.xml\"]\nmemcap_gb = 1\ntime = \"2m\"\n";
+    store::recipe_put(&r.bus, recipe, None).await.unwrap();
+    let job = r.job("20261127-110000-bababa", &r.heads[0]);
+    r.send(&job).await;
+    let summary = r.receipt(&job.id).await;
+    assert_eq!(summary.status, BuildStatus::Pass);
+    Some((r, summary))
+}
+
+async fn log_read(
+    r: &Rig,
+    summary: &hgl_ai_proto::build::Summary,
+    step: &str,
+    bytes: Option<&str>,
+) -> Result<Vec<u8>, String> {
+    hgl_ai_build::log::request(
+        &r.bus,
+        Seat::new("w1").unwrap(),
+        "lab1",
+        &summary.id,
+        Some(step.into()),
+        bytes.map(str::to_string),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_ranges_are_bounded() {
+    let Some((r, summary)) = log_fixture().await else {
+        return;
+    };
+    let log_path = PathBuf::from(summary.steps[0].log.as_ref().unwrap());
+    std::fs::write(&log_path, vec![b'x'; 100_000]).unwrap();
+    assert_eq!(
+        log_read(&r, &summary, "check", Some("0-999999"))
+            .await
+            .unwrap()
+            .len(),
+        64 << 10
+    );
+    assert_eq!(
+        log_read(&r, &summary, "check", None).await.unwrap().len(),
+        64 << 10
+    );
+    r.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn log_access_is_limited_to_summary_steps_and_artifacts() {
+    let Some((r, summary)) = log_fixture().await else {
+        return;
+    };
+    assert_eq!(
+        log_read(&r, &summary, "check", Some("1-4")).await.unwrap(),
+        b"bcd"
+    );
+    assert_eq!(
+        log_read(&r, &summary, &summary.steps[0].artifacts[0], None)
+            .await
+            .unwrap(),
+        b"report"
+    );
+    assert!(log_read(&r, &summary, "status.json", None).await.is_err());
+    assert!(
+        log_read(&r, &summary, "../status.json", None)
+            .await
+            .is_err()
+    );
+    let log_path = PathBuf::from(summary.steps[0].log.as_ref().unwrap());
+    let artifact_path = log_path
+        .parent()
+        .unwrap()
+        .join(&summary.steps[0].artifacts[0]);
+    std::fs::remove_file(&artifact_path).unwrap();
+    std::os::unix::fs::symlink(
+        log_path.parent().unwrap().join("status.json"),
+        &artifact_path,
+    )
+    .unwrap();
+    assert!(
+        log_read(&r, &summary, &summary.steps[0].artifacts[0], None)
+            .await
+            .is_err()
+    );
+    r.stop().await;
 }

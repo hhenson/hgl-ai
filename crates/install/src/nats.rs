@@ -27,8 +27,40 @@ pub enum Auth<'a> {
     Users(&'a crate::users::Registry),
 }
 
+/// The hub's WebSocket listener, for the console's page (docs/owner.md §3): loopback,
+/// plain (the TLS proxy in front of the console serves it at `<console url>/nats`), and
+/// only for pages of the console's origin.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Websocket {
+    pub port: u16,
+    pub origins: Vec<String>,
+}
+
+/// The listener `cfg` asks for: a websocket port, a console, and hub users (a shared
+/// token would give the page every right).
+pub fn websocket_of(cfg: &hgl_ai_config::Config) -> Option<Websocket> {
+    let srv = cfg.server.as_ref()?;
+    let console = cfg.console.as_ref()?;
+    let port = srv.websocket_port?;
+    (srv.auth == hgl_ai_config::HubAuth::Users).then(|| Websocket {
+        port,
+        origins: vec![console.url.trim_end_matches('/').to_string()],
+    })
+}
+
 /// `<data_dir>/nats.conf`: listen address, JetStream store, authorization.
 pub fn render_conf(listen: &str, port: u16, store_dir: &Path, auth: &Auth) -> String {
+    render_conf_ws(listen, port, store_dir, auth, None)
+}
+
+/// [`render_conf`] with the WebSocket listener, if any.
+pub fn render_conf_ws(
+    listen: &str,
+    port: u16,
+    store_dir: &Path,
+    auth: &Auth,
+    ws: Option<&Websocket>,
+) -> String {
     let authorization = match auth {
         Auth::Token(t) => format!("authorization {{\n  token: {}\n}}\n", conf_str(t)),
         Auth::Users(reg) => crate::users::render_authorization(reg),
@@ -42,10 +74,22 @@ pub fn render_conf(listen: &str, port: u16, store_dir: &Path, auth: &Auth) -> St
          \n\
          jetstream {{\n  store_dir: {store}\n}}\n\
          \n\
-         {authorization}",
+         {websocket}{authorization}",
+        websocket = ws.map(render_websocket).unwrap_or_default(),
         host = conf_str(listen),
         pid = conf_str(&pid_path(store_dir).display().to_string()),
         store = conf_str(&store_dir.display().to_string()),
+    )
+}
+
+fn render_websocket(w: &Websocket) -> String {
+    let origins: Vec<String> = w.origins.iter().map(|o| conf_str(o)).collect();
+    format!(
+        "# The console's page, through the TLS proxy at <console url>/nats.\n\
+         websocket {{\n  host: \"127.0.0.1\"\n  port: {}\n  no_tls: true\n  \
+         allowed_origins: [{}]\n}}\n\n",
+        w.port,
+        origins.join(", ")
     )
 }
 
@@ -280,6 +324,53 @@ authorization {
             render_conf("::", 1, Path::new(r#"/a"b"#), &Auth::Token("t"))
                 .contains(r#"store_dir: "/a\"b""#)
         );
+        let ws = Websocket {
+            port: 4223,
+            origins: vec!["https://console.example.com".into()],
+        };
+        let c = render_conf_ws(
+            "127.0.0.1",
+            4222,
+            Path::new("/s"),
+            &Auth::Token("t"),
+            Some(&ws),
+        );
+        assert!(
+            c.contains(
+                "websocket {\n  host: \"127.0.0.1\"\n  port: 4223\n  no_tls: true\n  \
+                 allowed_origins: [\"https://console.example.com\"]\n}\n\nauthorization {"
+            ),
+            "{c}"
+        );
+    }
+
+    #[test]
+    fn websocket_needs_a_console_and_hub_users() {
+        let mut cfg = hgl_ai_config::Config::new("hub");
+        let mut srv = hgl_ai_config::Server {
+            websocket_port: Some(4223),
+            ..Default::default()
+        };
+        cfg.server = Some(srv.clone());
+        assert_eq!(websocket_of(&cfg), None, "no console");
+        cfg.console = Some(hgl_ai_config::Console {
+            url: "https://c.example.com/".into(),
+            ..Default::default()
+        });
+        assert_eq!(
+            websocket_of(&cfg),
+            Some(Websocket {
+                port: 4223,
+                origins: vec!["https://c.example.com".into()]
+            })
+        );
+        srv.auth = hgl_ai_config::HubAuth::Token;
+        cfg.server = Some(srv.clone());
+        assert_eq!(websocket_of(&cfg), None, "a shared token");
+        srv.auth = hgl_ai_config::HubAuth::Users;
+        srv.websocket_port = None;
+        cfg.server = Some(srv);
+        assert_eq!(websocket_of(&cfg), None, "not asked for");
     }
 
     /// The rendered file is a valid `nats-server` configuration (when one is installed).

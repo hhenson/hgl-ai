@@ -48,7 +48,10 @@ Open decisions are issues in this repository.
 - **ROLE-7 — Services.** Deterministic programs, not agents:
   - *coordinator*: one batched GitHub read at most every 5 minutes into
     `HGL_STATE/prs`; an immediate `note` when a review bot finding or a failed
-    check lands on a `ready` or `approved` pull request.
+    check lands on a `ready` or `approved` pull request. Every 15 minutes it
+    sends triage one note covering newly opened or reopened items in watched
+    repositories that still need intake. Triage passes flagged external PRs to
+    the controller to route review to a different model family.
   - *desk*: runs the fixed regression sets for each `ready` compiler head
     merged onto `main`, one run at a time, and sends a factual receipt. Not part of
     this repository.
@@ -93,6 +96,12 @@ Open decisions are issues in this repository.
   `hgl-compiler` is followed by the wrapper pin update and a new `main` state.
 - **ROLE-13 — No scope creep.** A defect found on the way that the change does
   not need is filed or linked, not fixed in the same pull request.
+- **Focused re-review for hgl-ai.** After a sendback, if the fix changes only what the
+  findings named, the reviewer checks each finding against the diff since the reviewed
+  head and checks that diff for regressions. The receipt binds the new exact head
+  (ROLE-9). A fix beyond the findings gets a full review. This follows the owner's
+  decision (HPH, 2026-11-28: "4. Yes to both", hgl-ai#118); ROLE-10, ROLE-11 and
+  ROLE-20 also remain in force.
 
 ## 3. Model assignment
 
