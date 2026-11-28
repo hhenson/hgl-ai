@@ -587,10 +587,19 @@ impl TreeRecord {
 
     /// Fold in `held`, the record already registered under this key, keeping what is
     /// fresher there: `families` only grow, and `handoff_seq` and `class` (by `class_seq`)
-    /// never go back (hgl-ai#51). A record of another tree made at this path (another
-    /// `created_at` or `seq`) is not merged: this one replaces it.
+    /// never go back (hgl-ai#51). Of two trees made at this path (another `created_at` or
+    /// `seq`), the later made, by `(seq, created_at)`, is kept whole. A record of another
+    /// key changes nothing.
     pub fn merge_held(&mut self, held: &TreeRecord) {
+        if (&held.host, &held.seat, &held.task, held.review)
+            != (&self.host, &self.seat, &self.task, self.review)
+        {
+            return;
+        }
         if (&held.created_at, held.seq) != (&self.created_at, self.seq) {
+            if (held.seq, &held.created_at) > (self.seq, &self.created_at) {
+                *self = held.clone();
+            }
             return;
         }
         for f in &held.families {
@@ -599,9 +608,14 @@ impl TreeRecord {
             }
         }
         self.handoff_seq = self.handoff_seq.max(held.handoff_seq);
-        if held.class_seq > self.class_seq {
-            self.class = held.class;
-            self.class_seq = held.class_seq;
+        match (held.class_seq, self.class_seq) {
+            // No note sequence to order them: keep the held class, if it has one.
+            (None, None) => self.class = held.class.or(self.class),
+            (h, s) if h > s => {
+                self.class = held.class;
+                self.class_seq = h;
+            }
+            _ => {}
         }
     }
 }
@@ -947,11 +961,79 @@ mod tests {
         m.merge_held(&listed);
         assert_eq!(m, held);
 
-        // Another tree made at this path is replaced, not merged.
-        let mut other = held.clone();
-        other.seq = Some(1);
+        // Of two trees made at this path, the later made is kept whole, either way.
+        let mut older = held.clone();
+        older.seq = Some(1);
+        older.handoff_seq = Some(20);
         let mut m = listed.clone();
-        m.merge_held(&other);
-        assert_eq!(m, listed);
+        m.merge_held(&older);
+        assert_eq!(m, listed, "a newer listing replaces an older tree's record");
+        let mut newer = held.clone();
+        newer.seq = Some(20);
+        newer.created_at = "20261127T090000Z".into();
+        let mut m = listed.clone();
+        m.merge_held(&newer);
+        assert_eq!(m, newer, "a stale listing keeps the newer tree's record");
+        // Same seq, later made.
+        let mut later = listed.clone();
+        later.created_at = "20261127T090000Z".into();
+        let mut m = listed.clone();
+        m.merge_held(&later);
+        assert_eq!(m, later);
+
+        // A record of another key changes nothing.
+        for other in [
+            TreeRecord {
+                review: true,
+                ..newer.clone()
+            },
+            TreeRecord {
+                seat: seat("w2"),
+                ..newer.clone()
+            },
+            TreeRecord {
+                host: "build-2".into(),
+                ..held.clone()
+            },
+        ] {
+            let mut m = listed.clone();
+            m.merge_held(&other);
+            assert_eq!(m, listed, "{}", other.key());
+        }
+
+        // With no class sequence on either side, the held class stays.
+        let (mut a, mut b) = (listed.clone(), listed.clone());
+        a.class_seq = None;
+        b.class_seq = None;
+        a.class = None;
+        b.class = Some(TaskClass::Complex);
+        let mut m = a.clone();
+        m.merge_held(&b);
+        assert_eq!((m.class, m.class_seq), (Some(TaskClass::Complex), None));
+        a.class = Some(TaskClass::Simple);
+        let mut m = a.clone();
+        m.merge_held(&b);
+        assert_eq!(m.class, Some(TaskClass::Complex));
+        let mut m = b.clone();
+        m.merge_held(&TreeRecord {
+            class: None,
+            ..b.clone()
+        });
+        assert_eq!(m.class, Some(TaskClass::Complex), "not erased");
+        // A set sequence outranks none, either way.
+        let mut m = a.clone();
+        m.merge_held(&TreeRecord {
+            class_seq: Some(2),
+            class: Some(TaskClass::Standard),
+            ..b.clone()
+        });
+        assert_eq!((m.class, m.class_seq), (Some(TaskClass::Standard), Some(2)));
+        let mut m = TreeRecord {
+            class_seq: Some(2),
+            class: Some(TaskClass::Standard),
+            ..a.clone()
+        };
+        m.merge_held(&b);
+        assert_eq!((m.class, m.class_seq), (Some(TaskClass::Standard), Some(2)));
     }
 }

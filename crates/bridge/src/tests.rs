@@ -495,6 +495,54 @@ async fn a_report_listed_before_a_handoff_turn_keeps_the_turns_record() {
     stop(tx, j).await;
 }
 
+/// r3 on #57: the report lists a tree, then `closed` removes it and an `assign` makes the
+/// task's tree anew at that key. The report keeps the newer tree's record.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_report_listed_before_a_tree_was_made_anew_keeps_the_new_record() {
+    let h = harness();
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Rename it"),
+    );
+    eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
+    stop(tx, j).await;
+    let key = "build-1.w1.demo-41";
+
+    h.bus.hold_tree_merges();
+    let reports = h.bus.sent_containing("work_root uses").len();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("the report holds its listing", || {
+        h.bus.tree_merges_held() == 1
+    })
+    .await;
+    let c = h.bus.push(
+        "w1",
+        note(Kind::Closed, "w1", 41, "[claude] Closed: demo#41"),
+    );
+    eventually("closed acked", || h.bus.events(c) == [Ev::Ack]).await;
+    let again = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 41, "[claude] Assign: demo#41 Again"),
+    );
+    eventually("assign acked", || h.bus.events(again) == [Ev::Ack]).await;
+    assert_eq!(h.bus.trees()[key].seq, Some(again), "the new tree's record");
+
+    h.bus.release_tree_merges();
+    eventually("the report", || {
+        h.bus.sent_containing("work_root uses").len() > reports
+    })
+    .await;
+    let rec = &h.bus.trees()[key];
+    assert_eq!(
+        (rec.seq, rec.handoff_seq),
+        (Some(again), Some(again)),
+        "the report did not bring the removed tree back"
+    );
+    stop(tx, j).await;
+}
+
 /// r1's minor 3 on hgl-ai PR 25: a dead letter quotes the note's class, so a resend keeps it.
 #[test]
 fn a_dead_letter_quotes_the_class() {

@@ -579,6 +579,22 @@ async fn hosts_and_trees_round_trip() {
     assert_eq!(held.families, [Family::Gpt, Family::Claude]);
     assert_eq!(held.size_bytes, 50);
     assert_eq!(bus.trees().await.unwrap(), vec![held.clone()]);
+    // r3 on #57: a stale snapshot of an older tree at this key writes nothing over the
+    // newer tree's record.
+    let mut newer = held.clone();
+    newer.seq = Some(20);
+    newer.created_at = "20261127T090000Z".into();
+    newer.families = vec![Family::Gemini];
+    bus.tree_put(&newer).await.unwrap();
+    let mut old = a.clone();
+    old.seq = Some(1);
+    assert_eq!(bus.tree_merge(&old).await.unwrap(), newer);
+    assert_eq!(bus.trees().await.unwrap(), vec![newer.clone()]);
+    // A newer tree's listing replaces an older tree's record.
+    let mut newest = a.clone();
+    newest.seq = Some(30);
+    assert_eq!(bus.tree_merge(&newest).await.unwrap(), newest);
+    assert_eq!(bus.trees().await.unwrap(), vec![newest.clone()]);
     // Absent: the merge creates it.
     bus.tree_del(&a.key()).await.unwrap();
     assert_eq!(bus.tree_merge(&a).await.unwrap(), a);
