@@ -745,6 +745,45 @@ impl Trees {
         }
     }
 
+    /// Fetch the pushed head of a kept implementor tree's branch, and fast-forward the tree
+    /// to it when it is behind (hgl-ai#55): a seat the task moved to in between may have
+    /// pushed. Returns the new HEAD when it moved; a branch never pushed, or one that has
+    /// diverged, is left as it is.
+    pub fn refresh_branch(&self, dir: &Path, f: &TaskFile) -> Result<Option<String>> {
+        let Some(branch) = f.branch.as_deref().filter(|_| !f.review) else {
+            return Ok(None);
+        };
+        let tracking = format!("refs/remotes/origin/{branch}");
+        let fetched = {
+            let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            let clone = self.ensure_clone(&f.repo)?;
+            self.git.output(
+                &clone,
+                [
+                    "fetch",
+                    "--quiet",
+                    "origin",
+                    &format!("+refs/heads/{branch}:{tracking}"),
+                ],
+            )?
+        };
+        if !fetched.ok {
+            return Ok(None);
+        }
+        let src = dir.join("src");
+        let (head, pushed) = (self.rev(&src, "HEAD")?, self.rev(&src, &tracking)?);
+        if head == pushed
+            || !self
+                .git
+                .check(&src, ["merge-base", "--is-ancestor", &head, &pushed])?
+        {
+            return Ok(None);
+        }
+        self.git
+            .run(&src, ["merge", "--ff-only", "--quiet", &pushed])?;
+        Ok(Some(pushed))
+    }
+
     /// `<work_root>/clones/<repo>`: a bare repository with `origin`, fetched now.
     fn ensure_clone(&self, repo: &str) -> Result<PathBuf> {
         let clone = self.layout.clone_dir(repo)?;

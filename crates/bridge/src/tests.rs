@@ -2444,3 +2444,5 @@ async fn low_disk_holds_new_trees_under_drain_too() {
     eventually("reviewed under drain", || h.bus.events(r) == [Ev::Ack]).await;
     stop(tx, j).await;
 }
+
+mod reuse;

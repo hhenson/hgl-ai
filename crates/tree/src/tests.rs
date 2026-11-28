@@ -602,3 +602,76 @@ fn a_leading_dot_repository_is_refused_before_a_tree() {
     ));
     assert!(!e.root.join("work/w1").join(".github-5").exists());
 }
+
+/// hgl-ai#55: a kept tree takes the commits the seat the task moved to pushed in between;
+/// a branch never pushed, or one that has diverged, is left as it is.
+#[test]
+fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
+    let e = env();
+    let c = e
+        .trees
+        .create(&seat("w1"), &task(55), &implement("Kept"))
+        .unwrap();
+    let src = c.dir.join("src");
+    let head = |p: &Path| {
+        e.git
+            .run(p, ["rev-parse", "HEAD"])
+            .unwrap()
+            .trim()
+            .to_string()
+    };
+    assert_eq!(
+        e.trees.refresh_branch(&c.dir, &c.file).unwrap(),
+        None,
+        "not pushed"
+    );
+    let branch = c.file.branch.clone().unwrap();
+    commit(&e.git, &src, "w1.txt", "w1\n", "w1's work");
+    e.git
+        .run(
+            &src,
+            ["push", "--quiet", "origin", &format!("HEAD:{branch}")],
+        )
+        .unwrap();
+    // The interim seat, elsewhere, pushes on the same branch.
+    e.git.run(&e.seed, ["fetch", "--quiet", "origin"]).unwrap();
+    e.git
+        .run(
+            &e.seed,
+            [
+                "checkout",
+                "--quiet",
+                "-b",
+                &branch,
+                &format!("origin/{branch}"),
+            ],
+        )
+        .unwrap();
+    let theirs = commit(&e.git, &e.seed, "w2.txt", "w2\n", "w2's work");
+    e.git
+        .run(&e.seed, ["push", "--quiet", "origin", &branch])
+        .unwrap();
+    assert_eq!(
+        e.trees.refresh_branch(&c.dir, &c.file).unwrap(),
+        Some(theirs.clone())
+    );
+    assert_eq!(head(&src), theirs);
+    assert!(src.join("w2.txt").exists());
+    assert_eq!(
+        e.trees.refresh_branch(&c.dir, &c.file).unwrap(),
+        None,
+        "up to date"
+    );
+    // Diverged: both sides commit; the tree keeps its own.
+    let ours = commit(&e.git, &src, "w1b.txt", "w1b\n", "w1 again");
+    commit(&e.git, &e.seed, "w2b.txt", "w2b\n", "w2 again");
+    e.git
+        .run(&e.seed, ["push", "--quiet", "origin", &branch])
+        .unwrap();
+    assert_eq!(
+        e.trees.refresh_branch(&c.dir, &c.file).unwrap(),
+        None,
+        "diverged"
+    );
+    assert_eq!(head(&src), ours);
+}
