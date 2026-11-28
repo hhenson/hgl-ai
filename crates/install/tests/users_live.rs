@@ -993,17 +993,20 @@ async fn seeded(hub: &Hub) -> jetstream::Context {
 }
 
 /// Whether anything is stored on `subject` in `HUB`; every subject a role could write is
-/// in some stream.
+/// in some stream. Absent only when the stream answers "no message found": any other
+/// error fails the test, so a denial proof cannot pass on a failed read.
 async fn stored(admin: &jetstream::Context, subject: &str) -> bool {
+    use async_nats::jetstream::stream::LastRawMessageErrorKind;
     let name = admin
         .stream_by_subject(subject)
         .await
         .unwrap_or_else(|e| panic!("no stream holds {subject}: {e}"));
     let stream = admin.get_stream(&name).await.unwrap();
-    stream
-        .get_last_raw_message_by_subject(subject)
-        .await
-        .is_ok()
+    match stream.get_last_raw_message_by_subject(subject).await {
+        Ok(_) => true,
+        Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => false,
+        Err(e) => panic!("reading {subject} back from {name}: {e}"),
+    }
 }
 
 /// Up to `n` messages of one pull, within two seconds.
@@ -1031,7 +1034,7 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
     let Some(hub) = Hub::accounts() else { return };
     let admin = seeded(&hub).await;
     for (role, who) in ROLE_USERS {
-        let (_c, js) = hub.js_of(who).await;
+        let (conn, js) = hub.js_of(who).await;
         for row in access_table() {
             let a = row.of(role);
             let what = format!("{who} ({role}) {:?} {a:?}", row.target);
@@ -1040,15 +1043,56 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                     Target::AccountInfo => {
                         assert!(js.query_account().await.unwrap().streams > 0, "{what}");
                     }
-                    Target::Keys { bucket, keys } => {
+                    Target::Keys { bucket, keys } if keys != ">" => {
+                        // Some keys: a direct get by subject, and no more: no other key,
+                        // no stream state (counts, key names), no consumer.
+                        let p = hgl_ai_proto::HUB_API_PREFIX;
+                        let s = format!("KV_{bucket}");
+                        let get = |key: &str| {
+                            let subject = format!("{p}.DIRECT.GET.{s}.$KV.{bucket}.{key}");
+                            let c = conn.clone();
+                            async move {
+                                tokio::time::timeout(
+                                    Duration::from_secs(1),
+                                    c.request(subject, "".into()),
+                                )
+                                .await
+                                .ok()
+                                .and_then(|r| r.ok())
+                                .map(|m| String::from_utf8_lossy(&m.payload).into_owned())
+                            }
+                        };
+                        assert_eq!(get("links.a.b").await.as_deref(), Some("seed"), "{what}");
+                        assert_eq!(get("d.a.b.c").await, None, "{what}");
+                        unanswered(
+                            &conn,
+                            vec![
+                                (format!("{p}.STREAM.INFO.{s}"), serde_json::json!({})),
+                                (
+                                    format!("{p}.STREAM.INFO.{s}"),
+                                    serde_json::json!({"subjects_filter": ">"}),
+                                ),
+                                (format!("{p}.DIRECT.GET.{s}"), serde_json::json!({"seq": 1})),
+                                (
+                                    format!("{p}.STREAM.MSG.GET.{s}"),
+                                    serde_json::json!({"seq": 1}),
+                                ),
+                                (
+                                    format!("{p}.CONSUMER.CREATE.{s}"),
+                                    serde_json::json!({"stream_name": s, "config": {}}),
+                                ),
+                            ],
+                        )
+                        .await;
+                    }
+                    Target::Keys { bucket, .. } => {
                         let store = js.get_key_value(bucket).await.expect(&what);
-                        let key = if keys == ">" { "seed.a" } else { "links.a.b" };
                         assert_eq!(
-                            store.get(key).await.expect(&what).unwrap(),
+                            store.get("seed.a").await.expect(&what).unwrap(),
                             "seed",
                             "{what}"
                         );
-                        if keys == ">" {
+                        {
                             let s = js.get_stream(format!("KV_{bucket}")).await.unwrap();
                             let first = s.cached_info().state.first_sequence;
                             s.direct_get(first).await.expect(&what);
@@ -1062,12 +1106,6 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                                 .await
                                 .expect(&what);
                             assert_eq!(pull(&c, 2).await.len(), 2, "a batch: {what}");
-                        } else {
-                            // Only those keys: no other key, no consumer.
-                            let r =
-                                tokio::time::timeout(Duration::from_secs(2), store.get("d.a.b.c"))
-                                    .await;
-                            assert!(!matches!(r, Ok(Ok(Some(_)))), "{what}");
                         }
                     }
                     Target::Stream(name)
@@ -1284,7 +1322,17 @@ async fn accounts_refuse_every_write_outside_a_row() {
     }
     let notes = admin.get_stream("HGL_NOTES").await.unwrap();
     assert!(notes.get_raw_message(1).await.is_ok(), "nothing purged");
-    assert!(admin.get_stream("EVIL").await.is_err());
+    match admin.get_stream("EVIL").await {
+        Err(e) => assert!(
+            matches!(
+                e.kind(),
+                jetstream::context::GetStreamErrorKind::JetStream(j)
+                    if j.error_code() == jetstream::ErrorCode::STREAM_NOT_FOUND
+            ),
+            "reading EVIL back: {e}"
+        ),
+        Ok(_) => panic!("a role created EVIL"),
+    }
 }
 
 /// The parts #141 left unproven: acknowledgement (ack, progress, nak, redelivery), a

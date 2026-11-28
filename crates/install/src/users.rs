@@ -583,8 +583,9 @@ impl Access {
 pub enum Target {
     /// `$JS.API.INFO`: the hub's JetStream use and limits.
     AccountInfo,
-    /// The keys of `bucket` matching `keys` (`>`: all). Read: get by key, and, for all
-    /// keys, by sequence and through pull consumers. Write: put, create, update, delete.
+    /// The keys of `bucket` matching `keys` (`>`: all). Read: get by key (a direct get
+    /// by subject), and, for all keys, the stream's state, by sequence and through pull
+    /// consumers. Write: put, create, update, delete.
     Keys { bucket: String, keys: String },
     /// A stream read through any pull consumer, with acknowledgement, and by sequence.
     Stream(String),
@@ -714,9 +715,11 @@ impl Target {
                 Target::AccountInfo => out.push(api("INFO")),
                 Target::Keys { bucket, keys } => {
                     let s = kv(bucket);
-                    out.push(api(&format!("STREAM.INFO.{s}")));
                     out.push(api_stream(&format!("DIRECT.GET.{s}.$KV.{bucket}.{keys}")));
+                    // The stream's state (counts, and key names by subject filter) only
+                    // with every key: some keys are read by subject alone.
                     if keys == ">" {
+                        out.push(api(&format!("STREAM.INFO.{s}")));
                         out.push(api_stream(&format!("DIRECT.GET.{s}")));
                         out.push(api(&format!("STREAM.MSG.GET.{s}")));
                         out.extend(consumers(&s));
@@ -1392,12 +1395,15 @@ mod tests {
             Role::Console,
             "$JS.API.DIRECT.GET.KV_HGL_SLACK.$KV.HGL_SLACK.links.*.*"
         ));
-        assert!(
-            !role_services(Role::Console)
-                .iter()
-                .any(|s| s.subject.contains("KV_HGL_SLACK")
-                    && !s.subject.ends_with("links.*.*")
-                    && !s.subject.contains("STREAM.INFO")),
+        // Not even the stream's state: its counts and, by subject filter, its key names.
+        let slack: Vec<_> = role_services(Role::Console)
+            .into_iter()
+            .filter(|s| s.subject.contains("HGL_SLACK"))
+            .map(|s| s.subject)
+            .collect();
+        assert_eq!(
+            slack,
+            ["$JS.API.DIRECT.GET.KV_HGL_SLACK.$KV.HGL_SLACK.links.*.*"]
         );
         assert_eq!(CONSOLE_FEED, hgl_ai_owner::FEED);
         // Consumer lists only where consumer state is read, never of `HGL_OWNER`,
