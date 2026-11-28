@@ -7,7 +7,7 @@ use chrono::{DateTime, Utc};
 use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_owner::digest::{Digest, Question, Report};
 use hgl_ai_owner::{self as owner, Body, EVENT_VERSION, Event, Priority, Status, Thread, event};
-use hgl_ai_proto::{CONSOLE_PREFIX, parse_stamp};
+use hgl_ai_proto::{CONSOLE_PREFIX, check_handle, parse_stamp};
 use sha2::{Digest as _, Sha256};
 
 use crate::App;
@@ -221,10 +221,40 @@ fn new_decisions(
         tip,
         selected[more..]
             .iter()
-            .map(|line| preview(line, 360))
+            .map(|line| decision_preview(line))
             .collect(),
         more,
     )
+}
+
+fn decision_preview(line: &str) -> String {
+    let mut fields = line.splitn(4, ' ');
+    let (Some(at), Some(id), Some(issue), Some(answer)) =
+        (fields.next(), fields.next(), fields.next(), fields.next())
+    else {
+        return preview(line, 360);
+    };
+    if !id.starts_with("q-") || owner::check_id(id).is_err() || parse_stamp(at).is_none() {
+        return preview(line, 360);
+    }
+
+    // The fold writes `<who> (<user>): <answer> [<who>, <time>]` after the issue.
+    // A clipped header is only safe to share up to the issue.
+    let prefix = format!("{at} {id} {issue}");
+    let Some((who, rest)) = answer.split_once(" (") else {
+        return preview(&prefix, 360);
+    };
+    let Some((user, said)) = rest.split_once("): ") else {
+        return preview(&prefix, 360);
+    };
+    let author = if who != user && check_handle(who).is_ok() {
+        who
+    } else {
+        "owner"
+    };
+    let signature = format!(" [{}]", owner::model::signed(who, at));
+    let said = said.strip_suffix(&signature).unwrap_or(said);
+    preview(&format!("{prefix} {author}: {said}"), 360)
 }
 
 fn line_id(line: &str) -> String {

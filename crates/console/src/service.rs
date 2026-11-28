@@ -1298,6 +1298,76 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
+    async fn slack_digest_redacts_console_answer_sign_in() {
+        use hgl_ai_owner::digest::{self, Digest};
+
+        let Some((_srv, url, token)) = hub() else {
+            eprintln!("skipped: nats-server is not on PATH");
+            return;
+        };
+        let bus = Bus::connect_url(&url, Some(token)).await.unwrap();
+        bus.provision().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(dir.path());
+        let mut feed = feed(&bus).await;
+        let mut expected = Vec::new();
+        let mut emails = Vec::new();
+        for (email, handle) in [
+            ("signed-owner@example.com", Some("This Dude")),
+            ("unsigned-owner@example.com", None),
+        ] {
+            let id = owner::ask(
+                &bus,
+                &app.controller,
+                question("Choose", "Which?".into(), "Use the first rule".into()),
+            )
+            .await
+            .unwrap();
+            fold_to(&app, &bus, &mut feed, &id, 0).await;
+            let answer = owner::owner_event(
+                &bus,
+                &app.controller,
+                &id,
+                email,
+                handle,
+                owner::Body::Answer {
+                    choice: owner::Choice::Other,
+                    option: None,
+                    text: "Use the second rule [approved]".into(),
+                    note: String::new(),
+                },
+            )
+            .await
+            .unwrap();
+            fold_to(&app, &bus, &mut feed, &id, answer).await;
+            let thread = owner::show(&bus, &id).await.unwrap().unwrap();
+            expected.push(format!(
+                "{} {id} alpha#7 {}: other: Use the second rule [approved]",
+                thread.answer.unwrap().at,
+                handle.unwrap_or("owner")
+            ));
+            emails.push(email);
+        }
+
+        let log = owner::decisions_tail(&bus, 2).await.unwrap();
+        let subject = digest::subject("TTEST", "CSTATUS");
+        let through = DateTime::from_timestamp(Utc::now().timestamp() + 2, 0).unwrap();
+        assert!(
+            crate::digest::round(&app, &bus, &subject, through)
+                .await
+                .unwrap()
+        );
+        let stored = bus.owner_event_last(&subject).await.unwrap().unwrap();
+        let payload = String::from_utf8(stored.payload).unwrap();
+        for (line, email) in log.iter().zip(emails) {
+            assert!(line.contains(email));
+            assert!(!payload.contains(email));
+        }
+        let batch: Digest = serde_json::from_str(&payload).unwrap();
+        assert_eq!(batch.decisions, expected);
+    }
+
+    #[tokio::test]
     async fn empty_slack_checkpoint_keeps_new_and_migrated_p2_across_downtime() {
         use hgl_ai_owner::digest::{self, Digest};
 
