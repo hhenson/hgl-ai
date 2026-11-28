@@ -2,21 +2,28 @@
 //! (`[github.gate.<repo>] coordinator_lands`), `gh coord run` lands each pull request whose
 //! gates all pass, in Ready order ([`crate::candidates`]), one gate attempt per candidate per
 //! round under the landing lock, which it does not wait for. The gate is the controller's
-//! (exact head, current `main` and its merge test, an other-family clean receipt, checks,
-//! the bot and threads), and it also confirms that the pull request is still Ready at that
-//! head ([`gate::Opts::ready_at_head`]). A local build verdict it lacks is asked of a builder
-//! (BUILD-15) and read in a later round.
+//! (exact head, current `main`, an other-family clean receipt, checks, the bot and threads)
+//! with three more conditions: the local build verdicts for the head on the present `main`
+//! (BUILD-15), so a repository that names none is not landed on checks alone; Ready at that
+//! head, read again with the pull request right before the merge call
+//! ([`gate::Opts::ready_at_head`]); and no `hold`, read before each attempt and again right
+//! before the merge call. A build verdict it lacks is asked of a builder and read in a
+//! later round; the ask is kept on the hub (`coord.ask.<repo>.<pr>.<name>`), so a restart
+//! waits for that build rather than ask again.
 //!
-//! First in each round, a landing record left in an opted-in repository
-//! ([`crate::progress`]) is finished by the same attempt when its merge is confirmed: the
-//! record holds the merge commit, or GitHub reports the pull request merged. A record whose
-//! pull request is open is the candidates' to decide; one closed without a merge is left,
-//! and not asked about again.
+//! Its landing records say so (`by: coordinator`); it finishes and deletes only those. The
+//! controller's records, whatever they hold (the wrapper's pins left, say), are the
+//! controller's. First in each round, a record of its own whose merge is confirmed (the
+//! record holds the merge commit, or GitHub reports the pull request merged) is finished
+//! by the same attempt. One whose pull request is open is the candidates' to decide; one
+//! closed without a merge is retired (deleted, with its asks).
 //!
 //! Every landing it does or finishes is reported in two more steps of its record, under
 //! the same lock and before the record is deleted: a `note` to the controller, then a
-//! `decisions.log` line. A step that fails leaves the record, and the next round does only
-//! what is left. A `PARTIAL` goes to the controller once. The wrapper's pins are left to the
+//! `decisions.log` line. The report is written into the record before it is sent, so a
+//! resend is the same note (the same message id) and the same line. A step that fails
+//! leaves the record, and the next round does only what is left. A `PARTIAL` goes to the
+//! controller once, a step of its record too. The wrapper's pins are left to the
 //! controller.
 
 use std::collections::BTreeSet;
@@ -25,7 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hgl_ai_bus::Bus;
-use hgl_ai_proto::{Kind as NoteKind, Note};
+use hgl_ai_proto::{Kind as NoteKind, Note, utc_now_stamp};
 
 use crate::bot::{BotState, NoteState};
 use crate::builds::GateBuilds;
@@ -34,9 +41,9 @@ use crate::exec::Gh;
 use crate::gate::{self, Kind};
 use crate::land::{self, LandOpts, Landing};
 use crate::lock::{LandLock, holder};
-use crate::progress::{self, Progress};
-use crate::table::{Checks, PrInfo, Row};
-use crate::{Error, Result, Settings, short};
+use crate::progress::{self, Progress, Report};
+use crate::table::{Checks, PrInfo, Row, hold_active};
+use crate::{Error, Result, Settings, short, state};
 
 /// How long one gate attempt may wait on a merge GitHub accepted but has not done; past
 /// it the record is kept and a later round finishes the landing.
@@ -44,41 +51,64 @@ pub const MERGE_WAIT: Duration = Duration::from_secs(5 * 60);
 /// The landing record's steps for the coordinator's reports, after the landing's own.
 pub const STEP_NOTE: &str = "coord.note";
 pub const STEP_DECISION: &str = "coord.decision";
+pub const STEP_PARTIAL: &str = "coord.partial";
+/// [`Progress::by`] of the coordinator's landing records.
+pub const BY: &str = "coordinator";
+/// Where the coordinator keeps the gate builds it asked for (`<repo>.<pr>.<name>`).
+pub const ASK_PREFIX: &str = "coord.ask.";
 
 /// The coordinator's landing state across rounds.
 pub struct AutoLand {
-    /// The gate builds asked for, so a verdict on its way is not asked for again.
+    /// The gate builds asked for, so a verdict on its way is not asked for again; kept on
+    /// the hub too.
     builds: Arc<GateBuilds>,
-    /// `PARTIAL` lines sent to the controller: each once.
+    /// `PARTIAL` lines sent to the controller for a landing with no record of its own.
     partial: BTreeSet<String>,
-    /// Records whose pull request GitHub showed closed without a merge, by repository,
-    /// number and head: not asked about again.
-    closed: BTreeSet<(String, u64, String)>,
 }
 
 /// One pull request to try: a candidate, or a landing record to finish.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct Try {
-    repo: String,
-    number: u64,
-    head: String,
+pub(crate) struct Try {
+    pub(crate) repo: String,
+    pub(crate) number: u64,
+    pub(crate) head: String,
+}
+
+/// Whether `HGL_STATE/hold` holds now. Unreadable: an error, and the round stops.
+async fn hold_now(bus: &Bus) -> Result<Option<String>> {
+    Ok(bus
+        .state_get(state::KEY_HOLD)
+        .await?
+        .map(|e| e.value)
+        .filter(|v| hold_active(v, chrono::Utc::now())))
+}
+
+fn ours(p: &Progress) -> bool {
+    p.by.as_deref() == Some(BY)
 }
 
 impl AutoLand {
     pub fn new(s: &Settings) -> AutoLand {
         AutoLand {
-            builds: Arc::new(GateBuilds::new(s.coord_seat.clone(), "coordinator")),
+            builds: Arc::new(GateBuilds::durable(
+                s.coord_seat.clone(),
+                "coordinator",
+                ASK_PREFIX,
+            )),
             partial: BTreeSet::new(),
-            closed: BTreeSet::new(),
         }
     }
 
-    /// The options of one attempt: Ready at the head asked for, the gate builds asked for,
-    /// the record kept for the reports, the pins left to the controller.
-    fn opts(&self) -> LandOpts {
+    /// The options of one attempt: Ready at the head asked for, the build verdicts and no
+    /// hold, both read again at the merge; the gate builds asked for, the record ours and
+    /// kept for the reports, the pins left to the controller.
+    pub(crate) fn opts(&self) -> LandOpts {
         LandOpts {
             gate: gate::Opts {
                 ready_at_head: true,
+                require_verdicts: true,
+                hold_at_merge: true,
+                record_by: Some(BY),
                 ..gate::Opts::default()
             },
             timeout: MERGE_WAIT,
@@ -91,9 +121,10 @@ impl AutoLand {
     }
 
     /// One round over this round's open pull requests: finish the landing records left,
-    /// then try each candidate in Ready order. Stops at a rate limit, a sign-in failure or
-    /// an unreachable hub; any other failure of one pull request is logged and the next is
-    /// tried. What a landing reported is in its record, so a stop loses none of it.
+    /// then try each candidate in Ready order, each only while no `hold` holds. Stops at
+    /// a hold, a rate limit, a sign-in failure or an unreachable hub; any other failure of
+    /// one pull request is logged and the next is tried. What a landing reported is in its
+    /// record, so a stop loses none of it.
     pub async fn round<G: Gh>(
         &mut self,
         gh: &G,
@@ -102,6 +133,10 @@ impl AutoLand {
         infos: &[PrInfo],
     ) -> Result<()> {
         if !s.repos.iter().any(|r| s.coordinator_lands(r)) {
+            return Ok(());
+        }
+        if let Some(h) = hold_now(bus).await? {
+            tracing::info!("hold until {}: no landing", h.trim());
             return Ok(());
         }
         let mut tries = self.records(gh, s, bus, infos).await?;
@@ -120,6 +155,10 @@ impl AutoLand {
             }
         }
         for t in tries {
+            if let Some(h) = hold_now(bus).await? {
+                tracing::info!("hold until {}: no more landings this round", h.trim());
+                return Ok(());
+            }
             match self.attempt(gh, s, bus, &t).await {
                 Ok(()) => {}
                 Err(Error::Locked(m)) => tracing::info!("{} #{}: {m}", t.repo, t.number),
@@ -150,29 +189,77 @@ impl AutoLand {
         t: &Try,
         lock: &LandLock,
     ) -> Result<()> {
+        // A record that is not ours is the controller's landing (its pins may be all that
+        // is left): left to it, whatever it holds.
+        if let Some(p) = progress::read(bus, &t.repo, t.number).await?
+            && !ours(&p)
+        {
+            tracing::info!(
+                "{} #{}: a landing record not the coordinator's; left to the controller",
+                t.repo,
+                t.number
+            );
+            return Ok(());
+        }
         let l =
             land::merge_locked(gh, s, bus, &t.repo, t.number, &t.head, &self.opts(), lock).await?;
         tracing::info!("{}", l.outcome.line);
         match l.outcome.kind {
-            Kind::Merged | Kind::Resumed => report(s, bus, t, &l, lock).await,
-            Kind::Partial if self.partial.insert(l.outcome.line.clone()) => {
-                let body = with_after(format!("[coord] Partial: {}", l.outcome.line), &l);
+            Kind::Merged | Kind::Resumed => self.report(s, bus, t, &l, lock).await,
+            Kind::Partial => self.partial(s, bus, t, &l, lock).await,
+            _ => Ok(()),
+        }
+    }
+
+    /// A `PARTIAL` to the controller once: a step of the landing's record (kept with its
+    /// note's `created_at`, so a resend is the same message), else once per process.
+    pub(crate) async fn partial(
+        &mut self,
+        s: &Settings,
+        bus: &Bus,
+        t: &Try,
+        l: &Landing,
+        lock: &LandLock,
+    ) -> Result<()> {
+        let body = with_after(format!("[coord] Partial: {}", l.outcome.line), l);
+        let Some(mut p) = progress::read(bus, &t.repo, t.number).await?.filter(ours) else {
+            if self.partial.insert(l.outcome.line.clone()) {
                 let n = note(s, t, &l.outcome.head, body, None)?;
                 if let Err(e) = bus.send(&n).await {
                     self.partial.remove(&l.outcome.line);
                     return Err(e.into());
                 }
-                Ok(())
             }
-            _ => Ok(()),
+            return Ok(());
+        };
+        if p.has(STEP_PARTIAL) {
+            return Ok(());
         }
+        let r = match p.partial.clone() {
+            Some(r) => r,
+            None => {
+                let r = Report {
+                    at: utc_now_stamp(),
+                    note: body,
+                    decision: String::new(),
+                };
+                p.partial = Some(r.clone());
+                progress::write(bus, &t.repo, t.number, &p).await?;
+                r
+            }
+        };
+        let n = note(s, t, &l.outcome.head, r.note, Some(&r.at))?;
+        lock.confirm("reporting a partial landing").await?;
+        bus.send(&n).await?;
+        p.mark(STEP_PARTIAL);
+        progress::write(bus, &t.repo, t.number, &p).await
     }
 
-    /// The landing records to finish in opted-in repositories: each whose merge is
-    /// confirmed, by the record or by GitHub. A record of a pull request among the open
-    /// ones with no merge recorded is the candidates' to decide; absence from this round's
-    /// read is not taken as closed (it reads at most 50 per repository, and a repository
-    /// may give no answer), so GitHub is asked.
+    /// The landing records of its own to finish in opted-in repositories: each whose
+    /// merge is confirmed, by the record or by GitHub. A record of a pull request among the
+    /// open ones with no merge recorded is the candidates' to decide; absence from this
+    /// round's read is not taken as closed (it reads at most 50 per repository, and a
+    /// repository may give no answer), so GitHub is asked. Closed without a merge: retired.
     async fn records<G: Gh>(
         &mut self,
         gh: &G,
@@ -191,6 +278,9 @@ impl AutoLand {
             let Some(p) = progress::read(bus, &repo, number).await? else {
                 continue;
             };
+            if !ours(&p) {
+                continue;
+            }
             if hgl_ai_proto::check_head(&p.head).is_err() {
                 tracing::warn!("{key}: no head recorded; left to the controller");
                 continue;
@@ -204,8 +294,7 @@ impl AutoLand {
                 let open = infos
                     .iter()
                     .any(|i| i.row.repo == t.repo && i.row.number == t.number);
-                let seen = (t.repo.clone(), t.number, t.head.clone());
-                if open || self.closed.contains(&seen) {
+                if open {
                     continue;
                 }
                 let pr = match gate::fetch_pr(gh, s, &t.repo, t.number).await {
@@ -218,8 +307,7 @@ impl AutoLand {
                 };
                 if !pr.merged {
                     if pr.state != "open" {
-                        tracing::info!("{key}: closed without a merge; left");
-                        self.closed.insert(seen);
+                        self.retire(s, bus, &t).await?;
                     }
                     continue;
                 }
@@ -228,54 +316,116 @@ impl AutoLand {
         }
         Ok(out)
     }
+
+    /// Delete an intent of its own whose pull request GitHub shows closed without a
+    /// merge, under the landing lock and only if the record is still that intent; and the
+    /// gate builds asked for it.
+    async fn retire(&self, s: &Settings, bus: &Bus, t: &Try) -> Result<()> {
+        let who = holder(s, &format!("coordinator {}#{}", t.repo, t.number));
+        let lock = match LandLock::acquire(bus, &t.repo, &who, Duration::ZERO).await {
+            Ok(l) => l,
+            Err(Error::Locked(m)) => {
+                tracing::info!("{} #{}: {m}", t.repo, t.number);
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        };
+        let r = async {
+            let still = progress::read(bus, &t.repo, t.number)
+                .await?
+                .is_some_and(|p| ours(&p) && p.merge.is_none() && p.head == t.head);
+            if !still {
+                return Ok(());
+            }
+            lock.confirm("retiring a landing record").await?;
+            progress::delete(bus, &t.repo, t.number).await?;
+            self.builds.forget(bus, &t.repo, t.number).await?;
+            tracing::info!(
+                "{} #{}: closed without a merge; its landing record is retired",
+                t.repo,
+                t.number
+            );
+            Ok(())
+        }
+        .await;
+        lock.release().await;
+        r
+    }
+
+    /// A landing's reports, each a step of its record, then the record's removal. The
+    /// report is written into the record first (its stamp the `landed` notes'
+    /// `created_at`), so a resend is the same note to the controller and the same
+    /// `decisions.log` line, written once.
+    async fn report(
+        &self,
+        s: &Settings,
+        bus: &Bus,
+        t: &Try,
+        l: &Landing,
+        lock: &LandLock,
+    ) -> Result<()> {
+        let o = &l.outcome;
+        let mut p = progress::read(bus, &t.repo, t.number)
+            .await?
+            .unwrap_or_else(|| Progress::new(&o.head, o.merge_commit.clone()).by(Some(BY)));
+        if !ours(&p) {
+            return Ok(());
+        }
+        let r = match p.report.clone() {
+            Some(r) => r,
+            None => {
+                let r = first_report(s, t, l, &p);
+                p.report = Some(r.clone());
+                progress::write(bus, &t.repo, t.number, &p).await?;
+                r
+            }
+        };
+        if !p.has(STEP_NOTE) {
+            let n = note(s, t, &o.head, r.note.clone(), Some(&r.at))?;
+            lock.confirm("reporting the landing").await?;
+            bus.send(&n).await?;
+            p.mark(STEP_NOTE);
+            progress::write(bus, &t.repo, t.number, &p).await?;
+        }
+        if !p.has(STEP_DECISION) {
+            hgl_ai_owner::decision_once(bus, &r.decision)
+                .await
+                .map_err(|e| Error::Invalid(format!("writing decisions.log: {e}")))?;
+            p.mark(STEP_DECISION);
+            progress::write(bus, &t.repo, t.number, &p).await?;
+        }
+        self.builds.forget(bus, &t.repo, t.number).await?;
+        lock.confirm("removing the landing record").await?;
+        progress::delete(bus, &t.repo, t.number).await
+    }
 }
 
-/// A landing's reports, each a step of its record, then the record's removal: the note to
-/// the controller (with the landing's `landed` notes' `created_at`, so a resend carries the
-/// same message id), then the `decisions.log` line (stamped the same, so it is written once).
-async fn report(s: &Settings, bus: &Bus, t: &Try, l: &Landing, lock: &LandLock) -> Result<()> {
+/// The report of a landing as first made: stamped with its `landed` notes' `created_at`.
+fn first_report(s: &Settings, t: &Try, l: &Landing, p: &Progress) -> Report {
     let o = &l.outcome;
-    let mut p = progress::read(bus, &t.repo, t.number)
-        .await?
-        .unwrap_or_else(|| Progress::new(&o.head, o.merge_commit.clone()));
     let merge = o
         .merge_commit
         .clone()
         .or_else(|| p.merge.clone())
         .unwrap_or_default();
-    let stamp = p.notes_at.clone().unwrap_or_else(|| p.updated_at.clone());
-    let line = format!(
-        "landed {}#{} at {} as {}",
+    let at = p.notes_at.clone().unwrap_or_else(utc_now_stamp);
+    let what = format!(
+        "{}#{} at {} as {}",
         t.repo,
         t.number,
         short(&o.head),
         short(&merge)
     );
-    if !p.has(STEP_NOTE) {
-        let how = if o.kind == Kind::Resumed {
-            ", finishing an earlier attempt"
-        } else {
-            ""
-        };
-        let body = with_after(
-            format!("[coord] Landed: {}{how}", &line["landed ".len()..]),
-            l,
-        );
-        let n = note(s, t, &o.head, body, Some(&stamp))?;
-        lock.confirm("reporting the landing").await?;
-        bus.send(&n).await?;
-        p.mark(STEP_NOTE);
-        progress::write(bus, &t.repo, t.number, &p).await?;
+    let how = if o.kind == Kind::Resumed {
+        ", finishing an earlier attempt"
+    } else {
+        ""
+    };
+    Report {
+        note: with_after(format!("[coord] Landed: {what}{how}"), l),
+        decision: format!("{at} {}: landed {what}", s.coord_seat),
+        at,
     }
-    if !p.has(STEP_DECISION) {
-        let entry = format!("{stamp} {}: {line}", s.coord_seat);
-        hgl_ai_owner::decision_once(bus, &entry)
-            .await
-            .map_err(|e| Error::Invalid(format!("writing decisions.log: {e}")))?;
-        p.mark(STEP_DECISION);
-        progress::write(bus, &t.repo, t.number, &p).await?;
-    }
-    progress::delete(bus, &t.repo, t.number).await
 }
 
 fn with_after(mut body: String, l: &Landing) -> String {

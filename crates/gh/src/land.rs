@@ -372,7 +372,7 @@ async fn settle<G: Gh>(
             );
             resumed.merge_commit = Some(merge.clone());
             eprintln!("{}", resumed.line);
-            let p = p.unwrap_or_else(|| Progress::new(&head, Some(merge)));
+            let p = p.unwrap_or_else(|| Progress::new(&head, Some(merge)).by(o.gate.record_by));
             let (after, what) =
                 after_merge(gh, s, bus, repo, number, &resumed, o, lock, Some(p)).await?;
             Ok((
@@ -478,7 +478,8 @@ pub(crate) async fn after_merge<G: Gh>(
 ) -> Result<(Vec<String>, String)> {
     let merge = outcome.merge_commit.clone().unwrap_or_default();
     let resumed = outcome.kind == Kind::Resumed;
-    let mut p = prog.unwrap_or_else(|| Progress::new(&outcome.head, Some(merge.clone())));
+    let mut p = prog
+        .unwrap_or_else(|| Progress::new(&outcome.head, Some(merge.clone())).by(o.gate.record_by));
     p.merge = Some(merge.clone());
     let merged = format!("{repo} #{number} is merged at {}", short(&merge));
     let mut after = Vec::new();

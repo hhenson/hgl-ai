@@ -85,7 +85,7 @@ async fn write_hold(
 ) -> Result<()> {
     match change {
         HoldChange::Set(v) => {
-            store::put_latest(b, state::KEY_HOLD, v).await?;
+            let v = store::raise_hold(b, v).await?;
             tracing::warn!("GraphQL allowance {} left: hold until {v}", rate.remaining);
         }
         HoldChange::Clear => {
@@ -186,11 +186,10 @@ async fn on_rate_limit<G: Gh>(
     let v = table::hold_on_limit(graphql_reset(gh).await, last_rate, now);
     tracing::warn!("rate limited ({msg}): hold until {v}");
     match bus {
-        Some(b) => {
-            if let Err(e) = store::put_latest(b, state::KEY_HOLD, &v).await {
-                tracing::warn!("writing {}: {e}", state::KEY_HOLD);
-            }
-        }
+        Some(b) => match store::raise_hold(b, &v).await {
+            Ok(held) => return held,
+            Err(e) => tracing::warn!("writing {}: {e}", state::KEY_HOLD),
+        },
         None => {
             let _ = writeln!(out, "rate limited: would hold until {v}");
         }

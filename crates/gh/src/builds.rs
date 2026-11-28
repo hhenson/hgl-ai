@@ -18,6 +18,8 @@ use hgl_ai_proto::build::{
 };
 use hgl_ai_proto::{Seat, utc_now_stamp};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Error, Result};
 
 /// One local build verdict as the gate reads it, for this head on this `main` under the
@@ -41,8 +43,13 @@ pub enum VerdictState {
 pub const MAX_ASKS: u32 = 3;
 
 /// The gate build this command asked for last, for one verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Asked {
+    /// The pull request, in a durable ask's value (its key alone may be ambiguous).
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    pr: u64,
     head: String,
     main: String,
     recipe: u64,
@@ -62,6 +69,10 @@ pub struct GateBuilds {
     /// Who asked, in the summaries.
     pub requester: String,
     asked: Mutex<BTreeMap<String, Asked>>,
+    /// The `HGL_STATE` key prefix each ask is also written under before it is sent, so a
+    /// restarted requester waits for the build it asked for rather than ask again (the
+    /// coordinator, a long-lived service); `None`: this command's memory only.
+    durable: Option<String>,
 }
 
 /// What one verdict needs: the gate's pull request, name, head, `main` and the recipe
@@ -98,7 +109,83 @@ impl GateBuilds {
             sender,
             requester: requester.into(),
             asked: Mutex::new(BTreeMap::new()),
+            durable: None,
         }
+    }
+
+    /// [`GateBuilds::new`] whose asks are kept on the hub under `prefix` too:
+    /// `<prefix><repo>.<pr>.<name>`, JSON of the build asked for last.
+    pub fn durable(sender: Seat, requester: impl Into<String>, prefix: &str) -> GateBuilds {
+        GateBuilds {
+            durable: Some(prefix.to_string()),
+            ..GateBuilds::new(sender, requester)
+        }
+    }
+
+    /// A durable ask's key for `w`, valid or `Err` why not.
+    fn ask_key(&self, w: &Want<'_>) -> Option<std::result::Result<String, String>> {
+        let p = self.durable.as_ref()?;
+        let k = format!("{p}{}.{}.{}", w.repo, w.pr, w.name);
+        Some(
+            hgl_ai_proto::check_state_key(&k)
+                .map(|_| k.clone())
+                .map_err(|_| format!("{k} is not a state key; the ask cannot be kept")),
+        )
+    }
+
+    /// The durable ask for `w`'s slot, into memory when memory has none (a restart).
+    async fn recall(&self, bus: &Bus, w: &Want<'_>) -> Result<()> {
+        let Some(Ok(k)) = self.ask_key(w) else {
+            return Ok(());
+        };
+        if self.slot_held(w) {
+            return Ok(());
+        }
+        let Some(e) = bus.state_get(&k).await? else {
+            return Ok(());
+        };
+        match serde_json::from_str::<Asked>(&e.value) {
+            Ok(a) if a.repo == w.repo && a.pr == w.pr => {
+                self.asked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(w.slot())
+                    .or_insert(a);
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("{k}: unreadable gate build ask ({err})"),
+        }
+        Ok(())
+    }
+
+    fn slot_held(&self, w: &Want<'_>) -> bool {
+        self.asked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&w.slot())
+    }
+
+    /// Forget every ask for `repo#pr`, in memory and on the hub: it landed or closed.
+    pub async fn forget(&self, bus: &Bus, repo: &str, pr: u64) -> Result<()> {
+        let slots = verdict_prefix(repo, pr);
+        self.asked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| !k.starts_with(&slots));
+        let Some(p) = &self.durable else {
+            return Ok(());
+        };
+        for k in bus.state_keys(&format!("{p}{repo}.{pr}.")).await? {
+            let ours = bus
+                .state_get(&k)
+                .await?
+                .and_then(|e| serde_json::from_str::<Asked>(&e.value).ok())
+                .is_some_and(|a| a.repo == repo && a.pr == pr);
+            if ours {
+                bus.state_del(&k).await?;
+            }
+        }
+        Ok(())
     }
 
     /// The build asked for `w`'s exact head, `main` and recipe, if any.
@@ -135,6 +222,11 @@ impl GateBuilds {
         let Some(b) = request::choose(&live, platform, None) else {
             return Ok(Err(format!("no live {platform} builder is registered")));
         };
+        let key = match self.ask_key(w) {
+            Some(Err(why)) => return Ok(Err(why)),
+            Some(Ok(k)) => Some(k),
+            None => None,
+        };
         let id = new_build_id();
         let job = BuildJob {
             v: BUILD_VERSION,
@@ -153,10 +245,9 @@ impl GateBuilds {
             notify: None,
             requester: self.requester.clone(),
         };
-        request::send(bus, self.sender.clone(), &b, &job)
-            .await
-            .map_err(store_err)?;
         let a = Asked {
+            repo: w.repo.to_string(),
+            pr: w.pr,
             head: w.head.to_string(),
             main: w.main.to_string(),
             recipe: w.recipe,
@@ -164,6 +255,19 @@ impl GateBuilds {
             builder: b.label.clone(),
             asks: asks + 1,
         };
+        // Kept before it is sent: a restart after the send finds it and waits for it.
+        if let Some(k) = &key {
+            let text = serde_json::to_string(&a).expect("an ask encodes");
+            crate::store::put_latest(bus, k, &text).await?;
+        }
+        if let Err(e) = request::send(bus, self.sender.clone(), &b, &job).await {
+            if let Some(k) = &key
+                && let Err(d) = bus.state_del(k).await
+            {
+                tracing::warn!("{k}: removing an ask not sent: {d}");
+            }
+            return Err(store_err(e));
+        }
         self.asked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -276,6 +380,7 @@ pub async fn verdict_state(
     };
     let builders = bus.builders().await?;
     let now = utc_now_stamp();
+    builds.recall(bus, &w).await?;
     let asked = builds.asked(&w);
     // Why the build to wait for is lost, and the builder that lost it; `None` with nothing
     // to wait for.
@@ -337,6 +442,11 @@ pub async fn verdict_state(
                         a.id, a.builder
                     )));
                 }
+            }
+            // Kept before the send and no summary: the send never happened (a summary is
+            // written before the job is sent).
+            None if builds.durable.is_some() => {
+                Some((format!("{} was not sent to {}", a.id, a.builder), None))
             }
             // Queued (or its summary not kept): waiting while its builder takes jobs.
             _ if taking(&builders, &a.builder) => {

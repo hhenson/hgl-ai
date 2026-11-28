@@ -29,6 +29,48 @@ pub async fn put_latest(bus: &Bus, key: &str, value: &str) -> Result<u64> {
     Err(last.expect("at least one attempt").into())
 }
 
+/// Set `HGL_STATE/hold` to `value` (a time), compare-and-set, unless a hold already
+/// there holds at least as long: one with no time, or a later one (another writer's, the
+/// controller's or the owner's, is never shortened). Returns the value in effect.
+pub async fn raise_hold(bus: &Bus, value: &str) -> Result<String> {
+    let mut last = None;
+    for attempt in 0..ATTEMPTS {
+        let cur = bus.state_get(crate::state::KEY_HOLD).await?;
+        let rev = cur.as_ref().map(|e| e.revision).unwrap_or(0);
+        if let Some(e) = &cur
+            && holds_as_long(&e.value, value)
+        {
+            return Ok(e.value.trim().to_string());
+        }
+        match bus.state_update(crate::state::KEY_HOLD, value, rev).await {
+            Err(e @ BusError::Conflict { .. }) => {
+                last = Some(e);
+                tokio::time::sleep(backoff(attempt)).await;
+            }
+            other => {
+                other?;
+                return Ok(value.to_string());
+            }
+        }
+    }
+    Err(last.expect("at least one attempt").into())
+}
+
+/// Whether the hold `current` holds at least until `value` does.
+fn holds_as_long(current: &str, value: &str) -> bool {
+    use crate::table::{hold_active, parse_time};
+    let now = chrono::Utc::now();
+    if !hold_active(current, now) {
+        return false;
+    }
+    let first = |v: &str| v.split_whitespace().next().and_then(parse_time);
+    match (first(current), first(value)) {
+        (None, _) => true,
+        (Some(c), Some(v)) => c >= v,
+        (Some(_), None) => false,
+    }
+}
+
 /// Delete `key` only if it still holds `value` (a `hold` another writer renewed stays).
 /// Returns whether it was deleted.
 pub async fn clear_if(bus: &Bus, key: &str, value: &str) -> Result<bool> {
@@ -88,5 +130,19 @@ mod tests {
         assert_eq!(newest_lines("a\nb\n", 2), None);
         assert_eq!(newest_lines("a\nb\nc\n", 2).as_deref(), Some("b\nc\n"));
         assert_eq!(newest_lines("a\n\nb\nc", 1).as_deref(), Some("c\n"));
+    }
+
+    /// Review (r6): the coordinator's hold never shortens another writer's.
+    #[test]
+    fn a_hold_is_only_raised() {
+        let later = "2999-01-01T00:00:00Z";
+        let sooner = "2998-01-01T00:00:00Z";
+        assert!(holds_as_long(later, sooner));
+        assert!(holds_as_long(later, later));
+        assert!(!holds_as_long(sooner, later));
+        assert!(holds_as_long("owner freeze", later), "no time: holds");
+        assert!(holds_as_long(&format!("{later} release"), sooner));
+        assert!(!holds_as_long("2000-01-01T00:00:00Z", later), "passed");
+        assert!(!holds_as_long("", later));
     }
 }

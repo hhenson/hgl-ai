@@ -319,8 +319,18 @@ pub struct Opts {
     pub merge_until: Option<tokio::time::Instant>,
     /// Merge only while the pull request is Ready at the head asked for, by its note
     /// comments (WORK-6, [`crate::bot::ready_mark`]): the coordinator's landings, which
-    /// chose it by that.
+    /// chose it by that. Read again right before the merge call, with the pull request:
+    /// a later `Sent back` or `Blocked`, or another head, stops it.
     pub ready_at_head: bool,
+    /// Merge only on the local build verdicts (BUILD-15) for the head on the present
+    /// `main`: a repository that names none is refused, whatever its checks say (the
+    /// coordinator's landings, hgl-ai#123).
+    pub require_verdicts: bool,
+    /// Read `HGL_STATE/hold` again right before the merge call, and do not merge while it
+    /// holds (or when it cannot be read).
+    pub hold_at_merge: bool,
+    /// Who the landing record is written for ([`Progress::by`]); `None`: the controller.
+    pub record_by: Option<&'static str>,
 }
 
 /// The last word of a gate line.
@@ -338,6 +348,7 @@ pub enum Kind {
     BotLimit,
     Behind,
     /// `gh land`: `HGL_STATE/hold` was still active at the deadline; the gate did not run.
+    /// [`Opts::hold_at_merge`]: a hold read right before the merge call; nothing merged.
     Hold,
     /// Dry run: the gate is satisfied and it would merge.
     WouldMerge,
@@ -425,6 +436,24 @@ macro_rules! need {
 }
 
 /// The gate's decision over what is known so far.
+/// Whether the note comments leave the pull request Ready at `asked` (WORK-6): the latest
+/// note is `Ready` or `Approved` and a `Ready` at `asked` stands. `Err` says why not.
+pub fn ready_standing(comments: &[Comment], asked: &str) -> std::result::Result<(), String> {
+    let note = crate::bot::note_state(comments);
+    let standing = matches!(
+        note,
+        Some(crate::bot::NoteState::Ready | crate::bot::NoteState::Approved)
+    ) && crate::bot::ready_mark(comments, asked).at.is_some();
+    if standing {
+        return Ok(());
+    }
+    let latest = note.map_or("none".to_string(), |n| format!("{n:?}"));
+    Err(format!(
+        "not Ready at {} (latest note: {latest})",
+        short(asked)
+    ))
+}
+
 pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts) -> Step {
     let pr = &f.pr;
     let head = pr.head.as_str();
@@ -460,19 +489,15 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
     }
     if opts.ready_at_head {
         let comments = need!(f.comments, Need::BotComments);
-        let note = crate::bot::note_state(comments);
-        let standing = matches!(
-            note,
-            Some(crate::bot::NoteState::Ready | crate::bot::NoteState::Approved)
-        ) && crate::bot::ready_mark(comments, asked).at.is_some();
-        if !standing {
-            let latest = note.map_or("none".to_string(), |n| format!("{n:?}"));
-            let line = format!(
-                "{prefix} not Ready at {} (latest note: {latest}) BLOCKED",
-                short(asked)
-            );
-            return done(Kind::Blocked, line, false);
+        if let Err(why) = ready_standing(comments, asked) {
+            return done(Kind::Blocked, format!("{prefix} {why} BLOCKED"), false);
         }
+    }
+    if opts.require_verdicts && rules.verdicts.is_empty() {
+        let line = format!(
+            "{prefix} names no local build verdict: a merge needs a builder's verdict for the head on main BLOCKED"
+        );
+        return done(Kind::Blocked, line, false);
     }
     let unresolved = *need!(f.unresolved, Need::Unresolved);
     let mut behind = *need!(f.behind, Need::Behind);
@@ -1057,6 +1082,72 @@ async fn fill<G: Gh>(
     Ok(())
 }
 
+/// Right before the merge call, what [`Opts::ready_at_head`] and [`Opts::hold_at_merge`]
+/// ask read again: the pull request still open at `head`, still Ready at `asked`, and no
+/// `hold`. `Some` is the outcome that stops the merge; any doubt stops it.
+#[allow(clippy::too_many_arguments)]
+async fn before_merge<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: Option<&Bus>,
+    repo: &str,
+    number: u64,
+    asked: &str,
+    head: &str,
+    line: &str,
+    opts: &Opts,
+) -> Result<Option<Outcome>> {
+    let stop = |kind: Kind, why: String, retry: bool| {
+        Some(Outcome::new(
+            kind,
+            format!("{line} {why} {}", kind.word()),
+            retry,
+            head,
+        ))
+    };
+    if opts.ready_at_head {
+        let pr = fetch_pr(gh, s, repo, number).await?;
+        if pr.merged || pr.state != "open" || pr.head != head {
+            let why = format!(
+                "at the merge: {} at {}, not open at {}",
+                if pr.merged {
+                    "merged"
+                } else {
+                    pr.state.as_str()
+                },
+                short(&pr.head),
+                short(head)
+            );
+            return Ok(stop(Kind::Blocked, why, false));
+        }
+        let r = s.full(repo);
+        let list = exec::get_list(
+            gh,
+            &format!("repos/{r}/issues/{number}/comments?per_page=100"),
+        )
+        .await?;
+        let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
+        if let Err(why) = ready_standing(&comments, asked) {
+            return Ok(stop(Kind::Blocked, format!("at the merge: {why}"), false));
+        }
+    }
+    if opts.hold_at_merge {
+        let Some(b) = bus else {
+            return Ok(stop(Kind::Hold, format!("{NO_HUB}: hold unknown"), true));
+        };
+        if let Some(h) = b.state_get(crate::state::KEY_HOLD).await?
+            && crate::table::hold_active(&h.value, chrono::Utc::now())
+        {
+            return Ok(stop(
+                Kind::Hold,
+                format!("at the merge: hold until {}", h.value.trim()),
+                true,
+            ));
+        }
+    }
+    Ok(None)
+}
+
 /// Run the gate on `repo#number` for the head `asked`. With `act`, bring the branch up to
 /// date or merge where the gate says so, and ask `builds` for the local build verdicts it
 /// lacks; without, say what it would do. Under a landing lock, the lock is confirmed ours
@@ -1121,12 +1212,18 @@ pub async fn evaluate<G: Gh>(
                 });
             }
             Step::Merge(line) => {
+                if let Some(o) =
+                    before_merge(gh, s, bus, repo, number, asked, &f.pr.head, &line, opts).await?
+                {
+                    return Ok(o);
+                }
                 if let Some(l) = lock {
                     l.confirm(&format!("merging {repo} #{number}")).await?;
                 }
                 // The intent first: a failure from here on leaves a record a retry resumes.
                 if let Some(b) = bus {
-                    progress::write(b, repo, number, &Progress::new(&f.pr.head, None)).await?;
+                    let p = Progress::new(&f.pr.head, None).by(opts.record_by);
+                    progress::write(b, repo, number, &p).await?;
                 }
                 // The lease as it is now, just confirmed: not as it was when the landing began.
                 let lease = match (lock, bus) {
@@ -1147,7 +1244,7 @@ pub async fn evaluate<G: Gh>(
                 if after.merged {
                     let m = after.merge_commit.clone().unwrap_or_default();
                     if let Some(b) = bus {
-                        let p = Progress::new(&f.pr.head, Some(m.clone()));
+                        let p = Progress::new(&f.pr.head, Some(m.clone())).by(opts.record_by);
                         progress::write(b, repo, number, &p).await?;
                     }
                     let mut o = Outcome::new(
@@ -1321,6 +1418,36 @@ mod tests {
         assert!(matches!(
             decide(&f, REPO, HEAD, &rules(), &Opts::default()),
             Step::Merge(_)
+        ));
+    }
+
+    /// The coordinator's landings (hgl-ai#123, r6): a repository that names no local build
+    /// verdict is refused, whatever its checks; one that names them needs them.
+    #[test]
+    fn coordinator_needs_a_build_verdict() {
+        let opts = Opts {
+            require_verdicts: true,
+            ..Opts::default()
+        };
+        let f = allowed();
+        let mut r = rules();
+        r.verdicts.clear();
+        let o = outcome(&f, &r, &opts);
+        assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+        assert!(
+            o.line.contains("names no local build verdict"),
+            "{}",
+            o.line
+        );
+        assert!(!o.retry);
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &r, &Opts::default()),
+            Step::Merge(_)
+        ));
+        r.verdicts = vec!["linux".into()];
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &r, &opts),
+            Step::Need(Need::Verdicts)
         ));
     }
 
