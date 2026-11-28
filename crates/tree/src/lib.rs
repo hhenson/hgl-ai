@@ -123,11 +123,29 @@ pub struct TaskFile {
     /// (PROTO-21): verdicts go to the task's tree with the newest.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub handoff_seq: Option<u64>,
-    /// Implementor trees: the commit the tree's index and files were last brought to, at
-    /// its creation, the end of a turn, or a refresh (hgl-ai#55). Another tree of this host
-    /// sharing the branch can move the ref under them; [`Trees::refresh_branch`] catches up.
+    /// Implementor trees: the tree's own local branch when it is not `branch`, the remote
+    /// branch it pushes to (`<branch>@<seat>`, hgl-ai#55). Two trees of a host never share a
+    /// local branch, so only a tree's own actions move its HEAD.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub checkout: Option<String>,
+    pub local_branch: Option<String>,
+}
+
+impl TaskFile {
+    /// The local branch checked out in an implementor tree.
+    pub fn local(&self) -> Option<&str> {
+        self.local_branch.as_deref().or(self.branch.as_deref())
+    }
+}
+
+/// What [`Trees::refresh_branch`] found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Refresh {
+    /// At the pushed branch, ahead of it, or never pushed.
+    Current,
+    /// Fast-forwarded to this pushed commit.
+    Forwarded(String),
+    /// Cannot be brought to the pushed branch without losing work: why, and the files.
+    Blocked { why: String, files: Vec<String> },
 }
 
 impl TaskFile {
@@ -381,7 +399,9 @@ impl Trees {
         let prefix = &self.github.branch_prefix;
         let from_note = slug::branch_name(prefix, task.issue, &slug::note_slug(note_line));
         let starts = slug::branch_starts(prefix, task.issue);
-        let ours = |h: &&String| starts.iter().any(|p| h.starts_with(p.as_str()));
+        // A tree's own local branch (`<branch>@<seat>`) is never the task's branch.
+        let ours =
+            |h: &&String| !h.contains('@') && starts.iter().any(|p| h.starts_with(p.as_str()));
         // The task's branch: on the remote (a sendback, a resumed or moved task), else one
         // made on this host and not pushed yet, else a new one. Of several, the note's name.
         let pick = |names: &[String]| {
@@ -404,16 +424,54 @@ impl Trees {
         let local = locals.contains(&branch);
         let base_ref = self.resolve_base(clone, base)?;
         let src_os = src.as_os_str();
-        if local {
-            // Another seat of this host may still have the branch checked out (the task
-            // moved to this seat, ROLE-15): share it rather than fail.
-            let mut args: Vec<&std::ffi::OsStr> = vec!["worktree".as_ref(), "add".as_ref()];
-            if let Some(other) = self.checked_out_at(clone, &branch)? {
-                tracing::warn!(%branch, other = %other.display(), "the branch is checked out in another tree of this host; sharing it");
-                args.push("--force".as_ref());
+        let other = if local {
+            self.checked_out_at(clone, &branch)?
+        } else {
+            None
+        };
+        let mut local_branch = None;
+        if let Some(other) = other {
+            // Another tree of this host has the branch checked out (the task moved to this
+            // seat, ROLE-15): this one takes a local branch of its own, so neither moves the
+            // other's HEAD (hgl-ai#55). It starts from the pushed branch when that has the
+            // other's commits, else from the other's (its unpushed work follows), and pushes
+            // to the task's branch.
+            let own = format!("{branch}@{seat}");
+            tracing::info!(%branch, %own, other = %other.display(), "the branch is checked out in another tree of this host; taking a local branch of its own");
+            if !locals.contains(&own) {
+                let tracking = format!("refs/remotes/origin/{branch}");
+                let pushed = on_remote.is_some()
+                    && self.has_commit(clone, &tracking)?
+                    && self
+                        .git
+                        .check(clone, ["merge-base", "--is-ancestor", &branch, &tracking])?;
+                let from = if pushed {
+                    tracking.as_str()
+                } else {
+                    branch.as_str()
+                };
+                self.git.run(clone, ["branch", "--no-track", &own, from])?;
+                if on_remote.is_some() {
+                    self.git.run(
+                        clone,
+                        [
+                            "branch",
+                            &format!("--set-upstream-to=origin/{branch}"),
+                            &own,
+                        ],
+                    )?;
+                }
             }
-            args.extend([src_os, branch.as_ref()]);
-            self.git.run(clone, args)?;
+            self.git.run(
+                clone,
+                ["worktree".as_ref(), "add".as_ref(), src_os, own.as_ref()],
+            )?;
+            local_branch = Some(own);
+        } else if local {
+            self.git.run(
+                clone,
+                ["worktree".as_ref(), "add".as_ref(), src_os, branch.as_ref()],
+            )?;
         } else if on_remote.is_some() {
             // A sendback or a resumed task: continue the pushed branch.
             let tracking = format!("origin/{branch}");
@@ -460,7 +518,7 @@ impl Trees {
             branch: Some(branch),
             base: base_ref,
             main,
-            checkout: Some(start.clone()),
+            local_branch,
             start,
             created_at: hgl_ai_proto::utc_now_stamp(),
             conflicts: Vec::new(),
@@ -556,7 +614,7 @@ impl Trees {
             class: None,
             class_seq: None,
             handoff_seq: None,
-            checkout: None,
+            local_branch: None,
         })
     }
 
@@ -597,7 +655,7 @@ impl Trees {
         let branch = file.as_ref().and_then(|f| f.branch.clone());
         if let Some(clone) = &clone {
             let _ = self.git.output(clone, ["worktree", "prune"])?;
-            if let Some(b) = &branch {
+            if let Some(b) = file.as_ref().and_then(|f| f.local()) {
                 let _ = self.git.output(clone, ["branch", "-D", b])?;
             }
         }
@@ -760,36 +818,18 @@ impl Trees {
         }
     }
 
-    /// Bring a kept implementor tree to its branch's newest commit (hgl-ai#55), keeping its
-    /// uncommitted changes: a seat the task moved to in between may have committed on it.
-    /// First, a branch that another tree of this host moved under this one (the two share
-    /// the ref) since [`TaskFile::checkout`] (else `start`): a two-way `read-tree -m -u` from
-    /// that commit to HEAD, which takes the other tree's files and refuses to overwrite a
-    /// change of this one. Then the pushed branch, fetched: a fast-forward when the tree is
-    /// behind; a branch never pushed, or one that has diverged, is left. Records the commit
-    /// reached in `f.checkout` and returns it when the index or files moved; an error leaves
-    /// `checkout` as it was.
-    pub fn refresh_branch(&self, dir: &Path, f: &mut TaskFile) -> Result<Option<String>> {
-        let Some(branch) = f.branch.clone().filter(|_| !f.review) else {
-            return Ok(None);
+    /// Bring a kept implementor tree to its pushed branch (hgl-ai#55): a seat the task moved
+    /// to in between may have pushed. Its own local branch is fast-forwarded when behind,
+    /// keeping uncommitted changes. When a change of the tree's own is in a file the pushed
+    /// commits change, or the branch has diverged from the pushed one, it is left as it is
+    /// and `Blocked`: a turn would run on a stale tree.
+    pub fn refresh_branch(&self, dir: &Path, f: &TaskFile) -> Result<Refresh> {
+        let Some(branch) = f.branch.as_deref().filter(|_| !f.review) else {
+            return Ok(Refresh::Current);
         };
         let src = dir.join("src");
         // A git killed in an earlier turn may have left its lock behind.
         clear_stale_index_lock(&src);
-        let head = self.rev(&src, "HEAD")?;
-        let old = f.checkout.clone().unwrap_or_else(|| f.start.clone());
-        let mut moved = false;
-        if old != head {
-            let index = |t: &Self| {
-                t.git
-                    .run(&src, ["write-tree"])
-                    .map(|o| o.trim().to_string())
-            };
-            let before = index(self)?;
-            self.git
-                .run(&src, ["read-tree", "-m", "-u", old.as_str(), head.as_str()])?;
-            moved = index(self)? != before;
-        }
         let tracking = format!("refs/remotes/origin/{branch}");
         let fetched = {
             let _g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -804,36 +844,57 @@ impl Trees {
                 ],
             )?
         };
-        if fetched.ok {
-            let pushed = self.rev(&src, &tracking)?;
-            if pushed != head
-                && self
-                    .git
-                    .check(&src, ["merge-base", "--is-ancestor", &head, &pushed])?
-            {
-                self.git
-                    .run(&src, ["merge", "--ff-only", "--quiet", &pushed])?;
-                moved = true;
-            }
+        if !fetched.ok {
+            // Not pushed (the clone's own fetch has reached origin).
+            return Ok(Refresh::Current);
         }
-        let now = self.rev(&src, "HEAD")?;
-        f.checkout = Some(now.clone());
-        Ok(moved.then_some(now))
-    }
-
-    /// Record in `task.json` the commit an implementor tree's index and files are at after a
-    /// turn ([`TaskFile::checkout`]).
-    pub fn note_checkout(&self, dir: &Path) -> Result<()> {
-        let mut f = read_task(dir)?;
-        if f.review || f.branch.is_none() {
-            return Ok(());
+        let (head, pushed) = (self.rev(&src, "HEAD")?, self.rev(&src, &tracking)?);
+        let is_ancestor =
+            |a: &str, b: &str| self.git.check(&src, ["merge-base", "--is-ancestor", a, b]);
+        if head == pushed || is_ancestor(&pushed, &head)? {
+            return Ok(Refresh::Current);
         }
-        let head = self.rev(&dir.join("src"), "HEAD")?;
-        if f.checkout.as_deref() != Some(head.as_str()) {
-            f.checkout = Some(head);
-            write_task(dir, &f)?;
+        let changed = |from: &str, to: &str| -> Result<Vec<String>> {
+            let out = self
+                .git
+                .run(&src, ["diff", "--name-only", "--no-renames", from, to])?;
+            Ok(out.lines().map(str::to_string).collect())
+        };
+        let theirs = changed(&head, &pushed)?;
+        if !is_ancestor(&head, &pushed)? {
+            let base = self
+                .git
+                .run(&src, ["merge-base", &head, &pushed])?
+                .trim()
+                .to_string();
+            let (ours, theirs) = (changed(&base, &head)?, changed(&base, &pushed)?);
+            return Ok(Refresh::Blocked {
+                why: format!(
+                    "branch {} has diverged from origin/{branch}",
+                    f.local().unwrap_or(branch)
+                ),
+                files: ours.into_iter().filter(|p| theirs.contains(p)).collect(),
+            });
         }
-        Ok(())
+        let status = self
+            .git
+            .run(&src, ["status", "--porcelain", "--no-renames", "-z"])?;
+        let dirty: Vec<String> = status
+            .split('\0')
+            .filter_map(|e| e.get(3..))
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect();
+        let files: Vec<String> = theirs.into_iter().filter(|p| dirty.contains(p)).collect();
+        if !files.is_empty() {
+            return Ok(Refresh::Blocked {
+                why: format!("uncommitted changes in files the pushed origin/{branch} changes"),
+                files,
+            });
+        }
+        self.git
+            .run(&src, ["merge", "--ff-only", "--quiet", &pushed])?;
+        Ok(Refresh::Forwarded(pushed))
     }
 
     /// `<work_root>/clones/<repo>`: a bare repository with `origin`, fetched now.

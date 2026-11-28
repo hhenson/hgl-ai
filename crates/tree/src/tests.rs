@@ -474,6 +474,9 @@ fn a_task_moved_to_another_seat_of_the_host_keeps_its_branch() {
         w1.dir.join("src/w2.txt").exists(),
         "the unpushed work follows"
     );
+    // hgl-ai#55: the second tree has a local branch of its own, pushing to the task's.
+    assert_eq!(w1.file.local(), Some("codex/q3-three@w1"));
+    assert_eq!(w2.file.local(), Some("codex/q3-three"));
     // The first seat's removal leaves the branch the second still uses.
     e.trees.remove(&seat("w2"), &task(3), false).unwrap();
     assert_eq!(
@@ -481,8 +484,13 @@ fn a_task_moved_to_another_seat_of_the_host_keeps_its_branch() {
             .run(&w1.dir.join("src"), ["branch", "--show-current"])
             .unwrap()
             .trim(),
-        "codex/q3-three"
+        "codex/q3-three@w1"
     );
+    let clone = e.root.join("work/clones/demo");
+    let heads = e.trees.local_heads(&clone).unwrap();
+    assert_eq!(heads, ["codex/q3-three@w1"], "w2's went with it");
+    e.trees.remove(&seat("w1"), &task(3), false).unwrap();
+    assert!(e.trees.local_heads(&clone).unwrap().is_empty());
 }
 
 /// Carbon's check 7c: branches named as docs/work.md says (`codex/q<issue>-<short-name>`)
@@ -608,8 +616,26 @@ fn status(e: &Env, src: &Path) -> String {
     e.git.run(src, ["status", "--porcelain"]).unwrap()
 }
 
+fn head(e: &Env, src: &Path) -> String {
+    e.git
+        .run(src, ["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string()
+}
+
+fn push(e: &Env, src: &Path, branch: &str) {
+    e.git
+        .run(
+            src,
+            ["push", "--quiet", "origin", &format!("HEAD:{branch}")],
+        )
+        .unwrap();
+}
+
 /// hgl-ai#55: a kept tree takes the commits the seat the task moved to pushed in between,
-/// from another clone; a branch never pushed, or one that has diverged, is left as it is.
+/// from another clone, keeping its own changes; a branch never pushed, or ahead, is left;
+/// one that has diverged is blocked, naming the files both sides changed.
 #[test]
 fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
     let e = env();
@@ -617,38 +643,13 @@ fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
         .trees
         .create(&seat("w1"), &task(55), &implement("Kept"))
         .unwrap();
-    let mut f = c.file.clone();
-    assert_eq!(
-        f.checkout.as_deref(),
-        Some(f.start.as_str()),
-        "made at start"
-    );
+    let f = c.file.clone();
     let src = c.dir.join("src");
-    let head = |p: &Path| {
-        e.git
-            .run(p, ["rev-parse", "HEAD"])
-            .unwrap()
-            .trim()
-            .to_string()
-    };
-    assert_eq!(
-        e.trees.refresh_branch(&c.dir, &mut f).unwrap(),
-        None,
-        "not pushed"
-    );
+    let refresh = || e.trees.refresh_branch(&c.dir, &f).unwrap();
+    assert_eq!(refresh(), Refresh::Current, "not pushed");
     let branch = f.branch.clone().unwrap();
     commit(&e.git, &src, "w1.txt", "w1\n", "w1's work");
-    e.git
-        .run(
-            &src,
-            ["push", "--quiet", "origin", &format!("HEAD:{branch}")],
-        )
-        .unwrap();
-    // The turn's end records where it left the files.
-    write_task(&c.dir, &f).unwrap();
-    e.trees.note_checkout(&c.dir).unwrap();
-    let mut f = read_task(&c.dir).unwrap();
-    assert_eq!(f.checkout, Some(head(&src)));
+    push(&e, &src, &branch);
     // The interim seat, in another clone, pushes on the same branch.
     e.git.run(&e.seed, ["fetch", "--quiet", "origin"]).unwrap();
     e.git
@@ -667,99 +668,134 @@ fn a_kept_tree_fast_forwards_to_its_pushed_branch() {
     e.git
         .run(&e.seed, ["push", "--quiet", "origin", &branch])
         .unwrap();
-    // An uncommitted change of w1's own is kept.
+    // Changes of w1's own in other files are kept.
     std::fs::write(src.join("mine.txt"), "mine\n").unwrap();
-    assert_eq!(
-        e.trees.refresh_branch(&c.dir, &mut f).unwrap(),
-        Some(theirs.clone())
-    );
-    assert_eq!(
-        (head(&src), f.checkout.clone()),
-        (theirs.clone(), Some(theirs.clone()))
-    );
+    std::fs::write(src.join("w1.txt"), "w1, uncommitted\n").unwrap();
+    assert_eq!(refresh(), Refresh::Forwarded(theirs.clone()));
+    assert_eq!(head(&e, &src), theirs);
     assert_eq!(std::fs::read_to_string(src.join("w2.txt")).unwrap(), "w2\n");
-    assert_eq!(status(&e, &src), "?? mine.txt\n");
+    assert_eq!(status(&e, &src), " M w1.txt\n?? mine.txt\n");
+    e.git.run(&src, ["checkout", "--", "w1.txt"]).unwrap();
     std::fs::remove_file(src.join("mine.txt")).unwrap();
-    assert_eq!(
-        e.trees.refresh_branch(&c.dir, &mut f).unwrap(),
-        None,
-        "up to date"
-    );
-    // Diverged: both sides commit; the tree keeps its own.
+    assert_eq!(refresh(), Refresh::Current, "up to date");
     let ours = commit(&e.git, &src, "w1b.txt", "w1b\n", "w1 again");
-    commit(&e.git, &e.seed, "w2b.txt", "w2b\n", "w2 again");
+    assert_eq!(
+        refresh(),
+        Refresh::Current,
+        "ahead: unpushed work of its own"
+    );
+    // Diverged: both sides commit; the tree keeps its own and is blocked.
+    commit(&e.git, &e.seed, "w1b.txt", "w2b\n", "w2 again");
     e.git
         .run(&e.seed, ["push", "--quiet", "origin", &branch])
         .unwrap();
-    assert_eq!(
-        e.trees.refresh_branch(&c.dir, &mut f).unwrap(),
-        None,
-        "diverged"
-    );
-    assert_eq!(head(&src), ours);
+    match refresh() {
+        Refresh::Blocked { why, files } => {
+            assert!(why.contains("diverged"), "{why}");
+            assert_eq!(files, ["w1b.txt"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(head(&e, &src), ours);
     assert_eq!(status(&e, &src), "");
 }
 
-/// r1's major 1 on PR 75: two seats of one host share the branch's ref, so the other
-/// seat's commit moves it under the kept tree. Its index and files catch up, with nothing
-/// staged that would revert that commit, and its own uncommitted changes are kept; a change
-/// the catch-up would overwrite stops it, and the tree is left as it was.
+/// The controller's decision on PR 75: two trees of one host never share a local branch.
+/// Each moves only by its own actions; the kept one fast-forwards to what the other pushed,
+/// files and index, and a change of its own the pushed commits would overwrite blocks it.
 #[test]
-fn a_kept_tree_catches_up_with_a_ref_another_tree_of_its_host_moved() {
+fn trees_of_one_host_have_branches_of_their_own() {
     let e = env();
     let w1 = e
         .trees
         .create(&seat("w1"), &task(56), &implement("Shared"))
         .unwrap();
     let src1 = w1.dir.join("src");
+    let branch = w1.file.branch.clone().unwrap();
     commit(&e.git, &src1, "a.txt", "w1\n", "w1's work");
-    e.trees.note_checkout(&w1.dir).unwrap();
+    push(&e, &src1, &branch);
     let w2 = e
         .trees
         .create(&seat("w2"), &task(56), &implement("Shared"))
         .unwrap();
     let src2 = w2.dir.join("src");
-    std::fs::write(src1.join("mine.txt"), "mine\n").unwrap();
-    std::fs::write(src1.join("a.txt"), "w1, uncommitted\n").unwrap();
+    let own = format!("{branch}@w2");
+    assert_eq!(
+        (w2.file.branch.as_deref(), w2.file.local()),
+        (Some(branch.as_str()), Some(own.as_str()))
+    );
+    assert_eq!(head(&e, &src2), head(&e, &src1), "from the pushed branch");
+    assert_eq!(
+        e.git
+            .run(&src2, ["rev-parse", "--abbrev-ref", "@{u}"])
+            .unwrap()
+            .trim(),
+        format!("origin/{branch}")
+    );
+    // Both commit; neither moves the other.
+    let w1_head = commit(&e.git, &src1, "c.txt", "w1 local\n", "w1 local");
     let theirs = commit(&e.git, &src2, "b.txt", "w2\n", "w2's work");
+    assert_eq!(head(&e, &src1), w1_head);
     assert_eq!(
-        e.git.run(&src1, ["rev-parse", "HEAD"]).unwrap().trim(),
-        theirs,
-        "the ref moved under w1"
+        (status(&e, &src1), status(&e, &src2)),
+        (String::new(), String::new())
     );
-    assert!(
-        status(&e, &src1).contains("D  b.txt"),
-        "a staged revert, before"
-    );
-    let mut f = read_task(&w1.dir).unwrap();
+    e.git
+        .run(&src1, ["reset", "--quiet", "--hard", "HEAD~"])
+        .unwrap();
+    push(&e, &src2, &branch);
+    std::fs::write(src1.join("mine.txt"), "mine\n").unwrap();
     assert_eq!(
-        e.trees.refresh_branch(&w1.dir, &mut f).unwrap(),
-        Some(theirs.clone())
+        e.trees.refresh_branch(&w1.dir, &w1.file).unwrap(),
+        Refresh::Forwarded(theirs.clone())
     );
-    assert_eq!(f.checkout.as_deref(), Some(theirs.as_str()));
+    assert_eq!(head(&e, &src1), theirs);
     assert_eq!(std::fs::read_to_string(src1.join("b.txt")).unwrap(), "w2\n");
-    assert_eq!(
-        status(&e, &src1),
-        " M a.txt\n?? mine.txt\n",
-        "only w1's own changes"
-    );
-    e.git.run(&src1, ["checkout", "--", "a.txt"]).unwrap();
+    assert_eq!(status(&e, &src1), "?? mine.txt\n", "only w1's own change");
     std::fs::remove_file(src1.join("mine.txt")).unwrap();
-    assert_eq!(status(&e, &src1), "");
-    write_task(&w1.dir, &f).unwrap();
 
-    // w2 changes a file w1 has an uncommitted change in: no catch-up, nothing lost.
+    // w2 pushes a change to a file w1 has an uncommitted change in: blocked, nothing lost.
     std::fs::write(src1.join("b.txt"), "w1's own\n").unwrap();
     commit(&e.git, &src2, "b.txt", "w2 again\n", "w2 again");
-    let mut f = read_task(&w1.dir).unwrap();
-    assert!(e.trees.refresh_branch(&w1.dir, &mut f).is_err());
-    assert_eq!(
-        f.checkout.as_deref(),
-        Some(theirs.as_str()),
-        "left as it was"
-    );
+    push(&e, &src2, &branch);
+    match e.trees.refresh_branch(&w1.dir, &w1.file).unwrap() {
+        Refresh::Blocked { why, files } => {
+            assert!(why.contains("uncommitted"), "{why}");
+            assert_eq!(files, ["b.txt"]);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(head(&e, &src1), theirs, "left as it was");
     assert_eq!(
         std::fs::read_to_string(src1.join("b.txt")).unwrap(),
         "w1's own\n"
     );
+}
+
+/// #47's branch reuse never takes a tree's own `<branch>@<seat>` for the task's branch,
+/// even one pushed by mistake.
+#[test]
+fn a_seats_own_branch_is_not_the_tasks() {
+    let e = env();
+    e.git
+        .run(
+            &e.seed,
+            [
+                "push",
+                "--quiet",
+                "origin",
+                "HEAD:refs/heads/codex/q57-old@w2",
+            ],
+        )
+        .unwrap();
+    let c = e
+        .trees
+        .create(
+            &seat("w1"),
+            &task(57),
+            &implement("[claude] Assign: demo#57 New"),
+        )
+        .unwrap();
+    assert_eq!(c.file.branch.as_deref(), Some("codex/q57-new"));
+    assert_eq!(c.file.local_branch, None);
 }

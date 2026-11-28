@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hgl_ai_proto::{Kind, Note, Role, TaskClass, TaskKey, TreeRecord};
-use hgl_ai_tree::{Create, TASK_FILE};
+use hgl_ai_tree::{Create, Refresh, TASK_FILE};
 use tokio::sync::watch;
 
 use crate::adapter::{self, Parser, TurnInput};
@@ -406,6 +406,10 @@ pub enum Outcome {
     /// Stopped because its task ended.
     Stopped,
     Shutdown,
+    /// The tree cannot be brought to the task's pushed branch without losing work
+    /// (hgl-ai#55): the notes are held as for `PrepFailed`, and the controller told once
+    /// with a `blocked` note.
+    Blocked(String),
     /// Another process holds the turn lock (who, as far as known).
     Busy(String),
     PrepFailed(String),
@@ -569,7 +573,7 @@ impl<B: BusApi> Bridge<B> {
                 // class is in that tree's record (PROTO-21). With the note that made it.
                 let mut start: Option<(Classed, Option<u64>)> = None;
                 let mut made = false;
-                let mut file = match &job.create {
+                let file = match &job.create {
                     Some((seq, c)) => {
                         let trees = self.trees.clone();
                         let (s, t, c, seq) = (name.clone(), task.clone(), c.clone(), *seq);
@@ -634,28 +638,29 @@ impl<B: BusApi> Bridge<B> {
                         task,
                         &newer,
                     ));
-                    let (trees, d, mut f) = (self.trees.clone(), dir.clone(), file.clone());
-                    match tokio::task::spawn_blocking(move || {
-                        let r = trees.refresh_branch(&d, &mut f);
-                        (f, r)
-                    })
-                    .await
-                    {
-                        Ok((f, r)) => {
-                            file = f;
-                            match r {
-                                Ok(Some(head)) => {
-                                    tracing::info!(seat = %name, %task, %head, "brought to the branch's newest commit");
-                                }
-                                Ok(None) => {}
-                                Err(e) => {
-                                    tracing::warn!(seat = %name, %task, "bringing the tree to its branch: {e}")
-                                }
-                            }
+                    // Never a turn on a stale tree: one that cannot be brought to the pushed
+                    // branch holds its notes and tells the controller.
+                    let (trees, d, f) = (self.trees.clone(), dir.clone(), file.clone());
+                    match tokio::task::spawn_blocking(move || trees.refresh_branch(&d, &f)).await {
+                        Ok(Ok(Refresh::Current)) => {}
+                        Ok(Ok(Refresh::Forwarded(head))) => {
+                            tracing::info!(seat = %name, %task, %head, "fast-forwarded to the pushed branch");
                         }
-                        Err(e) => {
-                            tracing::warn!(seat = %name, %task, "bringing the tree to its branch: {e}")
+                        Ok(Ok(Refresh::Blocked { why, files })) => {
+                            return Outcome::Blocked(format!(
+                                "{} cannot be brought to its pushed branch: {why} ({})",
+                                dir.display(),
+                                if files.is_empty() {
+                                    "no file changed on both sides".to_string()
+                                } else {
+                                    files.join(", ")
+                                }
+                            ));
                         }
+                        Ok(Err(e)) => {
+                            return Outcome::PrepFailed(format!("fetching the branch: {e}"));
+                        }
+                        Err(e) => return Outcome::PrepFailed(e.to_string()),
                     }
                 }
                 (dir, held, Some(file), start)
@@ -811,15 +816,6 @@ impl<B: BusApi> Bridge<B> {
             && let Err(e) = save_session(&dir, r.runtime.as_str(), id)
         {
             tracing::warn!(dir = %dir.display(), "saving the session id: {e}");
-        }
-        // Where the turn left the files, so a later one sees a ref moved under them (hgl-ai#55).
-        if let Target::Tree { review: false, .. } = &job.target {
-            let (trees, d) = (self.trees.clone(), dir.clone());
-            match tokio::task::spawn_blocking(move || trees.note_checkout(&d)).await {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => tracing::warn!(dir = %dir.display(), "recording the checkout: {e}"),
-                Err(e) => tracing::warn!(dir = %dir.display(), "recording the checkout: {e}"),
-            }
         }
         if !run.reaped {
             tracing::error!(seat = %name, "a process of the turn survived; the turn lock stays held by it");
