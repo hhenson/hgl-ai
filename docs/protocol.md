@@ -104,10 +104,11 @@ before hub users takes one shared token until it moves.
     the system's limit) is not retried: the bridge sends `term` and tells the
     controller which notes it dropped.
   - At shutdown or a lost lease, held and running notes are naked (handed back).
-- **PROTO-9 — Idempotent sends.** Each note carries a `Nats-Msg-Id` of
+- **PROTO-9 — Idempotent sends.** Notes normally carry a `Nats-Msg-Id` of
   `<sender>-<created_at>-<sha256(envelope)[0:12]>` over recipient, kind, repo,
   issue, head, base and body (and `by` and `class` when set), so a retried send is
-  dropped and no other note is.
+  dropped and no other note is. Coordinator PR alerts use the comparison
+  table revision, repository, PR, head and finding as their message ID.
 
 ## 4. Notes
 
@@ -309,7 +310,7 @@ before hub users takes one shared token until it moves.
 | `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted. Read from the notes stream every 10 s; written when it changes. |
 | `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
-| `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
+| `coord.alerts` | coordinator service | JSON array of pending alert notes and delivery metadata, saved before `prs` advances. Retries run during holds and GitHub read failures. The queue retains at most 100 entries within the state byte limit and reports oldest-entry drops. Five failed sends replace an alert with a dead-letter note for the controller. |
 | `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
@@ -343,11 +344,18 @@ Each step after the merge (`landed.log`, `main`, the `landed` notes, the comment
 then, for `gh land`, the pins) is recorded in `landing.<repo>.<pr>` as it is done.
 The same command run again finds the pull request merged and does only the steps
 not done: no second `landed.log` line, the notes with their first `created_at`, no
-second comment. It reports success only when all are done; pins that did not land
-give `PARTIAL` (exit 3). A pull request found merged with neither a record nor a
-`landed.log` line has every step done then. `main` is written only whole: a failed
-read is tried three times, then the landing fails; a repository with no `main`
-(HTTP 404) is left out with a warning.
+second comment. It reports success only when all are done. A step after the merge
+that fails (pins that did not land, a GitHub error, a failed hub write, a lost landing
+lock) gives `PARTIAL` (exit 3): the merge commit, the steps not done, the error, and
+"run the same command again to finish"; the record is kept. Without `--json` the
+lines of the steps done follow it. An unreachable hub is still exit 10. Before it
+reads the pins, `gh pins sync` (and so `gh land`) finishes the landing of any pin pull
+request (its branch the pin branch) whose record shows it merged, or that GitHub shows
+merged; it is not left behind pins that read current. One another sync finished first
+is done, and the sync goes on to the pins. Its dry run reads the hub for them too. A pull
+request found merged with neither a record nor a `landed.log` line has every step
+done then. `main` is written only whole: a failed read is tried three times, then the
+landing fails; a repository with no `main` (HTTP 404) is left out with a warning.
 
 `HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream
 sequence of the note that ended the task for the seat. A later end replaces an

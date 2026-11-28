@@ -6,7 +6,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use hgl_ai_bus::{Bus, ProvisionOptions};
-use hgl_ai_proto::{Kind, Seat};
+use hgl_ai_proto::{Kind, Note, Seat};
 
 use crate::backlog::Backlog;
 use crate::coord::{self, CoordOpts};
@@ -520,7 +520,12 @@ async fn a_lost_landing_lock_stops_the_landing() {
         merge_commit: Some("01e99ea5e46457bac035ca8a2699b6b6575b32ed".into()),
         head: HEAD.into(),
     };
-    let r = land::after_merge(&gh, &s, &a, "alpha", 7, &merged, &o, &held, None).await;
+    let mut p = crate::progress::Progress::new(HEAD, None);
+    let mut lines = Vec::new();
+    let r = land::after_merge(
+        &gh, &s, &a, "alpha", 7, &merged, &o, &held, &mut p, &mut lines,
+    )
+    .await;
     match r {
         Err(Error::LeaseLost(m)) => assert!(
             m.ends_with(
@@ -573,7 +578,7 @@ async fn a_hold_at_the_deadline_stops_the_landing() {
 
 /// A JetStream API request over the plain NATS protocol (the hub here has no auth), for a
 /// test to change the hub under the code it tests. Returns the reply's payload.
-fn js_api(url: &str, subject: &str) -> String {
+fn js_api(url: &str, subject: &str, payload: &str) -> String {
     use std::io::{BufRead, BufReader, Write};
     let addr = url.trim_start_matches("nats://");
     let stream = std::net::TcpStream::connect(addr).unwrap();
@@ -587,7 +592,8 @@ fn js_api(url: &str, subject: &str) -> String {
     assert!(line.starts_with("INFO"), "{line}");
     write!(
         w,
-        "CONNECT {{\"verbose\":false,\"pedantic\":false}}\r\nSUB _INBOX.t 1\r\nPUB {subject} _INBOX.t 0\r\n\r\nPING\r\n"
+        "CONNECT {{\"verbose\":false,\"pedantic\":false}}\r\nSUB _INBOX.t 1\r\nPUB {subject} _INBOX.t {}\r\n{payload}\r\nPING\r\n",
+        payload.len()
     )
     .unwrap();
     loop {
@@ -738,7 +744,7 @@ async fn intake_retries_pending_delivery_and_checks_history_after_the_duplicate_
     b.state_create(crate::intake::KEY, &cursor(&note).to_string())
         .await
         .unwrap();
-    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES");
+    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES", "");
     assert!(reply.contains("\"success\":true"), "{reply}");
     let round = crate::intake::Round::load(Some(&b), chrono::Utc::now())
         .await
@@ -779,11 +785,9 @@ async fn intake_retries_pending_delivery_and_checks_history_after_the_duplicate_
     assert!(serde_json::from_str::<serde_json::Value>(&entry.value).unwrap()["pending"].is_null());
 }
 
-/// Carbon's check 8b (hgl-ai#8): a round whose alerts cannot be sent (the notes stream is
-/// gone) keeps them on the hub, and the next run sends them, though the table it compares
-/// with no longer shows the change.
+/// Alerts from consecutive failed rounds survive a restart, even after the table advances.
 #[tokio::test]
-async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
+async fn alerts_from_consecutive_failed_rounds_survive_a_restart() {
     let Some(h) = hub() else { return };
     let b = bus(&h).await;
     let mut s = settings();
@@ -791,43 +795,55 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
     store::put_latest(&b, state::KEY_PRS, &fixture("coord-prev.prs"))
         .await
         .unwrap();
-    // The run's backlog round too (merged with the owner console's coordinator).
-    let gh = || {
+    let prs = fixture("coord-batch.json");
+    let gh = |prs: &str| {
         FakeGh::default()
             .on("auth status", "")
             .on("query Backlog", &fixture("backlog-batch.json"))
             .on("query Intake", &empty_intake(3).to_string())
-            .on("graphql", &fixture("coord-batch.json"))
+            .on("graphql", prs)
     };
     let o = CoordOpts {
         once: true,
         dry_run: false,
         interval: coord::MIN_INTERVAL,
     };
-    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES");
+    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES", "");
     assert!(reply.contains("\"success\":true"), "{reply}");
-    let r = coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new()).await;
-    assert!(r.is_err(), "the sends failed");
-    // The table moved on; the alerts wait on the hub.
-    let t = Table::parse(&b.state_get(state::KEY_PRS).await.unwrap().unwrap().value);
-    assert_eq!(t.rows.len(), 6);
-    let kept = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap().value;
-    let kept: Vec<hgl_ai_proto::Note> = serde_json::from_str(&kept).unwrap();
-    assert_eq!(kept.len(), 2);
+    let first = prs.replace("\"state\": \"FAILURE\"", "\"state\": \"SUCCESS\"");
+    let mut ids = Vec::new();
+    for (snapshot, expected) in [(&first, vec![11]), (&prs, vec![11, 12])] {
+        let r = coord::run(&gh(snapshot), &s, Some(&b), &o, &mut Vec::new()).await;
+        assert!(r.is_err(), "the sends failed");
+        let t = Table::parse(&b.state_get(state::KEY_PRS).await.unwrap().unwrap().value);
+        assert_eq!(t.rows.len(), 6);
+        let kept = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap().value;
+        let kept: Vec<hgl_ai_proto::Note> = serde_json::from_str(&kept).unwrap();
+        assert_eq!(kept.iter().map(|n| n.issue).collect::<Vec<_>>(), expected);
+        let stored_ids: Vec<_> = kept.iter().map(hgl_ai_proto::Note::msg_id).collect();
+        assert!(stored_ids.starts_with(&ids), "the retry keeps the same ID");
+        ids = stored_ids;
+    }
 
     // The stream is back; a new run (a restarted service) sends them.
     b.provision().await.unwrap();
     let controller = Seat::new("controller").unwrap();
     let mut inbox = b.inbox(&controller).await.unwrap();
-    coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new())
-        .await
-        .unwrap();
+    let offline = FakeGh::default()
+        .on("auth status", "")
+        .fail("graphql", "gh: Server Error (HTTP 502)");
+    assert!(
+        coord::run(&offline, &s, Some(&b), &o, &mut Vec::new())
+            .await
+            .is_err()
+    );
     let got = inbox.fetch(10, Duration::from_secs(5)).await.unwrap();
     let firsts: Vec<String> = got
         .iter()
         .map(|d| d.note.body.lines().next().unwrap_or("").to_string())
         .collect();
     assert_eq!(got.len(), 2, "{firsts:?}");
+    assert_eq!(got.iter().map(|d| d.note.msg_id()).collect::<Vec<_>>(), ids);
     assert!(
         firsts[0].starts_with("[coord] Alert: alpha#11"),
         "{firsts:?}"
@@ -836,8 +852,8 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
     for d in &got {
         d.ack().await.unwrap();
     }
-    // Sent once: a third round sends nothing.
-    coord::run(&gh(), &s, Some(&b), &o, &mut Vec::new())
+    // After recovery, an unchanged round sends nothing.
+    coord::run(&gh(&prs), &s, Some(&b), &o, &mut Vec::new())
         .await
         .unwrap();
     assert!(
@@ -849,21 +865,314 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
     );
 }
 
+#[tokio::test]
+async fn the_table_waits_for_a_durable_alert_queue() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+    let previous = fixture("coord-prev.prs");
+    store::put_latest(&b, state::KEY_PRS, &previous)
+        .await
+        .unwrap();
+    let gh = FakeGh::default()
+        .on("auth status", "")
+        .on("query Backlog", &fixture("backlog-batch.json"))
+        .on("query Intake", &empty_intake(3).to_string())
+        .on("graphql", &fixture("coord-batch.json"));
+    let o = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+    let controller = Seat::new("controller").unwrap();
+    let mut inbox = b.inbox(&controller).await.unwrap();
+
+    // Keep the table writable while the stream refuses the alert queue subject.
+    let info = js_api(&h.url, "$JS.API.STREAM.INFO.KV_HGL_STATE", "");
+    let info: serde_json::Value = serde_json::from_str(&info).unwrap();
+    let mut config = info["config"].clone();
+    config["subjects"] = serde_json::json!(["$KV.HGL_STATE.prs", "$KV.HGL_STATE.hold"]);
+    let reply = js_api(
+        &h.url,
+        "$JS.API.STREAM.UPDATE.KV_HGL_STATE",
+        &config.to_string(),
+    );
+    assert!(!reply.contains("\"error\""), "{reply}");
+
+    let r = coord::run(&gh, &s, Some(&b), &o, &mut Vec::new()).await;
+    assert!(r.is_err(), "writing the alert queue should fail");
+    assert_eq!(
+        b.state_get(state::KEY_PRS).await.unwrap().unwrap().value,
+        previous
+    );
+    assert!(
+        inbox
+            .fetch(10, Duration::from_millis(300))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let reply = js_api(
+        &h.url,
+        "$JS.API.STREAM.UPDATE.KV_HGL_STATE",
+        &info["config"].to_string(),
+    );
+    assert!(!reply.contains("\"error\""), "{reply}");
+    coord::run(&gh, &s, Some(&b), &o, &mut Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox.fetch(10, Duration::from_secs(2)).await.unwrap().len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn an_overflowing_alert_queue_drops_the_oldest_and_drains_during_hold() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+    let previous = fixture("coord-prev.prs");
+    b.state_create(state::KEY_PRS, &previous).await.unwrap();
+    let large = "\"é".repeat(130_000);
+    let legacy: Vec<_> = (1..=2)
+        .map(|issue| {
+            let mut note = Note::new(
+                s.coord_seat.clone(),
+                s.controller.clone(),
+                Kind::Note,
+                &large,
+            );
+            note.issue = issue;
+            note
+        })
+        .collect();
+    let saved = serde_json::to_string(&legacy).unwrap();
+    b.state_create(coord::KEY_UNSENT, &saved).await.unwrap();
+    let url = "https://github.com/o/alpha/pull/12";
+    let prs = fixture("coord-batch.json").replace(
+        &format!("\"{url}\""),
+        &format!("\"{url}/{}\"", "x".repeat(12_000)),
+    );
+    let gh = FakeGh::default().on("auth status", "").on("graphql", &prs);
+    let opts = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES", "");
+    assert!(reply.contains("\"success\":true"), "{reply}");
+
+    assert!(
+        coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new())
+            .await
+            .is_err()
+    );
+    let current = b.state_get(state::KEY_PRS).await.unwrap().unwrap().value;
+    assert_ne!(
+        previous, current,
+        "the bounded queue lets the table advance"
+    );
+    let entry = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap();
+    assert!(entry.value.len() <= hgl_ai_bus::MAX_VALUE_BYTES);
+    let kept: Vec<Note> = serde_json::from_str(&entry.value).unwrap();
+    assert_eq!(
+        kept.iter().map(|n| n.issue).collect::<Vec<_>>(),
+        [2, 11, 12, 0]
+    );
+    assert!(kept[3].body.contains("dropped 1 oldest"));
+
+    b.provision().await.unwrap();
+    let mut inbox = b.inbox(&s.controller).await.unwrap();
+    b.state_create(state::KEY_HOLD, "2100-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let held = FakeGh::default().on("auth status", "");
+    coord::run(&held, &s, Some(&b), &opts, &mut Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(held.calls().len(), 1, "hold suppressed all GitHub reads");
+    let got = inbox.fetch(10, Duration::from_secs(2)).await.unwrap();
+    assert_eq!(got.into_iter().map(|d| d.note).collect::<Vec<_>>(), kept);
+    assert!(b.state_get(coord::KEY_UNSENT).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn an_invalid_alert_becomes_a_durable_dead_letter_after_five_failures() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let s = settings();
+    let mut invalid = Note::new(
+        s.coord_seat.clone(),
+        s.controller.clone(),
+        Kind::Note,
+        "bad alert",
+    );
+    invalid.v = 0;
+    invalid.repo = Some("alpha".to_string());
+    invalid.issue = 11;
+    let good = Note::new(
+        s.coord_seat.clone(),
+        s.controller.clone(),
+        Kind::Note,
+        "good alert",
+    );
+    b.state_create(
+        coord::KEY_UNSENT,
+        &serde_json::to_string(&[invalid, good.clone()]).unwrap(),
+    )
+    .await
+    .unwrap();
+    b.state_create(state::KEY_HOLD, "2100-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let gh = FakeGh::default().on("auth status", "");
+    let opts = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+    let mut inbox = b.inbox(&s.controller).await.unwrap();
+    for _ in 0..5 {
+        let error = coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, Error::Bus(hgl_ai_bus::BusError::Proto(_))));
+    }
+    let entry = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap();
+    let queued: Vec<Note> = serde_json::from_str(&entry.value).unwrap();
+    let [report] = queued.as_slice() else {
+        panic!("expected just the dead letter")
+    };
+    assert_eq!(report.issue, 11);
+    assert!(report.body.starts_with("[coord] Dead letter:"));
+    assert!(report.body.contains("unsupported version 0"));
+    assert!(report.body.contains("bad alert"));
+
+    let signed_out = FakeGh::default().fail("auth status", "bad credentials");
+    let error = coord::run(&signed_out, &s, Some(&b), &opts, &mut Vec::new())
+        .await
+        .unwrap_err();
+    assert!(matches!(error, Error::Auth(_)));
+    let got = inbox.fetch(10, Duration::from_secs(2)).await.unwrap();
+    assert_eq!(
+        got.into_iter().map(|d| d.note).collect::<Vec<_>>(),
+        [good, report.clone()]
+    );
+    assert!(b.state_get(coord::KEY_UNSENT).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn alert_report_failures_drop_invalid_reports_and_retry_transient_failures() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let s = settings();
+    let invalid = Note::new(
+        s.coord_seat.clone(),
+        Seat::owner(),
+        Kind::Note,
+        "[coord] Invalid report recipient",
+    );
+    let valid = Note::new(
+        s.coord_seat.clone(),
+        s.controller.clone(),
+        Kind::Note,
+        "[coord] Dead letter: pending report",
+    );
+    let report = |note: &Note| {
+        let mut value = serde_json::to_value(note).unwrap();
+        value["report"] = true.into();
+        value
+    };
+    let saved = serde_json::json!([report(&invalid), report(&valid)]);
+    b.state_create(coord::KEY_UNSENT, &saved.to_string())
+        .await
+        .unwrap();
+    b.state_create(state::KEY_HOLD, "2100-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES", "");
+    assert!(reply.contains("\"success\":true"), "{reply}");
+    let gh = FakeGh::default().on("auth status", "");
+    let opts = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+
+    let result = coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new()).await;
+    assert!(matches!(
+        result,
+        Err(Error::Bus(hgl_ai_bus::BusError::Proto(_)))
+    ));
+    let kept = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap();
+    let queued: Vec<Note> = serde_json::from_str(&kept.value).unwrap();
+    assert_eq!(queued.as_slice(), std::slice::from_ref(&valid));
+
+    let result = coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new()).await;
+    assert!(matches!(
+        result,
+        Err(Error::Bus(hgl_ai_bus::BusError::Nats(_)))
+    ));
+    let retried = b.state_get(coord::KEY_UNSENT).await.unwrap().unwrap();
+    assert_eq!(retried.revision, kept.revision);
+
+    b.provision().await.unwrap();
+    let mut inbox = b.inbox(&s.controller).await.unwrap();
+    coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new())
+        .await
+        .unwrap();
+    let got = inbox.fetch(10, Duration::from_secs(2)).await.unwrap();
+    assert_eq!(got.into_iter().map(|d| d.note).collect::<Vec<_>>(), [valid]);
+    assert!(b.state_get(coord::KEY_UNSENT).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn malformed_alert_state_is_replaced_before_advancing_the_table() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    b.state_create(coord::KEY_UNSENT, "{").await.unwrap();
+    b.state_create(state::KEY_PRS, &fixture("coord-prev.prs"))
+        .await
+        .unwrap();
+    let mut s = settings();
+    s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+    let gh = FakeGh::default()
+        .on("auth status", "")
+        .on("query Backlog", &fixture("backlog-batch.json"))
+        .on("query Intake", &empty_intake(3).to_string())
+        .on("graphql", &fixture("coord-batch.json"));
+    let opts = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+    let mut inbox = b.inbox(&s.controller).await.unwrap();
+    coord::run(&gh, &s, Some(&b), &opts, &mut Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        inbox.fetch(10, Duration::from_secs(2)).await.unwrap().len(),
+        2
+    );
+    assert!(b.state_get(coord::KEY_UNSENT).await.unwrap().is_none());
+}
+
 const MERGE: &str = "01e99ea5e46457bac035ca8a2699b6b6575b32ed";
 
-/// The hub as a landing of `alpha#7` (issue 980) finds it: the author's tree with its
-/// family, and a clean review receipt from another family among the controller's notes
-/// (with notes that are not one for it around it).
-async fn authored_and_reviewed(b: &Bus) {
+async fn register_pr_author(b: &Bus, repo: &str) {
     let tree = hgl_ai_proto::TreeRecord {
         host: "build-1".into(),
         seat: Seat::new("w1").unwrap(),
         task: hgl_ai_proto::TaskKey {
-            repo: "alpha".into(),
+            repo: repo.into(),
             issue: 980,
         },
         review: false,
-        path: "/w/w1/alpha-980".into(),
+        path: format!("/w/w1/{repo}-980"),
         branch: Some("codex/980-format-patterns".into()),
         created_at: "20260101T000000Z".into(),
         size_bytes: 0,
@@ -874,6 +1183,13 @@ async fn authored_and_reviewed(b: &Bus) {
         handoff_seq: None,
     };
     b.tree_put(&tree).await.unwrap();
+}
+
+/// The hub as a landing of `alpha#7` (issue 980) finds it: the author's tree with its
+/// family, and a clean review receipt from another family among the controller's notes
+/// (with notes that are not one for it around it).
+async fn authored_and_reviewed(b: &Bus) {
+    register_pr_author(b, "alpha").await;
     let controller = Seat::new("controller").unwrap();
     let note = |kind: Kind, from: &str, pr: u64, body: &str| {
         let mut n =
@@ -1035,10 +1351,11 @@ async fn a_merge_still_pending_keeps_its_record() {
     );
 }
 
-/// Carbon's check 4 (hgl-ai#7): the read right after the merge fails (one HTTP 502). The
-/// retry finds the pull request merged and finishes its landing (`landed.log`, `main`, the
-/// notes, the comment) instead of reporting it merged with nothing recorded; a third run
-/// finds it landed and does nothing.
+/// Carbon's check 4 (hgl-ai#7): the read right after the merge fails (one HTTP 502):
+/// `PARTIAL`, naming every step after the merge as not done, not a bare error. The retry
+/// finds the pull request merged and finishes its landing (`landed.log`, `main`, the notes,
+/// the comment) instead of reporting it merged with nothing recorded; a third run finds it
+/// landed and does nothing.
 #[tokio::test]
 async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     let Some(h) = hub() else { return };
@@ -1049,10 +1366,19 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     s.pins = vec![];
     let o = land::LandOpts::default();
     let gh = landing_gh(|g| g.push_fail_once("pulls/7", "gh: Server Error (HTTP 502)"));
-    let e = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o)
-        .await
-        .unwrap_err();
-    assert!(e.to_string().contains("HTTP 502"), "{e}");
+    let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(l.outcome.kind, crate::gate::Kind::Partial);
+    assert!(!l.outcome.kind.satisfied(), "exit 3");
+    assert!(
+        l.outcome.line.starts_with(
+            "alpha #7 is merged, but landed.log, main, the landed notes and the comment are not done ("
+        ) && l.outcome.line.contains("HTTP 502")
+            && l.outcome
+                .line
+                .ends_with("; run the same command again to finish PARTIAL"),
+        "{}",
+        l.outcome.line
+    );
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "merged");
     let rec = crate::progress::read(&b, "alpha", 7)
         .await
@@ -1099,8 +1425,29 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
         "done"
     );
 
-    let again = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    // Asked with an older head (the gate updated the branch before the merge): the merged
+    // head is reported, and the line ends in its status word (r6 on #133).
+    let older = "e".repeat(40);
+    let again = land::land(&gh, &s, &b, "alpha", 7, &older, &o)
+        .await
+        .unwrap();
     assert_eq!(again.outcome.kind, crate::gate::Kind::AlreadyMerged);
+    assert_eq!(again.outcome.head, HEAD);
+    assert_eq!(again.outcome.merge_commit.as_deref(), Some(MERGE));
+    assert!(
+        again.outcome.line.ends_with(" MERGED")
+            && again
+                .outcome
+                .line
+                .contains(&format!("at {}", crate::short(HEAD))),
+        "{}",
+        again.outcome.line
+    );
+    let again = land::merge_once(&gh, &s, &b, "alpha", 7, &older, &o)
+        .await
+        .unwrap();
+    assert_eq!(again.outcome.kind, crate::gate::Kind::AlreadyMerged);
+    assert_eq!(again.outcome.head, HEAD);
     assert!(
         again.after[0].starts_with("landed earlier"),
         "{:?}",
@@ -1110,9 +1457,9 @@ async fn a_landing_cut_off_after_the_merge_is_finished_by_its_retry() {
     assert_eq!(landed_notes(&b).await.len(), 3);
 }
 
-/// `main` cannot be read after the merge (HTTP 502, three times): the landing fails rather
-/// than write a `main` without the repository; the retry finishes from where it stopped,
-/// without a second `landed.log` line.
+/// `main` cannot be read after the merge (HTTP 502, three times): `PARTIAL` rather than a
+/// `main` without the repository, naming the steps left; the retry finishes from where it
+/// stopped, without a second `landed.log` line.
 #[tokio::test]
 async fn a_landing_that_could_not_read_main_resumes_there() {
     let Some(h) = hub() else { return };
@@ -1130,10 +1477,18 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
             .push_fail_once("git/ref/heads/main", "gh: Server Error (HTTP 502)")
             .push_fail_once("git/ref/heads/main", "gh: Server Error (HTTP 502)")
     });
-    let e = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o)
-        .await
-        .unwrap_err();
-    assert!(e.to_string().contains("HTTP 502"), "{e}");
+    let l = land::land(&gh, &s, &b, "alpha", 7, HEAD, &o).await.unwrap();
+    assert_eq!(l.outcome.kind, crate::gate::Kind::Partial);
+    assert_eq!(l.outcome.merge_commit.as_deref(), Some(MERGE));
+    assert!(
+        l.outcome.line.starts_with(&format!(
+            "alpha #7 is merged at {}, but main, the landed notes and the comment are not done (",
+            &MERGE[..8]
+        )) && l.outcome.line.contains("HTTP 502"),
+        "{}",
+        l.outcome.line
+    );
+    assert!(l.after.is_empty(), "{:?}", l.after);
     assert!(
         b.state_get(state::KEY_MAIN).await.unwrap().is_none(),
         "no partial main"
@@ -1159,6 +1514,91 @@ async fn a_landing_that_could_not_read_main_resumes_there() {
     assert_eq!(landed_notes(&b).await.len(), 3);
     assert_eq!(posts(&gh, "issues/7/comments"), 1);
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1);
+}
+
+/// hgl-ai#7: the comment cannot be posted after the merge (one HTTP 502) under
+/// `merge-if-clean`: `PARTIAL`, naming only the comment, with the lines of the steps done;
+/// the record keeps them done. The same command posts the comment, and sends no note again.
+#[tokio::test]
+async fn a_landing_whose_comment_failed_is_partial_and_finished_by_its_retry() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let mut s = settings();
+    s.repos = vec!["alpha".into()];
+    s.pins = vec![];
+    let o = land::LandOpts::default();
+    let gh = landing_gh(|g| {
+        g.push_fail_once("issues/7/comments -f body", "gh: Server Error (HTTP 502)")
+    });
+    // Ahead of the rule that answers every comments call.
+    {
+        let mut rules = gh.rules.lock().unwrap();
+        let i = rules
+            .iter()
+            .position(|r| r.0 == "issues/7/comments -f body")
+            .unwrap();
+        let r = rules.remove(i);
+        rules.insert(0, r);
+    }
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(l.outcome.kind, crate::gate::Kind::Partial);
+    assert!(!l.outcome.kind.satisfied(), "exit 3");
+    assert_eq!(l.outcome.merge_commit.as_deref(), Some(MERGE));
+    assert!(
+        l.outcome.line.starts_with(&format!(
+            "alpha #7 is merged at {}, but the comment is not done (",
+            &MERGE[..8]
+        )) && l.outcome.line.contains("HTTP 502"),
+        "{}",
+        l.outcome.line
+    );
+    assert!(
+        l.after
+            .iter()
+            .any(|a| a.starts_with("sent landed for alpha-980 to w1")),
+        "{:?}",
+        l.after
+    );
+    let rec = crate::progress::read(&b, "alpha", 7)
+        .await
+        .unwrap()
+        .expect("the record is kept");
+    assert_eq!(
+        rec.done,
+        [
+            crate::progress::LANDED_LOG,
+            crate::progress::MAIN,
+            crate::progress::NOTES
+        ]
+    );
+    assert_eq!(landed_notes(&b).await.len(), 3);
+
+    let l = land::merge_once(&gh, &s, &b, "alpha", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Resumed,
+        "{}",
+        l.outcome.line
+    );
+    assert_eq!(l.after, ["commented on alpha#7"]);
+    assert_eq!(
+        posts(&gh, "issues/7/comments"),
+        2,
+        "the failed post and one more"
+    );
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "not merged again");
+    assert_eq!(landed_notes(&b).await.len(), 3, "no note sent again");
+    assert!(
+        crate::progress::read(&b, "alpha", 7)
+            .await
+            .unwrap()
+            .is_none()
+    );
 }
 
 fn git(dir: &std::path::Path, args: &[&str]) -> String {
@@ -1190,6 +1630,139 @@ fn commit_on(seed: &std::path::Path, branch: &str, from: &str, file: &str, text:
     );
     git(seed, &["push", "--quiet", "--force", "origin", branch]);
     git(seed, &["rev-parse", "HEAD"])
+}
+
+#[tokio::test]
+async fn evaluate_carries_only_past_merges_without_unresolved_findings() {
+    use crate::gate::{Kind as GateKind, Opts, evaluate};
+    use hgl_ai_proto::{Family, Note, ReviewReceipt, Verdict};
+    use serde_json::json;
+
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let repo = "hgl-ai";
+    register_pr_author(&b, repo).await;
+
+    let source = tempfile::tempdir().unwrap();
+    let path = source.path();
+    git(path, &["init", "--quiet", "--template=", "-b", "main"]);
+    let commit = |file: &str| {
+        std::fs::write(path.join(file), file).unwrap();
+        git(path, &["add", file]);
+        git(path, &["commit", "--quiet", "-m", file]);
+        git(path, &["rev-parse", "HEAD"])
+    };
+    commit("base");
+    git(path, &["switch", "-c", "pr"]);
+    let reviewed = commit("pr");
+    let update = |file: &str| {
+        git(path, &["switch", "main"]);
+        let main = commit(file);
+        git(path, &["switch", "pr"]);
+        git(path, &["merge", "--no-ff", "--no-edit", "main"]);
+        (main, git(path, &["rev-parse", "HEAD"]))
+    };
+    let (_, middle) = update("main-first");
+    let (main, head) = update("main-second");
+
+    let mut s = settings();
+    s.receipt_carry_url = path.to_str().unwrap().into();
+    s.gates.entry(repo.into()).or_default().checks = vec!["lint".into()];
+    let gh = FakeGh::default()
+        .on("pulls/7/files", &fixture("pr-files.json"))
+        .on("Accept: application/vnd.github.v3.diff", &fixture("pr.diff"))
+        .on("pulls/7", &fixture("pr-open.json").replace(HEAD, &head))
+        .on("git/ref/heads/main", &json!({"object": {"sha": main}}).to_string())
+        .on("compare/", r#"{"ahead_by":0}"#)
+        .on(
+            "graphql",
+            r#"{"data":{"repository":{"pullRequest":{"reviewThreads":{"nodes":[]}}}}}"#,
+        )
+        .on(
+            "issues/7/comments",
+            &fixture("comments-clean.json").replace(HEAD, &head).replace(&HEAD[..10], &head[..10]),
+        )
+        .on(
+            &format!("git/commits/{head}"),
+            &json!({"parents": [{"sha": middle}, {"sha": main}]}).to_string(),
+        )
+        .on(
+            &format!("commits/{head}/check-runs"),
+            r#"{"check_runs":[{"id":1,"name":"lint","status":"completed","conclusion":"success"}]}"#,
+        )
+        .on(&format!("commits/{head}/status?"), r#"{"statuses":[]}"#);
+    let receipt: ReviewReceipt = serde_json::from_str(&fixture("receipt.json")).unwrap();
+    let send = async |sha: &str, family: Family, verdict: Verdict| {
+        let mut receipt = receipt.clone();
+        receipt.repo = repo.into();
+        receipt.head = sha.into();
+        receipt.main.clone_from(&main);
+        receipt.family = family;
+        receipt.verdict = verdict;
+        let mut note = Note::new(
+            receipt.reviewer.clone(),
+            s.controller.clone(),
+            Kind::Receipt,
+            serde_json::to_string(&receipt).unwrap(),
+        );
+        note.repo = Some(repo.into());
+        note.issue = 7;
+        note.head = Some(sha.into());
+        b.send(&note).await.unwrap();
+    };
+    let run = async || {
+        evaluate(
+            &gh,
+            &s,
+            Some(&b),
+            repo,
+            7,
+            &head,
+            &Opts::default(),
+            false,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+    };
+    send(&reviewed, Family::Claude, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::WouldMerge, "{}", o.line);
+    assert!(
+        o.line.contains(&format!("receipt carried from {reviewed}")),
+        "{}",
+        o.line
+    );
+
+    send(&middle, Family::Claude, Verdict::Findings).await;
+    send(&middle, Family::Gpt, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::Blocked, "{}", o.line);
+
+    send(&middle, Family::Claude, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::WouldMerge, "{}", o.line);
+    assert!(
+        o.line.contains(&format!("receipt carried from {middle}")),
+        "{}",
+        o.line
+    );
+
+    send(&head, Family::Claude, Verdict::Findings).await;
+    send(&head, Family::Gpt, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::Blocked, "{}", o.line);
+    assert!(
+        o.line.contains("receipts at the head have findings"),
+        "{}",
+        o.line
+    );
+
+    send(&head, Family::Claude, Verdict::Clean).await;
+    let o = run().await;
+    assert_eq!(o.kind, GateKind::WouldMerge, "{}", o.line);
+    assert!(o.line.contains("receipt r1/claude"), "{}", o.line);
 }
 
 /// Ask until the verdict is judged (pass, fail) or the gate build did not run.
@@ -1585,6 +2158,185 @@ async fn a_lost_running_with_a_queued_replacement_is_asked_once() {
     r.stop().await;
 }
 
+/// What GitHub shows for the wrapper's pins current at `cccccccc` (the compiler's `main`)
+/// and pin pull request `n` merged at `merge`.
+fn pins_current_gh(n: u64, merge: &str) -> FakeGh {
+    let sha = |c: char| c.to_string().repeat(40);
+    let sub = |c: char| format!("{{\"type\":\"submodule\",\"sha\":\"{}\"}}", sha(c));
+    let pr = fixture("pr-merged.json")
+        .replace("\"number\": 7", &format!("\"number\": {n}"))
+        .replace(MERGE, merge)
+        .replace(HEAD, &sha('d'))
+        .replace("codex/980-format-patterns", "codex/pins-compiler-cccccccc");
+    FakeGh::default()
+        .on(&format!("hgl-project/pulls/{n}"), &pr)
+        .on("hgl-compiler/pulls/7", &fixture("pr-merged.json"))
+        .on(
+            "git/ref/heads/main",
+            &format!("{{\"object\":{{\"sha\":\"{}\"}}}}", sha('c')),
+        )
+        .on("hgl-compiler/contents/spec/hgl_spec", &sub('5'))
+        .on("hgl-compiler/contents/spec/hgl_core", &sub('6'))
+        .on("hgl-project/contents/hgl-compiler", &sub('c'))
+        .on("hgl-project/contents/hgl_spec", &sub('5'))
+        .on("hgl-project/contents/hgl_core", &sub('6'))
+}
+
+/// hgl-ai#133: a compiler landing raised the pins, and the pin pull request's landing
+/// stopped after its merge (its record holds the merge, nothing done); the compiler's
+/// landing is `PARTIAL`. Its retry finds the pins current, and finishes the pin pull
+/// request's landing (`landed.log`, `main`, the record) before its own, rather than delete
+/// its own record and leave the pin landing's behind.
+#[tokio::test]
+async fn a_pin_landing_cut_off_after_its_merge_is_finished_by_the_retry() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let pin_head = "d".repeat(40);
+    // The compiler's landing: every step under the lock done, the pins left.
+    let mut src = crate::progress::Progress::new(HEAD, Some(MERGE.into()));
+    for step in [
+        crate::progress::LANDED_LOG,
+        crate::progress::MAIN,
+        crate::progress::NOTES,
+        crate::progress::COMMENT,
+    ] {
+        src.mark(step);
+    }
+    crate::progress::write(&b, "hgl-compiler", 7, &src)
+        .await
+        .unwrap();
+    // The pin pull request's: merged, its `landed.log` write failed.
+    let pin = crate::progress::Progress::new(&pin_head, Some(pin_merge.into()));
+    crate::progress::write(&b, "hgl-project", 50, &pin)
+        .await
+        .unwrap();
+
+    let gh = pins_current_gh(50, pin_merge);
+    let o = land::LandOpts::default();
+    let l = land::land(&gh, &s, &b, "hgl-compiler", 7, HEAD, &o)
+        .await
+        .unwrap();
+    assert_eq!(
+        l.outcome.kind,
+        crate::gate::Kind::Resumed,
+        "{}",
+        l.outcome.line
+    );
+    assert!(l.outcome.kind.satisfied(), "exit 0");
+    assert!(
+        l.after
+            .iter()
+            .any(|a| a.starts_with("hgl-project #50 was merged at 02e99ea5")),
+        "{:?}",
+        l.after
+    );
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "{log}");
+    assert!(
+        log.trim_end()
+            .ends_with(&format!("hgl-project #50 {pin_merge}")),
+        "{log}"
+    );
+    let main = b.state_get(state::KEY_MAIN).await.unwrap().unwrap().value;
+    assert!(
+        main.contains(&format!("hgl-project pins hgl-compiler {}", "c".repeat(40))),
+        "{main}"
+    );
+    for (repo, n) in [("hgl-compiler", 7), ("hgl-project", 50)] {
+        assert!(
+            crate::progress::read(&b, repo, n).await.unwrap().is_none(),
+            "{repo} #{n} finished"
+        );
+    }
+    assert_eq!(posts(&gh, "merge-async"), 0, "nothing merged");
+
+    // Only the intent was recorded (the merge commit's write failed), and GitHub shows it
+    // merged: `gh pins sync` finishes it too.
+    let pin = crate::progress::Progress::new(&pin_head, None);
+    crate::progress::write(&b, "hgl-project", 51, &pin)
+        .await
+        .unwrap();
+    // An intent whose pull request is not merged is the gate's, not resumed here.
+    crate::progress::write(&b, "hgl-project", 52, &pin)
+        .await
+        .unwrap();
+    let open = fixture("pr-open.json")
+        .replace("\"number\": 7", "\"number\": 52")
+        .replace("codex/980-format-patterns", "codex/pins-compiler-cccccccc");
+    // A wrapper pull request that is not a pin one, merged, its notes and comment left:
+    // its own command finishes it, with them; the sync does not.
+    let mut other = crate::progress::Progress::new(HEAD, Some(MERGE.into()));
+    other.mark(crate::progress::LANDED_LOG);
+    other.mark(crate::progress::MAIN);
+    crate::progress::write(&b, "hgl-project", 53, &other)
+        .await
+        .unwrap();
+    let merged = fixture("pr-merged.json").replace("\"number\": 7", "\"number\": 53");
+    let gh = FakeGh::default()
+        .on("hgl-project/pulls/52", &open)
+        .on("hgl-project/pulls/53", &merged)
+        .on("auth status", "");
+    let gh = {
+        let more = pins_current_gh(51, pin_merge);
+        let r = std::mem::take(&mut *more.rules.lock().unwrap());
+        gh.rules.lock().unwrap().extend(r);
+        gh
+    };
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&r, crate::pins::Synced::Landed(o) if o.line.starts_with("hgl-project #51 is merged at 02e99ea5")),
+        "{r:?}"
+    );
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert!(
+        log.trim_end()
+            .ends_with(&format!("hgl-project #51 {pin_merge}")),
+        "{log}"
+    );
+    assert!(
+        crate::progress::read(&b, "hgl-project", 51)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        crate::progress::read(&b, "hgl-project", 52)
+            .await
+            .unwrap()
+            .is_some(),
+        "not merged: left"
+    );
+    assert_eq!(
+        crate::progress::read(&b, "hgl-project", 53)
+            .await
+            .unwrap()
+            .map(|p| p.done),
+        Some(vec![
+            crate::progress::LANDED_LOG.to_string(),
+            crate::progress::MAIN.to_string()
+        ]),
+        "not a pin pull request: left"
+    );
+    assert!(!log.contains("hgl-project #53"), "{log}");
+    assert_eq!(posts(&gh, "merge-async"), 0);
+    // Current, with nothing left to finish.
+    for n in [52, 53] {
+        crate::progress::delete(&b, "hgl-project", n).await.unwrap();
+    }
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&r, crate::pins::Synced::Current(l) if l == "pins current at cccccccc"),
+        "{r:?}"
+    );
+}
+
 /// `tasks` with no task is never written empty (an empty create fails every round), and
 /// a text left from a task that is gone is cleared.
 #[tokio::test]
@@ -1635,4 +2387,154 @@ async fn tasks_without_a_task_write_nothing() {
         .await
         .unwrap();
     assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
+}
+
+/// `gh` for [`a_pin_landing_finished_by_another_sync_is_done`]: at the first call matching
+/// `trigger`, another sync finishes the landing of the pin pull request `n` (its
+/// `landed.log` line, its record gone).
+struct Racing {
+    gh: FakeGh,
+    bus: Bus,
+    merge: String,
+    trigger: &'static str,
+    n: u64,
+    raced: std::sync::atomic::AtomicBool,
+}
+
+impl Racing {
+    fn new(gh: FakeGh, bus: Bus, merge: &str, trigger: &'static str, n: u64) -> Racing {
+        Racing {
+            gh,
+            bus,
+            merge: merge.into(),
+            trigger,
+            n,
+            raced: Default::default(),
+        }
+    }
+}
+
+/// A fresh `prs` table whose row for the wrapper's pull request `n` says the review bot is
+/// at its usage limit: the gate's table check would stop a landing there (BOTLIMIT).
+async fn bot_limit_row(b: &Bus, n: u64) {
+    let text = format!(
+        "# read {}\nhgl-project\t{n}\t{}\topen\tlimit\t0\tpass\t{}\n",
+        hgl_ai_proto::utc_now_stamp(),
+        "d".repeat(40),
+        hgl_ai_proto::utc_now_stamp()
+    );
+    store::put_latest(b, state::KEY_PRS, &text).await.unwrap();
+}
+
+impl crate::exec::Gh for Racing {
+    async fn exec(
+        &self,
+        args: Vec<String>,
+        stdin: Option<Vec<u8>>,
+    ) -> crate::Result<crate::exec::Output> {
+        if args.join(" ").contains(self.trigger)
+            && !self.raced.swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let line = format!("20261128T000000Z hgl-project #{} {}", self.n, self.merge);
+            store::append_bounded(&self.bus, state::KEY_LANDED, &line, 100)
+                .await
+                .unwrap();
+            crate::progress::delete(&self.bus, "hgl-project", self.n)
+                .await
+                .unwrap();
+        }
+        self.gh.exec(args, stdin).await
+    }
+}
+
+/// hgl-ai#133: two syncs pick the same unfinished pin landing, and the other finishes it
+/// first. This one finds it landed: done, not `NotLanded`, and the plan is still read. It
+/// finds that before the gate, whose table says BOTLIMIT for the pull request (r6).
+/// A dry run reads the hub too: it names an unfinished pin landing, rather than say the
+/// pins are current.
+#[tokio::test]
+async fn a_pin_landing_finished_by_another_sync_is_done() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let pin = crate::progress::Progress::new(&"d".repeat(40), Some(pin_merge.into()));
+    crate::progress::write(&b, "hgl-project", 50, &pin)
+        .await
+        .unwrap();
+
+    let dry = crate::exec::ReadOnly(pins_current_gh(50, pin_merge));
+    let r = crate::pins::sync(&dry, &s, Some(&b), &crate::pins::PinOpts::default(), true)
+        .await
+        .unwrap();
+    assert!(
+        matches!(&r, crate::pins::Synced::Would(l) if l == "would finish the landing of the pin pull request hgl-project#50"),
+        "{r:?}"
+    );
+    assert!(
+        crate::progress::read(&b, "hgl-project", 50)
+            .await
+            .unwrap()
+            .is_some()
+    );
+
+    bot_limit_row(&b, 50).await;
+    let gh = Racing::new(
+        pins_current_gh(50, pin_merge),
+        bus(&h).await,
+        pin_merge,
+        "hgl-project/pulls/50",
+        50,
+    );
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(r.ok(), "{r:?}");
+    assert!(
+        matches!(&r, crate::pins::Synced::Current(l) if l == "pins current at cccccccc"),
+        "{r:?}"
+    );
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "landed once: {log}");
+    assert!(
+        b.state_get(state::KEY_MAIN).await.unwrap().is_none(),
+        "not finished again"
+    );
+}
+
+/// r6 on #133: a sync finds an open pin pull request, and another sync lands it while this
+/// one waits for the lock. This one finds it landed in `landed.log` before the gate (whose
+/// table says BOTLIMIT): done, not `NotLanded` with "already MERGED".
+#[tokio::test]
+async fn an_open_pin_pull_request_landed_by_another_sync_is_done() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = vec!["hgl-compiler".into()];
+    let pin_merge = "02e99ea5e46457bac035ca8a2699b6b6575b32ed";
+    let head = "d".repeat(40);
+    bot_limit_row(&b, 60).await;
+    let stale = format!("{{\"type\":\"submodule\",\"sha\":\"{}\"}}", "b".repeat(40));
+    let open = format!("[{{\"number\":60,\"head\":{{\"sha\":\"{head}\"}}}}]");
+    // First match wins: the wrapper's main holds an old compiler pin; the open pull
+    // request's head holds the wanted ones.
+    let gh = FakeGh::default()
+        .on("pulls?state=open", &open)
+        .on("hgl-project/contents/hgl-compiler?ref=main", &stale);
+    let more = pins_current_gh(60, pin_merge);
+    let r = std::mem::take(&mut *more.rules.lock().unwrap());
+    gh.rules.lock().unwrap().extend(r);
+    let gh = Racing::new(gh, bus(&h).await, pin_merge, "pulls?state=open", 60);
+    let r = crate::pins::sync(&gh, &s, Some(&b), &crate::pins::PinOpts::default(), false)
+        .await
+        .unwrap();
+    assert!(r.ok(), "{r:?}");
+    assert!(
+        matches!(&r, crate::pins::Synced::Landed(o) if o.kind == crate::gate::Kind::AlreadyMerged),
+        "{r:?}"
+    );
+    assert_eq!(posts(&gh.gh, "merge-async"), 0, "not merged again");
+    let log = b.state_get(state::KEY_LANDED).await.unwrap().unwrap().value;
+    assert_eq!(log.lines().count(), 1, "landed once: {log}");
 }
