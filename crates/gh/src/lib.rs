@@ -9,6 +9,7 @@
 //! | --- | --- |
 //! | [`coord`] | `gh coord run`: the batched pull request table `HGL_STATE/prs`, `hold`, alerts |
 //! | [`backlog`] | `gh coord run`, every 15 min: the claimable queue `HGL_STATE/backlog`, daily `HGL_METRICS` |
+//! | `intake` | `gh coord run`, every 15 min: new and reopened issues and PRs for triage |
 //! | [`gate`] | `gh merge-if-clean`: the merge gate |
 //! | [`builds`] | the gate builds that write the local build verdicts (BUILD-15) |
 //! | [`land`] | `gh land`: the gate in a loop, then `main`, `landed.log`, `landed` notes, pins |
@@ -24,6 +25,7 @@ pub mod builds;
 pub mod coord;
 pub mod exec;
 pub mod gate;
+mod intake;
 pub mod land;
 pub mod lock;
 pub mod merge;
@@ -287,6 +289,32 @@ pub(crate) mod testutil {
 
     pub fn json(name: &str) -> serde_json::Value {
         serde_json::from_str(&fixture(name)).unwrap_or_else(|e| panic!("{name}: {e}"))
+    }
+
+    pub fn empty_intake(repo_count: usize) -> serde_json::Value {
+        use serde_json::json;
+        let mut data = json!({
+            "rateLimit": { "cost": 1, "remaining": 4900, "resetAt": "2100-01-01T00:00:00Z" }
+        });
+        for i in 0..repo_count * 2 {
+            data[format!("r{i}")] = json!({
+                "items": { "pageInfo": { "hasNextPage": false, "endCursor": null }, "nodes": [] }
+            });
+        }
+        json!({ "data": data })
+    }
+
+    pub fn intake_node(
+        number: u64,
+        created: chrono::DateTime<chrono::Utc>,
+        updated: chrono::DateTime<chrono::Utc>,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "id": format!("item-{number}"), "number": number, "title": format!("Item {number}"),
+            "createdAt": created, "updatedAt": updated, "author": { "login": "contributor" },
+            "assignees": { "totalCount": 0 }, "labels": { "nodes": [] },
+            "timelineItems": { "nodes": [] }
+        })
     }
 }
 

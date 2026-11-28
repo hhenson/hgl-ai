@@ -79,6 +79,9 @@ user (`[github] token_file`); run that step again to replace it.
 Automatic sendback comments require [Issues or Pull requests write access](https://docs.github.com/en/rest/issues/comments#create-an-issue-comment) on the routed repositories.
 With read-only access, the coordinator forwards findings to the controller for sendback.
 
+During the intake cutover, deploy and verify the coordinator's triage delivery
+before disabling the interim `hgl-intakewatch` timer.
+
 The server user's own commands run with `sudo -u hgl-ai env HOME=/var/lib/hgl-ai
 hgl-ai ...` (`server user add`, `doctor`).
 
