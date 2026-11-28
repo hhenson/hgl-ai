@@ -27,7 +27,7 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Cmd {
-    /// The coordinator service: the pull request table, `hold`, alerts, the backlog and daily metrics.
+    /// The coordinator service: pull requests, `hold`, alerts, backlog, metrics and triage intake.
     Coord {
         #[command(subcommand)]
         cmd: CoordCmd,
@@ -103,12 +103,12 @@ impl VerdictArgs {
 
 #[derive(clap::Subcommand)]
 enum CoordCmd {
-    /// Run rounds every interval (at least 5 minutes); the backlog round every 15 minutes.
+    /// Check PRs at least 5 minutes apart. Run backlog and intake every 15 minutes.
     Run {
         /// One round of each, then exit.
         #[arg(long)]
         once: bool,
-        /// Print the table, the alerts, the backlog and the metrics samples; write no state, send nothing.
+        /// Print the planned state writes and notes.
         #[arg(long)]
         dry_run: bool,
         /// Default: `github.coord_interval`.
@@ -373,9 +373,16 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                     .map_err(lift)?;
             } else {
                 let bus = Bus::connect(&cfg).await?;
-                coord::run(&gh, &s, Some(&bus), &o, &mut out)
-                    .await
-                    .map_err(lift)?;
+                let round = coord::run(&gh, &s, Some(&bus), &o, &mut out);
+                if once {
+                    round.await.map_err(lift)?;
+                } else {
+                    // Beside the rounds, every few seconds: each task's last note.
+                    tokio::select! {
+                        r = round => r.map_err(lift)?,
+                        () = hgl_ai_gh::tasks::run(&bus) => {}
+                    }
+                }
             }
             Ok(EXIT_OK)
         }

@@ -227,12 +227,16 @@ pub async fn run(
     Ok(())
 }
 
-async fn pause(retries: &mut Backoff, error: Option<anyhow::Error>, operation: &str) {
+fn retry_delay(retries: &mut Backoff, error: Option<anyhow::Error>, operation: &str) -> Duration {
     let delay = retries.delay(error.as_ref());
     if let Some(error) = error {
         tracing::warn!(?delay, "{operation}: {error}");
     }
-    sleep(delay).await;
+    delay
+}
+
+async fn pause(retries: &mut Backoff, error: Option<anyhow::Error>, operation: &str) {
+    sleep(retry_delay(retries, error, operation)).await;
 }
 
 struct Adapter<'a> {
@@ -467,6 +471,14 @@ impl<'a> Adapter<'a> {
     }
 
     async fn socket_loop(&self) {
+        self.socket_loop_with_sleep(sleep).await;
+    }
+
+    async fn socket_loop_with_sleep<F, Fut>(&self, mut wait: F)
+    where
+        F: FnMut(Duration) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
         let mut retries = Backoff::default();
         loop {
             let started = Instant::now();
@@ -474,7 +486,7 @@ impl<'a> Adapter<'a> {
             if started.elapsed() >= HEALTHY {
                 retries = Backoff::default();
             }
-            pause(&mut retries, result.err(), "Slack Socket Mode").await;
+            wait(retry_delay(&mut retries, result.err(), "Slack Socket Mode")).await;
         }
     }
 

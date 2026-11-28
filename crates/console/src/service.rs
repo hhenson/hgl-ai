@@ -1,7 +1,6 @@
 //! `hgl-ai console run`: the web server and its background work: connecting to the hub,
 //! folding the owner channel into threads (and sending the owner's notes), notifying
-//! the owner of new questions (OWN-9), the controller's `tick` (OWN-1, OWN-7), and the
-//! telemetry snapshot.
+//! the owner of new questions (OWN-9) and the controller's `tick` (OWN-1, OWN-7).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,8 +19,6 @@ const RESTORE_WAIT: Duration = Duration::from_secs(10);
 pub const FOLD_RETRY: Duration = Duration::from_secs(2);
 /// Between attempts to reach the hub.
 const RECONNECT: Duration = Duration::from_secs(10);
-/// Between telemetry readings.
-pub const TELEMETRY_EVERY: Duration = Duration::from_secs(10);
 /// `p2` questions are batched into one notification this often (OWN-9).
 pub const P2_BATCH: Duration = Duration::from_secs(3600);
 /// How long TLS material is kept before it is read again (renewed certificates).
@@ -353,30 +350,6 @@ fn status_channel(app: &App) -> Option<(&str, &str)> {
     Some((&slack.team, slack.status_channel.as_deref()?))
 }
 
-async fn telemetry_loop(app: Arc<App>, bus: Arc<Bus>) {
-    let mut notes = crate::telemetry::NotesIndex::default();
-    let stale = app.cfg.stale_after();
-    loop {
-        let snap = crate::telemetry::read(&bus, &mut notes, stale, Utc::now()).await;
-        app.telemetry.send_if_modified(|old| {
-            let changed = serde_json::to_string(&*snap_view(old)).ok()
-                != serde_json::to_string(&*snap_view(&Arc::new(snap.clone()))).ok();
-            if changed {
-                *old = Arc::new(snap.clone());
-            }
-            changed
-        });
-        tokio::time::sleep(TELEMETRY_EVERY).await;
-    }
-}
-
-/// A snapshot without its read time, to tell whether anything changed.
-fn snap_view(s: &Arc<crate::telemetry::Snapshot>) -> Arc<crate::telemetry::Snapshot> {
-    let mut c = (**s).clone();
-    c.read_at = String::new();
-    Arc::new(c)
-}
-
 /// The key of the pending `p2` batch in `HGL_CONSOLE`.
 const P2_KEY: &str = "p2.pending";
 /// The key of the undelivered `p1` notifications in `HGL_CONSOLE`.
@@ -470,8 +443,7 @@ pub async fn start_background(app: Arc<App>) {
     tokio::spawn(fold_loop(app.clone(), bus.clone()));
     tokio::spawn(tick_loop(app.clone(), bus.clone()));
     tokio::spawn(batch_loop(app.clone(), bus.clone()));
-    tokio::spawn(p1_loop(app.clone(), bus.clone()));
-    tokio::spawn(telemetry_loop(app, bus));
+    tokio::spawn(p1_loop(app, bus));
 }
 
 fn expand(p: &str) -> std::path::PathBuf {

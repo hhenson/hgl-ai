@@ -663,6 +663,8 @@ impl<B: BusApi> Bridge<B> {
                     // Another bridge may serve the seat now: start nothing more, stop the
                     // running turn at once, hand every note back.
                     stopping = true;
+                    #[cfg(test)]
+                    self.bus.seat_lease_stop(seat.name(), false);
                     fetcher.abort();
                     end.lost = Some(st.running.is_some());
                     stop_turn(&st.running, Stop::Graceful(Duration::ZERO));
@@ -712,6 +714,10 @@ impl<B: BusApi> Bridge<B> {
             .chain(st.deferred.drain(..).map(|(d, _)| d));
         for d in held {
             let _ = d.nak(self.opts.nak_delay).await;
+        }
+        #[cfg(test)]
+        if end.lost.is_some() {
+            self.bus.seat_lease_stop(seat.name(), true);
         }
         end
     }
@@ -1100,7 +1106,8 @@ impl<B: BusApi> Bridge<B> {
         for (d, p) in st.pending.iter().zip(&plans) {
             let new_tree = match &p.target {
                 Target::Tree { task, review } => {
-                    p.create.is_some() && self.trees.existing(seat.name(), task, *review).is_none()
+                    p.create.is_some()
+                        && (*review || self.trees.existing(seat.name(), task, *review).is_none())
                 }
                 Target::Inbox => false,
             };
