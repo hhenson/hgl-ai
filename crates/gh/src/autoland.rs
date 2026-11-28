@@ -44,6 +44,9 @@ pub struct AutoLand {
     decisions: Vec<String>,
     /// `PARTIAL` lines sent to the controller: each once.
     partial: BTreeSet<String>,
+    /// Notes for the controller not taken yet ([`AutoLand::take_reports`]): kept whatever
+    /// ends the round, so a landing done before a later failure is still reported.
+    reports: Vec<Note>,
 }
 
 /// One pull request to try: a candidate, or a landing record to finish.
@@ -62,7 +65,13 @@ impl AutoLand {
             builds: Arc::new(GateBuilds::new(s.coord_seat.clone(), "coordinator")),
             decisions: Vec::new(),
             partial: BTreeSet::new(),
+            reports: Vec::new(),
         }
+    }
+
+    /// The notes for the controller made so far; the caller queues them (`coord.alerts`).
+    pub fn take_reports(&mut self) -> Vec<Note> {
+        std::mem::take(&mut self.reports)
     }
 
     /// The options of one attempt: no wait for the lock, the gate builds asked for, the
@@ -78,9 +87,10 @@ impl AutoLand {
     }
 
     /// One round: finish the landing records left, then try each candidate in Ready order.
-    /// `table` is this round's table. Returns the notes for the controller. Stops at a
-    /// rate limit, a sign-in failure or an unreachable hub; any other failure of one pull
-    /// request is logged and the next is tried.
+    /// `table` is this round's table. Stops at a rate limit, a sign-in failure or an
+    /// unreachable hub; any other failure of one pull request is logged and the next is
+    /// tried. Either way the landings done are in [`AutoLand::take_reports`] and their
+    /// `decisions.log` lines are written (or kept for the next round).
     pub async fn round<G: Gh>(
         &mut self,
         gh: &G,
@@ -88,10 +98,23 @@ impl AutoLand {
         bus: &Bus,
         infos: &[PrInfo],
         table: &str,
-    ) -> Result<Vec<Note>> {
+    ) -> Result<()> {
         self.write_decisions(bus).await;
+        let r = self.attempts(gh, s, bus, infos, table).await;
+        self.write_decisions(bus).await;
+        r
+    }
+
+    async fn attempts<G: Gh>(
+        &mut self,
+        gh: &G,
+        s: &Settings,
+        bus: &Bus,
+        infos: &[PrInfo],
+        table: &str,
+    ) -> Result<()> {
         if !s.repos.iter().any(|r| s.coordinator_lands(r)) {
-            return Ok(Vec::new());
+            return Ok(());
         }
         let mut tries = records(s, bus, infos).await?;
         let notes = if needs_notes(s, infos) {
@@ -109,7 +132,6 @@ impl AutoLand {
             }
         }
         let o = self.opts();
-        let mut out = Vec::new();
         for t in tries {
             if t.candidate {
                 match table::table_word(Some(table), &t.repo, t.number, &t.head, false, Utc::now())
@@ -128,8 +150,8 @@ impl AutoLand {
             match land::merge_once(gh, s, bus, &t.repo, t.number, &t.head, &o).await {
                 Ok(l) => {
                     tracing::info!("{}", l.outcome.line);
-                    if let Some(n) = self.report(s, &t, &l)? {
-                        out.push(n);
+                    if let Some(n) = self.report(s, &t, &l) {
+                        self.reports.push(n);
                     }
                 }
                 Err(Error::Locked(m)) => tracing::info!("{} #{}: {m}", t.repo, t.number),
@@ -140,13 +162,12 @@ impl AutoLand {
                 Err(e) => tracing::warn!("landing {} #{}: {e}", t.repo, t.number),
             }
         }
-        self.write_decisions(bus).await;
-        Ok(out)
+        Ok(())
     }
 
     /// What the controller hears of one attempt: a landing done or finished, or a
     /// `PARTIAL` not reported before. A landing also gets its `decisions.log` line.
-    fn report(&mut self, s: &Settings, t: &Try, l: &Landing) -> Result<Option<Note>> {
+    fn report(&mut self, s: &Settings, t: &Try, l: &Landing) -> Option<Note> {
         let o = &l.outcome;
         let merge = o.merge_commit.as_deref().unwrap_or_default();
         let first = match o.kind {
@@ -170,7 +191,7 @@ impl AutoLand {
             Kind::Partial if self.partial.insert(o.line.clone()) => {
                 format!("[coord] Partial: {}", o.line)
             }
-            _ => return Ok(None),
+            _ => return None,
         };
         let mut body = first;
         for a in &l.after {
@@ -186,8 +207,13 @@ impl AutoLand {
         n.repo = Some(t.repo.clone());
         n.issue = t.number;
         n.head = Some(o.head.clone()).filter(|h| hgl_ai_proto::check_head(h).is_ok());
-        n.validate()?;
-        Ok(Some(n))
+        match n.validate() {
+            Ok(()) => Some(n),
+            Err(e) => {
+                tracing::warn!("a landing report for {} #{}: {e}", t.repo, t.number);
+                None
+            }
+        }
     }
 
     /// Write the `decisions.log` lines not written yet; those that fail stay for the next
@@ -334,7 +360,6 @@ mod tests {
                 &one(),
                 &landing(Kind::Merged, "merged MERGED", &["landed.log", "main"]),
             )
-            .unwrap()
             .unwrap();
         assert_eq!(
             n.body,
@@ -353,7 +378,6 @@ mod tests {
         );
         let n = a
             .report(&s, &one(), &landing(Kind::Resumed, "MERGED", &[]))
-            .unwrap()
             .unwrap();
         assert!(
             n.body.ends_with(", finishing an earlier attempt\n"),
@@ -363,12 +387,12 @@ mod tests {
         assert_eq!(a.decisions.len(), 2);
         // A PARTIAL once per line; no decision line for it.
         let p = landing(Kind::Partial, "the comment is not posted PARTIAL", &[]);
-        let n = a.report(&s, &one(), &p).unwrap().unwrap();
+        let n = a.report(&s, &one(), &p).unwrap();
         assert_eq!(
             n.body,
             "[coord] Partial: the comment is not posted PARTIAL\n"
         );
-        assert!(a.report(&s, &one(), &p).unwrap().is_none());
+        assert!(a.report(&s, &one(), &p).is_none());
         assert_eq!(a.decisions.len(), 2);
         // Nothing for a gate not met, nor for a landing done earlier by another.
         for k in [
@@ -378,11 +402,7 @@ mod tests {
             Kind::Updated,
             Kind::AlreadyMerged,
         ] {
-            assert!(
-                a.report(&s, &one(), &landing(k, "x", &[]))
-                    .unwrap()
-                    .is_none()
-            );
+            assert!(a.report(&s, &one(), &landing(k, "x", &[])).is_none());
         }
         assert_eq!(a.decisions.len(), 2);
     }

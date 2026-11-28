@@ -370,14 +370,18 @@ pub async fn run<G: Gh>(
                         .as_deref()
                         .is_some_and(|h| table::hold_active(h, Utc::now()))
                 {
-                    match lands.round(gh, s, b, &infos, &text).await {
-                        Ok(notes) if notes.is_empty() => {}
-                        Ok(notes) => {
-                            queue(&mut unsent, notes);
-                            if let Err(e) = send_unsent(b, &mut unsent, &mut stored).await {
-                                tracing::warn!("reporting a landing: {e}");
-                            }
+                    let r = lands.round(gh, s, b, &infos, &text).await;
+                    // Before the result: a landing done ahead of a later failure is still
+                    // reported.
+                    let notes = lands.take_reports();
+                    if !notes.is_empty() {
+                        queue(&mut unsent, notes);
+                        if let Err(e) = send_unsent(b, &mut unsent, &mut stored).await {
+                            tracing::warn!("reporting a landing: {e}");
                         }
+                    }
+                    match r {
+                        Ok(()) => {}
                         Err(Error::RateLimited(m)) => {
                             hold = Some(
                                 on_rate_limit(gh, bus, last_rate.as_ref(), &m, Utc::now(), out)

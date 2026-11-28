@@ -1504,7 +1504,8 @@ async fn the_coordinator_lands_a_ready_pull_request() {
     let (s, infos, table) = ready_round();
     let gh = landing_gh(|g| g);
     let mut a = crate::autoland::AutoLand::new(&s);
-    let notes = a.round(&gh, &s, &b, &infos, &table).await.unwrap();
+    a.round(&gh, &s, &b, &infos, &table).await.unwrap();
+    let notes = a.take_reports();
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "merged");
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(
@@ -1550,7 +1551,8 @@ async fn the_coordinator_lands_a_ready_pull_request() {
     );
 
     let calls = gh.calls().len();
-    let notes = a.round(&gh, &s, &b, &[], &table).await.unwrap();
+    a.round(&gh, &s, &b, &[], &table).await.unwrap();
+    let notes = a.take_reports();
     assert!(notes.is_empty(), "{notes:?}");
     assert_eq!(gh.calls().len(), calls, "no GitHub call");
     assert_eq!(hgl_ai_owner::decisions_tail(&b, 10).await.unwrap().len(), 1);
@@ -1567,7 +1569,8 @@ async fn a_coordinator_landing_cut_off_after_the_merge_resumes_next_round() {
     let (s, infos, table) = ready_round();
     let gh = landing_gh(|g| g.push_fail_once("pulls/7", "gh: Server Error (HTTP 502)"));
     let mut a = crate::autoland::AutoLand::new(&s);
-    let first = a.round(&gh, &s, &b, &infos, &table).await.unwrap();
+    a.round(&gh, &s, &b, &infos, &table).await.unwrap();
+    let first = a.take_reports();
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "merged");
     assert!(
         first.iter().all(|n| !n.body.starts_with("[coord] Landed")),
@@ -1583,7 +1586,8 @@ async fn a_coordinator_landing_cut_off_after_the_merge_resumes_next_round() {
 
     // A new coordinator (a restart): the pull request is merged, so not among the open.
     let mut a = crate::autoland::AutoLand::new(&s);
-    let notes = a.round(&gh, &s, &b, &[], &table).await.unwrap();
+    a.round(&gh, &s, &b, &[], &table).await.unwrap();
+    let notes = a.take_reports();
     assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "not merged again");
     assert_eq!(notes.len(), 1, "{notes:?}");
     assert!(
@@ -1606,7 +1610,8 @@ async fn a_coordinator_landing_cut_off_after_the_merge_resumes_next_round() {
     );
     assert_eq!(hgl_ai_owner::decisions_tail(&b, 10).await.unwrap().len(), 1);
 
-    let notes = a.round(&gh, &s, &b, &[], &table).await.unwrap();
+    a.round(&gh, &s, &b, &[], &table).await.unwrap();
+    let notes = a.take_reports();
     assert!(notes.is_empty(), "{notes:?}");
 }
 
@@ -1628,12 +1633,8 @@ async fn without_opt_in_the_coordinator_lands_nothing() {
     .unwrap();
     let gh = landing_gh(|g| g);
     let mut a = crate::autoland::AutoLand::new(&s);
-    assert!(
-        a.round(&gh, &s, &b, &infos, &table)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    a.round(&gh, &s, &b, &infos, &table).await.unwrap();
+    assert!(a.take_reports().is_empty());
     assert!(gh.calls().is_empty(), "{:?}", gh.calls());
     assert!(
         crate::progress::read(&b, "alpha", 7)
@@ -1659,11 +1660,45 @@ async fn a_candidate_the_table_holds_back_costs_no_github_call() {
     .render();
     let gh = landing_gh(|g| g);
     let mut a = crate::autoland::AutoLand::new(&s);
-    assert!(
-        a.round(&gh, &s, &b, &infos, &table)
-            .await
-            .unwrap()
-            .is_empty()
-    );
+    a.round(&gh, &s, &b, &infos, &table).await.unwrap();
+    assert!(a.take_reports().is_empty());
     assert!(gh.calls().is_empty(), "{:?}", gh.calls());
+}
+
+/// hgl-ai#123, review: a candidate lands, then the next in Ready order hits GitHub's rate
+/// limit. The round fails, and the landing done before it is still reported and logged.
+#[tokio::test]
+async fn a_landing_before_a_rate_limit_is_still_reported() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    authored_and_reviewed(&b).await;
+    let (s, mut infos, _) = ready_round();
+    let mut eight = infos[0].clone();
+    eight.row.number = 8;
+    eight.ready_at = Some("2026-11-28T11:00:00Z".into());
+    infos.push(eight);
+    let table = Table {
+        read: hgl_ai_proto::utc_now_stamp(),
+        rate: None,
+        rows: infos.iter().map(|i| i.row.clone()).collect(),
+    }
+    .render();
+    let gh = landing_gh(|g| g.fail("/8", "gh: API rate limit exceeded (HTTP 403)"));
+    gh.rules.lock().unwrap().rotate_right(1);
+    let mut a = crate::autoland::AutoLand::new(&s);
+    let e = a.round(&gh, &s, &b, &infos, &table).await.unwrap_err();
+    assert!(matches!(e, Error::RateLimited(_)), "{e}");
+    assert_eq!(posts(&gh, "pulls/7/merge-async"), 1, "#7 merged");
+    let notes = a.take_reports();
+    assert_eq!(notes.len(), 1, "{notes:?}");
+    assert!(
+        notes[0]
+            .body
+            .starts_with("[coord] Landed: alpha#7 at 1f461fa7"),
+        "{}",
+        notes[0].body
+    );
+    assert!(a.take_reports().is_empty(), "taken once");
+    let log = hgl_ai_owner::decisions_tail(&b, 10).await.unwrap();
+    assert_eq!(log.len(), 1, "{log:?}");
 }
