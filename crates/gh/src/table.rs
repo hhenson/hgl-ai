@@ -16,8 +16,7 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
 use crate::bot::{
-    BotState, BotView, Comment, NoteState, Review, by_note_authors, note_state_across,
-    ready_mark_across,
+    BotState, BotView, Comment, NoteState, Review, by_note_authors, note_state, ready_mark_across,
 };
 use crate::{Error, Result, short};
 
@@ -272,8 +271,9 @@ const LATE: usize = 30;
 
 /// When the comments read from both ends do not meet, the `createdAt` of the first `late`
 /// comment: the comments before it back to the `early` ones were not read. Without
-/// `totalCount`, both full windows count as a gap.
-fn unread_gap(p: &Value, read: usize) -> Option<String> {
+/// `totalCount`, both full windows count as a gap. A gap with no `late` time to give is
+/// `now` (fail closed: nothing before it is known).
+fn unread_gap(p: &Value, read: usize, now: &str) -> Option<String> {
     let (early, late) = (nodes(p, &["early"]), nodes(p, &["late"]));
     let total = p
         .get("early")
@@ -286,10 +286,11 @@ fn unread_gap(p: &Value, read: usize) -> Option<String> {
     if !gap {
         return None;
     }
-    late.iter()
+    let first = late
+        .iter()
         .filter_map(|c| c.get("createdAt").and_then(Value::as_str))
-        .min()
-        .map(String::from)
+        .min();
+    Some(first.unwrap_or(now).to_string())
 }
 
 fn pr_info(
@@ -320,9 +321,21 @@ fn pr_info(
         .map(Review::from_graphql)
         .collect();
     let view = BotView::of(bot, &comments, &reviews);
+    // Across an unread run only the late comments count: the run may hold a later note.
+    let gap = unread_gap(p, comments.len(), read);
+    let late: Vec<Comment>;
+    let read_notes = match gap {
+        Some(_) => {
+            late = nodes(p, &["late"])
+                .iter()
+                .map(Comment::from_graphql)
+                .collect();
+            &late
+        }
+        None => &comments,
+    };
     // Only the fleet's own comments change a note state (anyone can comment).
-    let notes = by_note_authors(&comments, note_authors);
-    let gap = unread_gap(p, comments.len());
+    let notes = by_note_authors(read_notes, note_authors);
     let mark = ready_mark_across(&notes, &head, gap.as_deref());
     let rollup = nodes(p, &["commits"])
         .first()
@@ -342,7 +355,7 @@ fn pr_info(
             updated: read.to_string(),
             head: head.clone(),
         },
-        note: note_state_across(&notes, gap.as_deref()),
+        note: note_state(&notes),
         ready_at: mark.at,
         ready_cleared: mark.cleared,
         url: p
@@ -607,6 +620,15 @@ mod tests {
     /// alpha#11 of the fixture as a round reads it when `early` reports `total` comments; its
     /// `Ready` (the first comment) only in `early` when `total` is over 2.
     fn alpha11_total(total: Option<u64>, extra: &[(&str, &str, &str)]) -> PrInfo {
+        alpha11_shaped(total, extra, |_| {})
+    }
+
+    /// [`alpha11_total`], with `shape` applied to the pull request's JSON last.
+    fn alpha11_shaped(
+        total: Option<u64>,
+        extra: &[(&str, &str, &str)],
+        shape: impl Fn(&mut Value),
+    ) -> PrInfo {
         let mut v = json("coord-batch.json");
         let pr = v
             .pointer_mut("/data/r0/pullRequests/nodes")
@@ -631,8 +653,32 @@ mod tests {
                 "createdAt": at, "updatedAt": at,
             }));
         }
+        shape(pr);
         let (infos, ..) = parse_batch(&v, &repos(), BOT, &fleet(), READ).unwrap();
         infos.into_iter().find(|i| i.row.number == 11).unwrap()
+    }
+
+    #[test]
+    fn across_a_gap_early_comments_are_not_read() {
+        // The early Ready in the same second as the first late comment: still not read.
+        let same = alpha11_shaped(Some(99), &[], |pr| {
+            pr["early"]["nodes"][0]["createdAt"] = "2026-01-05T09:01:00Z".into();
+        });
+        assert_eq!((same.note, &same.ready_at), (None, &None));
+        assert_eq!(same.ready_cleared.as_deref(), Some("2026-01-05T09:01:00Z"));
+        // Fail closed: a gap with no late comment, or none with a time, clears at the read.
+        for shape in [
+            (|pr: &mut Value| pr["late"]["nodes"] = serde_json::json!([])) as fn(&mut Value),
+            |pr: &mut Value| {
+                for c in pr["late"]["nodes"].as_array_mut().unwrap() {
+                    c.as_object_mut().unwrap().remove("createdAt");
+                }
+            },
+        ] {
+            let i = alpha11_shaped(Some(99), &[], shape);
+            assert_eq!((i.note, &i.ready_at), (None, &None));
+            assert_eq!(i.ready_cleared.as_deref(), Some(READ));
+        }
     }
 
     #[test]

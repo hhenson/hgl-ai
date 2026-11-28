@@ -293,15 +293,8 @@ fn note_line(first: &str) -> Option<NoteState> {
 /// The latest note state among comments whose first line is a note's first line
 /// (`[codex] Ready: ...`, `[claude] (w3) Approved ...`).
 pub fn note_state(comments: &[Comment]) -> Option<NoteState> {
-    note_state_across(comments, None)
-}
-
-/// [`note_state`] when the comments read leave an unread run before the comment created at
-/// `gap`: only note comments from `gap` on count, as the latest note may be in the run.
-pub fn note_state_across(comments: &[Comment], gap: Option<&str>) -> Option<NoteState> {
     let mut found: Vec<(&str, NoteState)> = comments
         .iter()
-        .filter(|c| gap.is_none_or(|g| c.created_at.as_str() >= g))
         .filter_map(|c| {
             Some((
                 c.created_at.as_str(),
@@ -370,9 +363,9 @@ pub fn ready_mark(comments: &[Comment], head: &str) -> ReadyMark {
     ready_mark_across(comments, head, None)
 }
 
-/// [`ready_mark`] when the comments read leave an unread run before the comment created at
-/// `gap` (a long pull request read from both ends): a note there may have cleared Ready, so
-/// the gap clears it, at `gap`. A `Ready` after the gap marks it again.
+/// [`ready_mark`] over the comments after an unread run (a long pull request read from both
+/// ends): `comments` are only those after it, and a note in the run may have cleared Ready,
+/// so the mark starts cleared at `gap`. A `Ready` among `comments` marks it again.
 pub fn ready_mark_across(comments: &[Comment], head: &str, gap: Option<&str>) -> ReadyMark {
     let mut notes: Vec<(&str, NoteState, Option<&str>)> = comments
         .iter()
@@ -386,17 +379,11 @@ pub fn ready_mark_across(comments: &[Comment], head: &str, gap: Option<&str>) ->
         })
         .collect();
     notes.sort_by(|a, b| a.0.cmp(b.0));
-    let mut mark = ReadyMark::default();
-    let mut gap = gap;
-    let mut cross = |mark: &mut ReadyMark, upto: Option<&str>| {
-        if let Some(g) = gap.filter(|g| upto.is_none_or(|u| u >= *g)) {
-            mark.at = None;
-            mark.cleared = Some(g.to_string());
-            gap = None;
-        }
+    let mut mark = ReadyMark {
+        at: None,
+        cleared: gap.map(String::from),
     };
     for (at, st, declared) in notes {
-        cross(&mut mark, Some(at));
         let at_head = declared.is_some_and(|d| names_head(d, head));
         let keeps = match st {
             NoteState::Ready if at_head && declared.is_some_and(|d| d.len() >= READY_HEAD_MIN) => {
@@ -411,7 +398,6 @@ pub fn ready_mark_across(comments: &[Comment], head: &str, gap: Option<&str>) ->
             mark.cleared = Some(at.to_string());
         }
     }
-    cross(&mut mark, None);
     mark
 }
 
@@ -691,53 +677,28 @@ mod tests {
         };
         let t = |h: u32| format!("2026-01-01T{h:02}:00:00Z");
         let at = |s: &str| Some(s.to_string());
-        let early = c("[codex] Ready: o/r#7 at 1f461fa7", &t(1));
+        let gap = Some(t(4));
+        let gap = gap.as_deref();
+        // Only the comments after the gap are given; the mark starts cleared at it.
         let approved = c("[claude] Approved.", &t(5));
-        let again = c("[codex] Ready: o/r#7 at 1f461fa7", &t(6));
-        // Ready before the gap, an Approved after it: a Sent back may be in the gap.
-        let cs = [early.clone(), approved.clone()];
-        assert_eq!(ready_mark(&cs, H1).at, at(&t(1)), "no gap");
-        assert_eq!(
-            ready_mark_across(&cs, H1, Some(&t(4))),
-            ReadyMark {
-                at: None,
-                cleared: at(&t(4))
-            }
-        );
-        // Nothing read after the gap: cleared all the same.
-        let only = std::slice::from_ref(&early);
-        assert_eq!(ready_mark_across(only, H1, Some(&t(4))).cleared, at(&t(4)));
-        // A Ready after the gap (or at its first comment) stands.
-        let cs = [early.clone(), approved.clone(), again];
-        assert_eq!(ready_mark_across(&cs, H1, Some(&t(4))).at, at(&t(6)));
-        let cs = [early.clone(), c("[codex] Ready: o/r#7 at 1f461fa7", &t(4))];
-        assert_eq!(ready_mark_across(&cs, H1, Some(&t(4))).at, at(&t(4)));
-        // A clear after the gap is the later one.
-        let cs = [early, approved, c("[claude] Sent back", &t(7))];
-        assert_eq!(ready_mark_across(&cs, H1, Some(&t(4))).cleared, at(&t(7)));
-    }
-
-    #[test]
-    fn an_unread_gap_hides_the_latest_note() {
-        let c = |body: &str, at: &str| Comment {
-            author: "u".into(),
-            body: body.into(),
-            created_at: at.into(),
-            updated_at: at.into(),
+        let cleared = ReadyMark {
+            at: None,
+            cleared: at(&t(4)),
         };
-        let t = |h: u32| format!("2026-01-01T{h:02}:00:00Z");
-        let ready = c("[codex] Ready: o/r#7 at 1f461fa7", &t(1));
-        let chat = c("checks pass", &t(5));
-        let cs = [ready.clone(), chat.clone()];
-        assert_eq!(note_state(&cs), Some(NoteState::Ready));
-        // A note before the gap may be followed by one in it: no state.
-        assert_eq!(note_state_across(&cs, Some(&t(4))), None);
-        // A note from the gap on is the latest.
-        let cs = [ready, chat, c("[claude] Approved.", &t(6))];
+        assert_eq!(ready_mark_across(&[], H1, gap), cleared);
         assert_eq!(
-            note_state_across(&cs, Some(&t(4))),
-            Some(NoteState::Approved)
+            ready_mark_across(std::slice::from_ref(&approved), H1, gap),
+            cleared
         );
+        // A Ready after the gap, at its first comment's time too, stands.
+        let again = c("[codex] Ready: o/r#7 at 1f461fa7", &t(6));
+        let cs = [approved.clone(), again];
+        assert_eq!(ready_mark_across(&cs, H1, gap).at, at(&t(6)));
+        let first = c("[codex] Ready: o/r#7 at 1f461fa7", &t(4));
+        assert_eq!(ready_mark_across(&[first], H1, gap).at, at(&t(4)));
+        // A clear after the gap is the later one.
+        let cs = [approved, c("[claude] Sent back", &t(7))];
+        assert_eq!(ready_mark_across(&cs, H1, gap).cleared, at(&t(7)));
     }
 
     #[test]
