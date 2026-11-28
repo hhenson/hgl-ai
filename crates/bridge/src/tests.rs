@@ -863,7 +863,10 @@ async fn assign_then_sendback_resumes_then_landed_cleans_up() {
     ] {
         assert_eq!(c.env.get(k), Some(&v), "{k}");
     }
-    assert_eq!(&c.args[..4], ["exec", "--json", "-m", "gpt-6.2-astra"]);
+    assert_eq!(
+        &c.args[..5],
+        ["exec", "--json", "--strict-config", "-m", "gpt-6.2-astra"]
+    );
     assert!(!c.args.contains(&"resume".to_string()));
     assert!(
         c.stdin

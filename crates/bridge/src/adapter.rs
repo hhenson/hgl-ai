@@ -4,6 +4,7 @@
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
+pub use hgl_ai_config::{CODEX_PROFILE, codex_profile};
 use hgl_ai_config::{Resolved, model_args};
 use hgl_ai_proto::Runtime;
 use serde_json::Value;
@@ -59,7 +60,10 @@ pub fn command(program: &Path, t: &TurnInput) -> CmdSpec {
             if t.resume.is_some() {
                 s(&mut a, &["resume"]);
             }
-            s(&mut a, &["--json"]);
+            // `--strict-config`: a CLI that does not know `default_permissions` or
+            // `permissions` (no profiles) fails the turn instead of ignoring them and
+            // running read-only, without network (hgl-ai#59). `doctor` probes both.
+            s(&mut a, &["--json", "--strict-config"]);
             s(&mut a, &models);
             for c in codex_profile(t.writable) {
                 s(&mut a, &["-c", &c]);
@@ -115,40 +119,6 @@ fn agy_input(prompt: &str) -> Vec<u8> {
     let mut line = msg.to_string().into_bytes();
     line.push(b'\n');
     line
-}
-
-/// The Codex permission profile a turn runs under ([`codex_profile`]).
-pub const CODEX_PROFILE: &str = "hgl_task";
-
-/// The `-c` overrides that select [`CODEX_PROFILE`]: the whole disk readable, `writable`
-/// (the task directory and the clone) writable, and the network on.
-///
-/// A named profile, not `sandbox_mode = "workspace-write"` with
-/// `sandbox_workspace_write.writable_roots`: that legacy policy makes the `.git` of every
-/// writable root read-only and, where `.git` is a `gitdir:` pointer (a worktree), its target
-/// too. A task's `src/.git` points into the clone's `worktrees/`, so `index.lock` could not
-/// be created even with the clone writable (hgl-ai#29, codex-cli 0.172.0). A profile's
-/// paths are taken as given. `exec resume` honours it too, also for a session started
-/// under the legacy policy.
-pub fn codex_profile(writable: &[PathBuf]) -> Vec<String> {
-    let mut fs = vec![format!("{}=\"read\"", toml_str(":root"))];
-    fs.extend(
-        writable
-            .iter()
-            .map(|p| format!("{}=\"write\"", toml_str(&p.to_string_lossy()))),
-    );
-    vec![
-        format!("default_permissions={}", toml_str(CODEX_PROFILE)),
-        format!(
-            "permissions.{CODEX_PROFILE}.filesystem={{{}}}",
-            fs.join(",")
-        ),
-        format!("permissions.{CODEX_PROFILE}.network.enabled=true"),
-    ]
-}
-
-fn toml_str(s: &str) -> String {
-    serde_json::to_string(s).unwrap_or_else(|_| format!("\"{s}\""))
 }
 
 /// What a turn's output said.
@@ -550,6 +520,7 @@ mod tests {
         let want: Vec<&str> = [
             "exec",
             "--json",
+            "--strict-config",
             "-m",
             "gpt-6.1-sol",
             "-c",
@@ -566,11 +537,18 @@ mod tests {
             resolved: &plain,
             ..t
         };
-        let want: Vec<&str> = ["exec", "resume", "--json", "-m", "gpt-6.1-sol"]
-            .into_iter()
-            .chain(profile)
-            .chain(["--skip-git-repo-check", "T1", "-"])
-            .collect();
+        let want: Vec<&str> = [
+            "exec",
+            "resume",
+            "--json",
+            "--strict-config",
+            "-m",
+            "gpt-6.1-sol",
+        ]
+        .into_iter()
+        .chain(profile)
+        .chain(["--skip-git-repo-check", "T1", "-"])
+        .collect();
         let resumed = strs(&command(Path::new("codex"), &r));
         assert_eq!(resumed, want);
         // The legacy policy protects a worktree's gitdir (hgl-ai#29); it must not come back.

@@ -241,7 +241,9 @@ The session starts the seat's runtime with its model and effort in
 `HGL_AI_ROLE`, `HGL_AI_TASK_DIR` and `TMPDIR` set.
 
 Each CLI must be signed in once by its user (`claude`, `codex login`, `agy`).
-`doctor` reports a CLI that is installed but not signed in.
+`doctor` reports a CLI that is installed but not signed in, and for `codex`
+whether it applies the turns' permission profile (`codex profile`) and loads its
+`config.toml` under `--strict-config` (`codex config`).
 
 ## Proxy builders
 

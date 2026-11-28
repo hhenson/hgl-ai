@@ -243,7 +243,7 @@ A model's family comes from the `[models.<family>]` table that names it; an
 | Runtime | Turn | Resume | Model and effort |
 | --- | --- | --- | --- |
 | `claude` | `claude -p --output-format stream-json --verbose` | `--resume ID` from the last turn's `session_id` | `--model`, `--effort` |
-| `codex` | `codex exec --json -` | `codex exec resume --json ID -` | `-m`, `-c model_reasoning_effort=E` |
+| `codex` | `codex exec --json --strict-config -` | `codex exec resume --json --strict-config ID -` | `-m`, `-c model_reasoning_effort=E` |
 | `agy` | `agy --input-format stream-json --output-format stream-json` | `--conversation ID` | `--model SLUG-EFFORT`, `--effort` |
 
 - The prompt goes on stdin, never in an argument (Linux caps one at 128 KiB; a
@@ -258,7 +258,11 @@ A model's family comes from the `[models.<family>]` table that names it; an
   (`default_permissions`, `permissions.hgl_task`): the disk readable, the task
   directory and the clone writable, the network on. Not `workspace-write` with
   `writable_roots`: that makes each root's `.git`, and a `gitdir:` pointer's
-  target, read-only, so a worktree could not commit (hgl-ai#29). `claude`
+  target, read-only, so a worktree could not commit (hgl-ai#29). With
+  `--strict-config` a CLI without profiles fails the turn instead of ignoring
+  the keys and running read-only, without network; `doctor` runs the profile
+  under `codex sandbox` and loads the configuration under `--strict-config`
+  (hgl-ai#59). `claude`
   (`--permission-mode bypassPermissions`, `--add-dir`) and `agy`
   (`--dangerously-skip-permissions`) run with the user's own permissions. A turn
   that exceeds `turn_timeout` is stopped and counted as a failure (PROTO-8).
