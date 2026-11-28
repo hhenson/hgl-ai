@@ -1525,7 +1525,8 @@ async fn a_held_turn_lock_defers_the_turn() {
         note(Kind::Assign, "w1", 7, "[claude] Assign: demo#7 Seven"),
     );
     eventually("assign acked", || h.bus.events(a) == [Ev::Ack]).await;
-    let held = FileLock::turn(&h.work().join("w1/demo-7/turn.lock"))
+    let held = FileLock::turn_patiently(&h.work().join("w1/demo-7/turn.lock"))
+        .await
         .unwrap()
         .expect("free after the turn");
     let q = h.bus.push(
