@@ -1494,24 +1494,27 @@ impl<B: BusApi> Bridge<B> {
         cur: Option<Family>,
         to: Family,
     ) -> Option<String> {
-        if Some(to) == cur {
-            return None;
-        }
         let Target::Tree { task, review } = target else {
             return None;
         };
         if *review {
+            if Some(to) == cur {
+                return None;
+            }
             return Some(format!(
                 "a review keeps its family ({}), which differs from the author's",
                 cur.map(|f| f.to_string())
                     .unwrap_or_else(|| "unknown".into())
             ));
         }
-        let mut authors: HashSet<Family> = cur.into_iter().collect();
+        let mut authors: HashSet<Family> = HashSet::new();
         if let Some(dir) = self.trees.existing(seat.name(), task, false)
             && let Ok(f) = hgl_ai_tree::read_task(&dir)
         {
             authors.extend(f.families);
+        }
+        if Some(to) == cur && authors.contains(&to) {
+            return None;
         }
         authors.insert(to);
         let reviewers: HashSet<Family> = match self.bus.hosts().await {
