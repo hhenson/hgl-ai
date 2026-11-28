@@ -13,6 +13,7 @@ hgl-ai-bus.workspace = true
 hgl-ai-cap.workspace = true
 hgl-ai-tree.workspace = true
 tokio.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

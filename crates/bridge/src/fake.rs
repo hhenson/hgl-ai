@@ -52,6 +52,8 @@ struct Inner {
     inbox_broken: AtomicBool,
     /// Lease refreshes fail as if the hub did not answer.
     refresh_down: AtomicBool,
+    /// Lease refreshes hang, as when the hub stalls silently.
+    refresh_hangs: AtomicBool,
     /// `HGL_LOCKS` max_age in milliseconds; 0 is the protocol's.
     lease_max_age_ms: AtomicU64,
 }
@@ -168,6 +170,11 @@ impl FakeBus {
     /// Lease refreshes fail without an answer (`true`), as in a partition, or work.
     pub fn refresh_down(&self, down: bool) {
         self.0.refresh_down.store(down, Ordering::SeqCst);
+    }
+
+    /// Lease refreshes hang (`true`) until it is cleared, or work.
+    pub fn refresh_hangs(&self, hang: bool) {
+        self.0.refresh_hangs.store(hang, Ordering::SeqCst);
     }
 
     /// The `max_age` of `HGL_LOCKS` the bridge reads.
@@ -314,6 +321,9 @@ pub struct FakeLease {
 
 impl LeaseApi for FakeLease {
     async fn refresh(&mut self) -> Result<()> {
+        while self.bus.0.refresh_hangs.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         if self.bus.0.refresh_down.load(Ordering::SeqCst) {
             return Err(BusError::Nats("HGL_LOCKS: no responders".into()));
         }
