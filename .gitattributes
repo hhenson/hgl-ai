@@ -1,0 +1,2 @@
+# Vendored third-party files: shown as vendored, not diffed line by line.
+crates/console/assets/vendor/ag-grid/** linguist-vendored -diff

@@ -1,5 +1,6 @@
 // hgl-ai console: passkey ceremonies, live telemetry and the answer form. Embedded in
-// the binary; no other script runs (the page's CSP allows only this one).
+// the binary; the CSP allows only the console's own scripts: this one and, on the
+// telemetry page, the vendored AG Grid Community.
 "use strict";
 
 function b64urlToBuf(s) {
@@ -95,14 +96,197 @@ function wire(id, fn) {
   });
 }
 
+// ---- telemetry: tabs, and grids kept current by row diffs (crates/console/src/grid.rs) ----
+
+function tabs() {
+  const nav = document.querySelector("nav.tabs");
+  if (!nav) return;
+  const links = [...nav.querySelectorAll("a[data-tab]")];
+  const panels = links.map((a) => document.getElementById(a.dataset.tab));
+  if (!links.length || panels.some((p) => !p)) return;
+  nav.querySelector("ul").setAttribute("role", "tablist");
+  links.forEach((a, i) => {
+    a.parentElement.setAttribute("role", "presentation");
+    a.setAttribute("role", "tab");
+    a.setAttribute("aria-controls", panels[i].id);
+    panels[i].setAttribute("role", "tabpanel");
+    panels[i].setAttribute("aria-labelledby", a.id);
+  });
+  document.body.classList.add("tabbed");
+  const show = (id, focus) => {
+    if (!links.some((a) => a.dataset.tab === id)) id = links[0].dataset.tab;
+    links.forEach((a, i) => {
+      const on = a.dataset.tab === id;
+      a.setAttribute("aria-selected", on ? "true" : "false");
+      a.tabIndex = on ? 0 : -1;
+      panels[i].hidden = !on;
+      if (on) {
+        // On a narrow screen the strip scrolls sideways: keep the selected tab in it.
+        const ul = a.closest("ul");
+        const l = a.offsetLeft - ul.offsetLeft;
+        if (l < ul.scrollLeft || l + a.offsetWidth > ul.scrollLeft + ul.clientWidth) ul.scrollLeft = l - 16;
+        if (focus) a.focus();
+      }
+    });
+  };
+  // The selected tab is the URL fragment, so a reload or a shared link keeps it.
+  const select = (id, focus) => {
+    history.replaceState(null, "", "#" + id);
+    show(id, focus);
+  };
+  links.forEach((a, i) => {
+    a.addEventListener("click", (e) => { e.preventDefault(); select(a.dataset.tab); });
+    a.addEventListener("keydown", (e) => {
+      const n = links.length;
+      const j = { ArrowRight: i + 1, ArrowLeft: i - 1 + n, Home: 0, End: n - 1 }[e.key];
+      if (j === undefined) return;
+      e.preventDefault();
+      select(links[j % n].dataset.tab, true);
+    });
+  });
+  window.addEventListener("hashchange", () => show(decodeURIComponent(location.hash.slice(1))));
+  show(decodeURIComponent(location.hash.slice(1)));
+  // Without this the browser keeps its jump to the fragment's panel, past the tabs.
+  if (location.hash) window.scrollTo(0, 0);
+}
+
+function age(min) {
+  const m = Math.max(0, min | 0);
+  return m >= 1440 ? Math.floor(m / 1440) + "d" : m >= 60 ? Math.floor(m / 60) + "h" : m + "m";
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => "&#" + c.charCodeAt(0) + ";");
+}
+
+// Columns from the plain table's header: one definition, on the server. Each column is
+// at least as wide as its header and the first rows' text, up to a limit.
+function columnDefs(table, rows) {
+  const [sortField, sortDir] = (table.dataset.sort || "").split(" ");
+  return [...table.querySelectorAll("thead th[data-field]")].map((th) => {
+    const kind = th.dataset.kind;
+    const f = th.dataset.field;
+    const text = rows.slice(0, 200).reduce((n, r) => {
+      const v = r[f] == null ? "" : kind === "age" ? age(r[f]) : String(r[f]);
+      return Math.max(n, v.length);
+    }, 0);
+    const minWidth = Math.min(kind === "long" ? 220 : 260,
+      Math.max(80, th.textContent.length * 8 + 76, text * 8 + 36));
+    const c = {
+      field: th.dataset.field,
+      headerName: th.textContent,
+      enableCellChangeFlash: kind !== "rank" && kind !== "age",
+      filter: "agTextColumnFilter",
+      cellDataType: "text",
+    };
+    if (kind === "num" || kind === "rank" || kind === "age") {
+      c.type = "numericColumn";
+      c.filter = "agNumberColumnFilter";
+      c.cellDataType = "number";
+    }
+    if (kind === "age") c.valueFormatter = (p) => (p.value == null ? "" : age(p.value));
+    if (kind === "code") c.cellClass = "mono";
+    c.minWidth = minWidth;
+    if (kind === "long") Object.assign(c, { wrapText: true, autoHeight: true, flex: 3 });
+    if (kind === "rank") Object.assign(c, { flex: 0, width: minWidth });
+    if (c.field === sortField) c.sort = sortDir;
+    return c;
+  });
+}
+
+function makeGrid(table, rows) {
+  const div = document.createElement("div");
+  div.className = "tgrid ag-theme-quartz-auto-dark";
+  const cap = table.querySelector("caption");
+  const label = document.createElement("p");
+  label.className = "caption";
+  label.textContent = cap ? cap.textContent : "";
+  table.after(label, div);
+  table.hidden = true;
+  return agGrid.createGrid(div, {
+    theme: "legacy",
+    columnDefs: columnDefs(table, rows),
+    defaultColDef: { sortable: true, resizable: true, flex: 1 },
+    getRowId: (p) => p.data.id,
+    domLayout: "autoHeight",
+    rowData: [],
+    animateRows: false,
+    ensureDomOrder: true,
+    enableCellTextSelection: true,
+    suppressDragLeaveHidesColumns: true,
+    cellFlashDuration: 1200,
+    cellFadeDuration: 1500,
+    overlayNoRowsTemplate: '<span class="empty">' + escapeHtml(table.dataset.empty || "") + "</span>",
+  });
+}
+
 function live() {
   const panels = document.getElementById("panels");
   const status = document.getElementById("live");
   if (!panels || !panels.dataset.sse || !window.EventSource) return;
-  const es = new EventSource(panels.dataset.sse);
-  es.addEventListener("snapshot", (e) => {
-    panels.innerHTML = e.data;
+  if (!window.agGrid) {
+    if (status) status.textContent = "The grid did not load; this is the reading the page was loaded with.";
+    return;
+  }
+  const grids = {};
+  // A grid is made from the first rows it gets (they size its columns).
+  const grid = (name, rows) => {
+    if (!grids[name]) {
+      const table = panels.querySelector('table[data-grid="' + name + '"]');
+      if (!table) return null;
+      grids[name] = makeGrid(table, rows);
+    }
+    return grids[name];
+  };
+  const meta = (m) => {
+    if (!m) return;
+    const read = document.getElementById("read");
+    if (read) read.textContent = m.read;
+    const err = document.getElementById("read-error");
+    if (err) { err.textContent = m.error || ""; err.hidden = !m.error; }
+    panels.querySelectorAll("[data-note]").forEach((p) => {
+      const t = (m.notes || {})[p.dataset.note];
+      p.textContent = t || "";
+      p.hidden = !t;
+    });
+    Object.entries(m.counts || {}).forEach(([tab, n]) => {
+      const c = document.querySelector("#tab-" + tab + " .count");
+      if (c) c.textContent = n;
+    });
     if (status) status.textContent = "Live; updated " + new Date().toLocaleTimeString();
+  };
+  const es = new EventSource(panels.dataset.sse);
+  // Every row, first on each connection: applied as a transaction against what the grid
+  // has, so a reconnect keeps sort, filter, scroll and selection too.
+  es.addEventListener("reset", (e) => {
+    const d = JSON.parse(e.data);
+    Object.entries(d.tables || {}).forEach(([name, rows]) => {
+      const api = grid(name, rows);
+      if (!api) return;
+      const want = new Set(rows.map((r) => r.id));
+      const have = new Set();
+      const remove = [];
+      api.forEachNode((n) => { have.add(n.data.id); if (!want.has(n.data.id)) remove.push(n.data); });
+      api.applyTransaction({
+        add: rows.filter((r) => !have.has(r.id)),
+        update: rows.filter((r) => have.has(r.id)),
+        remove,
+      });
+    });
+    meta(d.meta);
+  });
+  es.addEventListener("diff", (e) => {
+    const d = JSON.parse(e.data);
+    Object.entries(d.tables || {}).forEach(([name, t]) => {
+      const api = grid(name, t.add || []);
+      if (!api) return;
+      api.applyTransaction({
+        add: t.add || [],
+        update: t.update || [],
+        remove: (t.remove || []).map((id) => ({ id })),
+      });
+    });
+    meta(d.meta);
   });
   es.onerror = () => { if (status) status.textContent = "Reconnecting…"; };
 }
@@ -125,6 +309,7 @@ function answerForm() {
 document.addEventListener("DOMContentLoaded", () => {
   wire("passkey-register", register);
   wire("passkey-signin", signin);
+  tabs();
   live();
   answerForm();
 });

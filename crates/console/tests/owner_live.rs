@@ -5,105 +5,16 @@
 
 mod common;
 
-use std::net::TcpListener;
-use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::routing::post;
 use common::*;
-use hgl_ai_bus::{Bus, Credential};
+use hgl_ai_bus::Bus;
 use hgl_ai_config::Notify;
 use hgl_ai_console::App;
-use hgl_ai_install::nats::{Auth, render_conf};
-use hgl_ai_install::users::{Registry, Role};
 use hgl_ai_owner::{self as owner, Ask, Body, Event, Priority, QOption, ThreadState};
 use hgl_ai_proto::{Kind, Seat};
-
-struct Server(Child);
-impl Drop for Server {
-    fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
-    }
-}
-
-struct Hub {
-    _server: Server,
-    _dir: tempfile::TempDir,
-    url: String,
-    creds: std::collections::BTreeMap<&'static str, Credential>,
-}
-
-fn start_hub() -> Option<Hub> {
-    let bin = std::env::split_paths(&std::env::var_os("PATH")?)
-        .map(|d| d.join("nats-server"))
-        .find(|p| p.is_file());
-    let Some(bin) = bin else {
-        eprintln!("skipped: nats-server is not on PATH");
-        return None;
-    };
-    let dir = tempfile::tempdir().unwrap();
-    let mut reg = Registry::default();
-    let mut creds = std::collections::BTreeMap::new();
-    for (n, r) in [
-        ("hub", Role::Seat),
-        ("console", Role::Console),
-        ("hub-admin", Role::Admin),
-    ] {
-        let t = reg.issue(n, r, false).unwrap();
-        creds.insert(n, hgl_ai_bus::parse_credential(&t).unwrap().unwrap());
-    }
-    let port = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
-    let conf = dir.path().join("nats.conf");
-    std::fs::create_dir_all(dir.path().join("store")).unwrap();
-    std::fs::write(
-        &conf,
-        render_conf(
-            "127.0.0.1",
-            port,
-            &dir.path().join("store"),
-            &Auth::Users(&reg),
-        ),
-    )
-    .unwrap();
-    let child = Command::new(bin)
-        .arg("-c")
-        .arg(&conf)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .unwrap();
-    let server = Server(child);
-    let up = (0..200).any(|_| {
-        std::thread::sleep(Duration::from_millis(50));
-        std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
-    });
-    assert!(up, "nats-server did not start");
-    Some(Hub {
-        _server: server,
-        _dir: dir,
-        url: format!("nats://127.0.0.1:{port}"),
-        creds,
-    })
-}
-
-async fn until<T, F: std::future::Future<Output = Option<T>>>(
-    what: &str,
-    mut f: impl FnMut() -> F,
-) -> T {
-    for _ in 0..100 {
-        if let Some(v) = f().await {
-            return v;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("timed out waiting for {what}");
-}
 
 /// A fake ntfy topic that records each push.
 async fn ntfy() -> (String, Arc<Mutex<Vec<(String, String, String)>>>) {

@@ -5,8 +5,11 @@
 //!
 //! Pages are rendered on the server; the one script, embedded like the stylesheet,
 //! drives the passkey ceremonies, live telemetry (server-sent events) and the answer form.
+//! The telemetry page also loads AG Grid Community, vendored at a pinned version
+//! (`assets/vendor/VENDOR.md`) and served from the console's own path.
 
 pub mod auth;
+pub mod grid;
 mod html;
 pub mod jwt;
 mod pages;
@@ -16,6 +19,7 @@ pub mod telemetry;
 use std::sync::{Arc, Mutex};
 
 use axum::Router;
+use axum::extract::Path;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -146,18 +150,59 @@ async fn security_headers(mut r: Response) -> Response {
     r
 }
 
-const STYLE: &str = include_str!("../assets/style.css");
-const SCRIPT: &str = include_str!("../assets/app.js");
+const STYLE: &[u8] = include_bytes!("../assets/style.css");
+const SCRIPT: &[u8] = include_bytes!("../assets/app.js");
 
-fn asset(kind: &'static str, body: &'static str) -> Response {
+/// The vendored AG Grid Community (`assets/vendor/VENDOR.md`), served under
+/// `/assets/ag-grid/<version>/`.
+pub const AG_GRID_VERSION: &str = "36.3.0";
+macro_rules! vendored {
+    ($($name:literal),* $(,)?) => {
+        &[$(($name, include_bytes!(concat!("../assets/vendor/ag-grid/", $name)))),*]
+    };
+}
+pub const AG_GRID_FILES: &[(&str, &[u8])] = vendored!(
+    "ag-grid-community.min.noStyle.js",
+    "ag-grid.min.css",
+    "ag-theme-quartz.min.css",
+    "data-32162e0dbc3e.svg",
+    "data-36b98d025184.svg",
+    "data-43d1b0e2ef6a.woff2",
+    "data-699c136b519a.svg",
+    "data-c56482da2aea.svg",
+);
+
+/// `/assets/ag-grid/<version>/<file>`
+pub fn ag_grid_path(file: &str) -> String {
+    format!("/assets/ag-grid/{AG_GRID_VERSION}/{file}")
+}
+
+fn content_type(name: &str) -> &'static str {
+    match name.rsplit('.').next() {
+        Some("js") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    }
+}
+
+fn asset(kind: &'static str, cache: &'static str, body: &'static [u8]) -> Response {
     (
-        [
-            (header::CONTENT_TYPE, kind),
-            (header::CACHE_CONTROL, "public, max-age=3600"),
-        ],
+        [(header::CONTENT_TYPE, kind), (header::CACHE_CONTROL, cache)],
         body,
     )
         .into_response()
+}
+
+async fn ag_grid(Path((version, file)): Path<(String, String)>) -> Response {
+    match AG_GRID_FILES.iter().find(|(n, _)| *n == file) {
+        // The version is in the path, so a file never changes under it.
+        Some((n, body)) if version == AG_GRID_VERSION => {
+            asset(content_type(n), "public, max-age=31536000, immutable", body)
+        }
+        _ => (StatusCode::NOT_FOUND, "not found\n").into_response(),
+    }
 }
 
 /// Every route of the console.
@@ -194,12 +239,13 @@ pub fn router(app: Arc<App>) -> Router {
         .route("/healthz", get(|| async { "ok\n" }))
         .route(
             "/assets/style.css",
-            get(|| async { asset("text/css; charset=utf-8", STYLE) }),
+            get(|| async { asset(content_type(".css"), "public, max-age=3600", STYLE) }),
         )
         .route(
             "/assets/app.js",
-            get(|| async { asset("text/javascript; charset=utf-8", SCRIPT) }),
+            get(|| async { asset(content_type(".js"), "public, max-age=3600", SCRIPT) }),
         )
+        .route("/assets/ag-grid/{version}/{file}", get(ag_grid))
         .fallback(|| async { (StatusCode::NOT_FOUND, "not found\n") })
         .layer(axum::middleware::map_response(security_headers))
         .with_state(app)

@@ -1,18 +1,22 @@
 //! The telemetry page (docs/owner.md §3): one snapshot of the hub, read every few
-//! seconds, rendered as HTML panels and pushed to open pages by server-sent events.
+//! seconds, turned into tables of rows (see [`crate::grid`]) that the page shows in tabs
+//! and the live feed sends as row diffs.
 
 use std::collections::{BTreeMap, HashMap};
-use std::fmt::Write as _;
 
 use chrono::{DateTime, Duration, Utc};
 use hgl_ai_bus::Bus;
 use hgl_ai_gh::backlog::{Backlog, QueueRow};
 use hgl_ai_gh::table::Table;
 use hgl_ai_owner::{Priority, Thread, ThreadKind};
+use hgl_ai_proto::build::{BuilderRecord, Summary};
+use hgl_ai_proto::usage::UsageRecord;
 use hgl_ai_proto::{HostRecord, Kind, MetricsSample, Note, STREAM_NOTES, TreeRecord};
 use serde::Serialize;
+use serde_json::{Value, json};
 
-use crate::html::{esc, time, when};
+use crate::grid::{self, Meta, Tables, row};
+use crate::html::when;
 
 /// Notes read for the tasks panel: the bus keeps 14 days.
 const NOTES_WINDOW_DAYS: i64 = 14;
@@ -21,6 +25,10 @@ const NOTES_MAX: usize = 20_000;
 pub const BURNDOWN_DAYS: usize = 14;
 /// `prs` older than this is stale (docs/protocol.md §8).
 const PRS_STALE_MIN: i64 = 15;
+/// Build runs shown.
+const RUNS_MAX: usize = 40;
+/// Landings shown.
+const LANDINGS_MAX: usize = 50;
 
 /// The last note about one task.
 #[derive(Debug, Clone, Serialize)]
@@ -132,6 +140,10 @@ pub struct Snapshot {
     pub hold: Option<String>,
     pub stale_trees: usize,
     pub open_questions: BTreeMap<String, usize>,
+    /// The newest build runs, newest first (`HGL_BUILD/run.*`).
+    pub runs: Vec<RunRow>,
+    pub builders: Vec<BuilderRecord>,
+    pub usage: Vec<UsageRecord>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -166,6 +178,44 @@ impl From<&QueueRow> for QueueRowOut {
     }
 }
 
+/// One build run, as the builds tab shows it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunRow {
+    pub id: String,
+    pub repo: String,
+    pub head: String,
+    pub host: String,
+    pub platform: String,
+    pub status: String,
+    pub started_at: String,
+    pub wall_ms: u64,
+    pub errors: u64,
+    pub passed: u64,
+    pub failed: u64,
+}
+
+impl From<&Summary> for RunRow {
+    fn from(s: &Summary) -> Self {
+        RunRow {
+            id: s.id.clone(),
+            repo: s.repo.clone(),
+            head: s
+                .head
+                .as_deref()
+                .map(|h| h.chars().take(8).collect())
+                .unwrap_or_default(),
+            host: s.host.clone(),
+            platform: s.platform.to_string(),
+            status: s.status.to_string(),
+            started_at: s.started_at.clone(),
+            wall_ms: s.wall_ms,
+            errors: s.errors_total,
+            passed: s.tests.passed,
+            failed: s.tests.failed,
+        }
+    }
+}
+
 fn parse_stamp(s: &str) -> Option<DateTime<Utc>> {
     hgl_ai_proto::parse_stamp(s)
 }
@@ -195,10 +245,43 @@ pub fn burndown(samples: &[MetricsSample]) -> BTreeMap<String, Vec<Day>> {
         .collect()
 }
 
+/// What one reading keeps for the next: the notes read so far and the finished runs.
+#[derive(Default)]
+pub struct Cache {
+    pub notes: NotesIndex,
+    runs: HashMap<String, RunRow>,
+}
+
+/// The newest [`RUNS_MAX`] runs, newest first; a finished run is read once.
+async fn read_runs(bus: &Bus, cache: &mut Cache) -> hgl_ai_bus::Result<Vec<RunRow>> {
+    let keys = bus.build_keys("run.").await?;
+    let newest: Vec<&String> = keys.iter().rev().take(RUNS_MAX).collect();
+    let mut out = Vec::new();
+    for k in &newest {
+        if let Some(r) = cache.runs.get(*k) {
+            out.push(r.clone());
+            continue;
+        }
+        let Some(e) = bus.build_get(k).await? else {
+            continue;
+        };
+        let Ok(s) = serde_json::from_slice::<Summary>(&e.value) else {
+            continue;
+        };
+        let r = RunRow::from(&s);
+        if s.status.is_final() {
+            cache.runs.insert((*k).clone(), r.clone());
+        }
+        out.push(r);
+    }
+    cache.runs.retain(|k, _| newest.contains(&k));
+    Ok(out)
+}
+
 /// Read everything the page shows.
 pub async fn read(
     bus: &Bus,
-    notes: &mut NotesIndex,
+    cache: &mut Cache,
     stale_after: std::time::Duration,
     now: DateTime<Utc>,
 ) -> Snapshot {
@@ -218,14 +301,14 @@ pub async fn read(
             }
         };
     }
-    if let Err(e) = notes.refresh(bus).await {
+    if let Err(e) = cache.notes.refresh(bus).await {
         errors.push(format!("notes: {e}"));
     }
     s.hosts = get!("hosts", bus.hosts()).unwrap_or_default();
     let trees: Vec<TreeRecord> = get!("trees", bus.trees()).unwrap_or_default();
     let stale = Duration::from_std(stale_after).unwrap_or(Duration::days(3));
     for t in &trees {
-        let last = notes.get(&t.task.repo, t.task.issue).cloned();
+        let last = cache.notes.get(&t.task.repo, t.task.issue).cloned();
         let old = parse_stamp(&t.created_at).is_some_and(|c| now - c > stale);
         s.stale_trees += usize::from(old);
         s.tasks.push(Task {
@@ -279,7 +362,7 @@ pub async fn read(
             .filter(|l| !l.trim().is_empty())
             .map(String::from)
             .collect();
-        let skip = lines.len().saturating_sub(20);
+        let skip = lines.len().saturating_sub(LANDINGS_MAX);
         s.landings = lines[skip..].iter().rev().cloned().collect();
     }
     s.mode = get!("mode", state("mode"))
@@ -298,318 +381,348 @@ pub async fn read(
             s.open_questions.insert(p.to_string(), n);
         }
     }
+    s.runs = get!("build runs", read_runs(bus, cache)).unwrap_or_default();
+    s.builders = get!("builders", bus.builders()).unwrap_or_default();
+    s.usage = get!("usage", bus.usage()).unwrap_or_default();
     if !errors.is_empty() {
         s.error = Some(errors.join("; "));
     }
     s
 }
 
-fn table(caption: &str, head: &[&str], rows: Vec<Vec<String>>, empty: &str) -> String {
-    let mut s = format!("<table><caption>{}</caption><thead><tr>", esc(caption));
-    for h in head {
-        let _ = write!(s, "<th scope=\"col\">{}</th>", esc(h));
-    }
-    s.push_str("</tr></thead><tbody>");
-    if rows.is_empty() {
-        let _ = write!(
-            s,
-            "<tr><td colspan=\"{}\">{}</td></tr>",
-            head.len(),
-            esc(empty)
-        );
-    }
-    for r in rows {
-        s.push_str("<tr>");
-        for c in r {
-            let _ = write!(s, "<td>{c}</td>");
-        }
-        s.push_str("</tr>");
-    }
-    s.push_str("</tbody></table>");
-    s
+fn minutes(stamp: &str, now: DateTime<Utc>) -> Value {
+    parse_stamp(stamp).map_or(Value::Null, |t| json!((now - t).num_minutes().max(0)))
 }
 
-fn age(stamp: &str, now: DateTime<Utc>) -> String {
-    match parse_stamp(stamp) {
-        Some(t) => {
-            let d = now - t;
-            if d.num_days() > 0 {
-                format!("{}d", d.num_days())
-            } else if d.num_hours() > 0 {
-                format!("{}h", d.num_hours())
-            } else {
-                format!("{}m", d.num_minutes().max(0))
-            }
-        }
-        None => "?".into(),
+fn stamp(s: &str) -> Value {
+    if s.is_empty() {
+        Value::Null
+    } else {
+        json!(when(s))
     }
 }
 
-/// The panels, as HTML (the page body and each server-sent update).
-pub fn render(s: &Snapshot) -> String {
+/// `YYYYMMDD` → `YYYY-MM-DD`.
+fn day(d: &str) -> String {
+    match (d.get(0..4), d.get(4..6), d.get(6..8)) {
+        (Some(y), Some(m), Some(dd)) if d.len() == 8 => format!("{y}-{m}-{dd}"),
+        _ => d.to_string(),
+    }
+}
+
+/// Every table's rows, keyed by a stable id (see [`crate::grid`]).
+pub fn tables(s: &Snapshot) -> Tables {
     let now = parse_stamp(&s.read_at).unwrap_or_else(Utc::now);
-    let mut o = String::new();
-    let _ = write!(o, "<p class=\"meta\">Read {}", time(&s.read_at));
-    if let Some(e) = &s.error {
-        let _ = write!(o, " · <span class=\"warn\">{}</span>", esc(e));
-    }
-    o.push_str("</p>");
+    let mut t = Tables::new();
 
-    // Fleet.
-    let q = |p: &str| s.open_questions.get(p).copied().unwrap_or(0);
-    let _ = write!(
-        o,
-        "<section aria-labelledby=\"t-fleet\"><h2 id=\"t-fleet\">Fleet</h2><dl class=\"facts\">\
-         <dt>Mode</dt><dd>{}</dd><dt>Hold</dt><dd>{}</dd><dt>Stale trees</dt><dd>{}</dd>\
-         <dt>Open questions</dt><dd>p1 {} · p2 {} · p3 {}</dd></dl></section>",
-        esc(&s.mode),
-        s.hold.as_deref().map(esc).unwrap_or_else(|| "none".into()),
-        s.stale_trees,
-        q("p1"),
-        q("p2"),
-        q("p3")
-    );
-
-    // Hosts and seats.
     let mut rows = Vec::new();
     for h in &s.hosts {
+        let host = [
+            ("host", json!(h.host)),
+            ("memcap_gb", json!(h.memcap_gb)),
+            ("free_gb", json!(h.work_root_free_gb)),
+        ];
         if h.seats.is_empty() {
-            rows.push(vec![
-                esc(&h.host),
-                "—".into(),
-                "".into(),
-                "".into(),
-                "".into(),
-                format!("{} GB", h.memcap_gb),
-                format!("{} GB", h.work_root_free_gb),
-            ]);
+            rows.push(row(h.host.clone(), host.clone()));
         }
         for st in &h.seats {
-            rows.push(vec![
-                esc(&h.host),
-                esc(st.seat.as_str()),
-                esc(st.role.as_str()),
-                esc(st.runtime.as_str()),
-                esc(&st.model),
-                format!("{} GB", h.memcap_gb),
-                format!("{} GB", h.work_root_free_gb),
+            let mut r = row(format!("{}/{}", h.host, st.seat), host.clone());
+            r.extend([
+                ("seat".into(), json!(st.seat.as_str())),
+                ("role".into(), json!(st.role.as_str())),
+                ("runtime".into(), json!(st.runtime.as_str())),
+                ("model".into(), json!(st.model)),
             ]);
+            rows.push(r);
         }
     }
-    let _ = write!(
-        o,
-        "<section aria-labelledby=\"t-hosts\"><h2 id=\"t-hosts\">Hosts and seats</h2>{}</section>",
-        table(
-            "Live hosts (a host record lapses two minutes after its bridge stops)",
-            &[
-                "Host",
-                "Seat",
-                "Role",
-                "Runtime",
-                "Model",
-                "Memory cap",
-                "Free disk"
-            ],
-            rows,
-            "No live host."
-        )
-    );
+    t.insert(grid::HOSTS.id, rows);
 
-    // Tasks in flight.
     let rows = s
         .tasks
         .iter()
-        .map(|t| {
-            let last = t
-                .last
-                .as_ref()
-                .map(|l| {
-                    format!(
-                        "{} {}→{} {}",
-                        esc(l.kind.as_str()),
-                        esc(&l.sender),
-                        esc(&l.recipient),
-                        time(&l.at)
-                    )
-                })
-                .unwrap_or_else(|| "—".into());
-            vec![
-                esc(&t.seat),
-                format!(
-                    "{}{}",
-                    esc(&t.task),
-                    if t.review { " (review)" } else { "" }
-                ),
-                esc(t.stage),
-                last,
-                format!(
-                    "{}{}",
-                    age(&t.created_at, now),
-                    if t.stale {
-                        " <span class=\"warn\">stale</span>"
-                    } else {
-                        ""
-                    }
-                ),
-            ]
+        .map(|k| {
+            let review = if k.review { "review" } else { "implement" };
+            row(
+                format!("{}/{}/{}/{review}", k.host, k.seat, k.task),
+                [
+                    ("seat", json!(k.seat)),
+                    ("task", json!(k.task)),
+                    ("work", json!(review)),
+                    ("stage", json!(k.stage)),
+                    (
+                        "last",
+                        k.last.as_ref().map_or(Value::Null, |l| {
+                            json!(format!("{} {}→{}", l.kind.as_str(), l.sender, l.recipient))
+                        }),
+                    ),
+                    (
+                        "last_at",
+                        k.last.as_ref().map_or(Value::Null, |l| stamp(&l.at)),
+                    ),
+                    ("host", json!(k.host)),
+                    ("age", minutes(&k.created_at, now)),
+                    ("stale", if k.stale { json!("stale") } else { Value::Null }),
+                ],
+            )
         })
         .collect();
-    let _ = write!(
-        o,
-        "<section aria-labelledby=\"t-tasks\"><h2 id=\"t-tasks\">Tasks in flight</h2>{}</section>",
-        table(
-            "Registered worktrees",
-            &["Seat", "Issue", "Stage", "Last note", "Age"],
-            rows,
-            "No task in flight."
-        )
-    );
+    t.insert(grid::TASKS.id, rows);
 
-    // Pull requests.
     let rows = s
         .prs
         .iter()
         .map(|p| {
-            vec![
-                format!("{}#{}", esc(&p.repo), p.number),
-                format!("<code>{}</code>", esc(&p.head)),
-                if p.draft {
-                    "draft".into()
-                } else {
-                    "open".into()
-                },
-                esc(&p.bot),
-                p.unresolved.to_string(),
-                esc(&p.checks),
-            ]
+            let pr = format!("{}#{}", p.repo, p.number);
+            row(
+                pr.clone(),
+                [
+                    ("pr", json!(pr)),
+                    ("head", json!(p.head)),
+                    ("state", json!(if p.draft { "draft" } else { "open" })),
+                    ("bot", json!(p.bot)),
+                    ("threads", json!(p.unresolved)),
+                    ("checks", json!(p.checks)),
+                ],
+            )
         })
         .collect();
-    let stale = if s.prs_stale && !s.prs_read.is_empty() {
-        " <span class=\"warn\">stale</span>"
-    } else {
-        ""
-    };
-    let _ = write!(
-        o,
-        "<section aria-labelledby=\"t-prs\"><h2 id=\"t-prs\">Pull requests</h2><p class=\"meta\">Read {}{stale}</p>{}</section>",
-        if s.prs_read.is_empty() {
-            "never".into()
-        } else {
-            time(&s.prs_read)
-        },
-        table(
-            "Open pull requests",
-            &["Pull request", "Head", "State", "Bot", "Threads", "Checks"],
-            rows,
-            "None open."
-        )
-    );
+    t.insert(grid::PRS.id, rows);
 
-    // Queue.
     let rows = s
         .queue
         .iter()
         .enumerate()
         .map(|(i, q)| {
-            vec![
-                (i + 1).to_string(),
-                format!("{}#{}", esc(&q.repo), q.number),
-                esc(&q.class),
-                esc(&when(&q.created)),
-                esc(&q.title),
-            ]
+            let issue = format!("{}#{}", q.repo, q.number);
+            row(
+                issue.clone(),
+                [
+                    ("pos", json!(i + 1)),
+                    ("issue", json!(issue)),
+                    ("class", json!(q.class)),
+                    ("opened", stamp(&q.created)),
+                    ("title", json!(q.title)),
+                ],
+            )
         })
         .collect();
-    let _ = write!(
-        o,
-        "<section aria-labelledby=\"t-queue\"><h2 id=\"t-queue\">Queue</h2><p class=\"meta\">Read {}</p>{}</section>",
-        if s.backlog_read.is_empty() {
-            "never".into()
-        } else {
-            time(&s.backlog_read)
-        },
-        table(
-            "Claimable issues in order, priority first",
-            &["#", "Issue", "Class", "Opened", "Title"],
-            rows,
-            "Nothing claimable."
-        )
-    );
+    t.insert(grid::QUEUE.id, rows);
 
-    // Backlog by label, and the burndown.
     let mut rows = Vec::new();
     for (repo, labels) in &s.labels {
         for (l, n) in labels {
-            rows.push(vec![esc(repo), esc(l), n.to_string()]);
+            rows.push(row(
+                format!("{repo}/{l}"),
+                [
+                    ("repo", json!(repo)),
+                    ("label", json!(l)),
+                    ("open", json!(n)),
+                ],
+            ));
         }
     }
-    let _ = write!(
-        o,
-        "<section aria-labelledby=\"t-backlog\"><h2 id=\"t-backlog\">Backlog</h2>{}",
-        table(
-            "Open issues by label and repository",
-            &["Repository", "Label", "Open"],
-            rows,
-            "No backlog reading yet."
-        )
-    );
-    for (repo, days) in &s.burndown {
-        let rows = days
-            .iter()
-            .map(|d| {
-                vec![
-                    esc(&format!(
-                        "{}-{}-{}",
-                        d.date.get(0..4).unwrap_or(""),
-                        d.date.get(4..6).unwrap_or(""),
-                        d.date.get(6..8).unwrap_or("")
-                    )),
-                    d.open.to_string(),
-                    d.opened.to_string(),
-                    d.closed.to_string(),
-                    format!("{:+}", d.net),
-                ]
-            })
-            .collect();
-        o.push_str(&table(
-            &format!("Burndown of {repo}"),
-            &["Day", "Open", "Opened", "Closed", "Net"],
-            rows,
-            "No samples.",
-        ));
-    }
-    o.push_str("</section>");
+    t.insert(grid::LABELS.id, rows);
 
-    // Landings.
+    let mut rows = Vec::new();
+    for (repo, days) in &s.burndown {
+        for d in days.iter().rev() {
+            rows.push(row(
+                format!("{repo}/{}", d.date),
+                [
+                    ("repo", json!(repo)),
+                    ("day", json!(day(&d.date))),
+                    ("open", json!(d.open)),
+                    ("opened", json!(d.opened)),
+                    ("closed", json!(d.closed)),
+                    ("net", json!(d.net)),
+                ],
+            ));
+        }
+    }
+    t.insert(grid::BURNDOWN.id, rows);
+
+    let mut seen: HashMap<&str, usize> = HashMap::new();
     let rows = s
         .landings
         .iter()
         .map(|l| {
+            // The same line twice (a landing run again) is two rows.
+            let n = seen.entry(l.as_str()).or_default();
+            *n += 1;
+            let id = if *n == 1 {
+                l.clone()
+            } else {
+                format!("{l} ({n})")
+            };
             let w: Vec<&str> = l.split_whitespace().collect();
             match w[..] {
-                [at, repo, pr, sha, ..] => vec![
-                    esc(&when(at)),
-                    format!("{} {}", esc(repo), esc(pr)),
-                    format!(
-                        "<code>{}</code>",
-                        esc(&sha.chars().take(8).collect::<String>())
-                    ),
-                ],
-                _ => vec![esc(l), String::new(), String::new()],
+                [at, repo, pr, sha, ..] => row(
+                    id,
+                    [
+                        ("when", json!(when(at))),
+                        ("pr", json!(format!("{repo} {pr}"))),
+                        ("merge", json!(sha.chars().take(8).collect::<String>())),
+                    ],
+                ),
+                _ => row(id, [("when", json!(l))]),
             }
         })
         .collect();
-    let _ = write!(
-        o,
-        "<section aria-labelledby=\"t-landed\"><h2 id=\"t-landed\">Landings and releases</h2>{}</section>",
-        table(
-            "The newest landings first",
-            &["When", "Pull request", "Merge"],
-            rows,
-            "Nothing landed yet."
-        )
-    );
-    o
+    t.insert(grid::LANDINGS.id, rows);
+
+    let q = |p: &str| s.open_questions.get(p).copied().unwrap_or(0);
+    let fleet = [
+        ("mode", "Mode", s.mode.clone()),
+        (
+            "hold",
+            "Hold",
+            s.hold.clone().unwrap_or_else(|| "none".into()),
+        ),
+        ("stale", "Stale trees", s.stale_trees.to_string()),
+        ("p1", "Open questions, p1", q("p1").to_string()),
+        ("p2", "Open questions, p2", q("p2").to_string()),
+        ("p3", "Open questions, p3", q("p3").to_string()),
+    ];
+    let rows = fleet
+        .into_iter()
+        .map(|(id, item, v)| row(id, [("item", json!(item)), ("value", json!(v))]))
+        .collect();
+    t.insert(grid::FLEET.id, rows);
+
+    let rows = s
+        .runs
+        .iter()
+        .map(|r| {
+            row(
+                r.id.clone(),
+                [
+                    ("run", json!(r.id)),
+                    ("repo", json!(r.repo)),
+                    ("head", json!(r.head)),
+                    ("host", json!(r.host)),
+                    ("platform", json!(r.platform)),
+                    ("status", json!(r.status)),
+                    ("started", stamp(&r.started_at)),
+                    ("wall_s", json!(r.wall_ms / 1000)),
+                    ("errors", json!(r.errors)),
+                    ("passed", json!(r.passed)),
+                    ("failed", json!(r.failed)),
+                ],
+            )
+        })
+        .collect();
+    t.insert(grid::RUNS.id, rows);
+
+    let rows = s
+        .builders
+        .iter()
+        .map(|b| {
+            let reachable = match (&b.reachable, &b.reason) {
+                (true, _) => "yes".to_string(),
+                (false, Some(r)) => format!("no: {r}"),
+                (false, None) => "no".to_string(),
+            };
+            let tools: Vec<String> = b
+                .toolchains
+                .iter()
+                .map(|(k, v)| format!("{k} {v}"))
+                .collect();
+            row(
+                b.label.clone(),
+                [
+                    ("builder", json!(b.label)),
+                    ("platform", json!(b.platform.to_string())),
+                    ("arch", json!(b.arch)),
+                    (
+                        "executor",
+                        json!(match &b.proxy {
+                            Some(p) => format!("{} via {p}", b.executor),
+                            None => b.executor.clone(),
+                        }),
+                    ),
+                    ("state", json!(b.state)),
+                    ("reachable", json!(reachable)),
+                    ("busy", json!(b.busy)),
+                    ("slots", json!(b.slots)),
+                    ("free_gb", json!(b.free_gb)),
+                    ("toolchains", json!(tools.join(", "))),
+                    ("updated", stamp(&b.updated_at)),
+                ],
+            )
+        })
+        .collect();
+    t.insert(grid::BUILDERS.id, rows);
+
+    let mut rows = Vec::new();
+    for u in &s.usage {
+        let login = u.label.clone().unwrap_or_else(|| u.account.clone());
+        let base = [
+            ("login", json!(login)),
+            ("runtime", json!(u.runtime.as_str())),
+            ("host", json!(u.host)),
+            ("plan", json!(u.plan)),
+            ("observed", stamp(&u.observed_at)),
+            ("limit", json!(u.limit_reached)),
+        ];
+        if u.buckets.is_empty() {
+            rows.push(row(u.key(), base.clone()));
+        }
+        for b in &u.buckets {
+            let mut r = row(
+                format!("{}/{}/{}", u.key(), b.scope, b.window),
+                base.clone(),
+            );
+            r.extend([
+                ("scope".into(), json!(b.scope)),
+                ("window".into(), json!(b.window)),
+                ("used_pct".into(), json!((b.used_pct * 10.0).round() / 10.0)),
+                (
+                    "resets".into(),
+                    b.resets_at.as_deref().map_or(Value::Null, stamp),
+                ),
+            ]);
+            rows.push(r);
+        }
+    }
+    t.insert(grid::USAGE.id, rows);
+    t
+}
+
+/// The page's text outside the tables.
+pub fn meta(s: &Snapshot) -> Meta {
+    let mut m = Meta {
+        read: if s.read_at.is_empty() {
+            "Not read yet.".into()
+        } else {
+            format!("Read {}", when(&s.read_at))
+        },
+        error: s.error.clone(),
+        ..Meta::default()
+    };
+    let read = |r: &str| {
+        if r.is_empty() {
+            "Read never".to_string()
+        } else {
+            format!("Read {}", when(r))
+        }
+    };
+    let mut prs = read(&s.prs_read);
+    if s.prs_stale && !s.prs_read.is_empty() {
+        prs.push_str(" · stale");
+    }
+    m.notes.insert("prs", prs);
+    m.notes.insert("queue", read(&s.backlog_read));
+    m.notes.insert("backlog", read(&s.backlog_read));
+    m.counts.insert("tasks", s.tasks.len());
+    m.counts.insert("prs", s.prs.len());
+    m.counts.insert("queue", s.queue.len());
+    m
+}
+
+/// The tabs and plain tables of the page.
+pub fn render(s: &Snapshot) -> String {
+    grid::html_tabs(&meta(s), &tables(s))
 }
 
 #[cfg(test)]
@@ -657,9 +770,8 @@ mod tests {
         assert_eq!((days[1].net, days[0].net), (-2, 3));
     }
 
-    #[test]
-    fn render_escapes() {
-        let s = Snapshot {
+    fn sample() -> Snapshot {
+        Snapshot {
             read_at: "20261127T100000Z".into(),
             queue: vec![QueueRowOut {
                 repo: "alpha".into(),
@@ -668,12 +780,69 @@ mod tests {
                 created: "20261120T000000Z".into(),
                 title: "<script>x</script>".into(),
             }],
+            tasks: vec![Task {
+                host: "lab1".into(),
+                seat: "w1".into(),
+                task: "alpha#7".into(),
+                review: false,
+                stage: "assigned",
+                last: None,
+                created_at: "20261127T080000Z".into(),
+                stale: false,
+            }],
+            landings: vec![
+                "20261127T090000Z alpha #5 0123456789abcdef".into(),
+                "20261127T090000Z alpha #5 0123456789abcdef".into(),
+            ],
             mode: "normal".into(),
             ..Snapshot::default()
-        };
-        let h = render(&s);
+        }
+    }
+
+    #[test]
+    fn rows_have_stable_ids() {
+        let s = sample();
+        let t = tables(&s);
+        assert_eq!(t["queue"][0]["id"], "alpha#3");
+        assert_eq!(t["queue"][0]["opened"], "2026-11-20 00:00 UTC");
+        assert_eq!(t["tasks"][0]["id"], "lab1/w1/alpha#7/implement");
+        assert_eq!(t["tasks"][0]["age"], 120);
+        assert_eq!(t["landings"][1]["id"], format!("{} (2)", s.landings[0]));
+        assert_eq!(t["fleet"][1]["value"], "none");
+        // Every table has a row list, and ids are unique within each.
+        for tab in grid::TABS {
+            for d in tab.tables {
+                let rows = &t[d.id];
+                let ids: std::collections::HashSet<_> =
+                    rows.iter().map(|r| r["id"].as_str().unwrap()).collect();
+                assert_eq!(ids.len(), rows.len(), "{}", d.id);
+            }
+        }
+        // A later reading changes only what changed: the task ages, the queue grows.
+        let mut later = s.clone();
+        later.read_at = "20261127T101000Z".into();
+        later.queue.push(QueueRowOut {
+            repo: "alpha".into(),
+            number: 4,
+            class: "codex".into(),
+            created: "20261121T000000Z".into(),
+            title: "Next".into(),
+        });
+        let d = grid::diff(&t, &tables(&later));
+        assert_eq!(d.keys().copied().collect::<Vec<_>>(), ["queue", "tasks"]);
+        assert_eq!(d["queue"].add.len(), 1);
+        assert!(d["queue"].update.is_empty() && d["queue"].remove.is_empty());
+        assert_eq!(d["tasks"].update[0]["age"], 130);
+    }
+
+    #[test]
+    fn render_escapes() {
+        let h = render(&sample());
         assert!(h.contains("&lt;script&gt;x&lt;/script&gt;"));
         assert!(!h.contains("<script>"));
         assert!(h.contains("<caption>Claimable issues in order, priority first</caption>"));
+        assert!(h.contains("<a href=\"#queue\" id=\"tab-queue\" data-tab=\"queue\">Queue <span class=\"count\">1</span></a>"));
+        assert!(h.contains("<section class=\"panel\" id=\"usage\""));
+        assert!(h.contains("<td>2h</td>"), "age as text");
     }
 }

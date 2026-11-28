@@ -342,27 +342,14 @@ async fn batch_loop(app: Arc<App>, bus: Arc<Bus>) {
 }
 
 async fn telemetry_loop(app: Arc<App>, bus: Arc<Bus>) {
-    let mut notes = crate::telemetry::NotesIndex::default();
+    let mut cache = crate::telemetry::Cache::default();
     let stale = app.cfg.stale_after();
     loop {
-        let snap = crate::telemetry::read(&bus, &mut notes, stale, Utc::now()).await;
-        app.telemetry.send_if_modified(|old| {
-            let changed = serde_json::to_string(&*snap_view(old)).ok()
-                != serde_json::to_string(&*snap_view(&Arc::new(snap.clone()))).ok();
-            if changed {
-                *old = Arc::new(snap.clone());
-            }
-            changed
-        });
+        let snap = crate::telemetry::read(&bus, &mut cache, stale, Utc::now()).await;
+        // Every reading: each page's feed sends only what changed, if anything.
+        app.telemetry.send_replace(Arc::new(snap));
         tokio::time::sleep(TELEMETRY_EVERY).await;
     }
-}
-
-/// A snapshot without its read time, to tell whether anything changed.
-fn snap_view(s: &Arc<crate::telemetry::Snapshot>) -> Arc<crate::telemetry::Snapshot> {
-    let mut c = (**s).clone();
-    c.read_at = String::new();
-    Arc::new(c)
 }
 
 /// The key of the pending `p2` batch in `HGL_CONSOLE`.
