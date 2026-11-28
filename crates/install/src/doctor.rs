@@ -790,6 +790,31 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 ));
             }
         }
+        // On the hub's host (this user's own server, or a server user found from the hub
+        // unit, as for a `--client-user`): consumers on the telemetry streams that outlive
+        // a page. No fleet part makes one; the `viewer` user can (docs/design.md §9).
+        if reached && (c.server.is_some() || su.is_some()) {
+            out.push(match hub.durables(c).await {
+                Ok(d) if d.is_empty() => {
+                    Check::ok("telemetry consumers", "none that outlives its page")
+                }
+                Ok(d) => Check::warn(
+                    "telemetry consumers",
+                    format!(
+                        "consumers no fleet part makes, durable or long-lived: {} (the \
+                         console page's `viewer` hub user can create them)",
+                        d.join(", ")
+                    ),
+                    "delete each as the admin hub user (`nats consumer rm <stream> <name>`); \
+                     if they come back, reissue the viewer's credential",
+                ),
+                Err(e) => Check::warn(
+                    "telemetry consumers",
+                    format!("cannot list them: {e}"),
+                    "rerun `hgl-ai server install`, which lets hub users list them",
+                ),
+            });
+        }
     }
 
     // The server user (a system install) runs no agents: no CLIs, skills, work_root
@@ -1609,6 +1634,18 @@ mod tests {
         assert_eq!(get(&cs, "service bridge").detail, "running");
         assert!(!cs.iter().any(|c| c.name == "client user"));
         assert!(!any_fail(&cs), "{cs:?}");
+        // The hub is this host's, though this user's configuration has no `[server]`
+        // nor `server_user`: the telemetry consumers are checked.
+        let cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        assert!(cfg.server.is_none() && cfg.server_user.is_none());
+        assert_eq!(get(&cs, "telemetry consumers").level, Level::Ok);
+        let hub = FakeHub {
+            durables: vec!["KV_HGL_TREES/idle".into()],
+            ..FakeHub::up()
+        };
+        let w = get(&run(&f, &hub).await, "telemetry consumers");
+        assert_eq!(w.level, Level::Warn);
+        assert!(w.detail.contains("KV_HGL_TREES/idle"), "{w:?}");
 
         f.readable
             .borrow_mut()
@@ -1648,7 +1685,12 @@ mod tests {
         ] {
             respond(&f, unit);
             let cs = run(&f, &FakeHub::up()).await;
-            for n in ["server user", "console credential", "service hub"] {
+            for n in [
+                "server user",
+                "console credential",
+                "service hub",
+                "telemetry consumers",
+            ] {
                 assert!(!cs.iter().any(|c| c.name == n), "{n} for {unit:?}");
             }
         }
@@ -1839,6 +1881,37 @@ mod tests {
         )
         .await;
         assert!(!cs.iter().any(|c| c.name == "hub inboxes"), "{cs:?}");
+    }
+
+    /// On the hub's host only: consumers on the telemetry streams that outlive a page.
+    #[tokio::test]
+    async fn lasting_telemetry_consumers() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(
+            !cs.iter().any(|c| c.name == "telemetry consumers"),
+            "not the hub's host"
+        );
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.server = Some(hgl_ai_config::Server::default());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let get = |cs: &[Check]| cs.iter().find(|c| c.name == "telemetry consumers").cloned();
+        let ok = get(&run(&f, &FakeHub::up()).await).unwrap();
+        assert_eq!(ok.level, Level::Ok);
+        let hub = FakeHub {
+            durables: vec!["KV_HGL_HOSTS/kept".into()],
+            ..FakeHub::up()
+        };
+        let w = get(&run(&f, &hub).await).unwrap();
+        assert_eq!(w.level, Level::Warn);
+        assert!(w.detail.contains("KV_HGL_HOSTS/kept"), "{}", w.detail);
+        assert!(
+            w.fix.as_deref().unwrap().contains("nats consumer rm"),
+            "{w:?}"
+        );
+        // Unreachable: the hub check says so; no second warning.
+        assert!(get(&run(&f, &FakeHub::down()).await).is_none());
     }
 
     #[tokio::test]

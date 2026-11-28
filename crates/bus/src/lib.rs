@@ -305,7 +305,13 @@ impl Bus {
         }
         match cred {
             Some(Credential::Token(t)) => opts = opts.token(t),
-            Some(Credential::Nkey { seed, .. }) => opts = opts.nkey(seed),
+            Some(Credential::Nkey { seed, role, .. }) => {
+                // The viewer may subscribe to its own inbox prefix only.
+                if role.as_deref() == Some("viewer") {
+                    opts = opts.custom_inbox_prefix(hgl_ai_proto::VIEWER_INBOX);
+                }
+                opts = opts.nkey(seed);
+            }
             None => {}
         }
         let client = opts.connect(url).await.map_err(|e| BusError::Unreachable {

@@ -49,6 +49,13 @@ pub fn user_inbox(nkey: &str) -> String {
 /// `JS.HUB.API.$KV.<b>.<k>` (a JetStream context with this API prefix writes there), and
 /// note, owner and usage subjects and acknowledgements keep their names.
 pub const HUB_API_PREFIX: &str = "JS.HUB.API";
+/// The inbox prefix of the `viewer` hub user (the console's page, docs/owner.md §3): its
+/// replies and deliveries come here, the only subjects it may subscribe to, so it never
+/// sees another client's replies on `_INBOX.>`. The page uses the same (`web/src/hub.ts`).
+pub const VIEWER_INBOX: &str = "_INBOX_VIEWER";
+/// The `HGL_STATE` keys the console's page reads (`web/src/tables.ts`, `STATE_KEYS`);
+/// the `viewer` user may read no other.
+pub const VIEWER_STATE_KEYS: [&str; 6] = ["prs", "backlog", "landed.log", "tasks", "mode", "hold"];
 /// The Slack adapter's delivery state and thread mappings.
 pub const KV_SLACK: &str = "HGL_SLACK";
 /// Owner words (OWN-5).
