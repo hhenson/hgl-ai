@@ -83,6 +83,8 @@ before hub users takes one shared token until it moves.
   broadcast address. `owner` and `console` are senders, never seats: no seat takes
   `all`, `owner` or `console`, and no note goes to `owner` or `console`. A seat is a logical address; the runtime and model bound
   to it can change (§6) without peers noticing.
+  A seat receives broadcasts published from its durable inbox's creation onward,
+  measured by the hub. Unicast published earlier remains eligible while retained.
 - **PROTO-8 — Ack after the turn.** The bridge sends `in_progress` every 60 s
   while a turn runs or a note is held, and `ack` after a clean exit. JetStream
   never drops a note (`max_deliver` is unlimited); the bridge decides:

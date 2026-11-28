@@ -3,7 +3,7 @@
 //! printed, when `nats-server` is not on `PATH`.
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use hgl_ai_proto::{
 
 struct Hub {
     child: Child,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     url: String,
     token: String,
 }
@@ -33,28 +33,48 @@ impl Hub {
             std::process::id(),
             dir.path().display().to_string().len()
         );
-        let child = Command::new(bin)
-            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--auth", &token])
+        let child = Self::spawn(&bin, dir.path(), &token);
+        let mut hub = Hub {
+            child,
+            dir,
+            url: String::new(),
+            token,
+        };
+        hub.wait_for_port();
+        Some(hub)
+    }
+
+    fn spawn(bin: &Path, dir: &Path, token: &str) -> Child {
+        Command::new(bin)
+            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--auth", token])
             .arg("-sd")
-            .arg(dir.path().join("store"))
+            .arg(dir.join("store"))
             .arg("-l")
-            .arg(dir.path().join("nats.log"))
+            .arg(dir.join("nats.log"))
             .arg("--ports_file_dir")
-            .arg(dir.path())
+            .arg(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("start nats-server");
-        let ports = dir.path().join(format!("nats-server_{}.ports", child.id()));
-        let mut hub = Hub {
-            child,
-            _dir: dir,
-            url: String::new(),
-            token,
-        };
+            .expect("start nats-server")
+    }
+
+    fn restart(&mut self) {
+        self.child.kill().expect("stop nats-server");
+        self.child.wait().expect("reap nats-server");
+        let bin = find_on_path("nats-server").expect("find nats-server for restart");
+        self.child = Self::spawn(&bin, self.dir.path(), &self.token);
+        self.wait_for_port();
+    }
+
+    fn wait_for_port(&mut self) {
+        let ports = self
+            .dir
+            .path()
+            .join(format!("nats-server_{}.ports", self.child.id()));
         let deadline = Instant::now() + Duration::from_secs(15);
-        hub.url = loop {
+        self.url = loop {
             let found = std::fs::read_to_string(&ports)
                 .ok()
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -68,7 +88,6 @@ impl Hub {
             );
             std::thread::sleep(Duration::from_millis(50));
         };
-        Some(hub)
     }
 
     async fn bus(&self) -> Bus {
@@ -352,27 +371,108 @@ async fn same_body_to_other_recipients_or_tasks_is_not_a_duplicate() {
 }
 
 #[tokio::test]
-async fn broadcast_reaches_every_inbox() {
+async fn broadcasts_reach_only_inboxes_created_before_publish() {
     let Some(hub) = Hub::start() else { return };
     let bus = hub.ready().await;
-    let mut w1 = bus.inbox(&seat("w1")).await.unwrap();
-    let r = bus
-        .send(&note("claude", "all", "[claude] Landed"))
+    let w1 = seat("w1");
+    let w2 = seat("w2");
+    drop(bus.inbox(&w1).await.unwrap());
+    let mut old = note("claude", "all", "old broadcast");
+    old.created_at = "20990101T000000Z".into();
+    let old = bus.send(&old).await.unwrap();
+    let direct = bus
+        .send(&note("claude", "w2", "early unicast"))
         .await
         .unwrap();
-    // An inbox created after the broadcast still gets it.
-    let mut w2 = bus.inbox(&seat("w2")).await.unwrap();
-    for inbox in [&mut w1, &mut w2] {
-        let got = inbox.fetch(10, LONG).await.unwrap();
+    let older = bus
+        .send(&note("claude", "all", "another old broadcast"))
+        .await
+        .unwrap();
+    let owner = bus
+        .send(&note("owner", "w2", "early owner note"))
+        .await
+        .unwrap();
+    let peek = bus.peek(&w2, 10, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        peek.iter().map(|n| n.seq).collect::<Vec<_>>(),
+        [direct.seq, owner.seq]
+    );
+    drop(bus.inbox(&w2).await.unwrap());
+
+    let mut fresh = note("claude", "all", "fresh broadcast");
+    fresh.created_at = "20000101T000000Z".into();
+    let fresh = bus.send(&fresh).await.unwrap();
+    // The original cutoff survives reopening from another connection.
+    let reopened = hub.bus().await;
+    let mut first = reopened.inbox(&w1).await.unwrap();
+    let mut second = reopened.inbox(&w2).await.unwrap();
+    let peek = reopened.peek(&w2, 1, Duration::ZERO).await.unwrap();
+    assert_eq!(peek.len(), 1);
+    assert_eq!(peek[0].seq, direct.seq);
+    let peek = reopened.peek(&w2, 10, LONG).await.unwrap();
+    assert_eq!(
+        peek.iter().map(|n| n.seq).collect::<Vec<_>>(),
+        [direct.seq, owner.seq, fresh.seq]
+    );
+
+    let got = first.fetch(10, LONG).await.unwrap();
+    assert_eq!(
+        got.iter().map(|d| d.seq).collect::<Vec<_>>(),
+        [old.seq, older.seq, fresh.seq]
+    );
+    for d in got {
+        d.ack().await.unwrap();
+    }
+    for seq in [direct.seq, owner.seq, fresh.seq] {
+        let got = second.fetch(1, Duration::ZERO).await.unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].seq, r.seq);
-        assert!(got[0].note.recipient.is_broadcast());
+        assert_eq!((got[0].seq, got[0].delivered), (seq, 1));
         got[0].ack().await.unwrap();
     }
+    assert!(second.fetch(1, Duration::ZERO).await.unwrap().is_empty());
+    let history = bus
+        .read_notes(&[Seat::broadcast()], 1, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        history.iter().map(|n| n.seq).collect::<Vec<_>>(),
+        [old.seq, older.seq, fresh.seq]
+    );
     assert!(
         bus.inbox(&Seat::broadcast()).await.is_err(),
         "`all` has no inbox"
     );
+    assert!(
+        bus.peek(&Seat::broadcast(), 1, Duration::ZERO)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn unread_broadcast_survives_hub_restart() {
+    let Some(mut hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let recipient = seat("w2");
+    bus.send(&note("claude", "all", "before inbox creation"))
+        .await
+        .unwrap();
+    drop(bus.inbox(&recipient).await.unwrap());
+    let unread = bus
+        .send(&note("claude", "all", "unread before restart"))
+        .await
+        .unwrap();
+    drop(bus);
+
+    hub.restart();
+    let bus = hub.bus().await;
+    let mut inbox = bus.inbox(&recipient).await.unwrap();
+    let got = inbox.fetch(10, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        got.iter().map(|d| (d.seq, d.delivered)).collect::<Vec<_>>(),
+        [(unread.seq, 1)]
+    );
+    got[0].ack().await.unwrap();
 }
 
 #[tokio::test]
@@ -1034,20 +1134,19 @@ async fn peeks_spend_no_delivery_and_naks_never_drop() {
     let Some(hub) = Hub::start() else { return };
     let bus = hub.ready().await;
     let claude = seat("claude");
+    let mut inbox = bus.inbox(&claude).await.unwrap();
     let first = bus.send(&note("w1", "claude", "one")).await.unwrap();
     bus.send(&note("w1", "w2", "not for claude")).await.unwrap();
     let all = bus
         .send(&Note::new(seat("w1"), Seat::broadcast(), Kind::Note, "all"))
         .await
         .unwrap();
-    // No inbox yet: everything for the seat.
     for _ in 0..8 {
         let p = bus.peek(&claude, 10, SHORT).await.unwrap();
         let seqs: Vec<u64> = p.iter().map(|n| n.seq).collect();
         assert_eq!(seqs, [first.seq, all.seq]);
         assert_eq!(p[0].note.body.trim(), "one");
     }
-    let mut inbox = bus.inbox(&claude).await.unwrap();
     let got = inbox.fetch(10, LONG).await.unwrap();
     assert_eq!(got.len(), 2);
     assert_eq!(got[0].delivered, 1, "peeks spent no delivery");
@@ -1090,9 +1189,6 @@ async fn peeks_spend_no_delivery_and_naks_never_drop() {
         .await
         .unwrap();
     assert_eq!(info.config.max_deliver, -1);
-    let b = w4.fetch(1, LONG).await.unwrap();
-    assert_eq!(b[0].seq, all.seq, "the broadcast first");
-    b[0].ack().await.unwrap();
     for i in 1..=20u64 {
         let d = w4.fetch(1, LONG).await.unwrap();
         assert_eq!((d[0].seq, d[0].delivered), (n.seq, i));
