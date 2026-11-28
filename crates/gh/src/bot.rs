@@ -300,6 +300,32 @@ pub fn note_state(comments: &[Comment]) -> Option<NoteState> {
     found.last().map(|f| f.1)
 }
 
+/// When the pull request became Ready at `head` (WORK-6 Ready order): the `created_at` of
+/// its latest `Ready` comment, when that comment names `head` (in full or by its first eight
+/// characters) and the latest note state is still `ready` or `approved`.
+pub fn ready_at<'a>(comments: &'a [Comment], head: &str) -> Option<&'a str> {
+    if !matches!(
+        note_state(comments),
+        Some(NoteState::Ready | NoteState::Approved)
+    ) {
+        return None;
+    }
+    let ready = comments
+        .iter()
+        .filter(|c| {
+            let first = c.body.lines().next().unwrap_or("").trim();
+            NOTE_LINE
+                .captures(first)
+                .is_some_and(|m| m[1].eq_ignore_ascii_case("ready"))
+        })
+        .max_by(|a, b| a.created_at.cmp(&b.created_at))?;
+    let short = head.get(..8)?;
+    ready
+        .body
+        .contains(short)
+        .then_some(ready.created_at.as_str())
+}
+
 static SIGNED: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?i)^\[[a-z0-9_.-]+\]\s*\((?:worker\s+([0-9]+)|([a-z0-9][a-z0-9_-]{0,31}))\)")
         .unwrap()
@@ -469,5 +495,35 @@ mod tests {
         assert_eq!(ready_signers(&cs), ["w5"]);
         assert_eq!(ready_signers(&[c("[codex] (w7) Ready: x", "x")]), ["w7"]);
         assert!(ready_signers(&[c("[codex] Ready: x", "x")]).is_empty());
+    }
+
+    #[test]
+    fn ready_time_at_the_head() {
+        let c = |body: &str, at: &str| Comment {
+            author: "u".into(),
+            body: body.into(),
+            created_at: at.into(),
+            updated_at: at.into(),
+        };
+        let first = c("[codex] Ready: o/r#7 at 1f461fa7", "2026-01-01T01:00:00Z");
+        let back = c("[claude] Sent back: one finding", "2026-01-01T02:00:00Z");
+        let again = c(
+            &format!("[codex] (w5) Ready: o/r#7 at {H1}"),
+            "2026-01-01T03:00:00Z",
+        );
+        let approved = c("[claude] Approved at 1f461fa7.", "2026-01-01T04:00:00Z");
+        assert_eq!(
+            ready_at(std::slice::from_ref(&first), H1),
+            Some("2026-01-01T01:00:00Z")
+        );
+        // The latest Ready counts, and an approval keeps it.
+        let all = [first.clone(), back, again, approved];
+        assert_eq!(ready_at(&all, H1), Some("2026-01-01T03:00:00Z"));
+        assert_eq!(ready_at(&all[..3], H1), Some("2026-01-01T03:00:00Z"));
+        // Sent back and not Ready again; Ready at another head; no note at all.
+        assert_eq!(ready_at(&all[..2], H1), None);
+        assert_eq!(ready_at(&[first], &"2".repeat(40)), None);
+        assert_eq!(ready_at(&[c("checks pass", "x")], H1), None);
+        assert_eq!(ready_at(&[], H1), None);
     }
 }

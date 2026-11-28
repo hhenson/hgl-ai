@@ -39,7 +39,16 @@ pub struct RepoGate {
     /// Regular expressions over check names that may still run but must not have failed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relax_optional: Vec<String>,
+    /// The coordinator lands this repository's pull requests itself once every gate passes,
+    /// in Ready order (docs/work.md WORK-6). Default `false`: the controller lands them.
+    /// Refused for the specification repositories ([`OWNER_MERGED`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub coordinator_lands: bool,
 }
+
+/// Repositories whose pull requests the owner merges: `coordinator_lands` is refused for
+/// them whatever the configuration says.
+pub const OWNER_MERGED: &[&str] = &["hgl_spec", "hgl_core"];
 
 fn yes() -> bool {
     true
@@ -59,6 +68,7 @@ impl Default for RepoGate {
             relax_paths: Vec::new(),
             relax_required: Vec::new(),
             relax_optional: Vec::new(),
+            coordinator_lands: false,
         }
     }
 }
@@ -200,6 +210,7 @@ fn default_gates() -> BTreeMap<String, RepoGate> {
             "cpp (sanitize, sdk)",
         ]),
         relax_optional: strings(&[r"^test \((macos|windows)-latest\)$"]),
+        coordinator_lands: false,
     };
     let checks = |c: &[&str]| RepoGate {
         checks: strings(c),
@@ -209,7 +220,10 @@ fn default_gates() -> BTreeMap<String, RepoGate> {
         ("hgl-compiler".to_string(), compiler),
         (
             "hgl-ai".to_string(),
-            checks(&["lint", "test (ubuntu-latest)", "test (macos-latest)"]),
+            RepoGate {
+                coordinator_lands: true,
+                ..checks(&["lint", "test (ubuntu-latest)", "test (macos-latest)"])
+            },
         ),
         (
             "hgl-project".to_string(),
@@ -237,6 +251,19 @@ fn default_pins() -> Vec<Pin> {
         via("hgl_spec", "spec/hgl_spec"),
         via("hgl_core", "spec/hgl_core"),
     ]
+}
+
+/// Refuse `coordinator_lands` for a repository the owner merges ([`OWNER_MERGED`]).
+pub fn validate_gates(gates: &BTreeMap<String, RepoGate>) -> Result<(), String> {
+    match gates
+        .iter()
+        .find(|(r, g)| g.coordinator_lands && OWNER_MERGED.contains(&r.as_str()))
+    {
+        Some((r, _)) => Err(format!(
+            "github.gate.{r}: coordinator_lands is refused; the owner merges {r}"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Check the GitHub service settings that the schema alone cannot.
@@ -318,5 +345,42 @@ mod tests {
         );
         assert!(toml::to_string(&g).unwrap().contains("verdicts"));
         assert!(!toml::to_string(&g).unwrap().contains("review_receipt"));
+    }
+
+    #[test]
+    fn coordinator_landing_is_opt_in() {
+        assert!(!RepoGate::default().coordinator_lands);
+        let g: RepoGate = toml::from_str("checks = [\"lint\"]").unwrap();
+        assert!(
+            !g.coordinator_lands,
+            "an entry that does not name it is off"
+        );
+        assert!(!toml::to_string(&g).unwrap().contains("coordinator_lands"));
+        let on: RepoGate = toml::from_str("coordinator_lands = true").unwrap();
+        assert!(on.coordinator_lands);
+        assert_eq!(
+            toml::to_string(&on).unwrap().trim(),
+            "coordinator_lands = true"
+        );
+        // Of the built-in entries only hgl-ai opts in.
+        let all = gates();
+        let on: Vec<&str> = all
+            .iter()
+            .filter(|(_, g)| g.coordinator_lands)
+            .map(|(r, _)| r.as_str())
+            .collect();
+        assert_eq!(on, ["hgl-ai"]);
+        validate_gates(&all).unwrap();
+        for r in OWNER_MERGED {
+            let mut g = all.clone();
+            g.insert(
+                r.to_string(),
+                toml::from_str("coordinator_lands = true").unwrap(),
+            );
+            let e = validate_gates(&g).unwrap_err();
+            assert!(e.contains(&format!("github.gate.{r}")), "{e}");
+            g.insert(r.to_string(), RepoGate::default());
+            validate_gates(&g).unwrap();
+        }
     }
 }

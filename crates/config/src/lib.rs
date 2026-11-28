@@ -649,6 +649,7 @@ impl Config {
         }
         self.controller()?;
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
+        github::validate_gates(&self.github.gate).map_err(ConfigError::Invalid)?;
         if let Some(c) = &self.console {
             c.validate().map_err(ConfigError::Invalid)?;
         }

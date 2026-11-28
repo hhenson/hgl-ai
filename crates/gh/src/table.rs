@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
-use crate::bot::{BotState, BotView, Comment, NoteState, Review, note_state};
+use crate::bot::{BotState, BotView, Comment, NoteState, Review, note_state, ready_at};
 use crate::{Error, Result, short};
 
 /// `CHECKS` of a row: the head commit's status check rollup.
@@ -158,6 +158,9 @@ impl Table {
 pub struct PrInfo {
     pub row: Row,
     pub note: Option<NoteState>,
+    /// `created_at` of the latest `Ready` comment at this head while the pull request is
+    /// still ready or approved ([`crate::bot::ready_at`]): its place in Ready order (WORK-6).
+    pub ready_at: Option<String>,
     pub url: String,
     pub review_url: Option<String>,
 }
@@ -298,6 +301,7 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
             head: head.clone(),
         },
         note: note_state(&comments),
+        ready_at: ready_at(&comments, &head).map(String::from),
         url: p
             .get("url")
             .and_then(Value::as_str)
@@ -555,6 +559,11 @@ mod tests {
             Some("https://github.com/o/alpha/pull/12#pullrequestreview-9")
         );
         assert_eq!(by(13).note, None);
+        // Ready order (WORK-6): the Ready comment at the head; an approval with no Ready
+        // comment read gives no place.
+        assert_eq!(by(11).ready_at.as_deref(), Some("2026-01-05T09:00:00Z"));
+        assert_eq!(by(12).ready_at, None);
+        assert_eq!(by(13).ready_at, None);
     }
 
     #[test]

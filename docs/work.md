@@ -59,6 +59,9 @@ findings, and a `done` note.
   each after its gates on the `main` it merges onto (ROLE-10); ones that merge cleanly
   together may land as one batch. When `main` moves, merge it into each open branch it
   now conflicts with and rerun the checks; a pull request that conflicts is not Ready.
+  Ready order is the time of the latest `Ready` comment at the pull request's head. Where
+  `[github.gate.<repo>] coordinator_lands` opts in, the coordinator takes them as landing
+  candidates in this order; it is never on for `hgl_spec` or `hgl_core`.
 - **WORK-7 — One conflict once.** Two tasks that turn out to touch the same code: finish
   one, then merge it into the other.
 

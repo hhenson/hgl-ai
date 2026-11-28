@@ -21,6 +21,7 @@
 pub mod backlog;
 pub mod bot;
 pub mod builds;
+pub mod candidates;
 pub mod coord;
 pub mod exec;
 pub mod gate;
@@ -219,6 +220,14 @@ impl Settings {
         }
     }
 
+    /// Whether the coordinator lands `repo`'s pull requests (`[github.gate.<repo>]
+    /// coordinator_lands`). Never for a repository the owner merges, whatever the
+    /// configuration says.
+    pub fn coordinator_lands(&self, repo: &str) -> bool {
+        !hgl_ai_config::github::OWNER_MERGED.contains(&repo)
+            && self.gates.get(repo).is_some_and(|g| g.coordinator_lands)
+    }
+
     /// `owner/name`
     pub fn full(&self, repo: &str) -> String {
         format!("{}/{}", self.owner, repo)
@@ -251,6 +260,15 @@ pub(crate) mod testutil {
     pub fn without_receipts(mut s: Settings, repos: &[&str]) -> Settings {
         for r in repos {
             s.gates.entry(r.to_string()).or_default().review_receipt = false;
+        }
+        s
+    }
+
+    /// `s` with `coordinator_lands` set to `on` for `repos`, bypassing the configuration's
+    /// check, as a hand-edited `[github.gate.<repo>]` would.
+    pub fn with_coordinator_lands(mut s: Settings, repos: &[&str], on: bool) -> Settings {
+        for r in repos {
+            s.gates.entry(r.to_string()).or_default().coordinator_lands = on;
         }
         s
     }
