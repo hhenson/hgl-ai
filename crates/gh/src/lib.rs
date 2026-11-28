@@ -21,6 +21,7 @@
 
 pub mod backlog;
 pub mod bot;
+pub mod bot_request;
 pub mod builds;
 pub mod coord;
 pub mod exec;

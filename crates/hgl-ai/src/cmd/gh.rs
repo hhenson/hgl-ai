@@ -27,6 +27,11 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Cmd {
+    /// Request a bot review using the controller’s own GitHub sign-in.
+    Bot {
+        #[command(subcommand)]
+        cmd: BotCmd,
+    },
     /// The coordinator service: pull requests, `hold`, alerts, backlog, metrics and triage intake.
     Coord {
         #[command(subcommand)]
@@ -56,6 +61,18 @@ enum Cmd {
     Approve(VerdictArgs),
     /// Send findings back on an exact head: one GitHub comment, then a `sendback` note.
     Sendback(VerdictArgs),
+}
+
+#[derive(clap::Subcommand)]
+enum BotCmd {
+    /// Request one review per exact head.
+    Request {
+        repo: String,
+        pr: u64,
+        head: String,
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(clap::Args)]
@@ -346,8 +363,59 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
     }
     let cfg = ctx.load_config()?;
     let s = Settings::from_config(&cfg)?;
-    let gh = gh_client(&cfg).await?;
+    let gh = if matches!(args.cmd.as_ref(), Cmd::Bot { .. }) {
+        let gh = GhCli::default();
+        hgl_ai_gh::exec::check_auth(&gh).await.map_err(lift)?;
+        gh
+    } else {
+        gh_client(&cfg).await?
+    };
     match *args.cmd {
+        Cmd::Bot {
+            cmd:
+                BotCmd::Request {
+                    repo,
+                    pr,
+                    head,
+                    dry_run,
+                },
+        } => {
+            use hgl_ai_gh::bot_request::{self, Request};
+            match bot_request::check(&gh, &s, &repo, pr, &head)
+                .await
+                .map_err(lift)?
+            {
+                Request::Already => println!("{repo}#{pr} at {head}: already requested"),
+                Request::Refused(reason) => return Err(NotReady(reason).into()),
+                Request::Needed if dry_run => {
+                    println!("would request bot review of {repo}#{pr} at {head}")
+                }
+                Request::Needed => {
+                    let bus = Bus::connect(&cfg).await?;
+                    let line = format!(
+                        "{} {}: bot review request for {repo}#{pr} at {head} (owner action)",
+                        hgl_ai_proto::utc_now_stamp(),
+                        s.controller
+                    );
+                    hgl_ai_owner::decision_append(&bus, &line).await?;
+                    // Recheck immediately before the write after recording the action.
+                    match bot_request::check(&gh, &s, &repo, pr, &head)
+                        .await
+                        .map_err(lift)?
+                    {
+                        Request::Needed => {
+                            bot_request::post(&gh, &s, &repo, pr, &head)
+                                .await
+                                .map_err(lift)?;
+                            println!("{repo}#{pr} at {head}: requested bot review");
+                        }
+                        Request::Already => println!("{repo}#{pr} at {head}: already requested"),
+                        Request::Refused(reason) => return Err(NotReady(reason).into()),
+                    }
+                }
+            }
+            Ok(EXIT_OK)
+        }
         Cmd::Coord {
             cmd:
                 CoordCmd::Run {
