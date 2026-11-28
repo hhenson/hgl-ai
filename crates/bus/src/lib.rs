@@ -65,6 +65,7 @@ use hgl_ai_proto::{
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
+use time::OffsetDateTime;
 use tokio::sync::OnceCell;
 
 mod build;
@@ -583,7 +584,8 @@ impl Bus {
         })
     }
 
-    /// The durable inbox of `seat`, created on first use.
+    /// The durable inbox of `seat`, created on first use. Only broadcasts published
+    /// from its creation onward are delivered; any retained unicast is eligible.
     pub async fn inbox(&self, seat: &Seat) -> Result<Inbox> {
         self.inbox_with(seat, InboxOptions::default()).await
     }
@@ -591,17 +593,13 @@ impl Bus {
     /// The durable inbox of `seat` with explicit consumer settings. The consumer
     /// is created, or updated to these settings if it exists.
     pub async fn inbox_with(&self, seat: &Seat, opts: InboxOptions) -> Result<Inbox> {
-        if seat.is_broadcast() {
-            return Err(BusError::Nats(format!(
-                "`{BROADCAST}` is the broadcast address; it has no inbox"
-            )));
-        }
+        check_inbox_seat(seat)?;
         let stream = self
             .js
             .get_stream(STREAM_NOTES)
             .await
             .map_err(|e| missing(&format!("stream {STREAM_NOTES}"), e))?;
-        let consumer = stream
+        let mut consumer = stream
             .create_consumer(pull::Config {
                 durable_name: Some(seat.consumer()),
                 description: Some(format!("inbox of seat {seat}")),
@@ -618,6 +616,12 @@ impl Bus {
             })
             .await
             .map_err(|e| nats(&format!("opening the inbox of {seat}"), e))?;
+        // After a hub restart, CREATE can report the reload time as `created`.
+        // INFO refreshes the cached creation time used to skip old broadcasts.
+        consumer
+            .info()
+            .await
+            .map_err(|e| nats(&format!("reading the inbox of {seat}"), e))?;
         Ok(Inbox {
             seat: seat.clone(),
             consumer,
@@ -637,7 +641,8 @@ impl Bus {
         max: usize,
         wait: Duration,
     ) -> Result<Vec<StreamNote>> {
-        Ok(self.read(seats, from, max, wait).await?.0)
+        let subjects = seats.iter().map(Seat::subject).collect();
+        Ok(self.read(subjects, from, max, wait, None).await?.0)
     }
 
     /// One page of a whole-history read: at most `max` messages for `seats` from stream
@@ -649,18 +654,20 @@ impl Bus {
         from: u64,
         max: usize,
     ) -> Result<(Vec<StreamNote>, Option<u64>)> {
-        self.read(seats, from, max, Duration::ZERO).await
+        let subjects = seats.iter().map(Seat::subject).collect();
+        self.read(subjects, from, max, Duration::ZERO, None).await
     }
 
     async fn read(
         &self,
-        seats: &[Seat],
+        subjects: Vec<String>,
         from: u64,
         max: usize,
         wait: Duration,
+        broadcast_start: Option<OffsetDateTime>,
     ) -> Result<(Vec<StreamNote>, Option<u64>)> {
         let mut out = Vec::new();
-        if max == 0 || seats.is_empty() {
+        if max == 0 || subjects.is_empty() {
             return Ok((out, None));
         }
         let stream = self
@@ -675,7 +682,7 @@ impl Bus {
                     start_sequence: from.max(1),
                 },
                 ack_policy: AckPolicy::None,
-                filter_subjects: seats.iter().map(Seat::subject).collect(),
+                filter_subjects: subjects,
                 inactive_threshold: READER_IDLE,
                 ..Default::default()
             })
@@ -683,24 +690,22 @@ impl Bus {
             .map_err(|e| nats("opening a stream reader", e))?;
         let name = reader.cached_info().name.clone();
         let mut last = None;
-        let read = self
-            .read_with(&reader, max, wait, &mut out, &mut last)
-            .await;
+        let read = Self::read_with(&reader, max, wait, &mut out, &mut last, broadcast_start).await;
         if let Err(e) = stream.delete_consumer(&name).await {
             tracing::debug!("deleting the stream reader {name}: {e}");
         }
         read.map(|()| (out, last))
     }
 
-    /// Read up to `max` messages (malformed ones count, and are skipped); `last` is the
-    /// stream sequence of the last one read.
+    /// Read up to `max` eligible messages (malformed ones count, and are skipped);
+    /// `last` is the stream sequence of the last eligible message read.
     async fn read_with(
-        &self,
         reader: &jetstream::consumer::PullConsumer,
         max: usize,
         wait: Duration,
         out: &mut Vec<StreamNote>,
         last: &mut Option<u64>,
+        broadcast_start: Option<OffsetDateTime>,
     ) -> Result<()> {
         let deadline = Instant::now().checked_add(wait);
         let mut seen = 0;
@@ -720,7 +725,7 @@ impl Bus {
                 .messages()
                 .await
                 .map_err(|e| nats("reading the stream", e))?;
-            let n = take_read(batch, out, last).await?;
+            let (_, n) = take_read(batch, out, last, broadcast_start).await?;
             seen += n;
             if n > 0 {
                 break;
@@ -733,8 +738,8 @@ impl Bus {
                 .messages()
                 .await
                 .map_err(|e| nats("reading the stream", e))?;
-            let n = take_read(batch, out, last).await?;
-            if n == 0 {
+            let (received, n) = take_read(batch, out, last, broadcast_start).await?;
+            if !received {
                 break;
             }
             seen += n;
@@ -744,19 +749,27 @@ impl Bus {
 
     /// What `seat`'s inbox has not acknowledged, oldest first, without a delivery: the notes
     /// after its acknowledgement floor (one acknowledged out of order may be among them).
+    /// Until the inbox is created, only unicast is eligible.
     pub async fn peek(&self, seat: &Seat, max: usize, wait: Duration) -> Result<Vec<StreamNote>> {
+        check_inbox_seat(seat)?;
         let stream = self
             .js
             .get_stream(STREAM_NOTES)
             .await
             .map_err(|e| missing(&format!("stream {STREAM_NOTES}"), e))?;
-        let from = match stream.consumer_info(seat.consumer()).await {
-            Ok(i) => i.ack_floor.stream_sequence + 1,
-            Err(e) if e.kind() == jetstream::context::ConsumerInfoErrorKind::NotFound => 1,
+        let mut subjects = vec![seat.subject(), seat.owner_subject()];
+        let (from, broadcast_start) = match stream.consumer_info(seat.consumer()).await {
+            Ok(i) => {
+                subjects.push(Seat::broadcast().subject());
+                (i.ack_floor.stream_sequence + 1, Some(i.created))
+            }
+            Err(e) if e.kind() == jetstream::context::ConsumerInfoErrorKind::NotFound => (1, None),
             Err(e) => return Err(nats(&format!("reading the inbox of {seat}"), e)),
         };
-        self.read_notes(&[seat.clone(), Seat::broadcast()], from, max, wait)
-            .await
+        Ok(self
+            .read(subjects, from, max, wait, broadcast_start)
+            .await?
+            .0)
     }
 
     pub async fn state_get(&self, key: &str) -> Result<Option<StateEntry>> {
@@ -1266,24 +1279,24 @@ impl Inbox {
             }
         }
         // Then whatever else is pending, without waiting.
-        if out.len() < max {
-            self.take_pending(max - out.len(), &mut out).await?;
+        while out.len() < max {
+            let remaining = max - out.len();
+            let batch = self
+                .consumer
+                .fetch()
+                .max_messages(remaining)
+                .messages()
+                .await
+                .map_err(|e| nats(&format!("reading the inbox of {}", self.seat), e))?;
+            if self.take(batch, &mut out).await? < remaining {
+                break;
+            }
         }
         Ok(out)
     }
 
-    async fn take_pending(&mut self, max: usize, out: &mut Vec<Delivery>) -> Result<()> {
-        let batch = self
-            .consumer
-            .fetch()
-            .max_messages(max)
-            .messages()
-            .await
-            .map_err(|e| nats(&format!("reading the inbox of {}", self.seat), e))?;
-        self.take(batch, out).await
-    }
-
-    async fn take(&mut self, mut batch: pull::Batch, out: &mut Vec<Delivery>) -> Result<()> {
+    async fn take(&mut self, mut batch: pull::Batch, out: &mut Vec<Delivery>) -> Result<usize> {
+        let mut received = 0;
         while let Some(m) = batch.next().await {
             let msg = match m {
                 Ok(msg) => msg,
@@ -1294,19 +1307,27 @@ impl Inbox {
                 }
                 Err(e) => return Err(nats(&format!("reading the inbox of {}", self.seat), e)),
             };
+            received += 1;
             if let Some(d) = self.accept(msg).await? {
                 out.push(d);
             }
         }
-        Ok(())
+        Ok(received)
     }
 
-    /// Turn one message into a delivery, or terminate it when it is not a valid note.
+    /// Turn one message into a delivery, skipping old broadcasts and terminating malformed notes.
     async fn accept(&self, msg: jetstream::Message) -> Result<Option<Delivery>> {
-        let (seq, delivered) = match msg.info() {
-            Ok(i) => (i.stream_sequence, u64::try_from(i.delivered).unwrap_or(0)),
-            Err(e) => return Err(nats("reading message metadata", e)),
-        };
+        let info = msg
+            .info()
+            .map_err(|e| nats("reading message metadata", e))?;
+        let seq = info.stream_sequence;
+        if broadcast_before(&msg, &info, self.consumer.cached_info().created) {
+            msg.double_ack()
+                .await
+                .map_err(|e| nats(&format!("skipping old broadcast {seq}"), e))?;
+            return Ok(None);
+        }
+        let delivered = u64::try_from(info.delivered).unwrap_or(0);
         match parse_note(msg.subject.as_str(), &msg.payload) {
             Ok(note) => Ok(Some(Delivery {
                 seq,
@@ -1332,24 +1353,52 @@ impl Inbox {
     }
 }
 
-/// Collect one batch of a stream reader; returns how many messages it held.
+/// Collect a stream reader batch. Return whether it held any messages and how many were eligible.
 async fn take_read(
     mut batch: pull::Batch,
     out: &mut Vec<StreamNote>,
     last: &mut Option<u64>,
-) -> Result<usize> {
+    broadcast_start: Option<OffsetDateTime>,
+) -> Result<(bool, usize)> {
+    let mut received = false;
     let mut n = 0;
     while let Some(m) = batch.next().await {
         let msg = m.map_err(|e| nats("reading the stream", e))?;
+        received = true;
+        let info = msg
+            .info()
+            .map_err(|e| nats("reading message metadata", e))?;
+        if broadcast_start.is_some_and(|start| broadcast_before(&msg, &info, start)) {
+            continue;
+        }
         n += 1;
-        let seq = msg.info().map(|i| i.stream_sequence).unwrap_or(0);
+        let seq = info.stream_sequence;
         *last = Some(last.map_or(seq, |l| l.max(seq)));
         match parse_note(msg.subject.as_str(), &msg.payload) {
             Ok(note) => out.push(StreamNote { seq, note }),
             Err(why) => tracing::debug!(seq, "skipping a malformed note: {why}"),
         }
     }
-    Ok(n)
+    Ok((received, n))
+}
+
+fn check_inbox_seat(seat: &Seat) -> Result<()> {
+    if seat.is_broadcast() {
+        return Err(BusError::Nats(format!(
+            "`{BROADCAST}` is the broadcast address; it has no inbox"
+        )));
+    }
+    Ok(())
+}
+
+/// Use the hub's stored publish time and consumer creation time, independent of sender clocks.
+fn broadcast_before(
+    msg: &jetstream::Message,
+    info: &jetstream::message::Info<'_>,
+    start: OffsetDateTime,
+) -> bool {
+    info.published < start
+        && msg.subject.as_str().rsplit_once('.') == Some((SUBJECT_PREFIX, BROADCAST))
 }
 
 /// Parse and check one inbox payload; the error says why it is rejected. The subject is

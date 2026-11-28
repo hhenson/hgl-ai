@@ -5,6 +5,7 @@
 pub mod driver;
 pub mod exec;
 pub mod lock;
+pub mod log;
 pub mod parse;
 pub mod recipe;
 pub mod request;
