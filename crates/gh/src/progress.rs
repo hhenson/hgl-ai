@@ -126,10 +126,20 @@ pub async fn delete(bus: &Bus, repo: &str, pr: u64) -> Result<()> {
 
 /// Whether `landed.log` holds a line for `repo #pr` (at `merge`, when given).
 pub fn log_has(log: &str, repo: &str, pr: u64, merge: Option<&str>) -> bool {
+    log_merges(log, repo, pr).any(|m| merge.is_none_or(|want| m == want))
+}
+
+/// The merge commit of the newest `landed.log` line for `repo #pr`.
+pub fn log_merge(log: &str, repo: &str, pr: u64) -> Option<String> {
+    log_merges(log, repo, pr).last().map(String::from)
+}
+
+/// The merge commits of the `landed.log` lines for `repo #pr`, oldest first.
+fn log_merges<'a>(log: &'a str, repo: &'a str, pr: u64) -> impl Iterator<Item = &'a str> {
     let number = format!("#{pr}");
-    log.lines().any(|l| {
+    log.lines().filter_map(move |l| {
         let w: Vec<&str> = l.split_whitespace().collect();
-        w.len() >= 4 && w[1] == repo && w[2] == number && merge.is_none_or(|m| w[3] == m)
+        (w.len() >= 4 && w[1] == repo && w[2] == number).then(|| w[3])
     })
 }
 
@@ -139,6 +149,14 @@ pub async fn landed(bus: &Bus, repo: &str, pr: u64, merge: Option<&str>) -> Resu
         .state_get(state::KEY_LANDED)
         .await?
         .is_some_and(|e| log_has(&e.value, repo, pr, merge)))
+}
+
+/// [`log_merge`] over the hub's `landed.log`.
+pub async fn landed_merge(bus: &Bus, repo: &str, pr: u64) -> Result<Option<String>> {
+    Ok(bus
+        .state_get(state::KEY_LANDED)
+        .await?
+        .and_then(|e| log_merge(&e.value, repo, pr)))
 }
 
 #[cfg(test)]
@@ -161,5 +179,8 @@ mod tests {
         assert!(!log_has(log, "alpha", 7, Some("m8")));
         assert!(!log_has(log, "alpha", 8, None));
         assert!(!log_has(log, "beta", 7, None));
+        assert_eq!(log_merge(log, "alpha", 7).as_deref(), Some("m7"));
+        assert_eq!(log_merge(log, "alpha", 70).as_deref(), Some("m70"));
+        assert_eq!(log_merge(log, "alpha", 8), None);
     }
 }

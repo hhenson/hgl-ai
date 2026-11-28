@@ -209,7 +209,17 @@ impl AutoLand {
         tracing::info!("{}", l.outcome.line);
         match l.outcome.kind {
             Kind::Merged | Kind::Resumed => self.report(s, bus, t, &l, lock).await,
-            Kind::Partial => self.partial(s, bus, t, &l, lock).await,
+            Kind::Partial => {
+                self.partial(s, bus, t, &l, lock).await?;
+                // Reported; refused credentials or the rate limit still stop the round.
+                match l.outcome.cause {
+                    Some(gate::Cause::Auth) => Err(Error::Auth(l.outcome.line.clone())),
+                    Some(gate::Cause::RateLimited) => {
+                        Err(Error::RateLimited(l.outcome.line.clone()))
+                    }
+                    None => Ok(()),
+                }
+            }
             _ => Ok(()),
         }
     }
