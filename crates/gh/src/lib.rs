@@ -1,9 +1,8 @@
 //! GitHub services and gates for hgl-ai (docs/design.md §2, docs/protocol.md §8).
 //!
-//! Everything shells out to `gh` (no GitHub library). Each command is split in two: pure
-//! functions that decide over parsed JSON (unit-tested with fixtures), and a thin layer that
-//! runs `gh` and the bus. Every command has a dry run that reads GitHub and prints what it
-//! would do, and changes nothing.
+//! GitHub operations shell out to `gh` (no GitHub library). Commands decide over facts read
+//! from GitHub and the bus. The merge gate also reads Git history for receipt carry.
+//! Every command has a dry run that reads the facts and prints what it would do.
 //!
 //! | Module | Command |
 //! | --- | --- |
@@ -124,6 +123,7 @@ pub struct Settings {
     /// This host's label: it names the holder of a landing lock.
     pub host: String,
     pub owner: String,
+    pub(crate) receipt_carry_url: String,
     pub repos: Vec<String>,
     pub branch_prefix: String,
     pub wrapper: String,
@@ -179,6 +179,7 @@ impl Settings {
         Ok(Settings {
             host: cfg.host.clone(),
             owner: g.owner.clone(),
+            receipt_carry_url: g.clone_url_for(gate::RECEIPT_CARRY_REPO),
             repos: g.repos.clone(),
             branch_prefix: g.branch_prefix.clone(),
             wrapper: g.wrapper.clone(),
