@@ -7,6 +7,7 @@
 
 pub mod agent;
 pub mod client;
+pub mod conf;
 pub mod doctor;
 pub mod env;
 pub mod hub;

@@ -7,16 +7,19 @@ use hgl_ai_bus::{Bus, BusError};
 use hgl_ai_config::Config;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES,
-    KV_USAGE, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
+    HUB_API_PREFIX, HostRecord, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS,
+    KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE,
 };
+
+use crate::users::{KV_VERDICTS, Role};
 
 pub trait Hub {
     /// Connect with the host configuration (client install).
     fn check(&self, cfg: &Config) -> impl Future<Output = Result<(), BusError>>;
     /// Connect and create the stream and buckets (server install).
     fn provision(&self, cfg: &Config) -> impl Future<Output = Result<(), BusError>>;
-    /// Doctor: `Err` when unreachable, else the stream and buckets that are missing.
+    /// Doctor: `Err` when unreachable, else the streams and buckets that are missing, of
+    /// those the credential's role may look up by the access table.
     fn health(&self, cfg: &Config) -> impl Future<Output = Result<Vec<String>, String>>;
     /// Doctor: `Some(true)` when the hub lets this host's hub user subscribe to `_INBOX.>`,
     /// every client's replies (a `nats.conf` from before hgl-ai#111), `Some(false)` when it
@@ -26,6 +29,12 @@ pub trait Hub {
     /// Doctor, on the hub's host: the consumers on the telemetry streams that outlive a
     /// page ([`lasting_consumers`]), as `<stream>/<name>`.
     fn durables(&self, cfg: &Config) -> impl Future<Output = Result<Vec<String>, String>>;
+    /// Doctor (`hub boundary`, any host): write `HGL_CANARY`, which no role may, directly
+    /// and by the reply route, then read it back. `Ok(None)`: the admin, who may write
+    /// anything, is not tried.
+    fn boundary(&self, cfg: &Config) -> impl Future<Output = Result<Option<Boundary>, String>>;
+    /// Doctor, on the hub's host (`hub clients`): the live hosts' records.
+    fn hosts(&self, cfg: &Config) -> impl Future<Output = Result<Vec<HostRecord>, String>>;
 }
 
 /// A consumer on the telemetry streams that lives on without its page: durable, or with an
@@ -58,19 +67,47 @@ pub async fn lasting_consumers(js: &async_nats::jetstream::Context) -> Result<Ve
     Ok(out)
 }
 
-/// The hub's JetStream as `cfg`'s credential, plainly (no bus, which would create).
-async fn jetstream_of(cfg: &Config) -> Result<async_nats::jetstream::Context, String> {
+/// A plain connection as `cfg`'s credential (no bus, whose permission warnings would
+/// print in `doctor`), with the JetStream API where the hub serves it to this user.
+struct Plain {
+    client: async_nats::Client,
+    js: async_nats::jetstream::Context,
+    /// The hub answered at [`HUB_API_PREFIX`]: this user is in a role account (hgl-ai#141).
+    accounts: bool,
+    /// The role the credential names; `None` for a shared token or a bare seed.
+    role: Option<Role>,
+}
+
+/// Connect as `cfg`'s credential and find the JetStream API as the bus does: under
+/// [`HUB_API_PREFIX`] when the hub answers there, else `$JS.API`. A user in one account
+/// is refused the probe; the refusal, not the timeout, ends the wait.
+async fn connect(cfg: &Config) -> Result<Plain, String> {
+    use async_nats::jetstream;
     let path = cfg.token_file().map_err(|e| e.to_string())?;
     let cred = hgl_ai_bus::read_credential(&path).map_err(|e| e.to_string())?;
     // A hub user may subscribe to its own inbox prefix only (hgl-ai#111).
     let inbox = cred.as_ref().and_then(hgl_ai_bus::Credential::inbox_prefix);
+    let role = match &cred {
+        Some(hgl_ai_bus::Credential::Nkey { role: Some(r), .. }) => r.parse().ok(),
+        _ => None,
+    };
+    let (tx, mut refused) = tokio::sync::mpsc::unbounded_channel::<String>();
     let mut opts = match cred {
         Some(hgl_ai_bus::Credential::Token(t)) => async_nats::ConnectOptions::with_token(t),
         Some(hgl_ai_bus::Credential::Nkey { seed, .. }) => {
             async_nats::ConnectOptions::with_nkey(seed)
         }
         None => async_nats::ConnectOptions::new(),
-    };
+    }
+    .event_callback(move |e| {
+        let tx = tx.clone();
+        async move {
+            let s = e.to_string();
+            if s.to_ascii_lowercase().contains("permissions violation") {
+                let _ = tx.send(s);
+            }
+        }
+    });
     if let Some(p) = inbox {
         opts = opts.custom_inbox_prefix(p);
     }
@@ -79,7 +116,84 @@ async fn jetstream_of(cfg: &Config) -> Result<async_nats::jetstream::Context, St
         .connect(cfg.hub.url.as_str())
         .await
         .map_err(|e| e.to_string())?;
-    Ok(async_nats::jetstream::new(client))
+    let imported = jetstream::with_prefix(client.clone(), HUB_API_PREFIX);
+    let probe = format!("\"{HUB_API_PREFIX}.INFO\"");
+    let accounts = tokio::select! {
+        r = tokio::time::timeout(Duration::from_secs(5), imported.query_account()) => {
+            matches!(r, Ok(Ok(_)))
+        }
+        () = async {
+            while let Some(m) = refused.recv().await {
+                if m.contains(&probe) {
+                    return;
+                }
+            }
+            std::future::pending::<()>().await
+        } => false,
+    };
+    let js = if accounts {
+        imported
+    } else {
+        jetstream::new(client.clone())
+    };
+    Ok(Plain {
+        client,
+        js,
+        accounts,
+        role,
+    })
+}
+
+/// The hub's JetStream as `cfg`'s credential.
+async fn jetstream_of(cfg: &Config) -> Result<async_nats::jetstream::Context, String> {
+    connect(cfg).await.map(|p| p.js)
+}
+
+/// Every stream `doctor` looks for, and every bucket.
+const STREAMS: [&str; 3] = [STREAM_NOTES, STREAM_OWNER, STREAM_USAGE];
+const BUCKETS: [&str; 13] = [
+    KV_STATE,
+    KV_HOSTS,
+    KV_TREES,
+    KV_LOCKS,
+    KV_ENDED,
+    KV_THREADS,
+    KV_METRICS,
+    KV_CONSOLE,
+    KV_USAGE,
+    KV_BUILD,
+    KV_SLACK,
+    KV_VERDICTS,
+    KV_CANARY,
+];
+
+/// The streams and buckets `role` may look up, of [`STREAMS`] and [`BUCKETS`]: by the
+/// access table, the viewer's own buckets, or (the admin, a shared token, a credential
+/// without a role) all.
+fn health_scope(role: Option<Role>) -> (Vec<&'static str>, Vec<&'static str>) {
+    match role {
+        Some(r) if crate::users::ACCOUNT_ROLES.contains(&r) => {
+            let reads = crate::users::stream_reads(r);
+            (
+                STREAMS.into_iter().filter(|s| reads.contains(*s)).collect(),
+                BUCKETS
+                    .into_iter()
+                    .filter(|b| reads.contains(&format!("KV_{b}")))
+                    .collect(),
+            )
+        }
+        Some(Role::Viewer) => (Vec::new(), crate::users::VIEWER_BUCKETS.to_vec()),
+        _ => (STREAMS.to_vec(), BUCKETS.to_vec()),
+    }
+}
+
+/// What `hub boundary` found (hgl-ai#146).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Boundary {
+    /// The hub served this user under [`HUB_API_PREFIX`]: a role account.
+    pub accounts: bool,
+    /// The routes by which a write reached `HGL_CANARY`: `directly`, `by the reply route`.
+    pub wrote: Vec<&'static str>,
 }
 
 /// The real hub, through `hgl-ai-bus`.
@@ -94,21 +208,20 @@ impl Hub for BusHub {
         Bus::connect(cfg).await?.provision().await
     }
 
-    /// Read-only: the bus API has no existence check that does not create, so
-    /// this looks the streams and buckets up directly.
+    /// Read-only: the bus API has no existence check that does not create, so this looks
+    /// the streams and buckets up directly, those the credential's role may look up only:
+    /// a lookup the hub refuses is not a missing bucket (r1 on hgl-ai#152).
     async fn health(&self, cfg: &Config) -> Result<Vec<String>, String> {
-        let js = jetstream_of(cfg).await?;
+        let c = connect(cfg).await?;
+        let (streams, buckets) = health_scope(c.role);
         let mut missing = Vec::new();
-        for s in [STREAM_NOTES, STREAM_OWNER, STREAM_USAGE] {
-            if js.get_stream(s).await.is_err() {
+        for s in streams {
+            if c.js.get_stream(s).await.is_err() {
                 missing.push(s.to_string());
             }
         }
-        for b in [
-            KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
-            KV_USAGE, KV_BUILD, KV_SLACK,
-        ] {
-            if js.get_key_value(b).await.is_err() {
+        for b in buckets {
+            if c.js.get_key_value(b).await.is_err() {
                 missing.push(b.to_string());
             }
         }
@@ -179,6 +292,79 @@ impl Hub for BusHub {
     async fn durables(&self, cfg: &Config) -> Result<Vec<String>, String> {
         lasting_consumers(&jetstream_of(cfg).await?).await
     }
+
+    /// Four writes at keys of their own under `doctor.<pid><nanos>`: on `$KV.HGL_CANARY.<k>`
+    /// and its name under the hub API prefix, directly and as the reply subject of a
+    /// lookup every role may make (`STREAM.INFO` of the canary), which one account lets
+    /// JetStream answer onto (hgl-ai#141). A second lookup, answered, shows the hub has
+    /// served the first; then each key is read back.
+    async fn boundary(&self, cfg: &Config) -> Result<Option<Boundary>, String> {
+        let c = connect(cfg).await?;
+        if c.role == Some(Role::Admin) {
+            return Ok(None);
+        }
+        let n = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_nanos());
+        let base = format!("doctor.{}{n}", std::process::id());
+        let api = if c.accounts {
+            HUB_API_PREFIX
+        } else {
+            "$JS.API"
+        };
+        let lookup = format!("{api}.STREAM.INFO.KV_{KV_CANARY}");
+        let key =
+            |route: &str, under: bool| format!("{base}.{route}{}", if under { "-api" } else { "" });
+        let subject = |k: &str, under: bool| {
+            let s = format!("$KV.{KV_CANARY}.{k}");
+            if under {
+                format!("{HUB_API_PREFIX}.{s}")
+            } else {
+                s
+            }
+        };
+        let mut tries = Vec::new();
+        for under in [false, true] {
+            let k = key("direct", under);
+            c.client
+                .publish(subject(&k, under), "hgl-ai doctor".into())
+                .await
+                .map_err(|e| e.to_string())?;
+            tries.push((k, "directly"));
+            let k = key("reply", under);
+            c.client
+                .publish_with_reply(lookup.clone(), subject(&k, under), "".into())
+                .await
+                .map_err(|e| e.to_string())?;
+            tries.push((k, "by the reply route"));
+        }
+        c.client.flush().await.map_err(|e| e.to_string())?;
+        let canary =
+            c.js.get_key_value(KV_CANARY)
+                .await
+                .map_err(|e| format!("no bucket {KV_CANARY} to read back: {e}"))?;
+        // JetStream answers API requests off the connection's order: give it a moment.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let mut wrote = Vec::new();
+        for (k, route) in tries {
+            let got = canary
+                .entry(k.as_str())
+                .await
+                .map_err(|e| format!("reading {KV_CANARY} back: {e}"))?;
+            if got.is_some() && !wrote.contains(&route) {
+                wrote.push(route);
+            }
+        }
+        Ok(Some(Boundary {
+            accounts: c.accounts,
+            wrote,
+        }))
+    }
+
+    async fn hosts(&self, cfg: &Config) -> Result<Vec<HostRecord>, String> {
+        let bus = Bus::connect(cfg).await.map_err(|e| e.to_string())?;
+        bus.hosts().await.map_err(|e| e.to_string())
+    }
 }
 
 #[cfg(test)]
@@ -198,6 +384,10 @@ pub(crate) mod fake {
         pub creds: RefCell<Vec<String>>,
         /// What [`Hub::shared_inbox`] answers when reachable.
         pub shared_inbox: Option<bool>,
+        /// What [`Hub::boundary`] answers when reachable.
+        pub boundary: Result<Option<Boundary>, String>,
+        /// What [`Hub::hosts`] answers when reachable.
+        pub hosts: Vec<HostRecord>,
     }
 
     impl FakeHub {
@@ -209,6 +399,11 @@ pub(crate) mod fake {
                 calls: RefCell::new(Vec::new()),
                 creds: RefCell::new(Vec::new()),
                 shared_inbox: None,
+                boundary: Ok(Some(Boundary {
+                    accounts: true,
+                    wrote: Vec::new(),
+                })),
+                hosts: Vec::new(),
             }
         }
         pub fn down() -> Self {
@@ -249,6 +444,15 @@ pub(crate) mod fake {
         async fn durables(&self, cfg: &Config) -> Result<Vec<String>, String> {
             self.answer("durables", cfg)
                 .map(|()| self.durables.clone())
+                .map_err(|e| e.to_string())
+        }
+        async fn boundary(&self, cfg: &Config) -> Result<Option<Boundary>, String> {
+            self.answer("boundary", cfg).map_err(|e| e.to_string())?;
+            self.boundary.clone()
+        }
+        async fn hosts(&self, cfg: &Config) -> Result<Vec<HostRecord>, String> {
+            self.answer("hosts", cfg)
+                .map(|()| self.hosts.clone())
                 .map_err(|e| e.to_string())
         }
     }
@@ -390,26 +594,9 @@ mod live {
         cfg.hub.url = format!("nats://127.0.0.1:{port}");
         cfg.hub.token_file = tok_file.display().to_string();
 
+        // A shared token is every role: every stream and bucket.
         let missing = BusHub.health(&cfg).await.unwrap();
-        assert_eq!(
-            missing,
-            [
-                STREAM_NOTES,
-                STREAM_OWNER,
-                STREAM_USAGE,
-                KV_STATE,
-                KV_HOSTS,
-                KV_TREES,
-                KV_LOCKS,
-                KV_ENDED,
-                KV_THREADS,
-                KV_METRICS,
-                KV_CONSOLE,
-                KV_USAGE,
-                KV_BUILD,
-                KV_SLACK
-            ]
-        );
+        assert_eq!(missing, [&STREAMS[..], &BUCKETS[..]].concat());
 
         let client = async_nats::ConnectOptions::with_token(token.clone())
             .connect(cfg.hub.url.as_str())
@@ -429,10 +616,7 @@ mod live {
             .await
             .unwrap();
         }
-        for b in [
-            KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_CONSOLE,
-            KV_USAGE, KV_BUILD, KV_SLACK,
-        ] {
+        for b in BUCKETS {
             js.create_key_value(async_nats::jetstream::kv::Config {
                 bucket: b.into(),
                 ..Default::default()
@@ -441,6 +625,14 @@ mod live {
             .unwrap();
         }
         assert!(BusHub.health(&cfg).await.unwrap().is_empty());
+        // A shared token writes anything, the canary too, by either route.
+        assert_eq!(
+            BusHub.boundary(&cfg).await.unwrap(),
+            Some(Boundary {
+                accounts: false,
+                wrote: vec!["directly", "by the reply route"],
+            })
+        );
 
         std::fs::write(&tok_file, "wrong\n").unwrap();
         assert!(

@@ -59,10 +59,10 @@ use async_nats::jetstream::{self, AckKind, context::Publish, kv, stream};
 use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
-    BROADCAST, CONSOLE_PREFIX, EndedRecord, HUB_API_PREFIX, HostRecord, KV_CONSOLE, KV_ENDED,
-    KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord,
-    Note, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey,
-    TreeRecord, USAGE_PREFIX, ended_key, utc_now_stamp,
+    BROADCAST, CONSOLE_PREFIX, EndedRecord, HUB_API_PREFIX, HostRecord, KV_CANARY, KV_CONSOLE,
+    KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE,
+    LockRecord, Note, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat,
+    TaskKey, TreeRecord, USAGE_PREFIX, ended_key, utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -145,6 +145,8 @@ pub const INBOX_MAX_DELIVER: i64 = -1;
 pub const MAX_NOTE_BYTES: usize = 1 << 20;
 /// Largest value a bucket holds.
 pub const MAX_VALUE_BYTES: usize = 1 << 20;
+/// How long a write that reached `HGL_CANARY` stays there.
+pub const CANARY_MAX_AGE: Duration = Duration::from_secs(7 * 86_400);
 /// `HGL_USAGE_LOG` keeps usage records 35 days, the burn-down history (PROTO-23).
 pub const USAGE_MAX_AGE: Duration = Duration::from_secs(35 * 86_400);
 /// Attempts [`Bus::append_line`] makes before giving up with [`BusError::Conflict`].
@@ -575,6 +577,14 @@ impl Bus {
                 Duration::ZERO,
             ),
             build::BUCKET,
+            // Stays empty while the hub enforces role boundaries (`doctor`, `hub boundary`).
+            (
+                KV_CANARY,
+                "hgl-ai role boundary canary; no role writes it",
+                stream::StorageType::File,
+                1,
+                CANARY_MAX_AGE,
+            ),
         ];
         for (bucket, description, storage, history, max_age) in buckets {
             self.js

@@ -14,8 +14,8 @@ use std::str::FromStr;
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE,
-    KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
+    CONSOLE_PREFIX, KV_CANARY, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK,
+    KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
     SLACK_OWNER_FILTER, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, USAGE_PREFIX,
     VIEWER_INBOX, VIEWER_STATE_KEYS,
 };
@@ -344,6 +344,9 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$JS.API.CONSUMER.INFO.{STREAM_OWNER}.{SLACK_FEED}"),
                 format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.{SLACK_FEED}"),
                 format!("$JS.ACK.{STREAM_OWNER}.{SLACK_FEED}.>"),
+                // The role boundary canary (`doctor`, `hub boundary`).
+                format!("$JS.API.STREAM.INFO.{}", kv(KV_CANARY)),
+                format!("$JS.API.DIRECT.GET.{}.>", kv(KV_CANARY)),
             ],
             publish_deny: Vec::new(),
         });
@@ -679,6 +682,8 @@ pub fn access_table() -> Vec<Row> {
         // The console reads the permalink index; delivery state is the adapter's.
         row(keys(KV_SLACK, "links.*.*"), [No, No, No, R, No]),
         row(all(KV_SLACK), [No, No, No, No, RW]),
+        // Every role reads the canary and none writes it (`doctor`, `hub boundary`).
+        row(all(KV_CANARY), [R, R, R, R, R]),
     ]
 }
 
@@ -894,6 +899,158 @@ pub fn render_accounts(reg: &Registry) -> String {
     }
     s.push_str("}\n");
     s
+}
+
+/// The streams `role` may look up (`STREAM.INFO`) by the access table, by stream name
+/// (a bucket's is `KV_<bucket>`): what `doctor` checks are there (`hub`).
+pub fn stream_reads(role: Role) -> std::collections::BTreeSet<String> {
+    role_services(role)
+        .into_iter()
+        .filter_map(|s| {
+            s.subject
+                .strip_prefix("$JS.API.STREAM.INFO.")
+                .map(String::from)
+        })
+        .collect()
+}
+
+/// How `nats.conf` lets users in, as `doctor` reads it (`hub accounts`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Layout {
+    /// No users: one shared token, or none.
+    Token,
+    /// Users with permissions, all in one account: role boundaries are not enforced.
+    OneAccount { users: usize },
+    /// One account per role (hgl-ai#141).
+    Accounts,
+}
+
+/// What [`audit`] finds: the layout, and on the account layout every way it is wider
+/// than [`render_accounts`] would make it from the registry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Audit {
+    pub layout: Layout,
+    pub problems: Vec<String>,
+}
+
+/// Check a hub's `nats.conf` against the registry and the access table (hgl-ai#141):
+/// each role's users in its own account and nowhere else, the admin alone in `HUB`,
+/// JetStream in `HUB` only, no stream exports, and service exports from `HUB` only, each
+/// to no account the table does not give it. Exports the table has and the file lacks are
+/// not problems: they take nothing away from the boundary.
+pub fn audit(text: &str, reg: &Registry) -> std::result::Result<Audit, String> {
+    use crate::conf::Value;
+    let conf = crate::conf::parse(text)?;
+    let Some(accounts) = conf.get("accounts") else {
+        let users = conf
+            .get("authorization")
+            .and_then(|a| a.get("users"))
+            .map_or(0, |u| u.items().len());
+        return Ok(Audit {
+            layout: if users == 0 {
+                Layout::Token
+            } else {
+                Layout::OneAccount { users }
+            },
+            problems: Vec::new(),
+        });
+    };
+    let mut problems = Vec::new();
+    if accounts.get(HUB_ACCOUNT).is_none() {
+        problems.push(format!("no {HUB_ACCOUNT} account"));
+    }
+    if conf.get("authorization").is_some() {
+        problems.push("an `authorization` block beside the accounts".to_string());
+    }
+    let by_key: BTreeMap<&str, &User> = reg.users.iter().map(|u| (u.nkey.as_str(), u)).collect();
+    let want = exports();
+    let mut placed: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+    let str_of = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_string);
+    for (name, acct) in accounts.entries() {
+        for u in acct.get("users").map(Value::items).unwrap_or_default() {
+            let Some(nkey) = u.get("nkey").and_then(Value::as_str) else {
+                problems.push(format!("{name} has a user without an NKey"));
+                continue;
+            };
+            match by_key.get(nkey) {
+                Some(user) => placed.entry(&user.nkey).or_default().push(name),
+                None => problems.push(format!(
+                    "{name} has a user the registry lacks ({})",
+                    fingerprint(nkey)
+                )),
+            }
+        }
+        let js = str_of(acct.get("jetstream"));
+        let js_on = acct.get("jetstream").is_some()
+            && !matches!(js.as_deref(), Some("disabled" | "false" | "disable"));
+        if js_on && name != HUB_ACCOUNT {
+            problems.push(format!("{name} has JetStream"));
+        }
+        for e in acct.get("exports").map(Value::items).unwrap_or_default() {
+            if let Some(s) = str_of(e.get("stream")) {
+                problems.push(format!("{name} exports the stream {s}"));
+                continue;
+            }
+            let Some(subject) = str_of(e.get("service")) else {
+                problems.push(format!("{name} has an export that is not a service"));
+                continue;
+            };
+            if name != HUB_ACCOUNT {
+                problems.push(format!(
+                    "{name} exports {subject}: only {HUB_ACCOUNT} exports"
+                ));
+                continue;
+            }
+            let Some(to) = e.get("accounts") else {
+                problems.push(format!("{HUB_ACCOUNT} exports {subject} to every account"));
+                continue;
+            };
+            let allowed: Vec<&str> = want
+                .iter()
+                .find(|(svc, _)| svc.subject == subject)
+                .map(|(_, roles)| roles.iter().map(|r| r.account()).collect())
+                .unwrap_or_default();
+            if allowed.is_empty() {
+                problems.push(format!(
+                    "{HUB_ACCOUNT} exports {subject}, which the access table has not"
+                ));
+                continue;
+            }
+            let wider: Vec<String> = to
+                .items()
+                .iter()
+                .filter_map(|a| a.as_str())
+                .filter(|a| !allowed.contains(a))
+                .map(String::from)
+                .collect();
+            if !wider.is_empty() {
+                problems.push(format!(
+                    "{HUB_ACCOUNT} exports {subject} to {}, beyond the access table",
+                    wider.join(", ")
+                ));
+            }
+        }
+    }
+    for u in &reg.users {
+        let at = placed.get(u.nkey.as_str()).cloned().unwrap_or_default();
+        let own = u.role.account();
+        match (u.role, at.as_slice()) {
+            // Not rendered until the viewer has its account (hgl-ai#148).
+            (Role::Viewer, []) => {}
+            (_, [a]) if *a == own => {}
+            (_, []) => problems.push(format!("{} ({}) is in no account", u.name, u.role)),
+            (_, _) => problems.push(format!(
+                "{} ({}) is in {}, not {own} alone",
+                u.name,
+                u.role,
+                at.join(", ")
+            )),
+        }
+    }
+    Ok(Audit {
+        layout: Layout::Accounts,
+        problems,
+    })
 }
 
 /// Write a credential (mode 0600, its directory 0700).
@@ -1492,5 +1649,144 @@ mod tests {
             assert!(o.status.success(), "{err}\n{conf}");
             assert!(!err.contains("[WRN]") && !err.contains("[ERR]"), "{err}");
         }
+    }
+
+    /// `hub accounts` (hgl-ai#146): the rendered layouts read back as what they are, and
+    /// each way of widening the account layout is found.
+    #[test]
+    fn audit_finds_what_widens_the_accounts() {
+        let reg = every_role();
+        let conf = |auth: &crate::nats::Auth| {
+            crate::nats::render_conf("127.0.0.1", 4222, Path::new("/s"), auth)
+        };
+        let users = audit(&conf(&crate::nats::Auth::Users(&reg)), &reg).unwrap();
+        assert_eq!(users.layout, Layout::OneAccount { users: 7 });
+        let token = audit(&conf(&crate::nats::Auth::Token("t")), &reg).unwrap();
+        assert_eq!(token.layout, Layout::Token);
+        let text = conf(&crate::nats::Auth::Accounts(&reg));
+        let clean = audit(&text, &reg).unwrap();
+        assert_eq!(clean.layout, Layout::Accounts);
+        assert!(clean.problems.is_empty(), "{:?}", clean.problems);
+        // A viewer user is not rendered yet (hgl-ai#148): not a problem.
+        let mut with_viewer = reg.clone();
+        with_viewer.issue("viewer", Role::Viewer, false).unwrap();
+        assert!(audit(&text, &with_viewer).unwrap().problems.is_empty());
+
+        let seat_only = exports()
+            .into_iter()
+            .find(|(_, roles)| roles == &[Role::Seat, Role::Coord, Role::Builder])
+            .unwrap()
+            .0
+            .subject;
+        let seat_line = text
+            .lines()
+            .find(|l| l.contains(&format!("\"{seat_only}\"")) && l.contains("service:"))
+            .unwrap()
+            .to_string();
+        let hub_nkey = reg.get("hub").unwrap().nkey.clone();
+        let hub_line = text
+            .lines()
+            .find(|l| l.contains(&hub_nkey))
+            .unwrap()
+            .to_string();
+        let exports_at = "    exports: [\n";
+        let cases: Vec<(String, String)> = vec![
+            (
+                text.replacen(
+                    exports_at,
+                    &format!("{exports_at}      {{ stream: \"hgl.>\", accounts: [SEAT] }}\n"),
+                    1,
+                ),
+                "HUB exports the stream hgl.>".to_string(),
+            ),
+            (
+                text.replace(&seat_line, &seat_line.replace("BUILDER", "BUILDER, SLACK")),
+                format!("HUB exports {seat_only} to SLACK, beyond the access table"),
+            ),
+            (
+                text.replace(
+                    &seat_line,
+                    &seat_line.replace(", accounts: [SEAT, COORD, BUILDER]", ""),
+                ),
+                format!("HUB exports {seat_only} to every account"),
+            ),
+            (
+                text.replacen(
+                    exports_at,
+                    &format!(
+                        "{exports_at}      {{ service: \"$KV.HGL_CANARY.>\", accounts: [SEAT] }}\n"
+                    ),
+                    1,
+                ),
+                "HUB exports $KV.HGL_CANARY.>, which the access table has not".to_string(),
+            ),
+            (
+                text.replacen(
+                    "  SEAT {\n",
+                    "  SEAT {\n    jetstream: enabled\n    exports: [ { service: \"x\" } ]\n",
+                    1,
+                ),
+                "SEAT has JetStream".to_string(),
+            ),
+            (
+                text.replacen(
+                    "  SEAT {\n",
+                    "  SEAT {\n    exports: [ { service: \"x\" } ]\n",
+                    1,
+                ),
+                "SEAT exports x: only HUB exports".to_string(),
+            ),
+            (
+                text.replacen(&hub_line, "", 1).replacen(
+                    "    users: [\n",
+                    &format!("    users: [\n{hub_line}\n"),
+                    1,
+                ),
+                "hub (seat) is in HUB, not SEAT alone".to_string(),
+            ),
+            (
+                text.replacen(
+                    &hub_line,
+                    &format!("{hub_line}\n{}", hub_line.replace(&hub_nkey, "UNKNOWN")),
+                    1,
+                ),
+                "SEAT has a user the registry lacks".to_string(),
+            ),
+            (
+                text.replacen(&hub_line, "", 1),
+                "hub (seat) is in no account".to_string(),
+            ),
+        ];
+        for (conf, want) in cases {
+            let a = audit(&conf, &reg).unwrap();
+            assert!(
+                a.problems.iter().any(|p| p.contains(&want)),
+                "{want}: {:?}",
+                a.problems
+            );
+        }
+        assert!(audit("accounts { HUB {", &reg).is_err());
+    }
+
+    /// `doctor`'s `hub` check looks up only what the role may (r1 on hgl-ai#152).
+    #[test]
+    fn stream_reads_follow_the_table() {
+        let seat = stream_reads(Role::Seat);
+        for s in [
+            "HGL_NOTES",
+            "HGL_OWNER",
+            "KV_HGL_STATE",
+            "KV_HGL_VERDICTS",
+            "KV_HGL_CANARY",
+        ] {
+            assert!(seat.contains(s), "{s}");
+        }
+        for s in ["KV_HGL_CONSOLE", "KV_HGL_SLACK"] {
+            assert!(!seat.contains(s), "{s}");
+        }
+        let slack: Vec<String> = stream_reads(Role::Slack).into_iter().collect();
+        assert_eq!(slack, ["HGL_OWNER", "KV_HGL_CANARY", "KV_HGL_SLACK"]);
+        let console = stream_reads(Role::Console);
+        assert!(console.contains("KV_HGL_CONSOLE") && !console.contains("KV_HGL_SLACK"));
     }
 }

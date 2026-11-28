@@ -159,6 +159,17 @@ older hub too), then rerun `hgl-ai server install`; until then `doctor` on the h
 services (rerun `hgl-ai client install`, which restarts them): a running process keeps
 the shared inbox until it restarts.
 
+`doctor` checks the role boundaries (hgl-ai#141):
+
+- `hub boundary` (every host): writes `HGL_CANARY`, which no role may, directly and as a
+  JetStream reply subject, and fails if anything arrives. It fails on a hub with every
+  user in one account.
+- `hub accounts` (the hub): `nats.conf` against the registry: each role's users in its
+  own account, the admin alone in `HUB`, no stream exports, no export wider than the
+  access table. Users in one account warn.
+- `hub clients` (the hub): live hosts whose client cannot use role accounts yet.
+- `hub` looks up only the streams and buckets the host's role may read.
+
 ```sh
 hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred
 hgl-ai server user add build-2 --role seat --nkey U...   # a host's own key; no secret here

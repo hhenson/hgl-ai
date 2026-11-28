@@ -2015,3 +2015,95 @@ async fn accounts_the_first_user_of_a_role_needs_one_reload() {
 fn role_writes_locks(role: Role) -> bool {
     writes_of(role).iter().any(|w| w == "$KV.HGL_LOCKS.>")
 }
+
+impl Hub {
+    /// A host's configuration with `who`'s credential as its `hub.token`.
+    fn host_cfg(&self, who: &str) -> hgl_ai_config::Config {
+        let Credential::Nkey { seed, user, role } = self.creds[who].clone() else {
+            unreachable!()
+        };
+        let dir = self.conf.with_file_name(format!("host-{who}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("hub.token");
+        std::fs::write(
+            &f,
+            Credential::render_nkey(&user.unwrap(), &role.unwrap(), &seed),
+        )
+        .unwrap();
+        let mut cfg = hgl_ai_config::Config::new("t");
+        cfg.hub.url = self.url.clone();
+        cfg.hub.token_file = f.display().to_string();
+        cfg
+    }
+}
+
+/// `doctor` on both layouts (hgl-ai#146): `hub boundary` fails on one account, where a
+/// write outside each role's rights reaches the canary by the reply route, and passes on
+/// role accounts, where nothing reaches it; `hub` finds every stream and bucket each role
+/// may look up, through the hub API prefix there; `hub clients` reads the live hosts.
+#[tokio::test]
+async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
+    use hgl_ai_install::{BusHub, Hub as _};
+    for accounts in [false, true] {
+        let hub = if accounts {
+            Hub::accounts()
+        } else {
+            Hub::start()
+        };
+        let Some(hub) = hub else { return };
+        let admin = seeded(&hub).await;
+        let canary = format!("KV_{}", hgl_ai_proto::KV_CANARY);
+        let count = || async {
+            let mut s = admin.get_stream(&canary).await.unwrap();
+            s.info().await.unwrap().state.messages
+        };
+        let before = count().await;
+        for (_, who) in ROLE_USERS {
+            let cfg = hub.host_cfg(who);
+            assert_eq!(
+                BusHub.health(&cfg).await.unwrap(),
+                Vec::<String>::new(),
+                "{who}, accounts {accounts}"
+            );
+            let b = BusHub.boundary(&cfg).await.unwrap().unwrap();
+            assert_eq!(b.accounts, accounts, "{who}");
+            let want: &[&str] = if accounts {
+                &[]
+            } else {
+                &["by the reply route"]
+            };
+            assert_eq!(b.wrote, want, "{who}, accounts {accounts}");
+        }
+        let after = count().await;
+        if accounts {
+            assert_eq!(after, before, "the canary stays empty");
+        } else {
+            assert_eq!(after, before + ROLE_USERS.len() as u64);
+        }
+        assert_eq!(BusHub.boundary(&hub.host_cfg("hub-admin")).await, Ok(None));
+
+        let rec = |host: &str, accounts_capable| hgl_ai_proto::HostRecord {
+            host: host.into(),
+            seats: Vec::new(),
+            memcap_gb: 1,
+            work_root_free_gb: 1,
+            updated_at: hgl_ai_proto::utc_now_stamp(),
+            accounts_capable,
+        };
+        let seat = hub.bus("build-1").await;
+        seat.host_put(&rec("build-1", true)).await.unwrap();
+        seat.host_put(&rec("old-1", false)).await.unwrap();
+        let mut hosts: Vec<(String, bool)> = BusHub
+            .hosts(&hub.host_cfg("hub-coord"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.host, h.accounts_capable))
+            .collect();
+        hosts.sort();
+        assert_eq!(
+            hosts,
+            [("build-1".to_string(), true), ("old-1".to_string(), false)]
+        );
+    }
+}

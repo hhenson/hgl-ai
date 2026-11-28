@@ -58,6 +58,9 @@ pub const VIEWER_INBOX: &str = "_INBOX_VIEWER";
 pub const VIEWER_STATE_KEYS: [&str; 6] = ["prs", "backlog", "landed.log", "tasks", "mode", "hold"];
 /// The Slack adapter's delivery state and thread mappings.
 pub const KV_SLACK: &str = "HGL_SLACK";
+/// A bucket no hub role may write and every role reads: `doctor` (`hub boundary`) tries a
+/// write there that its role must not have and checks that nothing arrived (hgl-ai#146).
+pub const KV_CANARY: &str = "HGL_CANARY";
 /// Owner words (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
 /// One owner event per Slack workspace, channel and reply or action timestamp in a thread.
