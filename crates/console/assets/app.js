@@ -1,5 +1,5 @@
-// hgl-ai console: passkey ceremonies, live telemetry and the answer form. Embedded in
-// the binary; no other script runs (the page's CSP allows only this one).
+// hgl-ai console: passkey ceremonies and the answer form on the server-rendered pages.
+// Embedded in the binary; the telemetry page is its own (crates/console/web).
 "use strict";
 
 function b64urlToBuf(s) {
@@ -95,18 +95,6 @@ function wire(id, fn) {
   });
 }
 
-function live() {
-  const panels = document.getElementById("panels");
-  const status = document.getElementById("live");
-  if (!panels || !panels.dataset.sse || !window.EventSource) return;
-  const es = new EventSource(panels.dataset.sse);
-  es.addEventListener("snapshot", (e) => {
-    panels.innerHTML = e.data;
-    if (status) status.textContent = "Live; updated " + new Date().toLocaleTimeString();
-  });
-  es.onerror = () => { if (status) status.textContent = "Reconnecting…"; };
-}
-
 function answerForm() {
   const form = document.querySelector("form.answer");
   if (!form) return;
@@ -125,6 +113,5 @@ function answerForm() {
 document.addEventListener("DOMContentLoaded", () => {
   wire("passkey-register", register);
   wire("passkey-signin", signin);
-  live();
   answerForm();
 });

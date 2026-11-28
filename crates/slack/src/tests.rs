@@ -1379,22 +1379,26 @@ async fn socket_mode_retries_quick_disconnects_with_growing_delays() {
     let slack = hub.bus("slack").await;
     let fake = FakeSlack::start().await;
     let adapter = fake.adapter(&slack).await;
+    let (delays_tx, mut delays_rx) = tokio::sync::mpsc::unbounded_channel();
     let disconnects = async {
-        let mut previous = None;
-        for min_ms in [0, 500, 1000, 2000] {
+        for min_ms in [500, 1000, 2000, 4000] {
             let (stream, _) = fake.listener.accept().await.unwrap();
-            if let Some(last) = previous {
-                assert!(Instant::now() - last >= Duration::from_millis(min_ms));
-            }
             let mut ws = ServerBuilder::new().accept(stream).await.unwrap();
-            previous = Some(Instant::now());
             ws.send(Message::text(json!({"type": "disconnect"}).to_string()))
                 .await
                 .unwrap();
+            let delay = delays_rx.recv().await.unwrap();
+            assert!(
+                delay >= Duration::from_millis(min_ms),
+                "{delay:?} < {min_ms}ms"
+            );
         }
     };
     tokio::select! {
         result = timeout(Duration::from_secs(12), disconnects) => result.unwrap(),
-        () = adapter.socket_loop() => panic!("Slack socket loop exited"),
+        () = adapter.socket_loop_with_sleep(|delay| {
+            delays_tx.send(delay).unwrap();
+            std::future::ready(())
+        }) => panic!("Slack socket loop exited"),
     }
 }

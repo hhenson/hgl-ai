@@ -1,0 +1,33 @@
+{
+  "name": "hgl-ai-console-web",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b && vite build",
+    "typecheck": "tsc -b",
+    "test": "vitest run",
+    "check": "tsc -b && vitest run && vite build"
+  },
+  "dependencies": {
+    "@nats-io/kv": "3.5.0",
+    "@nats-io/nats-core": "3.5.0",
+    "@radix-ui/react-tabs": "1.2.1",
+    "@tanstack/react-query": "5.108.4",
+    "ag-grid-community": "36.3.0",
+    "ag-grid-react": "36.3.0",
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "4.3.5",
+    "@types/node": "22.20.7",
+    "@types/react": "18.3.32",
+    "@types/react-dom": "18.3.7",
+    "@vitejs/plugin-react": "6.3.0",
+    "tailwindcss": "4.3.5",
+    "typescript": "5.9.3",
+    "vite": "8.4.0",
+    "vitest": "5.1.2"
+  }
+}
