@@ -1516,3 +1516,107 @@ async fn a_refresh_whose_answer_came_late_keeps_the_lease() {
     assert!(!lease.release().await.unwrap());
     assert!(other.release().await.unwrap());
 }
+
+/// A release whose lease was moved on by a refresh the caller dropped (the hub committed
+/// it; its answer came late) still deletes the lease, rather than leaving it to expire
+/// after `max_age` (hgl-ai#134).
+#[tokio::test]
+async fn a_release_after_a_refresh_whose_answer_came_late_deletes_the_lease() {
+    let Some(hub) = Hub::start() else { return };
+    let direct = hub.ready().await;
+    let proxy = SlowAck::start(&hub.url).await;
+    let bus = Bus::connect_url(&proxy.url, Some(hub.token.clone()))
+        .await
+        .expect("connect through the proxy");
+    let name = "seat.slow-release";
+    let mut lease = bus.lock_acquire(name, "bridge-1 pid 1").await.unwrap();
+    let before = lease.revision();
+    proxy.delay_next(
+        &format!("$KV.HGL_LOCKS.{name}"),
+        Duration::from_millis(1500),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), lease.refresh())
+            .await
+            .is_err(),
+        "the refresh was answered in time"
+    );
+    within(10, "the late answer is passed on", async || {
+        proxy.late() == 1
+    })
+    .await;
+    let kv = hub.raw().await.get_key_value("HGL_LOCKS").await.unwrap();
+    assert_eq!(
+        kv.entry(name).await.unwrap().unwrap().revision,
+        before + 1,
+        "the dropped refresh was committed"
+    );
+    assert_eq!(lease.revision(), before);
+
+    assert!(lease.release().await.unwrap(), "released, not leaked");
+    assert_eq!(direct.lock_get(name).await.unwrap(), None);
+    let next = direct.lock_acquire(name, "bridge-2 pid 2").await.unwrap();
+
+    // A lease another holder wrote over is not deleted by the old holder's release.
+    let taker = direct
+        .lock_take_over(name, "bridge-3 pid 3", "bridge-2 pid 2")
+        .await
+        .unwrap();
+    assert!(!next.release().await.unwrap());
+    assert_eq!(
+        direct.lock_get(name).await.unwrap().as_ref(),
+        Some(taker.record())
+    );
+    assert!(taker.release().await.unwrap());
+}
+
+/// Each acquisition has its own token, so a lease never mistakes another for its own: not
+/// one taken over by the same holder, nor one with the same holder and `acquired_at` (an
+/// expired lease re-acquired in the same second). Before the token the two ping-ponged,
+/// each refresh adopting the other's write (hgl-ai#134).
+#[tokio::test]
+async fn a_lease_with_the_same_holder_and_second_is_not_ours() {
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let name = "builder.same-second";
+    let mut old = bus.lock_acquire(name, "builder-1 pid 1").await.unwrap();
+    assert_eq!(old.record().token.len(), 32);
+
+    // The same holder takes it over (a restart that found its own lease).
+    let mut new = bus
+        .lock_take_over(name, "builder-1 pid 1", "builder-1 pid 1")
+        .await
+        .unwrap();
+    assert_eq!(new.record().holder, old.record().holder);
+    assert_ne!(new.record().token, old.record().token);
+    assert!(matches!(
+        old.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+    new.refresh().await.unwrap();
+    assert!(matches!(
+        old.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+
+    // The same holder and second, another token: what a re-acquire of an expired lease
+    // in the same second writes. Written directly, so the second is the same for sure.
+    let kv = hub.raw().await.get_key_value("HGL_LOCKS").await.unwrap();
+    let twin = hgl_ai_proto::LockRecord {
+        token: "0".repeat(32),
+        ..new.record().clone()
+    };
+    let at = kv
+        .put(name, serde_json::to_vec(&twin).unwrap().into())
+        .await
+        .unwrap();
+    assert!(matches!(
+        new.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+    assert!(!new.release().await.unwrap());
+    assert!(!old.release().await.unwrap());
+    let entry = kv.entry(name).await.unwrap().unwrap();
+    assert_eq!(entry.revision, at, "neither old lease wrote over it");
+    assert_eq!(bus.lock_get(name).await.unwrap(), Some(twin));
+}

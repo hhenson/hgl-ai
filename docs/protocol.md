@@ -304,11 +304,15 @@ before hub users takes one shared token until it moves.
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.
 
-`HGL_LOCKS` holds leases, `{"holder", "acquired_at"}`, created only if absent,
-rewritten every minute while held, deleted by their holder; one not rewritten
-within `max_age` expires. A rewrite is a compare-and-set at the holder's revision;
-one that finds the key moved and the value still its own (a rewrite whose answer it
-never saw) takes that revision, so only another value, or none, is a lost lease.
+`HGL_LOCKS` holds leases, `{"holder", "acquired_at", "token"}`, created only if
+absent, rewritten every minute while held, deleted by their holder; one not
+rewritten within `max_age` expires. `token` is random per acquisition (and
+take-over), so a lease's value is its own even against the same holder in the same
+second; a reader treats a record without one (an older writer) as token `""`. A
+rewrite or delete is a compare-and-set at the holder's revision; one that finds the
+key moved and the record, token included, still its own (a rewrite whose answer it
+never saw) takes that revision once, so only another record, or none, is a lost
+lease.
 `builder.<label>` is held by the one process serving that builder (`docs/build.md`).
 `lock.land.<repo>` is the landing lock: `gh land`,
 `gh merge-if-clean` and `gh release watch` hold it from before the gate until
