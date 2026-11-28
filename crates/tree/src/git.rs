@@ -61,9 +61,27 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let out = Command::new(&self.program)
-            .args(&args)
+        let out = self.raw_output_env(cwd, args, env)?;
+        Ok(Out {
+            ok: out.status.success(),
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    fn raw_output_env<I, S>(
+        &self,
+        cwd: &Path,
+        args: I,
+        env: &[(&str, &OsStr)],
+    ) -> Result<std::process::Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new(&self.program)
+            .args(args)
             .current_dir(cwd)
             .env_remove("GIT_DIR")
             .env_remove("GIT_WORK_TREE")
@@ -74,13 +92,35 @@ impl Git {
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .output()
-            .map_err(|e| TreeError::io(&self.program, e))?;
-        Ok(Out {
-            ok: out.status.success(),
-            code: out.status.code(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+            .map_err(|e| TreeError::io(&self.program, e))
+    }
+
+    /// Run and return stdout bytes unchanged, including non-UTF-8 patch content.
+    pub fn run_bytes_env<I, S>(
+        &self,
+        cwd: &Path,
+        args: I,
+        env: &[(&str, &OsStr)],
+    ) -> Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        let out = self.raw_output_env(cwd, &args, env)?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(TreeError::Git {
+                args: args
+                    .iter()
+                    .map(|a| a.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            })
+        }
     }
 
     /// Run and fail unless it exits 0; returns stdout.
@@ -135,6 +175,23 @@ pub(crate) struct TreeGit {
 type GitInvocation = (Vec<OsString>, Vec<(String, OsString)>);
 
 impl TreeGit {
+    pub(crate) fn checkout_git_dir(&self, cwd: &Path) -> Result<Option<PathBuf>> {
+        let dotgit = cwd.join(".git");
+        let dir = if dotgit.is_dir() {
+            dotgit
+        } else if let Some(dir) = crate::git_dir(cwd) {
+            dir
+        } else {
+            return Ok(None);
+        };
+        let dir = match dir.canonicalize() {
+            Ok(dir) => dir,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(TreeError::io(&dir, e)),
+        };
+        Ok(dir.join("HEAD").is_file().then_some(dir))
+    }
+
     fn args_env<I, S>(&self, cwd: &Path, args: I, env: &[(&str, &OsStr)]) -> Result<GitInvocation>
     where
         I: IntoIterator<Item = S>,
@@ -144,22 +201,8 @@ impl TreeGit {
         let git_dir = if bare {
             cwd.to_path_buf()
         } else {
-            let dotgit = cwd.join(".git");
-            let dir = if dotgit.is_dir() {
-                dotgit
-            } else {
-                crate::git_dir(cwd).ok_or_else(|| {
-                    TreeError::Invalid(format!("invalid checkout {}", cwd.display()))
-                })?
-            };
-            let dir = dir.canonicalize().map_err(|e| TreeError::io(&dir, e))?;
-            if !dir.join("HEAD").is_file() {
-                return Err(TreeError::Invalid(format!(
-                    "invalid git directory {}",
-                    dir.display()
-                )));
-            }
-            dir
+            self.checkout_git_dir(cwd)?
+                .ok_or_else(|| TreeError::Invalid(format!("invalid checkout {}", cwd.display())))?
         };
         let mut argv = Vec::new();
         let mut vars: Vec<_> = env
@@ -226,6 +269,24 @@ impl TreeGit {
             .map(|(k, v)| (k.as_str(), v.as_os_str()))
             .collect();
         self.git.run_env(cwd, args, &vars)
+    }
+
+    pub(crate) fn run_bytes_env<I, S>(
+        &self,
+        cwd: &Path,
+        args: I,
+        env: &[(&str, &OsStr)],
+    ) -> Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let (args, vars) = self.args_env(cwd, args, env)?;
+        let vars: Vec<_> = vars
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_os_str()))
+            .collect();
+        self.git.run_bytes_env(cwd, args, &vars)
     }
 
     pub(crate) fn check<I, S>(&self, cwd: &Path, args: I) -> Result<bool>

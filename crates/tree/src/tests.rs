@@ -884,3 +884,82 @@ fn clone_lock_serializes_processes_and_unlocks_inherited_descriptors() {
     child(true);
     drop(inherited);
 }
+#[test]
+fn salvage_preserves_non_utf8_patch_bytes() {
+    let e = env();
+    let c = e
+        .trees
+        .create(&seat("w1"), &task(981), &implement("bytes"))
+        .unwrap();
+    let src = c.dir.join("src");
+    std::fs::write(src.join("raw.txt"), b"committed \xff\n").unwrap();
+    e.git.run(&src, ["add", "raw.txt"]).unwrap();
+    e.git
+        .run(
+            &src,
+            [
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-m",
+                "raw bytes",
+            ],
+        )
+        .unwrap();
+    std::fs::write(src.join("raw.txt"), b"modified \xfe\n").unwrap();
+    let rm = e
+        .trees
+        .remove(&seat("w1"), &task(981), false)
+        .unwrap()
+        .unwrap();
+    let patch = std::fs::read(rm.salvage.unwrap()).unwrap();
+    assert!(
+        patch
+            .windows(b"+committed \xff\n".len())
+            .any(|w| w == b"+committed \xff\n")
+    );
+    assert!(
+        patch
+            .windows(b"+modified \xfe\n".len())
+            .any(|w| w == b"+modified \xfe\n")
+    );
+}
+
+fn assert_invalid_metadata_removed(metadata: &str, create_target: bool) {
+    let e = env();
+    let dir = e
+        .trees
+        .layout
+        .task_dir(&seat("w1"), &task(982), false)
+        .unwrap();
+    let src = dir.join("src");
+    std::fs::create_dir_all(&src).unwrap();
+    if create_target {
+        std::fs::create_dir_all(dir.join("metadata")).unwrap();
+    }
+    std::fs::write(src.join(".git"), metadata).unwrap();
+    let removed = e
+        .trees
+        .remove(&seat("w1"), &task(982), false)
+        .unwrap()
+        .unwrap();
+    assert!(removed.salvage.is_none());
+    assert!(!dir.exists());
+}
+
+#[test]
+fn removal_with_pruned_worktree_metadata() {
+    assert_invalid_metadata_removed("gitdir: ../missing\n", false);
+}
+
+#[test]
+fn removal_with_malformed_worktree_metadata() {
+    assert_invalid_metadata_removed("not a gitdir\n", false);
+}
+
+#[test]
+fn removal_with_worktree_metadata_missing_head() {
+    assert_invalid_metadata_removed("gitdir: ../metadata\n", true);
+}

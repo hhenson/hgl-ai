@@ -38,6 +38,7 @@ struct Inner {
     hosts: Mutex<Vec<HostRecord>>,
     deleted_hosts: Mutex<Vec<String>>,
     trees: Mutex<BTreeMap<String, TreeRecord>>,
+    tree_put_down: AtomicBool,
     /// While set, each `tree_merge` waits for a permit ([`FakeBus::hold_tree_merges`]).
     merge_gate: Mutex<Option<Arc<tokio::sync::Semaphore>>>,
     /// `tree_merge` calls waiting at the gate.
@@ -48,6 +49,8 @@ struct Inner {
     leases: Mutex<HashMap<String, (String, u64)>>,
     /// name -> when its holder's last write (take or refresh) was confirmed.
     confirmed: Mutex<HashMap<String, std::time::Instant>>,
+    /// First observed start and completion of each seat's lease-loss shutdown.
+    lease_stops: Mutex<HashMap<Seat, (std::time::Instant, Option<std::time::Instant>)>>,
     revision: AtomicU64,
     /// `HGL_ENDED`: key -> seq
     ended: Mutex<HashMap<String, u64>>,
@@ -174,6 +177,10 @@ impl FakeBus {
         g(&self.0.state).insert(k.into(), v.into());
     }
 
+    pub fn set_tree_put_down(&self, down: bool) {
+        self.0.tree_put_down.store(down, Ordering::SeqCst);
+    }
+
     pub fn trees(&self) -> BTreeMap<String, TreeRecord> {
         g(&self.0.trees).clone()
     }
@@ -240,9 +247,14 @@ impl FakeBus {
     /// Lease refreshes hang (`true`) until it is cleared, or work. Set under the leases'
     /// lock, which a refresh checks it under again after waiting: once this returns no
     /// refresh that has not yet taken the lock answers.
-    pub fn refresh_hangs(&self, hang: bool) {
+    pub fn refresh_hangs(&self, hang: bool) -> HashMap<String, std::time::Instant> {
         let _leases = g(&self.0.leases);
         self.0.refresh_hangs.store(hang, Ordering::SeqCst);
+        g(&self.0.confirmed).clone()
+    }
+
+    pub fn lease_stops(&self) -> HashMap<Seat, (std::time::Instant, Option<std::time::Instant>)> {
+        g(&self.0.lease_stops).clone()
     }
 
     /// The `max_age` of `HGL_LOCKS` the bridge reads.
@@ -267,6 +279,9 @@ impl FakeBus {
 
 impl Registry for FakeBus {
     async fn tree_put(&self, rec: &TreeRecord) -> Result<()> {
+        if self.0.tree_put_down.load(Ordering::SeqCst) {
+            return Err(no_responders());
+        }
         g(&self.0.trees).insert(rec.key(), rec.clone());
         Ok(())
     }
@@ -298,6 +313,19 @@ impl BusApi for FakeBus {
     type Inbox = FakeInbox;
     type Delivery = FakeDelivery;
     type Lease = FakeLease;
+
+    fn seat_lease_stop(&self, seat: &Seat, finished: bool) {
+        let mut stops = g(&self.0.lease_stops);
+        if finished {
+            if let Some((_, end)) = stops.get_mut(seat) {
+                end.get_or_insert_with(std::time::Instant::now);
+            }
+        } else {
+            stops
+                .entry(seat.clone())
+                .or_insert_with(|| (std::time::Instant::now(), None));
+        }
+    }
 
     async fn inbox(&self, seat: &Seat) -> Result<FakeInbox> {
         Ok(FakeInbox {

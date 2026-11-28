@@ -640,8 +640,12 @@ impl Trees {
         if src.join(".git").exists() {
             // A git killed with the turn may have left its lock; salvage reads through an
             // index of its own either way.
-            clear_stale_index_lock(&src);
-            salvage = self.salvage(&src, seat, task, file.as_ref(), &dir)?;
+            if self.git.checkout_git_dir(&src)?.is_some() {
+                clear_stale_index_lock(&src);
+                salvage = self.salvage(&src, seat, task, file.as_ref(), &dir)?;
+            } else {
+                tracing::warn!(src = %src.display(), "worktree metadata unavailable; nothing salvaged");
+            }
             if let Some(clone) = &clone {
                 let args: [&std::ffi::OsStr; 4] = [
                     "worktree".as_ref(),
@@ -715,7 +719,7 @@ impl Trees {
             task.issue,
             unpushed.len(),
             if dirty { "yes" } else { "no" }
-        );
+        ).into_bytes();
         if !unpushed.is_empty() {
             let mut fp = vec![
                 "format-patch".to_string(),
@@ -723,7 +727,7 @@ impl Trees {
                 "--binary".into(),
             ];
             fp.extend(range);
-            patch.push_str(&self.git.run(src, &fp)?);
+            patch.extend(self.git.run_bytes_env(src, &fp, &[])?);
         }
         if dirty {
             let index = dir.join("salvage.index");
@@ -737,9 +741,12 @@ impl Trees {
             let diffed = self
                 .git
                 .run_env(src, ["add", "--all", "--intent-to-add"], &env)
-                .and_then(|_| self.git.run_env(src, ["diff", "HEAD", "--binary"], &env));
+                .and_then(|_| {
+                    self.git
+                        .run_bytes_env(src, ["diff", "HEAD", "--binary"], &env)
+                });
             let _ = std::fs::remove_file(&index);
-            patch.push_str(&diffed?);
+            patch.extend(diffed?);
         }
         let dir = self.layout.salvage_dir();
         mkdir(&dir)?;
