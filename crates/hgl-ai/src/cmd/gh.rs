@@ -27,7 +27,7 @@ pub struct Args {
 
 #[derive(clap::Subcommand)]
 enum Cmd {
-    /// The coordinator service: the pull request table, `hold`, alerts, the backlog and daily metrics.
+    /// The coordinator service: pull requests, `hold`, alerts, backlog, metrics and triage intake.
     Coord {
         #[command(subcommand)]
         cmd: CoordCmd,
@@ -103,12 +103,12 @@ impl VerdictArgs {
 
 #[derive(clap::Subcommand)]
 enum CoordCmd {
-    /// Run rounds every interval (at least 5 minutes); the backlog round every 15 minutes.
+    /// Check PRs at least 5 minutes apart. Run backlog and intake every 15 minutes.
     Run {
         /// One round of each, then exit.
         #[arg(long)]
         once: bool,
-        /// Print the table, the alerts, the backlog and the metrics samples; write no state, send nothing.
+        /// Print the planned state writes and notes.
         #[arg(long)]
         dry_run: bool,
         /// Default: `github.coord_interval`.

@@ -48,7 +48,10 @@ Open decisions are issues in this repository.
 - **ROLE-7 — Services.** Deterministic programs, not agents:
   - *coordinator*: one batched GitHub read at most every 5 minutes into
     `HGL_STATE/prs`; an immediate `note` when a review bot finding or a failed
-    check lands on a `ready` or `approved` pull request.
+    check lands on a `ready` or `approved` pull request. Every 15 minutes it
+    sends triage one note covering newly opened or reopened items in watched
+    repositories that still need intake. Triage passes flagged external PRs to
+    the controller to route review to a different model family.
   - *desk*: runs the fixed regression sets for each `ready` compiler head
     merged onto `main`, one run at a time, and sends a factual receipt. Not part of
     this repository.
