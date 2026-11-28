@@ -92,7 +92,8 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
     s.push_str(
         "The `hgl-ai` skill describes the commands. Reply with `hgl-ai note send`.\n\
          Do not remove worktrees; the bridge does that. Keep all scratch inside $HGL_AI_TASK_DIR \
-         (TMPDIR and CARGO_TARGET_DIR point there), never /tmp.\n",
+         (TMPDIR and CARGO_TARGET_DIR point there), never /tmp.\n\
+         Run local builds in the foreground, never background them in the shell; wait for and report their summaries before ending the turn.\n",
     );
     if let Some(h) = c.hold {
         let _ = writeln!(

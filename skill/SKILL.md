@@ -85,7 +85,8 @@ The first body line names runtime and action: `[codex] Ready: hgl-compiler#980 a
 - `ready` notes and receipts name your model family and model.
 - Build and test with `hgl-ai build run` (each step is capped; exit 0 pass, 1 fail, 3 not
   run). Read its summary, not the log; open the log by byte range only when the summary
-  is not enough. A long or other-platform build: `--platform P --detach` (a builder runs
+  is not enough. Run local builds in the foreground, never background them in the shell;
+  wait for and report their summaries before ending the turn. A long or other-platform build: `--platform P --detach` (a builder runs
   it, so it outlives your turn), then `build wait ID`.
   Not run (a missing SDK, tool or recipe) goes to the controller as `blocked`; never work
   around it. A recipe change is a pull request to the repository's `recipes/`.
