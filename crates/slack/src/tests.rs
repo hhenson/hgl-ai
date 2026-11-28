@@ -1327,7 +1327,7 @@ async fn socket_mode_retries_quick_disconnects_with_growing_delays() {
 
 #[tokio::test]
 async fn status_feed_recovers_a_post_without_blocking_qa() {
-    use hgl_ai_owner::digest::{self, Digest, Question, Report};
+    use hgl_ai_owner::digest::{self, Decision, Digest, Question, Report};
 
     if Command::new("nats-server")
         .arg("--version")
@@ -1343,15 +1343,17 @@ async fn status_feed_recovers_a_post_without_blocking_qa() {
     let through = Utc::now().timestamp();
     let key = format!("TQA.CSTATUS.digest.{through}");
     let batch = Digest {
-        v: event::EVENT_VERSION,
+        v: digest::VERSION,
         through,
-        decision_tip: None,
         reports: vec![Report {
             seq: 7,
             at: hgl_ai_proto::utc_now_stamp(),
             body: "Landed repo#1. Running repo#2. Blocked on repo#3.".into(),
         }],
-        decisions: vec!["20261128T100000Z seat: Proceed with repo#1".into()],
+        decisions: vec![Decision {
+            thread: "q-00000001".into(),
+            preview: "20261128T100000Z q-00000001 Owner: Proceed with repo#1".into(),
+        }],
         questions: vec![Question {
             id: "q-00000001".into(),
             title: "Check the result".into(),
@@ -1377,10 +1379,22 @@ async fn status_feed_recovers_a_post_without_blocking_qa() {
         let mut status = adapter.open_status_feed("CSTATUS").await.unwrap();
         let mut qa = adapter.open_feed().await.unwrap();
         let console = hub.bus("console").await;
+        let legacy = json!({
+            "v": 1, "through": through - 7200, "reports": [],
+            "decisions": ["q-00000001 owner@example.com"], "questions": [],
+            "more_reports": 0, "more_decisions": 0, "more_questions": 0,
+        });
+        let legacy = console
+            .publish_event_after(&subject, &serde_json::to_vec(&legacy).unwrap(), 0)
+            .await
+            .unwrap();
+        let old = next(&mut status).await;
+        adapter.deliver_digest("CSTATUS", &old).await.unwrap();
+        old.ack().await.unwrap();
+        assert!(fake.items().is_empty());
         let checkpoint = Digest {
-            v: event::EVENT_VERSION,
+            v: digest::VERSION,
             through: through - 3600,
-            decision_tip: None,
             reports: vec![],
             decisions: vec![],
             questions: vec![],
@@ -1389,7 +1403,11 @@ async fn status_feed_recovers_a_post_without_blocking_qa() {
             more_questions: 0,
         };
         let checkpoint = console
-            .publish_event_after(&subject, &serde_json::to_vec(&checkpoint).unwrap(), 0)
+            .publish_event_after(
+                &subject,
+                &serde_json::to_vec(&checkpoint).unwrap(),
+                legacy.seq,
+            )
             .await
             .unwrap();
         let empty = next(&mut status).await;

@@ -3,6 +3,9 @@
 use hgl_ai_proto::SLACK_DIGEST_PREFIX;
 use serde::{Deserialize, Serialize};
 
+/// Version 2 carries only structured decision previews.
+pub const VERSION: u32 = 2;
+
 pub fn subject(team: &str, channel: &str) -> String {
     format!("{SLACK_DIGEST_PREFIX}.{team}.{channel}")
 }
@@ -19,14 +22,18 @@ pub struct Digest {
     pub v: u32,
     /// Exclusive end of the report and question window, in Unix seconds.
     pub through: i64,
-    /// Hash of the last decision log line read, even if the Slack preview clipped it.
-    pub decision_tip: Option<String>,
     pub reports: Vec<Report>,
-    pub decisions: Vec<String>,
+    pub decisions: Vec<Decision>,
     pub questions: Vec<Question>,
     pub more_reports: usize,
     pub more_decisions: usize,
     pub more_questions: usize,
+}
+
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+pub struct Decision {
+    pub thread: String,
+    pub preview: String,
 }
 
 impl Digest {

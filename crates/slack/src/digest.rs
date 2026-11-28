@@ -3,8 +3,8 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use hgl_ai_bus::{Feed, StreamMsg};
+use hgl_ai_owner::check_id;
 use hgl_ai_owner::digest::{self, Digest};
-use hgl_ai_owner::{EVENT_VERSION, check_id};
 use hgl_ai_proto::{SLACK_STATUS_FEED, parse_stamp};
 use serde_json::Value;
 
@@ -41,7 +41,7 @@ impl Adapter<'_> {
         let Some(through) = DateTime::from_timestamp(batch.through, 0) else {
             return Ok(());
         };
-        if batch.v != EVENT_VERSION || batch.is_empty() {
+        if batch.v != digest::VERSION || batch.is_empty() {
             return Ok(());
         }
         let (text, blocks) = render(&batch, through, &self.console_origin);
@@ -93,13 +93,12 @@ fn render(batch: &Digest, through: DateTime<Utc>, console: &str) -> (String, Vec
     if !batch.decisions.is_empty() {
         section(&mut text, &mut blocks, "Decisions");
         for decision in &batch.decisions {
-            section(&mut text, &mut blocks, decision);
-            if let Some(id) = decision
-                .split_whitespace()
-                .nth(1)
-                .filter(|id| check_id(id).is_ok())
-            {
-                blocks.push(interaction::console_link(&format!("{console}/t/{id}")));
+            section(&mut text, &mut blocks, &decision.preview);
+            if check_id(&decision.thread).is_ok() {
+                blocks.push(interaction::console_link(&format!(
+                    "{console}/t/{}",
+                    decision.thread
+                )));
             }
         }
     }

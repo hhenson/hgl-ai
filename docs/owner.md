@@ -128,10 +128,12 @@ honour Slack's rate limits.
 
 Set `[slack] status_channel` for the private, bot-only `#hgl-status` channel.
 At the top of each hour the console batches the controller's status reports,
-including milestone reports, recent decision log entries and newly opened `p2`
+including milestone reports, recent answers to questions and newly opened `p2`
 questions that are still open. The first batch reads the previous hour and takes
 over any pending `p2` notifications. The digest includes previews and links to the
 console's status reports, decisions and questions.
+Decision previews use the folded answer and its handle, or `owner` when the handle
+is absent. Entries recorded only in `decisions.log` stay in the console.
 
 The console checkpoints the first window and each nonempty batch in `HGL_OWNER`.
 The last checkpoint lets the console catch up after a restart. The Slack adapter keeps its

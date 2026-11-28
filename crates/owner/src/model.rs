@@ -361,6 +361,14 @@ impl Thread {
 
     /// `accept a: <line>`, `option b: <line>`, `reject`, `other: <text>`, then the note.
     pub fn answer_text(&self, a: &Answer) -> String {
+        let mut s = self.answer_content(a);
+        let who = a.handle.as_deref().unwrap_or(&a.user);
+        s.push_str(&format!(" [{}]", signed(who, &a.at)));
+        s
+    }
+
+    /// The answer and its note, without a signature.
+    pub fn answer_content(&self, a: &Answer) -> String {
         let mut s = match (a.choice, a.option.as_deref()) {
             (Choice::Accept | Choice::Option, Some(l)) => format!(
                 "{} {l}: {}",
@@ -373,8 +381,6 @@ impl Thread {
         if !a.note.trim().is_empty() {
             s.push_str(&format!(" (note: {})", a.note.trim()));
         }
-        let who = a.handle.as_deref().unwrap_or(&a.user);
-        s.push_str(&format!(" [{}]", signed(who, &a.at)));
         s
     }
 }

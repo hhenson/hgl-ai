@@ -1240,7 +1240,7 @@ pub(crate) mod tests {
         let batch: Digest = serde_json::from_slice(&stored.payload).unwrap();
         assert_eq!(batch.reports.len(), 1);
         assert_eq!(batch.reports[0].seq, report);
-        assert_eq!(batch.decisions, [decision]);
+        assert!(batch.decisions.is_empty());
         assert_eq!(batch.questions.len(), 1);
         assert_eq!(batch.questions[0].id, open);
         assert_eq!(batch.questions[0].title, "Open");
@@ -1250,28 +1250,23 @@ pub(crate) mod tests {
                 .contains("Private question context")
         );
 
-        // A ruling appended late still appears once, even with an older source time.
+        // Standalone log lines have no structured answer to share with Slack.
         let late = "20261127T000000Z controller: Late ruling";
         owner::decision_append(&bus, late).await.unwrap();
         assert!(
-            crate::digest::round(&app, &bus, &subject, through + P2_BATCH)
+            !crate::digest::round(&app, &bus, &subject, through + P2_BATCH)
                 .await
                 .unwrap()
         );
-        let stored = bus.owner_event_last(&subject).await.unwrap().unwrap();
-        let batch: Digest = serde_json::from_slice(&stored.payload).unwrap();
-        assert_eq!(batch.decisions, [late]);
-        assert!(batch.reports.is_empty() && batch.questions.is_empty());
-        assert!(
-            !crate::digest::round(&app, &bus, &subject, through + P2_BATCH * 2)
-                .await
-                .unwrap()
+        assert_eq!(
+            bus.owner_event_last(&subject).await.unwrap().unwrap().seq,
+            stored.seq
         );
     }
 
     #[tokio::test]
     async fn slack_digest_redacts_console_answer_sign_in() {
-        use hgl_ai_owner::digest::{self, Digest};
+        use hgl_ai_owner::digest::{self, Decision, Digest};
 
         let Some((_srv, url, token)) = hub() else {
             eprintln!("skipped: nats-server is not on PATH");
@@ -1284,46 +1279,54 @@ pub(crate) mod tests {
         let mut feed = feed(&bus).await;
         let mut expected = Vec::new();
         let mut emails = Vec::new();
-        for (email, handle) in [
-            ("signed-owner@example.com", Some("This Dude")),
-            ("unsigned-owner@example.com", None),
-        ] {
-            let id = owner::ask(
-                &bus,
-                &app.controller,
-                question("Choose", "Which?".into(), "Use the first rule".into()),
-            )
-            .await
-            .unwrap();
-            fold_to(&app, &bus, &mut feed, &id, 0).await;
-            let answer = owner::owner_event(
-                &bus,
-                &app.controller,
-                &id,
-                email,
-                handle,
-                owner::Body::Answer {
-                    choice: owner::Choice::Other,
-                    option: None,
-                    text: "Use the second rule [approved]".into(),
-                    note: String::new(),
-                },
-            )
-            .await
-            .unwrap();
-            fold_to(&app, &bus, &mut feed, &id, answer).await;
-            let thread = owner::show(&bus, &id).await.unwrap().unwrap();
-            expected.push(format!(
-                "{} {id} alpha#7 {}: other: Use the second rule [approved]",
-                thread.answer.unwrap().at,
-                handle.unwrap_or("owner")
-            ));
-            emails.push(email);
+        for issue in ["alpha#7 trial run", "alpha#7 (x): trial run"] {
+            for (email, handle) in [
+                ("signed-owner@example.com", Some("This Dude")),
+                ("unsigned-owner@example.com", None),
+            ] {
+                let mut ask = question("Choose", "Which?".into(), "Use the first rule".into());
+                ask.issue = Some(issue.into());
+                let id = owner::ask(&bus, &app.controller, ask).await.unwrap();
+                fold_to(&app, &bus, &mut feed, &id, 0).await;
+                let answer = owner::owner_event(
+                    &bus,
+                    &app.controller,
+                    &id,
+                    email,
+                    handle,
+                    owner::Body::Answer {
+                        choice: owner::Choice::Other,
+                        option: None,
+                        text: "Use the second rule [approved]".into(),
+                        note: String::new(),
+                    },
+                )
+                .await
+                .unwrap();
+                fold_to(&app, &bus, &mut feed, &id, answer).await;
+                let thread = owner::show(&bus, &id).await.unwrap().unwrap();
+                expected.push(Decision {
+                    thread: id.clone(),
+                    preview: format!(
+                        "{} {id} {issue} {}: other: Use the second rule [approved]",
+                        thread.answer.unwrap().at,
+                        handle.unwrap_or("owner")
+                    ),
+                });
+                emails.push(email);
+            }
         }
 
-        let log = owner::decisions_tail(&bus, 2).await.unwrap();
+        let log = owner::decisions_tail(&bus, emails.len()).await.unwrap();
+        assert_eq!(log.len(), emails.len());
         let subject = digest::subject("TTEST", "CSTATUS");
         let through = DateTime::from_timestamp(Utc::now().timestamp() + 2, 0).unwrap();
+        let legacy = serde_json::json!({
+            "v": 1, "through": (through - P2_BATCH).timestamp(), "decisions": log,
+        });
+        bus.publish_event_after(&subject, &serde_json::to_vec(&legacy).unwrap(), 0)
+            .await
+            .unwrap();
         assert!(
             crate::digest::round(&app, &bus, &subject, through)
                 .await
@@ -1337,6 +1340,11 @@ pub(crate) mod tests {
         }
         let batch: Digest = serde_json::from_str(&payload).unwrap();
         assert_eq!(batch.decisions, expected);
+        assert!(
+            !crate::digest::round(&app, &bus, &subject, through + P2_BATCH)
+                .await
+                .unwrap()
+        );
     }
 
     #[tokio::test]

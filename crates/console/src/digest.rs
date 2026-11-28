@@ -5,10 +5,10 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use hgl_ai_bus::{Bus, BusError};
-use hgl_ai_owner::digest::{Digest, Question, Report};
+use hgl_ai_owner::digest::{self, Decision, Digest, Question, Report};
 use hgl_ai_owner::{self as owner, Body, EVENT_VERSION, Event, Priority, Status, Thread, event};
-use hgl_ai_proto::{CONSOLE_PREFIX, check_handle, parse_stamp};
-use sha2::{Digest as _, Sha256};
+use hgl_ai_proto::{CONSOLE_PREFIX, OWNER_PREFIX, SLACK_OWNER_FILTER, check_handle, parse_stamp};
+use serde::Deserialize;
 
 use crate::App;
 use crate::service::{P2_BATCH, next_tick, p2_sent};
@@ -16,6 +16,13 @@ use crate::service::{P2_BATCH, next_tick, p2_sent};
 const REPORTS: usize = 6;
 const DECISIONS: usize = 6;
 const QUESTIONS: usize = 8;
+
+// Legacy digests can checkpoint the window. Their unsanitized content has no role here.
+#[derive(Deserialize)]
+struct Checkpoint {
+    v: u32,
+    through: i64,
+}
 
 pub async fn run(app: &App, bus: &Bus, subject: &str) {
     loop {
@@ -45,10 +52,13 @@ pub(crate) async fn round(
     let prior = bus.owner_event_last(subject).await?;
     let last = prior
         .as_ref()
-        .map(|message| serde_json::from_slice::<Digest>(&message.payload))
+        .map(|message| serde_json::from_slice::<Checkpoint>(&message.payload))
         .transpose()
         .map_err(|e| owner::Error::Invalid(format!("unreadable Slack digest: {e}")))?;
-    if last.as_ref().is_some_and(|batch| batch.v != EVENT_VERSION) {
+    if last
+        .as_ref()
+        .is_some_and(|batch| ![1, digest::VERSION].contains(&batch.v))
+    {
         return Err(owner::Error::Invalid(
             "unsupported Slack digest version".into(),
         ));
@@ -84,6 +94,7 @@ pub(crate) async fn round(
         BTreeMap::new()
     };
     let mut questions = BTreeMap::new();
+    let mut answers = Vec::new();
     // On first activation, check which pending questions actually belong to later
     // windows. Their Ask events remain in the stream and will be picked up then.
     let scan_before = if migrated.is_empty() {
@@ -93,7 +104,12 @@ pub(crate) async fn round(
     };
     let status_subject = event::status_subject();
     bus.owner_window(
-        vec![status_subject.clone(), format!("{CONSOLE_PREFIX}.thread.*")],
+        vec![
+            status_subject.clone(),
+            format!("{CONSOLE_PREFIX}.thread.*"),
+            format!("{OWNER_PREFIX}.thread.*"),
+            SLACK_OWNER_FILTER.into(),
+        ],
         since,
         scan_before,
         |message| {
@@ -125,17 +141,23 @@ pub(crate) async fn round(
             let Ok(event) = serde_json::from_slice::<Event>(&message.payload) else {
                 return;
             };
-            if event.id.starts_with("q-")
-                && event::validate_event(&message.subject, &event).is_ok()
-                && let Body::Ask(ask) = event.body
-                && ask.priority == Priority::P2
-                && ask.validate().is_ok()
+            if !event.id.starts_with("q-")
+                || event::validate_event(&message.subject, &event).is_err()
             {
-                if in_window {
-                    questions.entry(event.id).or_insert(ask.title);
-                } else {
-                    migrated.remove(&event.id);
+                return;
+            }
+            match event.body {
+                Body::Ask(ask) if ask.priority == Priority::P2 && ask.validate().is_ok() => {
+                    if in_window {
+                        questions.entry(event.id).or_insert(ask.title);
+                    } else {
+                        migrated.remove(&event.id);
+                    }
                 }
+                Body::Answer { .. } if in_window => {
+                    answers.push((message.seq, event.id));
+                }
+                _ => {}
             }
         },
     )
@@ -159,18 +181,33 @@ pub(crate) async fn round(
         }
     }
 
-    let all_decisions = owner::decisions_tail(bus, owner::DECISIONS_KEEP).await?;
-    let (decision_tip, decisions, more_decisions) =
-        new_decisions(&all_decisions, last.as_ref(), since);
+    let mut decisions = VecDeque::new();
+    let mut decision_count = 0;
+    for (seq, id) in answers {
+        let Some(thread) = owner::thread_at(bus, &app.controller, &id, seq).await? else {
+            continue;
+        };
+        // A refused answer leaves the reconstructed thread at the preceding event.
+        if thread.seq != seq {
+            continue;
+        }
+        let Some(decision) = decision_preview(&thread) else {
+            continue;
+        };
+        if decisions.len() == DECISIONS {
+            decisions.pop_front();
+        }
+        decisions.push_back(decision);
+        decision_count += 1;
+    }
     let batch = Digest {
-        v: EVENT_VERSION,
+        v: digest::VERSION,
         through: through.timestamp(),
-        decision_tip,
         more_reports: report_count - reports.len(),
-        more_decisions,
+        more_decisions: decision_count - decisions.len(),
         more_questions: open_count - open.len(),
         reports: reports.into(),
-        decisions,
+        decisions: decisions.into(),
         questions: open,
     };
     let has_content = !batch.is_empty();
@@ -195,70 +232,24 @@ pub(crate) async fn round(
     Ok(has_content)
 }
 
-fn new_decisions(
-    lines: &[String],
-    last: Option<&Digest>,
-    since: DateTime<Utc>,
-) -> (Option<String>, Vec<String>, usize) {
-    let tip = lines.last().map(|line| line_id(line));
-    let start = last
-        .and_then(|batch| batch.decision_tip.as_ref())
-        .and_then(|tip| lines.iter().rposition(|line| &line_id(line) == tip))
-        .map_or(0, |index| index + 1);
-    let selected: Vec<_> = lines[start..]
-        .iter()
-        .filter(|line| {
-            last.is_some()
-                || line
-                    .split_whitespace()
-                    .next()
-                    .and_then(parse_stamp)
-                    .is_some_and(|at| at >= since)
-        })
-        .collect();
-    let more = selected.len().saturating_sub(DECISIONS);
-    (
-        tip,
-        selected[more..]
-            .iter()
-            .map(|line| decision_preview(line))
-            .collect(),
-        more,
-    )
-}
-
-fn decision_preview(line: &str) -> String {
-    let mut fields = line.splitn(4, ' ');
-    let (Some(at), Some(id), Some(issue), Some(answer)) =
-        (fields.next(), fields.next(), fields.next(), fields.next())
-    else {
-        return preview(line, 360);
-    };
-    if !id.starts_with("q-") || owner::check_id(id).is_err() || parse_stamp(at).is_none() {
-        return preview(line, 360);
-    }
-
-    // The fold writes `<who> (<user>): <answer> [<who>, <time>]` after the issue.
-    // A clipped header is only safe to share up to the issue.
-    let prefix = format!("{at} {id} {issue}");
-    let Some((who, rest)) = answer.split_once(" (") else {
-        return preview(&prefix, 360);
-    };
-    let Some((user, said)) = rest.split_once("): ") else {
-        return preview(&prefix, 360);
-    };
-    let author = if who != user && check_handle(who).is_ok() {
-        who
-    } else {
-        "owner"
-    };
-    let signature = format!(" [{}]", owner::model::signed(who, at));
-    let said = said.strip_suffix(&signature).unwrap_or(said);
-    preview(&format!("{prefix} {author}: {said}"), 360)
-}
-
-fn line_id(line: &str) -> String {
-    hex::encode(Sha256::digest(line.as_bytes()))
+fn decision_preview(thread: &Thread) -> Option<Decision> {
+    let answer = thread.answer.as_ref()?;
+    let author = answer
+        .handle
+        .as_deref()
+        .filter(|handle| check_handle(handle).is_ok())
+        .unwrap_or("owner");
+    let issue = thread.issue.as_deref().unwrap_or("-");
+    let line = format!(
+        "{} {} {issue} {author}: {}",
+        answer.at,
+        thread.id,
+        thread.answer_content(answer)
+    );
+    Some(Decision {
+        thread: thread.id.clone(),
+        preview: preview(&line.replace(['\n', '\r'], " "), 360),
+    })
 }
 
 fn preview(text: &str, limit: usize) -> String {
