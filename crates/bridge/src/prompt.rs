@@ -64,6 +64,13 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
                 t.branch.as_deref().unwrap_or("?"),
                 t.base
             );
+            // A tree of its own on a host where another has the branch (hgl-ai#55).
+            if let (Some(local), Some(branch)) = (&t.local_branch, &t.branch) {
+                let _ = writeln!(
+                    s,
+                    "Its local branch is `{local}`; push with `git push origin HEAD:{branch}`."
+                );
+            }
         }
         None => {
             let _ = writeln!(s, "No task: this turn runs in the seat's inbox directory.");
@@ -202,6 +209,7 @@ mod tests {
             families: Vec::new(),
             class: None,
             class_seq: None,
+            local_branch: None,
         }
     }
 

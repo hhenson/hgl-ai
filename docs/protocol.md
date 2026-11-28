@@ -203,7 +203,15 @@ before hub users takes one shared token until it moves.
   it (an older note delivered again) changes nothing. A tree made anew for a task begun
   elsewhere (another host or seat) takes the class of the task's record set last, unless
   the note that made it carries a class: that note moved the task (`gh sendback --class C
-  --to SEAT`, ROLE-15) and its class is the task's there. Each `HGL_TREES` record carries the
+  --to SEAT`, ROLE-15) and its class is the task's there. A kept tree that a newer handoff
+  reaches takes the class set last, if newer than its own (hgl-ai#55). When another tree
+  took a handoff in between, the first newer one moved the task back, and its class, if
+  any, is the task's. Two trees of a host never share a local branch: a tree made while
+  another has the task's branch checked out takes `<branch>@<seat>`, which pushes to
+  `<branch>` and goes with the tree. A kept tree fast-forwards to the pushed branch,
+  keeping its uncommitted changes; when its branch has diverged, or such a change is in a
+  file the pushed commits change, no turn runs: the notes are held and retried, and the
+  bridge sends the controller one `blocked` note naming the tree and the files. Each `HGL_TREES` record carries the
   stream sequence of the note that made its tree (`seq`) and of the newest `assign` or
   `sendback` a turn in it ran (`handoff_seq`; a reused tree takes the later one, hgl-ai#44):
   the seat of the task's implementor tree with the newest handoff (else `seq`) is its current
