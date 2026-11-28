@@ -172,6 +172,11 @@ pub struct Bridge<B: BusApi> {
     host_id: String,
     /// How the seat leases are kept, from the hub's `max_age` ([`LeaseTiming`]).
     lease_timing: Mutex<LeaseTiming>,
+    /// A lock per tree key ([`Bridge::registry_lock`]), held by the report from its check
+    /// that a listed tree is still there through its write, and by a removal across its
+    /// deregistering, so the report never registers a tree removed after its listing
+    /// (hgl-ai#58).
+    registry: Mutex<BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// The seat leases' refresh, from `HGL_LOCKS`' `max_age` (PROTO-6): written every `every`
@@ -334,6 +339,7 @@ impl<B: BusApi> Bridge<B> {
             gate: Mutex::new(Gate::Open),
             served: Mutex::default(),
             leases: tokio::sync::Mutex::default(),
+            registry: Mutex::default(),
         })
     }
 
@@ -906,6 +912,7 @@ impl<B: BusApi> Bridge<B> {
             let failed =
                 match tokio::task::spawn_blocking(move || trees.remove(&s, &t, review)).await {
                     Ok(Ok(Some(rm))) => {
+                        let _reg = self.registry_lock(&rm.key).await;
                         if let Err(e) = self.bus.tree_del(&rm.key).await {
                             tracing::warn!(key = %rm.key, "deregistering: {e}");
                         }
@@ -1004,6 +1011,7 @@ impl<B: BusApi> Bridge<B> {
                     lock(&seat.cleanup).settle(&task, o.review);
                     let what = match &rm {
                         Some(rm) => {
+                            let _reg = self.registry_lock(&rm.key).await;
                             if let Err(e) = self.bus.tree_del(&rm.key).await {
                                 tracing::warn!(key = %rm.key, "deregistering: {e}");
                             }
