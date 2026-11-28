@@ -805,8 +805,10 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                          console page's `viewer` hub user can create them)",
                         d.join(", ")
                     ),
-                    "delete each as the admin hub user (`nats consumer rm <stream> <name>`); \
-                     if they come back, reissue the viewer's credential",
+                    "rerun `hgl-ai server install`, which retires the viewer's consumers on \
+                     the buckets it no longer reads; delete the rest as the admin hub user \
+                     (`nats consumer rm <stream> <name>`); if they come back, reissue the \
+                     viewer's credential",
                 ),
                 Err(e) => Check::warn(
                     "telemetry consumers",

@@ -36,10 +36,15 @@ pub const LASTING: Duration = Duration::from_secs(3600);
 /// ([`crate::users::VIEWER_BUCKETS`]) that outlive a page ([`LASTING`]), as
 /// `<stream>/<name>`. No part of the fleet makes one there, but the `viewer` user can:
 /// subjects cannot stop a `durable_name` or an `inactive_threshold` in a consumer create's
-/// body (docs/design.md §9).
+/// body (docs/design.md §9). Also every viewer consumer, lasting or not, on a bucket the
+/// viewer no longer reads ([`crate::users::VIEWER_RETIRED_BUCKETS`]).
 pub async fn lasting_consumers(js: &async_nats::jetstream::Context) -> Result<Vec<String>, String> {
     use futures::StreamExt;
     let mut out = Vec::new();
+    // Of a bucket the viewer no longer reads, every consumer of its, lasting or not.
+    for b in crate::users::VIEWER_RETIRED_BUCKETS {
+        out.extend(viewer_consumers(js, b).await?);
+    }
     for b in crate::users::VIEWER_BUCKETS {
         let name = format!("KV_{b}");
         let stream = js
@@ -56,6 +61,58 @@ pub async fn lasting_consumers(js: &async_nats::jetstream::Context) -> Result<Ve
     }
     out.sort();
     Ok(out)
+}
+
+/// Whether a consumer delivers to the viewer's inbox: one the page's `viewer` user made.
+fn delivers_to_viewer(c: &async_nats::jetstream::consumer::Config) -> bool {
+    c.deliver_subject
+        .as_deref()
+        .is_some_and(|d| d.starts_with(&format!("{}.", hgl_ai_proto::VIEWER_INBOX)))
+}
+
+/// The consumers on bucket `b`'s stream that deliver to the viewer, as `<stream>/<name>`.
+async fn viewer_consumers(
+    js: &async_nats::jetstream::Context,
+    b: &str,
+) -> Result<Vec<String>, String> {
+    use futures::StreamExt;
+    let name = format!("KV_{b}");
+    let stream = js
+        .get_stream(&name)
+        .await
+        .map_err(|e| format!("{name}: {e}"))?;
+    let mut out = Vec::new();
+    let mut list = stream.consumers();
+    while let Some(c) = list.next().await {
+        let c = c.map_err(|e| format!("listing the consumers of {name}: {e}"))?;
+        if delivers_to_viewer(&c.config) {
+            out.push(format!("{name}/{}", c.name));
+        }
+    }
+    Ok(out)
+}
+
+/// Delete the viewer's consumers on the buckets it no longer reads
+/// ([`crate::users::VIEWER_RETIRED_BUCKETS`]): a page of an earlier version may hold one,
+/// and it would go on delivering what the viewer may no longer read. Returns them.
+pub async fn retire_viewer_consumers(
+    js: &async_nats::jetstream::Context,
+) -> Result<Vec<String>, String> {
+    let mut gone = Vec::new();
+    for b in crate::users::VIEWER_RETIRED_BUCKETS {
+        for c in viewer_consumers(js, b).await? {
+            let (stream, name) = c.split_once('/').expect("stream/name");
+            let s = js
+                .get_stream(stream)
+                .await
+                .map_err(|e| format!("{stream}: {e}"))?;
+            s.delete_consumer(name)
+                .await
+                .map_err(|e| format!("deleting {c}: {e}"))?;
+            gone.push(c);
+        }
+    }
+    Ok(gone)
 }
 
 /// The hub's JetStream as `cfg`'s credential, plainly (no bus, which would create).
@@ -90,8 +147,19 @@ impl Hub for BusHub {
         Bus::connect(cfg).await.map(drop)
     }
 
+    /// Then retire the viewer's consumers on the buckets it no longer reads; a failure
+    /// there is reported, and `doctor` finds what is left.
     async fn provision(&self, cfg: &Config) -> Result<(), BusError> {
-        Bus::connect(cfg).await?.provision().await
+        Bus::connect(cfg).await?.provision().await?;
+        match jetstream_of(cfg).await {
+            Ok(js) => match retire_viewer_consumers(&js).await {
+                Ok(gone) if gone.is_empty() => {}
+                Ok(gone) => eprintln!("retired the viewer's consumers: {}", gone.join(", ")),
+                Err(e) => eprintln!("warning: retiring the viewer's consumers: {e}"),
+            },
+            Err(e) => eprintln!("warning: retiring the viewer's consumers: {e}"),
+        }
+        Ok(())
     }
 
     /// Read-only: the bus API has no existence check that does not create, so

@@ -97,50 +97,79 @@ pub fn clean_title(t: &str) -> String {
     one_line(t).chars().take(TITLE_MAX).collect()
 }
 
-/// Token shapes: GitHub, OpenAI-style and Slack tokens, NATS seeds.
+/// What a secret's value may look like after its name: quoted (either quote) or a word.
+const VALUE: &str = r#"("[^"]*"|'[^']*'|`[^`]*`|\S+)"#;
+
+/// Token shapes: GitHub, GitLab, npm, OpenAI-style, Slack and AWS keys, JWTs, NATS seeds,
+/// and a bearer credential.
 static TOKEN: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|S[UOANCAX][A-Z2-7]{50,})\b",
+        r"(?i:\bbearer\s+[A-Za-z0-9._~+/=-]{8,})|\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|glpat-[A-Za-z0-9_-]{20,}|npm_[A-Za-z0-9]{30,}|sk-[A-Za-z0-9_-]{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}|S[UOANCAX][A-Z2-7]{50,})\b",
     )
     .unwrap()
 });
-/// `NAME=value` or `NAME:value` where the name says it is secret.
-static ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|password|passwd|pwd|api[_-]?key|access[_-]?key|private[_-]?key|credentials?|seed|auth))(?:\s*=\s*|:)("[^"]*"|'[^']*'|\S+)"#,
-    )
+/// A name that is nothing but a secret's (`GH_TOKEN`, `db_password`, `"apiKey"`), then `=`
+/// or `:` with any spacing (shell, YAML, JSON, prose), then its value.
+static SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?i)\b([A-Za-z0-9_.-]*(?:token|secret|password|passwd|pwd|api[_ -]?key|access[_ -]?key|private[_ -]?key|client[_ -]?secret|credentials?))["'`]?\s*[:=]\s*{VALUE}"#
+    ))
     .unwrap()
 });
-/// `NAME: value`, a colon and a space, for the names that are nothing but a secret.
-static SECRET_COLON: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(?i)\b((?:password|passwd|secret|token|api[_ -]?key|access[_ -]?key|private[_ -]?key)):\s+("[^"]*"|'[^']*'|\S+)"#,
-    )
+/// A name that may be a secret's (`auth`, `seed`): only `name=value` or `name:value`, so
+/// that `Auth: sign-in fails` stays.
+static MAYBE_SECRET: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r#"(?i)\b([A-Za-z0-9_.-]*(?:auth|seed|key))["'`]?(?:\s*=\s*|:){VALUE}"#
+    ))
     .unwrap()
+});
+/// A quoted path, spaces and all: `"C:\Program Files\x"`, `'/home/a b/c'`, `"D:/x y"`.
+static QUOTED_PATH: LazyLock<Regex> = LazyLock::new(|| {
+    let start = r#"(?:[A-Za-z]:[\\/]|\\\\|~[\\/]|/[^/\s"'`]+/)"#;
+    Regex::new(&format!(r#""{start}[^"]*"|'{start}[^']*'|`{start}[^`]*`"#)).unwrap()
 });
 static EMAIL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,}").unwrap()
 });
-/// An absolute path: `~/…`, `/a/b…` (two parts or more; `/telemetry` alone stays), or a
-/// Windows drive path; at the start or after a space or opening punctuation (so not the
-/// path of a URL).
+/// An absolute path: `~/…`, `/a/b…` (two parts or more; `/telemetry` alone stays), a drive
+/// path either way round (`C:\x`, `C:/x`), a UNC path (`\\host\share`); at the start or
+/// after a space or punctuation, never in a URL (`https://h/a/b`).
 static PATH: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r#"(^|[\s(\[{'"`=,])(?:~/[^\s'"`)\]},]*|/[^\s/'"`)\]},]+/[^\s'"`)\]},]*|[A-Za-z]:\\[^\s'"`)\]},]*)"#,
-    )
+    let rest = r#"[^\s'"`)\]},]*"#;
+    Regex::new(&format!(
+        r#"(^|[\s(\[{{'"`=,:;<>|])(?:~[\\/]{rest}|/[^\s/'"`)\]}},]+/{rest}|[A-Za-z]:[\\/]{rest}|\\\\{rest})"#
+    ))
     .unwrap()
 });
+/// What is left of a path with a space in it, unquoted: any word with a backslash inside.
+static BACKSLASHED: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\S*\S\\\S+").unwrap());
 
-/// A title the console's page may show (anything a viewer-readable key holds): an email,
-/// an absolute path, a secret's assignment or a token shape replaced, then as
-/// [`clean_title`] keeps it.
+/// `name=[redacted]` for each `name` and value `re` finds; a value already redacted stays as
+/// it is (with what follows it).
+fn redact_value(re: &Regex, t: &str) -> String {
+    re.replace_all(t, |c: &regex::Captures| {
+        if c[2].starts_with("[redacted]") {
+            c[0].to_string()
+        } else {
+            format!("{}=[redacted]", &c[1])
+        }
+    })
+    .into_owned()
+}
+
+/// A title the console's page may show (anything a viewer-readable key holds): a token, a
+/// secret's value, a path or an email replaced, over the whole title, and only then cut as
+/// [`clean_title`] cuts it, so nothing crosses the cut half-redacted.
 pub fn page_title(t: &str) -> String {
     let t = one_line(t);
     let t = TOKEN.replace_all(&t, "[token]");
-    let t = ASSIGNMENT.replace_all(&t, "${1}=[redacted]");
-    let t = SECRET_COLON.replace_all(&t, "${1}: [redacted]");
+    let t = redact_value(&SECRET, &t);
+    let t = redact_value(&MAYBE_SECRET, &t);
+    let t = QUOTED_PATH.replace_all(&t, "[path]");
     let t = EMAIL.replace_all(&t, "[email]");
     let t = PATH.replace_all(&t, "${1}[path]");
+    let t = BACKSLASHED.replace_all(&t, "[path]");
     clean_title(&t)
 }
 
@@ -337,7 +366,8 @@ fn candidate(n: &Value) -> Option<(u64, bool, DateTime<Utc>, String)> {
     }
     let created = table::parse_time(n.get("createdAt")?.as_str()?)?;
     let title = n.get("title").and_then(Value::as_str).unwrap_or("");
-    Some((number, priority, created, clean_title(title)))
+    // The whole title: `render` redacts it, then cuts it (`page_title`).
+    Some((number, priority, created, one_line(title)))
 }
 
 fn count(v: &Value, path: &[&str]) -> Option<u64> {
@@ -749,6 +779,118 @@ mod tests {
         assert_eq!(clean_title("short"), "short");
     }
 
+    /// Every shape of secret, email and path, alone and straddling the 200-character cut,
+    /// through every writer of a viewer-readable title: the backlog's queue (from a GraphQL
+    /// node, as a round reads it), `prs`' `# pr` lines, `tasks`' `# title` lines and
+    /// `landed.log`. Nothing of the secret may come out, whole or cut.
+    #[test]
+    fn every_writer_redacts_then_cuts() {
+        let ghp = format!("ghp_{}", "Q".repeat(36));
+        let seed = format!("SU{}", "Q".repeat(56));
+        let jwt = "eyJhbGciOiJIUzI1.eyJzdWIiOiIxMjM0.SflKxwRJSMeKKF2QT4fw";
+        // (title, what may not appear in a writer's output)
+        let shapes: Vec<(String, Vec<&str>)> = vec![
+            ("GH_TOKEN: CANARY".into(), vec!["CANARY"]),
+            ("export GH_TOKEN=CANARY".into(), vec!["CANARY"]),
+            ("password: \"CANARY words\"".into(), vec!["CANARY", "words"]),
+            ("db.password='CANARY'".into(), vec!["CANARY"]),
+            (r#"{"apiKey":"CANARY"}"#.into(), vec!["CANARY"]),
+            ("AWS_SECRET_ACCESS_KEY = CANARY".into(), vec!["CANARY"]),
+            ("client secret: CANARY".into(), vec!["CANARY"]),
+            ("seed=CANARY and auth:CANARY".into(), vec!["CANARY"]),
+            ("Authorization: Bearer CANARYCANARY".into(), vec!["CANARY"]),
+            (format!("leaked {ghp}"), vec!["QQQQ", "ghp_"]),
+            (format!("nkey {seed}"), vec!["QQQQ"]),
+            (format!("jwt {jwt}"), vec!["eyJ", "SflKx"]),
+            ("key AKIAQQQQQQQQQQQQQQQQ".into(), vec!["AKIA"]),
+            (
+                "mail alice.b+x@mail.example.co.uk".into(),
+                vec!["alice", "example"],
+            ),
+            (
+                r#"Run "C:\Program Files\Alice App\x.exe" now"#.into(),
+                vec!["Program", "Alice", "x.exe"],
+            ),
+            (
+                "'C:/Users/alice/My Docs/x'".into(),
+                vec!["Users", "alice", "Docs"],
+            ),
+            ("Drive C:/Users/alice/x".into(), vec!["alice"]),
+            ("Drive D:\\work\\alice".into(), vec!["work", "alice"]),
+            (
+                "Share \\\\fileserver\\alice".into(),
+                vec!["fileserver", "alice"],
+            ),
+            (
+                "Unquoted C:\\Program Files\\alice".into(),
+                vec!["Program", "alice"],
+            ),
+            ("'/home/alice/my docs/x'".into(), vec!["alice", "docs"]),
+            ("Logs /home/alice/x".into(), vec!["alice"]),
+            ("Key ~/.ssh/id_alice".into(), vec!["ssh", "alice"]),
+            ("(path:/var/lib/alice)".into(), vec!["alice"]),
+            ("--config=/etc/alice/x".into(), vec!["alice"]),
+        ];
+        // Each again, after a prefix that puts it across the cut.
+        let mut all = shapes.clone();
+        for (t, bad) in &shapes {
+            for pad in [180, 190, 196] {
+                all.push((format!("{} {t}", "x".repeat(pad)), bad.clone()));
+            }
+        }
+        for (title, bad) in &all {
+            // The backlog: the round's own read of a GraphQL node, then the render.
+            let node = serde_json::json!({
+                "number": 1, "title": title, "createdAt": "2026-01-01T00:00:00Z",
+                "labels": {"nodes": [{"name": CLAIMABLE}]}
+            });
+            let (number, priority, created, t) = candidate(&node).unwrap();
+            let b = Backlog {
+                queue: vec![QueueRow {
+                    repo: "alpha".into(),
+                    number,
+                    priority,
+                    created: utc_stamp(created),
+                    title: t,
+                }],
+                ..Backlog::default()
+            };
+            // `prs`.
+            let mut pr = table::Table::parse("alpha\t1\th\topen\tnone\t0\tnone\tT\n");
+            pr.rows[0].detail.title = title.clone();
+            // `tasks`.
+            let mut titles = crate::tasks::Titles::default();
+            titles.insert("alpha", 1, title);
+            let tree: hgl_ai_proto::TreeRecord = serde_json::from_value(serde_json::json!({
+                "host": "h", "seat": "w1", "task": {"repo": "alpha", "issue": 1},
+                "path": "/w", "created_at": "20260101T000000Z",
+            }))
+            .unwrap();
+            let tasks =
+                crate::tasks::render(&crate::tasks::NotesIndex::default(), &[tree], &titles);
+            let outputs = [
+                ("backlog", b.render()),
+                ("prs", pr.render()),
+                ("tasks", tasks),
+                (
+                    "landed.log",
+                    crate::state::landed_line("S", "alpha", 1, "m", title),
+                ),
+            ];
+            for (writer, out) in outputs {
+                for frag in bad {
+                    assert!(
+                        !out.contains(frag),
+                        "{writer} leaks {frag:?} of {title:?}: {out}"
+                    );
+                }
+                for line in out.lines() {
+                    assert!(line.chars().count() <= TITLE_MAX + 60, "{writer}: {line}");
+                }
+            }
+        }
+    }
+
     /// What the page may not show is replaced; what it may is kept.
     #[test]
     fn page_titles_redact() {
@@ -767,15 +909,30 @@ mod tests {
                 "Leaked GH_TOKEN=abc123 in logs",
                 "Leaked GH_TOKEN=[redacted] in logs",
             ),
+            ("CI: GH_TOKEN: CANARY", "CI: GH_TOKEN=[redacted]"),
             (
                 "password: hunter2 vs password:hunter2",
-                "password: [redacted] vs password=[redacted]",
+                "password=[redacted] vs password=[redacted]",
             ),
             (
                 "Rotate the API key: sk_live_x",
-                "Rotate the API key: [redacted]",
+                "Rotate the API key=[redacted]",
             ),
             ("api_key = 'x y' gone", "api_key=[redacted] gone"),
+            (
+                r#"Body {"apiKey": "x y"} sent"#,
+                r#"Body {"apiKey=[redacted]} sent"#,
+            ),
+            (
+                r#"Install to "C:\Program Files\Hgl Ai\bin" fails"#,
+                "Install to [path] fails",
+            ),
+            (
+                "Drive C:/Users/bob/hgl and D:\\w",
+                "Drive [path] and [path]",
+            ),
+            ("Share \\\\files\\team\\x", "Share [path]"),
+            ("Unquoted C:\\Program Files\\x", "Unquoted [path] [path]"),
             (
                 &format!("Token ghp_{} seen", "a".repeat(36)),
                 "Token [token] seen",
@@ -783,6 +940,10 @@ mod tests {
             (
                 &format!("Seed SU{} seen", "A".repeat(56)),
                 "Seed [token] seen",
+            ),
+            (
+                "Header Authorization: Bearer abcdefgh123",
+                "Header Authorization: [token]",
             ),
             // Kept: a single-part path, a relative path, a URL, prose.
             (
@@ -794,6 +955,7 @@ mod tests {
                 "See https://github.com/o/r/pull/1",
             ),
             ("Auth: sign-in fails", "Auth: sign-in fails"),
+            ("Tokens: three kinds", "Tokens: three kinds"),
         ];
         for (t, want) in cases {
             assert_eq!(page_title(t), want, "{t}");

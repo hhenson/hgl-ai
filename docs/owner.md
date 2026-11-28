@@ -130,7 +130,9 @@ listener, at `<console url>/nats` on the console's own origin, as the hub user
 `viewer`. `viewer` reads five buckets, `HGL_HOSTS`, `HGL_STATE` (only the keys the page
 shows), `HGL_METRICS`, `HGL_BUILD` and `HGL_USAGE`, and nothing else (not `HGL_TREES`:
 its records hold paths), and sees no other client's replies. Titles in those keys come
-redacted (an email, an absolute path, a secret's assignment or a token shape replaced),
+redacted (an email, an absolute path, quoted or not, a secret's assignment in shell, YAML
+or JSON form, or a token shape replaced; the whole title, before it is cut to 200
+characters),
 and the header names the user by handle only. Its subject permissions
 are read-only, but replies are not enforced until hgl-ai#141 (docs/install.md,
 docs/design.md §9). The console hands its credential to a signed-in page

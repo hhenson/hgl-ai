@@ -279,6 +279,16 @@ fn pull_from(stream: &str) -> [String; 2] {
 /// records hold the trees' paths; the page reads the trees from `HGL_STATE/tasks`.
 pub const VIEWER_BUCKETS: [&str; 5] = [KV_HOSTS, KV_STATE, KV_METRICS, KV_BUILD, KV_USAGE];
 
+/// Buckets the viewer read in an earlier version (`HGL_TREES` until hgl-ai#173). A viewer
+/// consumer made then may still deliver there: `doctor` audits them and `server install`
+/// retires them ([`crate::hub::retire_viewer_consumers`]).
+pub const VIEWER_RETIRED_BUCKETS: [&str; 1] = [KV_TREES];
+
+/// The buckets whose consumers `doctor` audits: what the viewer reads and once read.
+pub fn viewer_audit_buckets() -> impl Iterator<Item = &'static str> {
+    VIEWER_BUCKETS.into_iter().chain(VIEWER_RETIRED_BUCKETS)
+}
+
 /// The viewer's publishes: what reading and watching [`VIEWER_BUCKETS`] needs, on those
 /// buckets' streams only, and of `HGL_STATE` only [`VIEWER_STATE_KEYS`]: bucket status,
 /// direct gets, the ordered push consumer a watch makes and its flow control. A consumer
@@ -376,7 +386,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         allow.extend(consumers_on(s));
     }
     // `doctor` lists the consumers on the telemetry streams (durables the viewer made).
-    allow.extend(VIEWER_BUCKETS.map(|b| format!("$JS.API.CONSUMER.LIST.{}", kv(b))));
+    allow.extend(viewer_audit_buckets().map(|b| format!("$JS.API.CONSUMER.LIST.{}", kv(b))));
     allow.extend(pull_from(STREAM_NOTES));
     allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_USAGE}.*"));
     // The owner's subjects; denied to every client but the console.
