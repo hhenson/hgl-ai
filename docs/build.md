@@ -105,7 +105,9 @@ artifacts = ["$HGL_AI_BUILD_DIR/report.xml"]
     the service manager restarts it. Checkouts and removals on one shared clone take
     turns.
   - The receipt (the summary JSON) goes to `r-<id>`, which the sender reads from the
-    stream, and to `--notify SEAT`. The step logs stay on the builder's host.
+    stream, and to `--notify SEAT`. Step logs and artifacts stay on the builder;
+    `build log` requests up to 64 KiB of a summary-named file over the hub. The builder
+    must be running and retain the run.
   - `hgl-ai builder drain|retire|resume LABEL` sets `HGL_STATE/builder.<label>`;
     `mode = drain` drains every builder. A shutdown cancels running builds and returns
     their jobs to the inbox.
