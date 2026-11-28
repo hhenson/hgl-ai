@@ -709,20 +709,23 @@ impl<B: BusApi> Bridge<B> {
             }
             if author || reclassed || handoff.is_some() {
                 match hgl_ai_tree::write_task(&dir, f) {
-                    Ok(()) => {
-                        let d = dir.clone();
-                        let size = tokio::task::spawn_blocking(move || hgl_ai_tree::dir_size(&d))
-                            .await
-                            .unwrap_or(0);
-                        let rec = self.trees.record(&dir, f, size);
-                        if let Err(e) = self.bus.tree_put(&rec).await {
-                            tracing::warn!(key = %rec.key(), "registering the task's families and class: {e}");
-                        }
-                    }
+                    Ok(()) => {}
                     Err(e) => {
                         return Outcome::PrepFailed(format!("recording the family and class: {e}"));
                     }
                 }
+            }
+            // Publish on every attempt: a previous attempt may have saved task.json but
+            // failed to publish it, and the gate must see the author before the turn.
+            let d = dir.clone();
+            let size = tokio::task::spawn_blocking(move || hgl_ai_tree::dir_size(&d))
+                .await
+                .unwrap_or(0);
+            let rec = self.trees.record(&dir, f, size);
+            if let Err(e) = self.bus.tree_put(&rec).await {
+                return Outcome::PrepFailed(format!(
+                    "registering the task's families and class: {e}"
+                ));
             }
         }
         let (cwd, writable) = match &job.target {

@@ -61,9 +61,27 @@ impl Git {
         I: IntoIterator<Item = S>,
         S: AsRef<OsStr>,
     {
-        let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
-        let out = Command::new(&self.program)
-            .args(&args)
+        let out = self.raw_output_env(cwd, args, env)?;
+        Ok(Out {
+            ok: out.status.success(),
+            code: out.status.code(),
+            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+        })
+    }
+
+    fn raw_output_env<I, S>(
+        &self,
+        cwd: &Path,
+        args: I,
+        env: &[(&str, &OsStr)],
+    ) -> Result<std::process::Output>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        Command::new(&self.program)
+            .args(args)
             .current_dir(cwd)
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .envs(env.iter().map(|(k, v)| (k, v)))
@@ -71,13 +89,35 @@ impl Git {
             .env("LC_ALL", "C")
             .stdin(Stdio::null())
             .output()
-            .map_err(|e| TreeError::io(&self.program, e))?;
-        Ok(Out {
-            ok: out.status.success(),
-            code: out.status.code(),
-            stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
-        })
+            .map_err(|e| TreeError::io(&self.program, e))
+    }
+
+    /// Run and return stdout bytes unchanged, including non-UTF-8 patch content.
+    pub fn run_bytes_env<I, S>(
+        &self,
+        cwd: &Path,
+        args: I,
+        env: &[(&str, &OsStr)],
+    ) -> Result<Vec<u8>>
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<OsStr>,
+    {
+        let args: Vec<OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+        let out = self.raw_output_env(cwd, &args, env)?;
+        if out.status.success() {
+            Ok(out.stdout)
+        } else {
+            Err(TreeError::Git {
+                args: args
+                    .iter()
+                    .map(|a| a.to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                code: out.status.code(),
+                stderr: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+            })
+        }
     }
 
     /// Run and fail unless it exits 0; returns stdout.

@@ -2674,3 +2674,63 @@ async fn low_disk_holds_new_trees_under_drain_too() {
 }
 
 mod reuse;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn author_registration_failure_blocks_and_retries_before_starting() {
+    let mut h = harness();
+    h.opts.prep_retry = Duration::from_millis(100);
+    h.script("codex", &format!("cat '{}'", fixture("codex-ok.jsonl")));
+    h.bus.set_tree_put_down(true);
+    let (tx, j) = h.start(&["w1"]);
+    let seq = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 981, "[claude] Assign: demo#981"),
+    );
+    eventually("registration failure", || {
+        !h.bus
+            .sent_containing("could not prepare demo#981")
+            .is_empty()
+    })
+    .await;
+    assert!(h.calls("codex").is_empty());
+    assert!(h.bus.events(seq).is_empty());
+    h.bus.set_tree_put_down(false);
+    eventually("turn after registration", || h.bus.events(seq) == [Ev::Ack]).await;
+    assert_eq!(h.calls("codex").len(), 1);
+    assert!(
+        h.bus
+            .trees()
+            .values()
+            .any(|r| r.task.issue == 981 && r.families.contains(&Family::Gpt))
+    );
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn replacement_review_waits_for_disk_before_removing_old_tree() {
+    let h = harness();
+    h.script("claude", &format!("cat '{}'", fixture("claude-ok.jsonl")));
+    let (tx, j) = h.start(&["r1"]);
+    let head = h
+        .git
+        .run(&h.seed, ["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let mut review = note(Kind::Review, "r1", 982, "[claude] Review: demo#982");
+    review.head = Some(head);
+    let first = h.bus.push("r1", review.clone());
+    eventually("first review", || h.bus.events(first) == [Ev::Ack]).await;
+    let marker = h.work().join("r1/demo-982-review/src/kept-marker");
+    std::fs::write(&marker, "keep").unwrap();
+    h.disk.0.store(crate::disk::GB, Ordering::SeqCst);
+    let second = h.bus.push("r1", review);
+    eventually("replacement held", || h.bus.progressed(second)).await;
+    assert!(marker.exists());
+    assert_eq!(h.calls("claude").len(), 1);
+    h.disk.0.store(1000 * crate::disk::GB, Ordering::SeqCst);
+    eventually("replacement runs", || h.bus.events(second) == [Ev::Ack]).await;
+    assert_eq!(h.calls("claude").len(), 2);
+    assert!(!marker.exists());
+    stop(tx, j).await;
+}
