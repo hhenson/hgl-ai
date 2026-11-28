@@ -82,7 +82,7 @@ pub const OWNER: &str = "owner";
 /// The sender of the console's own notes (`tick`); never a seat.
 pub const CONSOLE: &str = "console";
 /// Names no configured seat may take.
-pub const RESERVED_SEATS: [&str; 3] = [BROADCAST, OWNER, CONSOLE];
+pub const RESERVED_SEATS: [&str; 4] = [BROADCAST, OWNER, CONSOLE, SCREEN];
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum ProtoError {
@@ -143,7 +143,7 @@ impl Seat {
     pub fn is_screen(&self) -> bool {
         self.0 == SCREEN
     }
-    /// `all`, `owner` or `console`: an address or sender, never a configured seat.
+    /// `all`, `owner`, `console` or `screen`: an address or sender reserved by the protocol.
     pub fn is_reserved(&self) -> bool {
         RESERVED_SEATS.contains(&self.0.as_str())
     }

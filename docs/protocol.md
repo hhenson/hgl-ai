@@ -80,8 +80,10 @@ before hub users takes one shared token until it moves.
 | Builds | KV `HGL_BUILD` | file storage, history 64: `recipe.<repo>` (TOML), `run.<id>` (summary JSON; newest 1000 kept) |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
-  broadcast address. `owner` and `console` are senders, never seats: no seat takes
-  `all`, `owner` or `console`, and no note goes to `owner` or `console`. A seat is a logical address; the runtime and model bound
+  broadcast address. `owner` and `console` are sender names. `screen` is the
+  screen's sender and intake address. Those names are reserved in seat
+  configuration, and host labels also reserve `all` and `screen`.
+  A seat is a logical address; the runtime and model bound
   to it can change (§6) without peers noticing.
   A seat receives broadcasts published from its durable inbox's creation onward,
   measured by the hub. Unicast published earlier remains eligible while retained.

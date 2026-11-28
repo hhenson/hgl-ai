@@ -244,6 +244,16 @@ fn notes_send_wait_peek() {
         "note", "send", "--from", "w1", "--to", "claude", "--kind", "note",
     ]);
     assert_eq!(usage.status.code(), Some(2), "a body is required");
+
+    let screen = ok(&hub.run(&[
+        "note", "send", "--from", "screen", "--to", "claude", "--kind", "answer", "--body", "seen",
+    ]));
+    assert_eq!(screen, "seq 3\n");
+    let peeked = ok(&hub.run(&["note", "peek", "claude"]));
+    assert!(
+        peeked.contains("--- seq=3 from=screen kind=answer at "),
+        "{peeked}"
+    );
 }
 
 #[test]
