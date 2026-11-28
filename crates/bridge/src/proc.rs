@@ -517,6 +517,7 @@ pub(crate) mod ps {
     }
 
     /// Whether `pid` is a zombie (or gone).
+    #[cfg(test)]
     pub fn zombie(pid: i32) -> bool {
         let out = listing(Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]));
         out.trim().is_empty() || out.trim_start().starts_with('Z')

@@ -1220,11 +1220,12 @@ mod tests {
     fn sudo_words_answering(d: &Path, script: &str, answer: &str) -> Vec<Vec<String>> {
         let script = &off_tty(d, script, answer);
         let rec = d.join("sudo.words");
-        let _ = std::fs::remove_file(&rec);
-        // One write per step: the two ends of a pipeline record at once.
+        let _ = std::fs::remove_dir_all(&rec);
+        std::fs::create_dir(&rec).unwrap();
+        // The two ends of a pipeline can record simultaneously.
         let prog = format!(
-            "sudo() {{ printf '%s\\n' \"$@\" '' >>{r}; }}\n{script}\n",
-            r = shell_quote(&rec.display().to_string())
+            "sudo() {{ f=$(mktemp {r}/step.XXXXXX); printf '%s\\n' \"$@\" >\"$f\"; }}\n{script}\n",
+            r = shell_quote(&rec.display().to_string()),
         );
         let parse = std::process::Command::new("sh")
             .args(["-n", "-c", script])
@@ -1244,11 +1245,15 @@ mod tests {
             .env("HOME", d.join("caller"))
             .output()
             .unwrap();
-        std::fs::read_to_string(&rec)
+        std::fs::read_dir(&rec)
             .unwrap()
-            .split("\n\n")
-            .filter(|p| !p.is_empty())
-            .map(|p| p.lines().map(str::to_string).collect())
+            .map(|entry| {
+                std::fs::read_to_string(entry.unwrap().path())
+                    .unwrap()
+                    .lines()
+                    .map(str::to_string)
+                    .collect()
+            })
             .collect()
     }
 
