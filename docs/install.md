@@ -230,6 +230,15 @@ hgl-ai doctor
    this host's platform for the fleet (`docs/build.md`). SDK prefixes for recipes go in
    `[builder.sdk]`.
 
+For a builder running as a separate OS user, pass `--builder-user NAME` to
+`client install`. It records the user and leaves installation of that user's
+builder service to the administrator. Configure that user's own `config.toml`
+with `seat = []` and a `[builder]` section, and put its builder-role credential
+in `[builder] credential`, readable only by that user. Start the builder service
+under that account. Doctor checks the system service or the named user's service
+when its service manager is accessible. Remove any old client-user builder
+service when moving it to the separate account.
+
 `client uninstall` removes the services and the skills, keeping the
 configuration unless `--purge`. Both installers take `--dry-run`, and
 `--linger` to run `loginctl enable-linger` on Linux so services survive logout.
