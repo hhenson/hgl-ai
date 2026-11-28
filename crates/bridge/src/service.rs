@@ -91,6 +91,7 @@ impl<B: BusApi> Bridge<B> {
             memcap_gb: self.cfg.limits.memcap_gb,
             work_root_free_gb: self.free_gb().unwrap_or(0),
             updated_at: hgl_ai_proto::utc_now_stamp(),
+            accounts_capable: true,
         };
         if let Err(e) = self.bus.host_put(&rec).await {
             tracing::warn!("heartbeat: {e}");

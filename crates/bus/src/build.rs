@@ -3,12 +3,15 @@
 
 use std::time::{Duration, Instant};
 
+use async_nats::jetstream::consumer::DeliverPolicy;
+use async_nats::jetstream::stream::RawMessageErrorKind;
 use async_nats::jetstream::{kv, stream};
-use futures::StreamExt;
 use hgl_ai_proto::build::{BUILDER_PREFIX, BuilderRecord, KV_BUILD, builder_key};
 use hgl_ai_proto::{KV_HOSTS, Note, STREAM_NOTES, Seat};
 
-use super::{Bus, BusError, Result, check_kv_key, list_json_where, live_entry, missing, nats};
+use super::{
+    Bus, BusError, Result, check_kv_key, keys, kv_read, list_json_where, live_entry, missing, nats,
+};
 
 /// Revisions kept per `HGL_BUILD` key: a recipe's history (`recipe show --rev N`).
 pub const BUILD_HISTORY: i64 = 64;
@@ -68,19 +71,29 @@ impl Bus {
     pub async fn build_history(&self, key: &str) -> Result<Vec<BuildEntry>> {
         check_kv_key(key)?;
         let store = self.build_store().await?;
-        if live_entry(store, key).await?.is_none() {
+        let Some(latest) = live_entry(store, key).await? else {
             return Ok(Vec::new());
-        }
-        let mut h = store
-            .history(key)
-            .await
-            .map_err(|e| nats(&format!("reading the history of {key}"), e))?;
+        };
         let mut out = Vec::new();
-        while let Some(e) = h.next().await {
-            let e = e.map_err(|e| nats(&format!("reading the history of {key}"), e))?;
-            if e.operation == kv::Operation::Put {
-                out.push(entry(e));
+        let read = kv_read::read(self, store, key, DeliverPolicy::All, false, |m| {
+            if kv_read::is_put(m.headers.as_ref()) {
+                let info = m
+                    .info()
+                    .map_err(|e| nats("reading build revision metadata", e))?;
+                out.push(BuildEntry {
+                    value: m.payload.to_vec(),
+                    revision: info.stream_sequence,
+                    created: info.published.unix_timestamp(),
+                });
             }
+            Ok(())
+        })
+        .await;
+        match read {
+            Err(e) if self.legacy_kv_pull_denied(&e) => {
+                return legacy_history(store, key, latest.revision).await;
+            }
+            other => other?,
         }
         Ok(out)
     }
@@ -90,7 +103,7 @@ impl Bus {
         check_kv_key(key)?;
         super::check_value_size(key, value.len())?;
         let store = self.build_store().await?;
-        self.guarded(&format!("$KV.{KV_BUILD}.{key}"), async {
+        self.guarded(&self.kv_subject(KV_BUILD, key), async {
             store
                 .put(key, value.to_vec().into())
                 .await
@@ -103,7 +116,7 @@ impl Bus {
     pub async fn build_del(&self, key: &str) -> Result<()> {
         check_kv_key(key)?;
         let store = self.build_store().await?;
-        self.guarded(&format!("$KV.{KV_BUILD}.{key}"), async {
+        self.guarded(&self.kv_subject(KV_BUILD, key), async {
             store
                 .purge(key)
                 .await
@@ -115,17 +128,7 @@ impl Bus {
     /// The live keys of `HGL_BUILD` that start with `prefix`, sorted.
     pub async fn build_keys(&self, prefix: &str) -> Result<Vec<String>> {
         let store = self.build_store().await?;
-        let mut keys = store.keys().await.map_err(|e| nats("listing keys", e))?;
-        let mut out = Vec::new();
-        while let Some(k) = keys.next().await {
-            let k = k.map_err(|e| nats("listing keys", e))?;
-            if k.starts_with(prefix) {
-                out.push(k);
-            }
-        }
-        out.sort();
-        out.dedup();
-        Ok(out)
+        keys(self, store, |key| key.starts_with(prefix)).await
     }
 
     /// Write `HGL_HOSTS/builder.<label>`; it expires like a host record.
@@ -148,7 +151,7 @@ impl Bus {
     /// Every live builder record, ordered by label.
     pub async fn builders(&self) -> Result<Vec<BuilderRecord>> {
         let store = self.store(&self.hosts, KV_HOSTS).await?;
-        list_json_where(store, is_builder_key).await
+        list_json_where(self, store, is_builder_key).await
     }
 
     /// The last note sent to `address` (an address no inbox serves, such as a build's
@@ -199,6 +202,37 @@ impl Bus {
             tokio::time::sleep(left.min(POLL)).await;
         }
     }
+}
+
+/// Older single-account grants allow reads by sequence but no KV pulls.
+async fn legacy_history(store: &kv::Store, key: &str, latest: u64) -> Result<Vec<BuildEntry>> {
+    let subject = format!("{}{key}", store.prefix);
+    let mut out = Vec::new();
+    let mut next = 1;
+    while next <= latest {
+        let m = match store
+            .stream
+            .get_first_raw_message_by_subject(&subject, next)
+            .await
+        {
+            Ok(m) if m.sequence <= latest => m,
+            Ok(_) => break,
+            Err(e) if e.kind() == RawMessageErrorKind::NoMessageFound => break,
+            Err(e) => return Err(nats(&format!("reading the history of {key}"), e)),
+        };
+        if kv_read::is_put(Some(&m.headers)) {
+            out.push(BuildEntry {
+                value: m.payload.to_vec(),
+                revision: m.sequence,
+                created: m.time.unix_timestamp(),
+            });
+        }
+        if m.sequence == latest {
+            break;
+        }
+        next = m.sequence + 1;
+    }
+    Ok(out)
 }
 
 fn entry(e: kv::Entry) -> BuildEntry {

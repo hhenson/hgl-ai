@@ -1,5 +1,6 @@
 //! `hgl-ai doctor`: one line per check, with the fix. It changes nothing (but for
-//! a probe directory it removes again) and never spends a model turn.
+//! a probe directory it removes again, and the `HGL_CANARY` keys a hub that does not
+//! enforce role boundaries lets `hub boundary` write) and never spends a model turn.
 
 use std::os::unix::fs::MetadataExt as _;
 use std::path::Path;
@@ -799,6 +800,149 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                     "once every client runs this version, rerun `hgl-ai server install` (docs/install.md, Hub users)",
                 ));
             }
+        }
+        // Any host: does a write outside this host's role reach the hub (hgl-ai#141)?
+        let boundary = if reached {
+            hub.boundary(c).await
+        } else {
+            Ok(None)
+        };
+        match &boundary {
+            Ok(Some(b)) if b.wrote.is_empty() => out.push(Check::ok(
+                "hub boundary",
+                format!(
+                    "a write outside this role's rights stored nothing, directly or by the \
+                     reply route ({})",
+                    if b.accounts {
+                        "role accounts"
+                    } else {
+                        "one account"
+                    }
+                ),
+            )),
+            // The owner accepted one account's risk until the cutover (hgl-ai#141): a
+            // warning, so that it hides no other failure.
+            Ok(Some(b)) if !b.accounts => out.push(Check::warn(
+                "hub boundary",
+                format!(
+                    "single account: replies not isolated until the hgl-ai#147 cutover, see \
+                     hgl-ai#141 (a write to {} arrived {})",
+                    hgl_ai_proto::KV_CANARY,
+                    b.wrote.join(" and ")
+                ),
+                "the cutover to one account per role (hgl-ai#147)",
+            )),
+            Ok(Some(b)) => out.push(Check::fail(
+                "hub boundary",
+                format!(
+                    "on role accounts, the hub stored a write to {} this role may not \
+                     make, {}: role boundaries are not enforced",
+                    hgl_ai_proto::KV_CANARY,
+                    b.wrote.join(" and ")
+                ),
+                "check `hub accounts` on the hub; render nats.conf from the registry again",
+            )),
+            Ok(None) => {}
+            Err(e) => out.push(Check::warn(
+                "hub boundary",
+                format!("cannot test: {e}"),
+                "`hgl-ai init` provisions the canary bucket",
+            )),
+        }
+        // On the hub's host: the accounts `nats.conf` gives the users (hgl-ai#141). The file
+        // when this host has it; else what the hub showed this host's user.
+        if reached && (c.server.is_some() || su.is_some()) {
+            let users = c
+                .server
+                .as_ref()
+                .is_some_and(|s| s.auth == hgl_ai_config::HubAuth::Users);
+            let dir = env.expand(&c.paths.data_dir);
+            let conf = users
+                .then(|| sys.read_to_string(&dir.join("nats.conf")).ok())
+                .flatten();
+            let rerender = "render nats.conf from the registry again (`hgl-ai server \
+                            install`); do not edit its accounts by hand";
+            let one = |n: String| {
+                Check::warn(
+                    "hub accounts",
+                    format!("{n} in one account: role boundaries are not enforced"),
+                    "move the hub to one account per role once `hub clients` lists no host \
+                     (hgl-ai#141)",
+                )
+            };
+            match conf {
+                Some(text) => {
+                    let reg = crate::users::Registry::load(sys, &dir).unwrap_or_default();
+                    match crate::users::audit(&text, &reg) {
+                        Err(e) => out.push(Check::warn(
+                            "hub accounts",
+                            format!("cannot read nats.conf: {e}"),
+                            rerender,
+                        )),
+                        Ok(a) => match a.layout {
+                            crate::users::Layout::Token => {}
+                            crate::users::Layout::OneAccount { users } => {
+                                out.push(one(format!("{users} hub users")));
+                            }
+                            crate::users::Layout::Accounts if a.problems.is_empty() => {
+                                out.push(Check::ok(
+                                    "hub accounts",
+                                    "one account per role, the admin alone in HUB, service \
+                                     exports within the access table",
+                                ));
+                            }
+                            crate::users::Layout::Accounts => out.push(Check::fail(
+                                "hub accounts",
+                                a.problems.join("; "),
+                                rerender,
+                            )),
+                        },
+                    }
+                }
+                None => match &boundary {
+                    Ok(Some(b)) if b.accounts => out.push(Check::ok(
+                        "hub accounts",
+                        "this host's user is in a role account (nats.conf is not readable \
+                         here: run doctor as the server user for the full check)",
+                    )),
+                    Ok(Some(_)) => out.push(one("this host's user and the rest".into())),
+                    _ => {}
+                },
+            }
+            // Hosts whose client cannot use role accounts yet: the cutover waits for them.
+            out.push(match hub.hosts(c).await {
+                Ok(hosts) => {
+                    let old: Vec<&str> = hosts
+                        .iter()
+                        .filter(|h| !h.accounts_capable)
+                        .map(|h| h.host.as_str())
+                        .collect();
+                    if old.is_empty() {
+                        Check::ok(
+                            "hub clients",
+                            format!(
+                                "every live host's client can use role accounts ({} live)",
+                                hosts.len()
+                            ),
+                        )
+                    } else {
+                        Check::warn(
+                            "hub clients",
+                            format!(
+                                "live hosts whose client predates role accounts: {}",
+                                old.join(", ")
+                            ),
+                            "upgrade hgl-ai on each and rerun `hgl-ai client install` there, \
+                             which restarts its bridge",
+                        )
+                    }
+                }
+                Err(e) => Check::warn(
+                    "hub clients",
+                    format!("cannot read the live hosts: {e}"),
+                    "check the hub",
+                ),
+            });
         }
         // On the hub's host (this user's own server, or a server user found from the hub
         // unit, as for a `--client-user`): consumers on the telemetry streams that outlive
@@ -2295,6 +2439,201 @@ mod tests {
             c.fix.as_deref().unwrap().contains("server install"),
             "{c:?}"
         );
+    }
+
+    fn check<'a>(cs: &'a [Check], name: &str) -> Option<&'a Check> {
+        cs.iter().find(|c| c.name == name)
+    }
+
+    /// Any host: `hub boundary` passes when the canary stays empty, fails when a write
+    /// reached it, warns when it cannot tell, and is not tried as the admin (hgl-ai#146).
+    #[tokio::test]
+    async fn hub_boundary() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let with = |b| FakeHub {
+            boundary: b,
+            ..FakeHub::up()
+        };
+        let cs = run(&f, &FakeHub::up()).await;
+        let c = check(&cs, "hub boundary").unwrap();
+        assert_eq!(c.level, Level::Ok, "{c:?}");
+        assert!(c.detail.contains("role accounts"), "{c:?}");
+        // A plain client host has no hub-side checks.
+        assert!(check(&cs, "hub accounts").is_none() && check(&cs, "hub clients").is_none());
+        let cs = run(
+            &f,
+            &with(Ok(Some(crate::hub::Boundary {
+                accounts: false,
+                wrote: vec!["by the reply route"],
+            }))),
+        )
+        .await;
+        // One account: the accepted risk until the cutover, a warning (hgl-ai#141).
+        let c = check(&cs, "hub boundary").unwrap();
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(
+            c.detail.starts_with("single account: replies not isolated")
+                && c.detail.contains("by the reply route"),
+            "{c:?}"
+        );
+        assert!(!any_fail(&cs), "{cs:?}");
+        // Role accounts and still a write: a failure.
+        let cs = run(
+            &f,
+            &with(Ok(Some(crate::hub::Boundary {
+                accounts: true,
+                wrote: vec!["directly"],
+            }))),
+        )
+        .await;
+        let c = check(&cs, "hub boundary").unwrap();
+        assert_eq!(c.level, Level::Fail, "{c:?}");
+        assert!(
+            c.detail.contains("HGL_CANARY") && c.detail.contains("directly"),
+            "{c:?}"
+        );
+        assert!(any_fail(&cs));
+        let cs = run(&f, &with(Err("no bucket HGL_CANARY".into()))).await;
+        assert_eq!(check(&cs, "hub boundary").unwrap().level, Level::Warn);
+        let cs = run(&f, &with(Ok(None))).await;
+        assert!(check(&cs, "hub boundary").is_none(), "{cs:?}");
+        let cs = run(&f, &FakeHub::down()).await;
+        assert!(check(&cs, "hub boundary").is_none(), "{cs:?}");
+    }
+
+    fn host(name: &str, accounts_capable: bool) -> hgl_ai_proto::HostRecord {
+        hgl_ai_proto::HostRecord {
+            host: name.into(),
+            seats: Vec::new(),
+            memcap_gb: 0,
+            work_root_free_gb: 0,
+            updated_at: "20261128T000000Z".into(),
+            accounts_capable,
+        }
+    }
+
+    /// On the hub's host: `hub accounts` reads `nats.conf` against the registry, and
+    /// `hub clients` lists the live hosts too old for role accounts (hgl-ai#146).
+    #[tokio::test]
+    async fn hub_accounts_and_clients() {
+        use crate::users::{Registry, Role};
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.server = Some(hgl_ai_config::Server::default());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let dir = f.env.expand(&cfg.paths.data_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut reg = Registry::default();
+        for (n, r) in [
+            ("build-1", Role::Seat),
+            ("hub-admin", Role::Admin),
+            ("console", Role::Console),
+        ] {
+            reg.issue(n, r, false).unwrap();
+        }
+        reg.save(&f, &dir).unwrap();
+        let conf = |auth: &crate::nats::Auth| {
+            std::fs::write(
+                dir.join("nats.conf"),
+                crate::nats::render_conf("127.0.0.1", 4222, Path::new("/s"), auth),
+            )
+            .unwrap();
+        };
+        conf(&crate::nats::Auth::Users(&reg));
+        let cs = run(&f, &FakeHub::up()).await;
+        let c = check(&cs, "hub accounts").unwrap();
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(
+            c.detail
+                .contains("3 hub users in one account: role boundaries are not enforced"),
+            "{c:?}"
+        );
+        let c = check(&cs, "hub clients").unwrap();
+        assert_eq!(c.level, Level::Ok, "{c:?}");
+
+        conf(&crate::nats::Auth::Accounts(&reg));
+        let cs = run(&f, &FakeHub::up()).await;
+        assert_eq!(check(&cs, "hub accounts").unwrap().level, Level::Ok);
+        // A user moved into `HUB`: the admin is not alone there.
+        let text = std::fs::read_to_string(dir.join("nats.conf")).unwrap();
+        let seat = reg.get("build-1").unwrap().nkey.clone();
+        let line = text
+            .lines()
+            .find(|l| l.contains(&seat))
+            .unwrap()
+            .to_string();
+        let moved = text.replacen(&line, "", 1).replacen(
+            "    users: [\n",
+            &format!("    users: [\n{line}\n"),
+            1,
+        );
+        std::fs::write(dir.join("nats.conf"), moved).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        let c = check(&cs, "hub accounts").unwrap();
+        assert_eq!(c.level, Level::Fail, "{c:?}");
+        assert!(c.detail.contains("build-1 (seat) is in HUB"), "{c:?}");
+        std::fs::write(dir.join("nats.conf"), "accounts {").unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        assert_eq!(check(&cs, "hub accounts").unwrap().level, Level::Warn);
+
+        let hub = FakeHub {
+            hosts: vec![
+                host("hub", true),
+                host("build-2", false),
+                host("lab1", false),
+            ],
+            ..FakeHub::up()
+        };
+        let c = run(&f, &hub)
+            .await
+            .into_iter()
+            .find(|c| c.name == "hub clients")
+            .unwrap();
+        assert_eq!(c.level, Level::Warn, "{c:?}");
+        assert!(c.detail.ends_with(": build-2, lab1"), "{c:?}");
+
+        // A shared token: `hub auth` warns; no account verdict.
+        conf(&crate::nats::Auth::Token("t"));
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(check(&cs, "hub accounts").is_none(), "{cs:?}");
+    }
+
+    /// A system-installed hub, whose `nats.conf` this user cannot read: `hub accounts`
+    /// says what the hub showed this host's user.
+    #[tokio::test]
+    async fn hub_accounts_from_the_hub() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.server_user = Some(hgl_ai_config::ServerUser {
+            name: "hgl-ai".into(),
+            home: "/var/lib/hgl-ai".into(),
+            console_url: None,
+            slack: false,
+            client_user: None,
+        });
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let c = run(&f, &FakeHub::up())
+            .await
+            .into_iter()
+            .find(|c| c.name == "hub accounts")
+            .unwrap();
+        assert_eq!(c.level, Level::Ok, "{c:?}");
+        let one = FakeHub {
+            boundary: Ok(Some(crate::hub::Boundary {
+                accounts: false,
+                wrote: vec!["by the reply route"],
+            })),
+            ..FakeHub::up()
+        };
+        let c = run(&f, &one)
+            .await
+            .into_iter()
+            .find(|c| c.name == "hub accounts")
+            .unwrap();
+        assert_eq!(c.level, Level::Warn, "{c:?}");
     }
 
     /// A system-installed hub (no `server` section; `nats.conf` is the server user's):

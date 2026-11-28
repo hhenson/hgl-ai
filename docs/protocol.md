@@ -77,6 +77,7 @@ before hub users takes one shared token until it moves.
 | Ended | KV `HGL_ENDED` | file storage, history 1, `max_age` 15 d |
 | Usage | KV `HGL_USAGE`; stream `HGL_USAGE_LOG`, subjects `hgl.usage.>` | KV file storage, history 1; stream file storage, `max_age` 35 d, dedup window 24 h (§10) |
 | Builds | KV `HGL_BUILD` | file storage, history 64: `recipe.<repo>` (TOML), `run.<id>` (summary JSON; newest 1000 kept) |
+| Canary | KV `HGL_CANARY` | file storage, history 1, no age limit, per-message TTL allowed. `probe` (no TTL) only the admin writes, at provisioning. `control.<random>` (TTL 1 h) every role writes. `doctor.*` no role writes. Every role reads it and acknowledges `probe` through a consumer of its own. `doctor` (`hub boundary`) checks a write outside its role's rights does not arrive |
 
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
   broadcast address. `owner` and `console` are senders, never seats: no seat takes
@@ -362,11 +363,14 @@ Each bridge writes `HGL_HOSTS/<host>` every 30 s:
   "seats": [{"seat": "w3", "role": "implementor", "runtime": "codex", "family": "gpt", "model": "gpt-6.1-sol"}],
   "memcap_gb": 64,
   "work_root_free_gb": 812,
-  "updated_at": "20261127T083000Z"
+  "updated_at": "20261127T083000Z",
+  "accounts_capable": true
 }
 ```
 
 `host` is a configured label, never a network name or address.
+`accounts_capable` says the bridge supports role accounts. It defaults to false
+for older records.
 
 A builder writes `HGL_HOSTS/builder.<label>` with the same heartbeat and TTL
 (`hgl-ai hosts` leaves these out; `hgl-ai builder list` shows them):

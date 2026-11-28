@@ -58,6 +58,17 @@ pub const VIEWER_INBOX: &str = "_INBOX_VIEWER";
 pub const VIEWER_STATE_KEYS: [&str; 6] = ["prs", "backlog", "landed.log", "tasks", "mode", "hold"];
 /// The Slack adapter's delivery state and thread mappings.
 pub const KV_SLACK: &str = "HGL_SLACK";
+/// A bucket whose `doctor.*` keys no hub role may write: `doctor` (`hub boundary`) tries a
+/// write there that its role must not have and checks that nothing arrived (hgl-ai#146).
+pub const KV_CANARY: &str = "HGL_CANARY";
+/// The one key of `HGL_CANARY` the admin writes (`provision`), with [`CANARY_PROBE_VALUE`]:
+/// what `hub boundary` pulls onto a canary key by the reply route. Fixed, so a delivery
+/// that lands stores no hub metadata.
+pub const CANARY_PROBE: &str = "probe";
+pub const CANARY_PROBE_VALUE: &str = "hgl-ai canary";
+/// The `HGL_CANARY` keys `control.<random>` every role may write: `hub boundary`'s control
+/// write, which must land to show the canary takes new keys (hgl-ai#146).
+pub const CANARY_CONTROL: &str = "control";
 /// Owner words (OWN-5).
 pub const OWNER_PREFIX: &str = "hgl.owner";
 /// One owner event per Slack workspace, channel and reply or action timestamp in a thread.
@@ -569,6 +580,9 @@ pub struct HostRecord {
     pub memcap_gb: u64,
     pub work_root_free_gb: u64,
     pub updated_at: String,
+    /// This bridge's client supports role accounts. Older heartbeats lack the field.
+    #[serde(default)]
+    pub accounts_capable: bool,
 }
 
 /// `HGL_TREES/<host>.<seat>.<repo>-<issue>` (PROTO-13).

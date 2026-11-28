@@ -1143,6 +1143,7 @@ async fn the_page_watches_as_the_viewer() {
             memcap_gb: 64,
             work_root_free_gb: 100,
             updated_at: "20261128T000000Z".into(),
+            accounts_capable: false,
         })
         .await
         .unwrap();
@@ -1485,6 +1486,8 @@ fn write_pattern(t: &Target) -> Option<String> {
     match t {
         Target::Keys { bucket, keys } => Some(format!("$KV.{bucket}.{keys}")),
         Target::Subjects(s) => Some(s.clone()),
+        // Its keys are written by none but the control key.
+        Target::Probe { bucket, .. } => Some(format!("$KV.{bucket}.>")),
         _ => None,
     }
 }
@@ -1670,6 +1673,46 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                                 .expect(&what);
                             assert_eq!(pull(&c, 2).await.len(), 2, "a batch: {what}");
                         }
+                    }
+                    Target::Probe { bucket, key } => {
+                        // Keys by direct get; a consumer filtered to the probe, pulled
+                        // and acknowledged; no other consumer, durable or listing.
+                        let store = js.get_key_value(bucket).await.expect(&what);
+                        assert_eq!(store.get(key).await.expect(&what).unwrap(), "hgl-ai canary");
+                        let s = js.get_stream(format!("KV_{bucket}")).await.unwrap();
+                        let c = s
+                            .create_consumer(consumer::pull::Config {
+                                name: Some(format!("probe-{role}")),
+                                ack_policy: consumer::AckPolicy::Explicit,
+                                filter_subject: format!("$KV.{bucket}.{key}"),
+                                ..Default::default()
+                            })
+                            .await
+                            .expect(&what);
+                        let got = pull(&c, 1).await;
+                        assert_eq!(got.len(), 1, "{what}");
+                        got[0].double_ack().await.expect(&what);
+                        let p = hgl_ai_proto::HUB_API_PREFIX;
+                        let sn = format!("KV_{bucket}");
+                        unanswered(
+                            &conn,
+                            vec![
+                                (
+                                    format!("{p}.CONSUMER.CREATE.{sn}"),
+                                    serde_json::json!({"stream_name": sn, "config": {}}),
+                                ),
+                                (
+                                    format!("{p}.CONSUMER.CREATE.{sn}.x.$KV.{bucket}.seed.a"),
+                                    serde_json::json!({"stream_name": sn, "config": {"name": "x", "filter_subject": format!("$KV.{bucket}.seed.a")}}),
+                                ),
+                                (
+                                    format!("{p}.CONSUMER.DURABLE.CREATE.{sn}.d"),
+                                    serde_json::json!({"stream_name": sn, "config": {"durable_name": "d"}}),
+                                ),
+                                (format!("{p}.CONSUMER.LIST.{sn}"), serde_json::json!({})),
+                            ],
+                        )
+                        .await;
                     }
                     Target::Stream(name)
                     | Target::BySequence(name)
@@ -2042,4 +2085,164 @@ async fn accounts_the_first_user_of_a_role_needs_one_reload() {
 
 fn role_writes_locks(role: Role) -> bool {
     writes_of(role).iter().any(|w| w == "$KV.HGL_LOCKS.>")
+}
+
+/// Write a fixture credential as a host keeps one: mode 0600 from creation.
+fn write_private(path: &std::path::Path, text: &str) {
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(path)
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+}
+
+impl Hub {
+    /// A host's configuration with `who`'s credential as its `hub.token`.
+    fn host_cfg(&self, who: &str) -> hgl_ai_config::Config {
+        self.host_cfg_as(who, false)
+    }
+
+    /// [`Hub::host_cfg`], the credential a bare seed when `bare`: no role named.
+    fn host_cfg_as(&self, who: &str, bare: bool) -> hgl_ai_config::Config {
+        let Credential::Nkey { seed, user, role } = self.creds[who].clone() else {
+            unreachable!()
+        };
+        let dir = self.conf.with_file_name(format!("host-{who}-{bare}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("hub.token");
+        if !f.exists() {
+            let text = if bare {
+                seed
+            } else {
+                Credential::render_nkey(&user.unwrap(), &role.unwrap(), &seed)
+            };
+            write_private(&f, &text);
+        }
+        let mut cfg = hgl_ai_config::Config::new("t");
+        cfg.hub.url = self.url.clone();
+        cfg.hub.token_file = f.display().to_string();
+        cfg
+    }
+}
+
+/// `doctor` on both layouts (hgl-ai#146): `hub boundary` fails on one account, where a
+/// write outside each role's rights reaches the canary by the reply route, and passes on
+/// role accounts, where nothing reaches it; `hub` finds every stream and bucket each role
+/// may look up, through the hub API prefix there; `hub clients` reads the live hosts.
+#[tokio::test]
+async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
+    use hgl_ai_install::{BusHub, Hub as _};
+    for accounts in [false, true] {
+        let hub = if accounts {
+            Hub::accounts()
+        } else {
+            Hub::start()
+        };
+        let Some(hub) = hub else { return };
+        let admin = seeded(&hub).await;
+        let canary = format!("KV_{}", hgl_ai_proto::KV_CANARY);
+        // The canary's messages but the control writes.
+        let count = || async {
+            let mut s = admin.get_stream(&canary).await.unwrap();
+            let all = s.info().await.unwrap().state.messages;
+            let control = s
+                .info_with_subjects(format!("$KV.{}.control.*", hgl_ai_proto::KV_CANARY))
+                .await
+                .unwrap()
+                .count()
+                .await;
+            all - control as u64
+        };
+        let before = count().await;
+        // The probe never ages out of the canary (bot on #192); control writes carry a
+        // TTL; provisioning again keeps both.
+        hub.bus("hub-admin").await.provision().await.unwrap();
+        let mut s = admin.get_stream(&canary).await.unwrap();
+        let config = s.info().await.unwrap().config.clone();
+        assert_eq!(config.max_age, Duration::ZERO);
+        assert!(config.allow_message_ttl);
+        for (_, who) in ROLE_USERS {
+            let cfg = hub.host_cfg(who);
+            assert_eq!(
+                BusHub.health(&cfg).await.unwrap(),
+                Vec::<String>::new(),
+                "{who}, accounts {accounts}"
+            );
+            let b = BusHub.boundary(&cfg).await.unwrap().unwrap();
+            assert_eq!(b.accounts, accounts, "{who}");
+            let want: &[&str] = if accounts {
+                &[]
+            } else {
+                &["by the reply route"]
+            };
+            assert_eq!(b.wrote, want, "{who}, accounts {accounts}");
+        }
+        let after = count().await;
+        if accounts {
+            assert_eq!(after, before, "nothing but the control write arrived");
+        } else {
+            assert_eq!(after, before + ROLE_USERS.len() as u64);
+        }
+        assert_eq!(BusHub.boundary(&hub.host_cfg("hub-admin")).await, Ok(None));
+        // A bare seed names no role: `hub` checks what every role may look up. In a role
+        // account it is no admin and is tried; in one account (or a bare admin seed, in
+        // `HUB`) it may be the admin's and is not (r6 on #192).
+        let bare = hub.host_cfg_as("build-1", true);
+        assert_eq!(BusHub.health(&bare).await.unwrap(), Vec::<String>::new());
+        match BusHub.boundary(&bare).await {
+            Ok(Some(b)) if accounts => assert!(b.wrote.is_empty(), "{b:?}"),
+            Err(e) if !accounts => assert!(e.contains("names no role"), "{e}"),
+            other => panic!("accounts {accounts}: {other:?}"),
+        }
+        let bare_admin = hub.host_cfg_as("hub-admin", true);
+        let r = BusHub.boundary(&bare_admin).await;
+        assert!(matches!(&r, Err(e) if e.contains("names no role")), "{r:?}");
+        assert_eq!(count().await, after, "no untried credential wrote");
+
+        // A canary that refuses writes: the control write cannot land, so an absent reply
+        // key proves nothing, and no verdict is a pass (r6 on #192).
+        {
+            let mut stream = admin.get_stream(&canary).await.unwrap();
+            let mut config = stream.info().await.unwrap().config.clone();
+            config.max_messages = stream.info().await.unwrap().state.messages as i64;
+            config.discard = jetstream::stream::DiscardPolicy::New;
+            admin.update_stream(config.clone()).await.unwrap();
+            let r = BusHub.boundary(&hub.host_cfg("build-1")).await;
+            assert!(
+                matches!(&r, Err(e) if e.contains("no control write landed")),
+                "accounts {accounts}: {r:?}"
+            );
+            config.max_messages = -1;
+            admin.update_stream(config).await.unwrap();
+        }
+
+        let rec = |host: &str, accounts_capable| hgl_ai_proto::HostRecord {
+            host: host.into(),
+            seats: Vec::new(),
+            memcap_gb: 1,
+            work_root_free_gb: 1,
+            updated_at: hgl_ai_proto::utc_now_stamp(),
+            accounts_capable,
+        };
+        let seat = hub.bus("build-1").await;
+        seat.host_put(&rec("build-1", true)).await.unwrap();
+        seat.host_put(&rec("old-1", false)).await.unwrap();
+        let mut hosts: Vec<(String, bool)> = BusHub
+            .hosts(&hub.host_cfg("hub-coord"))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|h| (h.host, h.accounts_capable))
+            .collect();
+        hosts.sort();
+        assert_eq!(
+            hosts,
+            [("build-1".to_string(), true), ("old-1".to_string(), false)]
+        );
+    }
 }
