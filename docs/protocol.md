@@ -35,7 +35,8 @@ this repository.
   serves a seat holds the `flock` on `<data_dir>/seats/<seat>.lock`: the bridge,
   `note wait` and `note peek` alike.
   A bridge serves a seat only while it holds the lease `HGL_LOCKS/seat.<seat>`,
-  refreshed every 30 s (or a sixth of the bucket's `max_age`, if shorter). One the
+  refreshed every 30 s (or a sixth of the bucket's `max_age`, if shorter), every seat's
+  at once, each attempt bounded by that period. One the
   hub has not confirmed for half of `max_age` (no answer: a partition) stops the seat
   as a lost one does (its turn stopped, its notes naked), so it has stopped before
   the lease can expire and another host take it; `note wait` and `note peek` give it

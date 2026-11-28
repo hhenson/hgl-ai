@@ -557,43 +557,47 @@ impl<B: BusApi> Bridge<B> {
         }
     }
 
-    /// Refresh every held seat lease (with the heartbeat). A lease no longer ours stops its
-    /// seat; so does one the hub has not confirmed for the deadline ([`LeaseTiming`]): in a
-    /// partition no answer says it is lost, and it expires on its own while the seat would
-    /// still run.
+    /// Refresh every held seat lease (with the heartbeat), all at once: a round takes at
+    /// most `every` at any seat count. A lease no longer ours stops its seat; so does one the
+    /// hub has not confirmed for the deadline ([`LeaseTiming`]): in a partition no answer says
+    /// it is lost, and it expires on its own while the seat would still run.
     pub(crate) async fn refresh_leases(&self) {
         let t = *lock(&self.lease_timing);
         let mut leases = self.leases.lock().await;
-        let mut lost = Vec::new();
-        for (seat, held) in leases.iter_mut() {
+        let rounds = leases.iter_mut().map(|(seat, held)| async move {
             let r = tokio::time::timeout(t.every, held.lease.refresh()).await;
             let failed = match r {
                 Ok(Ok(())) => {
                     held.ok_at = Instant::now();
-                    continue;
+                    return None;
                 }
                 Ok(Err(BusError::LeaseLost { .. })) => {
-                    lost.push((
+                    return Some((
                         seat.clone(),
                         "is no longer ours (it expired or another bridge took it)".to_string(),
                     ));
-                    continue;
                 }
                 Ok(Err(e)) => e.to_string(),
                 Err(_) => format!("no answer within {:?}", t.every),
             };
             let since = held.ok_at.elapsed();
             if since >= t.deadline {
-                lost.push((
+                Some((
                     seat.clone(),
                     format!(
                         "was not refreshed for {since:?} ({failed}), so it could expire and another host take the seat"
                     ),
-                ));
+                ))
             } else {
                 tracing::warn!(%seat, "refreshing the seat lease: {failed}; trying again (unrefreshed for {since:?} of {:?})", t.deadline);
+                None
             }
-        }
+        });
+        let lost: Vec<_> = futures::future::join_all(rounds)
+            .await
+            .into_iter()
+            .flatten()
+            .collect();
         for (seat, why) in lost {
             if let Some(held) = leases.remove(&seat) {
                 tracing::error!(%seat, "the seat lease {why}; stopping the seat");
