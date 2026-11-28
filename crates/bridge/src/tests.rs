@@ -1436,7 +1436,13 @@ async fn the_lease_of_a_crashed_bridge_of_this_host_is_taken_over() {
 async fn a_lost_seat_lease_stops_the_seat() {
     let h = harness();
     let pid = h.calls.join("pid");
-    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    h.script(
+        "codex",
+        &format!(
+            "echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60",
+            p = pid.display()
+        ),
+    );
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1724,7 +1730,13 @@ async fn landed_without_a_tree_is_acked_silently() {
 async fn shutdown_stops_a_running_turn_after_the_grace_and_naks() {
     let h = harness();
     let pid = h.calls.join("pid");
-    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    h.script(
+        "codex",
+        &format!(
+            "echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60",
+            p = pid.display()
+        ),
+    );
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -1749,7 +1761,13 @@ async fn shutdown_stops_a_running_turn_after_the_grace_and_naks() {
 async fn a_failed_inbox_fetcher_stops_the_running_turn() {
     let h = harness();
     let pid = h.calls.join("pid");
-    h.script("codex", &format!("echo $$ > '{}'; sleep 60", pid.display()));
+    h.script(
+        "codex",
+        &format!(
+            "echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60",
+            p = pid.display()
+        ),
+    );
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
         "w1",
@@ -2006,7 +2024,7 @@ fn held_after_the_first(h: &H) -> (PathBuf, PathBuf) {
     h.script(
         "codex",
         &format!(
-            "if [ \"$n\" -ge 2 ]; then echo $$ > '{p}'; while [ ! -e '{g}' ]; do sleep 0.05; done; fi\ncat '{f}'",
+            "if [ \"$n\" -ge 2 ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; while [ ! -e '{g}' ]; do sleep 0.05; done; fi\ncat '{f}'",
             p = pid.display(),
             g = gate.display(),
             f = fixture("codex-ok.jsonl")
@@ -2097,7 +2115,7 @@ async fn a_late_end_hands_back_the_newer_notes_of_the_turn_it_stops() {
     h.script(
         "codex",
         &format!(
-            "if [ \"$n\" -eq 2 ]; then echo $$ > '{p}'; sleep 60; fi\ncat '{f}'",
+            "if [ \"$n\" -eq 2 ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60; fi\ncat '{f}'",
             p = pid.display(),
             f = fixture("codex-ok.jsonl")
         ),
@@ -2502,10 +2520,11 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
     let max_age = Duration::from_secs(3);
     h.bus.set_lease_max_age(max_age);
     let pid = h.calls.join("pid");
+    // Publish the pid only after it is complete: redirection creates an empty file first.
     h.script(
         "codex",
         &format!(
-            "if [ \"$n\" -eq 1 ]; then echo $$ > '{p}'; sleep 60; fi\ncat '{f}'",
+            "if [ \"$n\" -eq 1 ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; sleep 60; fi\ncat '{f}'",
             p = pid.display(),
             f = fixture("codex-ok.jsonl")
         ),
@@ -2559,7 +2578,8 @@ async fn an_unrefreshed_lease_stops_the_seat_before_it_can_expire() {
 
 /// hgl-ai#65: the hub stalls silently, so every refresh hangs until it times out (`every`).
 /// The refreshes run at once, so with any number of seats each stops before its lease can
-/// expire: its last refresh was at most `every` before the stall, at `every == max_age / 6`.
+/// expire. Measure each seat from its last confirmed write to its actual stop, rather than
+/// from the stall to when the test happens to observe all the notices.
 async fn hanging_refreshes_stop_every_seat_before_its_lease_can_expire(n: usize) {
     let mut h = harness();
     let max_age = Duration::from_secs(3);
@@ -2586,8 +2606,7 @@ async fn hanging_refreshes_stop_every_seat_before_its_lease_can_expire(n: usize)
                 .all(|s| h.bus.lease_holder(&format!("seat.{s}")).is_some())
     })
     .await;
-    h.bus.refresh_hangs(true);
-    let cut = std::time::Instant::now();
+    let confirmed = h.bus.refresh_hangs(true);
     eventually("every seat stopped", || {
         let told = h.bus.sent_containing("was not refreshed for");
         names
@@ -2595,15 +2614,21 @@ async fn hanging_refreshes_stop_every_seat_before_its_lease_can_expire(n: usize)
             .all(|s| told.iter().any(|t| t.sender.as_str() == s))
     })
     .await;
-    let took = cut.elapsed();
-    assert!(
-        took < max_age - every,
-        "{n} seats: the last stopped after {took:?}, when its lease could have expired"
-    );
-    assert!(
-        took >= max_age / 2 - every,
-        "{n} seats: not before the deadline: {took:?}"
-    );
+    let stops = h.bus.lease_stops();
+    for name in &names {
+        let last = confirmed[&format!("seat.{name}")];
+        let (start, end) = stops[&seat(name)];
+        let start = start.duration_since(last);
+        let end = end.expect("seat stopped").duration_since(last);
+        assert!(
+            start >= max_age / 2,
+            "{name}: stopped too early after {start:?}"
+        );
+        assert!(
+            end < max_age,
+            "{name}: stopped after {end:?}, when its lease could have expired"
+        );
+    }
     h.bus.refresh_hangs(false);
     stop(tx, j).await;
 }
