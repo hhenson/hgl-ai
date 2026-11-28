@@ -164,6 +164,7 @@ async fn remove(ctx: &Ctx, a: RemoveArgs) -> anyhow::Result<i32> {
             "key": rm.key,
             "dir": rm.dir,
             "branch": rm.branch,
+            "local_branch": rm.local_branch,
             "freed_bytes": rm.freed_bytes,
             "salvage": rm.salvage,
             "deregistered": deregistered.is_ok(),
