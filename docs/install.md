@@ -144,7 +144,7 @@ hgl-ai server user ...`).
 | `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
 | `screen` | publishes `hgl.notes.screen.<seat>` and `HGL_SCREEN/log.>`; pulls and acknowledges `inbox-screen`; reads `HGL_STATE`, `HGL_TREES` and `HGL_SCREEN/rule.>` |
-| `screen-rules` | writes `HGL_SCREEN/rule.>` and reads `HGL_SCREEN/log.>` by key |
+| `screen-rules` | reads and writes `HGL_SCREEN/rule.>` and `HGL_STATE/decisions.log`; lists and reads `HGL_SCREEN/log.>` |
 | `viewer` | nothing by subject (replies are not enforced until hgl-ai#141): reads and watches `HGL_HOSTS`, `HGL_TREES`, `HGL_METRICS`, `HGL_BUILD`, `HGL_USAGE`, and of `HGL_STATE` only `prs`, `backlog`, `landed.log`, `tasks`, `mode`, `hold` (the console's page, docs/owner.md §3); consumers only in the filtered create form; subscribes to `_INBOX_VIEWER.>` only; no other stream or bucket, no consumer delete (docs/design.md §9) |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
@@ -189,6 +189,15 @@ nk -inkey ~/.config/hgl-ai/hub-users/controller-rules.seed -pubout
 
 Register the printed public key as the hub's server user with
 `hgl-ai server user add controller-rules --role screen-rules --nkey U...`.
+Rerun `hgl-ai server install` on an existing hub to load the updated grants.
+
+Use that key as `HGL_AI_HUB_CREDENTIAL` with `hgl-ai screen rule add FILE`,
+`rule retire ID`, `rule list`, `rule show ID` and `screen log [--since SEQ]`.
+Load one JSON rule with `id`, `kinds`, `roles`, a one-sentence `when`,
+`action` (`close` or `answer`), `reply` for an answer, `cites`
+(`repo#number` or an exact decision line), and `expires` (UTC
+`YYYYMMDDTHHMMSSZ`). New rules start in `shadow`. If a rule command reports
+a pending decision-log write, repeat the same command to finish it.
 
 `user add` and `remove` rewrite `nats.conf` and reload the hub (SIGHUP through
 its pid file; connections that stay valid are kept). On the client: `hgl-ai client install --token-file <the .cred>`. A

@@ -28,6 +28,7 @@ hgl-ai-slack.workspace = true
 hgl-ai-usage.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

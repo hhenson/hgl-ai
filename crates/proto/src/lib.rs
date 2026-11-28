@@ -9,6 +9,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod screen;
 pub mod usage;
 pub use usage::{
     KV_USAGE, STREAM_USAGE, USAGE_PREFIX, UsageBucket, UsageLabel, UsageRecord,
@@ -21,6 +22,8 @@ pub const NOTE_VERSION: u32 = 1;
 pub const STREAM_NOTES: &str = "HGL_NOTES";
 pub const SUBJECT_PREFIX: &str = "hgl.notes";
 pub const KV_STATE: &str = "HGL_STATE";
+/// The controller's decision log in `HGL_STATE` (OWN-8).
+pub const KEY_DECISIONS: &str = "decisions.log";
 pub const KV_HOSTS: &str = "HGL_HOSTS";
 pub const KV_TREES: &str = "HGL_TREES";
 pub const KV_LOCKS: &str = "HGL_LOCKS";
@@ -96,6 +99,8 @@ pub enum ProtoError {
     Unknown { what: &'static str, value: String },
     #[error("note: {0}")]
     Note(String),
+    #[error("screen: {0}")]
+    Screen(String),
 }
 
 static SEAT_RE: LazyLock<Regex> =

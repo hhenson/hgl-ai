@@ -43,6 +43,7 @@
 
 pub mod cred;
 mod feed;
+mod screen;
 mod usage;
 
 use std::path::Path;
@@ -51,6 +52,7 @@ use std::time::{Duration, Instant};
 
 pub use cred::{Credential, parse_credential, read_credential};
 pub use feed::{Feed, StreamMsg};
+pub use screen::ScreenRuleEntry;
 pub use usage::UsagePut;
 
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
@@ -239,6 +241,7 @@ pub struct Bus {
     denied: Arc<Mutex<Vec<String>>>,
     /// Woken on each violation, so a refused publish fails at once.
     denied_tick: Arc<tokio::sync::Notify>,
+    scoped_api: OnceCell<&'static str>,
     state: OnceCell<kv::Store>,
     hosts: OnceCell<kv::Store>,
     trees: OnceCell<kv::Store>,
@@ -285,7 +288,13 @@ impl Bus {
                     if let async_nats::Event::ServerError(async_nats::ServerError::Other(m)) = &ev
                         && m.to_ascii_lowercase().contains("permissions violation")
                     {
-                        tracing::warn!("hub: {m}");
+                        if !m.contains(
+                            "JS.HUB.API.DIRECT.GET.KV_HGL_SCREEN.$KV.HGL_SCREEN.rule._ids",
+                        ) && !m.contains(
+                            "JS.HUB.API.DIRECT.GET.KV_HGL_STATE.$KV.HGL_STATE.decisions.log",
+                        ) {
+                            tracing::warn!("hub: {m}");
+                        }
                         if let Ok(mut d) = seen.lock() {
                             d.push(m.clone());
                             let n = d.len();
@@ -321,6 +330,7 @@ impl Bus {
             who,
             denied,
             denied_tick,
+            scoped_api: OnceCell::new(),
             state: OnceCell::new(),
             hosts: OnceCell::new(),
             trees: OnceCell::new(),

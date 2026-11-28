@@ -79,6 +79,14 @@ before hub users takes one shared token until it moves.
 | Usage | KV `HGL_USAGE`; stream `HGL_USAGE_LOG`, subjects `hgl.usage.>` | KV file storage, history 1; stream file storage, `max_age` 35 d, dedup window 24 h (§10) |
 | Builds | KV `HGL_BUILD` | file storage, history 64: `recipe.<repo>` (TOML), `run.<id>` (summary JSON; newest 1000 kept) |
 
+Screen records use `rule.<id>` for the rule and `rule._ids` for discovery.
+Retirement sets `retired_at` on the rule and preserves its older revisions.
+Each add or retirement records a line in `HGL_STATE/decisions.log`; a pending
+write travels with the rule revision so the command can resume after interruption.
+The first result for an original note sequence is kept at `log.<seq>`.
+`screen log --since SEQ` returns results with a strictly greater note sequence,
+in numeric order.
+
 - **PROTO-7 — Seat names** match `^[a-z0-9][a-z0-9_-]{0,31}$`. `all` is the
   broadcast address. `owner` and `console` are sender names. `screen` is the
   screen's sender and intake address. Those names are reserved in seat
