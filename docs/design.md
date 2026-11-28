@@ -72,6 +72,8 @@ hgl-ai note wait SEAT [--timeout DUR]     block, print, ack; holds the seat lock
 hgl-ai note peek SEAT                     print what the inbox has not acked; spends no delivery
 hgl-ai state get|put|del KEY [VALUE|-] [--if-revision N]
 hgl-ai state append KEY LINE|-
+hgl-ai precheck rules get
+hgl-ai precheck rules set --file FILE --if-revision N --reason TEXT
 hgl-ai hosts
 hgl-ai usage collect [--runtime R ...] [--dry-run]   one record per signed-in login (PROTO-23)
 hgl-ai usage show                         every login's limits, with hours to reset
@@ -377,3 +379,9 @@ What subjects cannot stop:
 - `viewer` may make many consumers at once; each without a durable name ends once
   idle for its threshold (5 s unless the body says otherwise).
 
+
+The pre-check rules live in `HGL_PRECHECK`, not in this repository. The controller
+uses an owner-held `precheck-rules` credential to apply a proposed JSON file; the
+architect proposes changes to the controller. `get` returns the rules, reason and
+revision; `set` validates the file and atomically compares the supplied revision.
+See docs/protocol.md for the schema and account permissions.

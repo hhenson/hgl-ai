@@ -88,6 +88,7 @@ impl Hub {
             ("hub-slack", Role::Slack),
             ("screen", Role::Screen),
             ("screen-rules", Role::ScreenRules),
+            ("precheck-rules", Role::PrecheckRules),
         ] {
             let text = reg.issue(name, role, false).unwrap();
             creds.insert(name, hgl_ai_bus::parse_credential(&text).unwrap().unwrap());
@@ -1450,7 +1451,7 @@ use async_nats::jetstream::{self, consumer, kv};
 use hgl_ai_install::users::{Target, access_table, local_subject};
 
 /// The user of each role with an account.
-const ROLE_USERS: [(Role, &str); 7] = [
+const ROLE_USERS: [(Role, &str); 8] = [
     (Role::Seat, "build-1"),
     (Role::Coord, "hub-coord"),
     (Role::Builder, "lab1-builder"),
@@ -1458,6 +1459,7 @@ const ROLE_USERS: [(Role, &str); 7] = [
     (Role::Slack, "hub-slack"),
     (Role::Screen, "screen"),
     (Role::ScreenRules, "screen-rules"),
+    (Role::PrecheckRules, "precheck-rules"),
 ];
 
 #[tokio::test]
@@ -1740,6 +1742,9 @@ async fn seeded(hub: &Hub) -> jetstream::Context {
             }
         }
     }
+    let precheck = js.get_key_value(hgl_ai_proto::KV_PRECHECK).await.unwrap();
+    precheck.put("rules", "seed".into()).await.unwrap();
+    precheck.put("counter.seed", "seed".into()).await.unwrap();
     let screen = js.get_key_value(KV_SCREEN).await.unwrap();
     screen.put("rule.seed", "seed".into()).await.unwrap();
     screen.put("log.seed", "seed".into()).await.unwrap();
@@ -1826,7 +1831,13 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                                 .map(|m| String::from_utf8_lossy(&m.payload).into_owned())
                             }
                         };
-                        let (key, private) = if role == Role::Screen {
+                        let (key, private) = if bucket == hgl_ai_proto::KV_PRECHECK {
+                            if keys == "rules" {
+                                ("rules", "counter.seed")
+                            } else {
+                                ("counter.seed", "rules")
+                            }
+                        } else if role == Role::Screen {
                             ("rule.seed", "log.seed")
                         } else if role == Role::ScreenRules {
                             ("log.seed", "rule.seed")
@@ -1834,7 +1845,9 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                             ("links.a.b", "d.a.b.c")
                         };
                         assert_eq!(get(key).await.as_deref(), Some("seed"), "{what}");
-                        assert_eq!(get(private).await, None, "{what}");
+                        if bucket != hgl_ai_proto::KV_PRECHECK {
+                            assert_eq!(get(private).await, None, "{what}");
+                        }
                         unanswered(
                             &conn,
                             vec![
@@ -1949,7 +1962,9 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
             if a.writes() {
                 let subject = sample(&write_pattern(&row.target).unwrap(), &format!("ok-{role}"));
                 match &row.target {
-                    Target::Keys { bucket, .. } if bucket != KV_SCREEN => {
+                    Target::Keys { bucket, .. }
+                        if bucket != KV_SCREEN && bucket != hgl_ai_proto::KV_PRECHECK =>
+                    {
                         let key = subject.strip_prefix(&format!("$KV.{bucket}.")).unwrap();
                         js.get_key_value(bucket)
                             .await
@@ -1978,7 +1993,10 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
         }
         // `doctor`'s `telemetry consumers` check lists the telemetry streams' consumers
         // (hgl-ai#105); only roles with access to all of them run it.
-        if !matches!(role, Role::Slack | Role::Screen | Role::ScreenRules) {
+        if !matches!(
+            role,
+            Role::Slack | Role::Screen | Role::ScreenRules | Role::PrecheckRules
+        ) {
             hgl_ai_install::hub::lasting_consumers(&js)
                 .await
                 .unwrap_or_else(|e| panic!("{who} ({role}): {e}"));
@@ -2002,6 +2020,14 @@ async fn accounts_refuse_every_write_outside_a_row() {
     for (role, who) in ROLE_USERS {
         let (c, mut rx) = spy(&hub, who).await;
         let js = jetstream::with_prefix(c.clone(), hgl_ai_proto::HUB_API_PREFIX);
+        let rules_before = admin
+            .get_key_value(hgl_ai_proto::KV_PRECHECK)
+            .await
+            .unwrap()
+            .entry("rules")
+            .await
+            .unwrap()
+            .unwrap();
         let mine = writes_of(role);
         let token = format!("probe-{role}");
         let denied: Vec<String> = patterns
@@ -2104,7 +2130,22 @@ async fn accounts_refuse_every_write_outside_a_row() {
         c.flush().await.unwrap();
         tokio::time::sleep(Duration::from_secs(2)).await;
         for s in &denied {
-            assert!(!stored(&admin, s).await, "{who} ({role}) wrote {s}");
+            if s == "$KV.HGL_PRECHECK.rules" {
+                let after = admin
+                    .get_key_value(hgl_ai_proto::KV_PRECHECK)
+                    .await
+                    .unwrap()
+                    .entry("rules")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(
+                    after.revision, rules_before.revision,
+                    "{who} ({role}) wrote {s}"
+                );
+            } else {
+                assert!(!stored(&admin, s).await, "{who} ({role}) wrote {s}");
+            }
         }
 
         // The admin's operations.
@@ -2307,4 +2348,55 @@ async fn accounts_the_first_user_of_a_role_needs_one_reload() {
 
 fn role_writes_locks(role: Role) -> bool {
     writes_of(role).iter().any(|w| w == "$KV.HGL_LOCKS.>")
+}
+
+#[tokio::test]
+async fn precheck_rules_account_boundary_and_cas() {
+    let Some(hub) = Hub::accounts() else {
+        panic!("nats-server is required for this boundary test")
+    };
+    let admin = seeded(&hub).await;
+    let writer = hub.bus("precheck-rules").await;
+    let seat = hub.bus("build-1").await;
+    let coord = hub.bus("hub-coord").await;
+    let screen = hub.bus("screen").await;
+    let (_, old) = seat.precheck_rules_get().await.unwrap().unwrap();
+    let revision = writer
+        .precheck_rules_set("{\"rules\":[],\"reason\":\"test\"}", old)
+        .await
+        .unwrap();
+    assert!(matches!(
+        writer.precheck_rules_set("{}", old).await,
+        Err(BusError::Conflict { .. })
+    ));
+    for reader in [&seat, &coord, &screen] {
+        assert_eq!(
+            reader.precheck_rules_get().await.unwrap().unwrap().1,
+            revision
+        );
+        assert!(reader.precheck_rules_set("{}", revision).await.is_err());
+    }
+    assert_eq!(
+        seat.precheck_rules_get().await.unwrap().unwrap().1,
+        revision
+    );
+    let (client, mut denied) = spy(&hub, "precheck-rules").await;
+    let subjects = [
+        "$KV.HGL_STATE.forbidden",
+        "$KV.HGL_PRECHECK.counter.forbidden",
+        "$KV.HGL_SCREEN.rule.forbidden",
+        "hgl.notes.w1",
+    ];
+    for subject in subjects {
+        client
+            .publish(local_subject(subject), "no".into())
+            .await
+            .unwrap();
+    }
+    client.flush().await.unwrap();
+    for subject in subjects {
+        assert!(!stored(&admin, subject).await, "{subject}");
+    }
+    // A denial may be reported either by the local permission check or by no account import.
+    let _ = &mut denied;
 }

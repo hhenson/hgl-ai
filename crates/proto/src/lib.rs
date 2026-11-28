@@ -9,6 +9,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+pub mod precheck;
 pub mod usage;
 pub use usage::{
     KV_USAGE, STREAM_USAGE, USAGE_PREFIX, UsageBucket, UsageLabel, UsageRecord,
@@ -59,6 +60,7 @@ pub const VIEWER_STATE_KEYS: [&str; 6] = ["prs", "backlog", "landed.log", "tasks
 /// The Slack adapter's delivery state and thread mappings.
 pub const KV_SLACK: &str = "HGL_SLACK";
 /// Rules and decision records for the screen.
+pub const KV_PRECHECK: &str = "HGL_PRECHECK";
 pub const KV_SCREEN: &str = "HGL_SCREEN";
 pub const SCREEN_RULE_KEYS: &str = "rule.>";
 pub const SCREEN_LOG_KEYS: &str = "log.>";

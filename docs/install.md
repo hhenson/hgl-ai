@@ -142,6 +142,7 @@ hgl-ai server user ...`).
 | `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
 | `screen` | publishes `hgl.notes.screen.<seat>` and `HGL_SCREEN/log.>`; pulls and acknowledges `inbox-screen`; reads `HGL_STATE`, `HGL_TREES` and `HGL_SCREEN/rule.>` |
+| `precheck-rules` | writes `HGL_PRECHECK/rules` only |
 | `screen-rules` | writes `HGL_SCREEN/rule.>` and reads `HGL_SCREEN/log.>` by key |
 | `viewer` | nothing by subject (replies are not enforced until hgl-ai#141): reads and watches `HGL_HOSTS`, `HGL_TREES`, `HGL_METRICS`, `HGL_BUILD`, `HGL_USAGE`, and of `HGL_STATE` only `prs`, `backlog`, `landed.log`, `tasks`, `mode`, `hold` (the console's page, docs/owner.md §3); consumers only in the filtered create form; subscribes to `_INBOX_VIEWER.>` only; no other stream or bucket, no consumer delete (docs/design.md §9) |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
@@ -358,3 +359,9 @@ runs no hgl-ai.
    <proxy>`, its reachability, free disk and tool versions.
 
 The alias and directory stay in the proxy's file, never on the hub.
+
+The pre-check rule writer uses a separate owner-held `precheck-rules` NKey. Generate
+its seed in the owner's account and register only its public key with
+`server user add --role precheck-rules --nkey`; the installer writes no seed.
+The controller applies proposed files with that credential. Isolated accounts are
+required for the write boundary.

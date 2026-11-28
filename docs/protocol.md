@@ -73,6 +73,7 @@ before hub users takes one shared token until it moves.
 | State | KV `HGL_STATE` | file storage, history 5 |
 | Hosts | KV `HGL_HOSTS` | memory storage, TTL 120 s |
 | Trees | KV `HGL_TREES` | file storage, history 1 |
+| Pre-check | KV `HGL_PRECHECK` | file storage, history 5; `rules` and `counter.<id>` keys |
 | Screen | KV `HGL_SCREEN` | file storage, history 5, `rule.>` and `log.>` keys |
 | Locks | KV `HGL_LOCKS` | file storage, history 1, `max_age` 30 min |
 | Ended | KV `HGL_ENDED` | file storage, history 1, `max_age` 15 d |
@@ -419,3 +420,20 @@ command or file, never a prompt (no model turn):
   in force. Seat and coordinator users may publish both, and every role reads the
   history; a host is to publish only the accounts its registration lists
   (#36).
+
+### Pre-check rule store
+
+`HGL_PRECHECK/rules` is a JSON object with `reason` and `rules`. The rules key's
+JetStream revision is the list version. A rule has `id` (`PC-` followed by a
+positive integer), `status` (`trial`, `active`, `retired`), `kind`
+(`mechanical`, `judgement`), `catches`, `check`, `applies` (array of patterns),
+`ask`, `example`, `sources` (array) and optional `repos` (array). Text fields and
+arrays must be nonempty, IDs unique, and the list has at most 30 rules.
+`counter.<id>` holds JSON counters `fires`, `catches`, `false_positives`, and
+`misses`; it is independent of the rule list.
+
+On the isolated account layout, SEAT, COORD, BUILDER and SCREEN read rules;
+only PRECHECK_RULES writes the list. COORD writes counters. The list write uses
+compare-and-set, with revision 0 for creation; the reason and list are committed
+together. PRECHECK_RULES holds no other write permission. A shared-token or
+single-account hub does not provide this isolation.
