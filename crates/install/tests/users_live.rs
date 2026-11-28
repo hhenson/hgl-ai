@@ -10,7 +10,7 @@ use futures::StreamExt;
 use hgl_ai_bus::{Bus, BusError, Credential};
 use hgl_ai_install::nats::{Auth, Websocket, render_conf_ws};
 use hgl_ai_install::users::{Registry, Role};
-use hgl_ai_proto::{Kind, MetricsSample, Note, Seat};
+use hgl_ai_proto::{KV_SCREEN, Kind, MetricsSample, Note, Seat};
 
 struct Server(Child, #[allow(dead_code)] tempfile::TempDir);
 impl Drop for Server {
@@ -95,6 +95,7 @@ impl Hub {
             ("hub-admin", Role::Admin),
             ("lab2", Role::Seat),
             ("hub-slack", Role::Slack),
+            ("screen", Role::Screen),
         ] {
             let text = reg.issue(name, role, false).unwrap();
             creds.insert(name, hgl_ai_bus::parse_credential(&text).unwrap().unwrap());
@@ -1419,13 +1420,158 @@ use async_nats::jetstream::{self, consumer, kv};
 use hgl_ai_install::users::{Target, access_table, local_subject};
 
 /// The user of each role with an account.
-const ROLE_USERS: [(Role, &str); 5] = [
+const ROLE_USERS: [(Role, &str); 6] = [
     (Role::Seat, "build-1"),
     (Role::Coord, "hub-coord"),
     (Role::Builder, "lab1-builder"),
     (Role::Console, "console"),
     (Role::Slack, "hub-slack"),
+    (Role::Screen, "screen"),
 ];
+
+#[tokio::test]
+async fn screen_notes_require_the_screen_sender_subject_and_kind_on_both_layouts() {
+    for accounts in [false, true] {
+        let Some(hub) = Hub::start_layout(accounts, &[], |_, conf| conf) else {
+            return;
+        };
+        let admin = hub.bus("hub-admin").await;
+        admin.provision().await.unwrap();
+        let js = hub.admin_js().await;
+        let worker = seat("w1");
+        let mut inbox = admin.inbox(&worker).await.unwrap();
+        let answer = Note::new(
+            Seat::screen(),
+            worker.clone(),
+            Kind::Answer,
+            "screen answer",
+        );
+        let digest = Note::new(Seat::screen(), worker.clone(), Kind::Note, "screen digest");
+        let worker_note = Note::new(seat("w2"), worker.clone(), Kind::Note, "seat note");
+        let wrong_kind = Note::new(Seat::screen(), worker.clone(), Kind::Question, "question");
+        let wrong_recipient = Note::new(Seat::screen(), seat("w2"), Kind::Note, "wrong recipient");
+        // Use the admin only to seed malformed envelopes that the receiver must reject.
+        for (subject, note) in [
+            (worker.subject(), &answer),
+            (worker.owner_subject(), &answer),
+            (worker.screen_subject(), &worker_note),
+            (worker.screen_subject(), &wrong_kind),
+            (worker.screen_subject(), &wrong_recipient),
+        ] {
+            js.publish(subject, serde_json::to_vec(note).unwrap().into())
+                .await
+                .unwrap()
+                .await
+                .unwrap();
+        }
+        let screen = hub.bus("screen").await;
+        let w2 = hub.bus("build-1").await;
+        assert!(matches!(
+            w2.send(&answer).await,
+            Err(BusError::Denied { .. })
+        ));
+        screen.send(&answer).await.unwrap();
+        screen.send(&digest).await.unwrap();
+        w2.send(&worker_note).await.unwrap();
+
+        let expected = [&answer, &digest, &worker_note];
+        let peek = admin.peek(&worker, 20, Duration::ZERO).await.unwrap();
+        assert_eq!(peek.iter().map(|n| &n.note).collect::<Vec<_>>(), expected);
+        let delivered = inbox.fetch(20, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(
+            delivered.iter().map(|d| &d.note).collect::<Vec<_>>(),
+            expected
+        );
+        for d in delivered {
+            d.ack().await.unwrap();
+        }
+        let info = js
+            .get_stream("HGL_NOTES")
+            .await
+            .unwrap()
+            .consumer_info(worker.consumer())
+            .await
+            .unwrap();
+        assert_eq!(
+            info.num_ack_pending, 0,
+            "malformed deliveries are terminated"
+        );
+        if !accounts {
+            let intake = Note::new(seat("w2"), Seat::screen(), Kind::Question, "intake");
+            w2.send(&intake).await.unwrap();
+            let mut inbox = screen.inbox(&Seat::screen()).await.unwrap();
+            let mut delivered = inbox.fetch(1, Duration::from_secs(2)).await.unwrap();
+            let delivery = delivered.pop().unwrap();
+            assert_eq!(delivery.note, intake);
+            delivery.ack().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn screen_cannot_read_or_reconfigure_other_notes_on_accounts_layout() {
+    let Some(hub) = Hub::accounts() else { return };
+    let admin = seeded(&hub).await;
+    let stream = admin.get_stream("HGL_NOTES").await.unwrap();
+    let other = stream
+        .create_consumer(consumer::pull::Config {
+            durable_name: Some("other".into()),
+            filter_subject: "hgl.notes.seed".into(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    assert_eq!(other.cached_info().num_pending, 2);
+    let (screen, _) = hub.js_of("screen").await;
+    let p = hgl_ai_proto::HUB_API_PREFIX;
+    let notes = "HGL_NOTES";
+    let intake = Seat::screen().consumer();
+    let create = serde_json::json!({
+        "stream_name": notes,
+        "config": {"durable_name": intake, "ack_policy": "explicit"}
+    });
+    unanswered(
+        &screen,
+        vec![
+            (
+                format!("{p}.CONSUMER.CREATE.{notes}.{intake}"),
+                create.clone(),
+            ),
+            (
+                format!("{p}.CONSUMER.DURABLE.CREATE.{notes}.{intake}"),
+                create,
+            ),
+            (
+                format!("{p}.CONSUMER.MSG.NEXT.{notes}.other"),
+                serde_json::json!({"batch": 1}),
+            ),
+            (
+                format!("{p}.STREAM.MSG.GET.{notes}"),
+                serde_json::json!({"seq": 1}),
+            ),
+            (
+                format!("{p}.STREAM.INFO.{notes}"),
+                serde_json::json!({"subjects_filter": ">"}),
+            ),
+            (format!("{p}.STREAM.INFO.HGL_OWNER"), serde_json::json!({})),
+            (
+                format!("{p}.STREAM.INFO.KV_HGL_THREADS"),
+                serde_json::json!({}),
+            ),
+            (
+                format!("{p}.STREAM.INFO.KV_HGL_LOCKS"),
+                serde_json::json!({}),
+            ),
+            (
+                format!("{p}.STREAM.INFO.KV_HGL_BUILD"),
+                serde_json::json!({}),
+            ),
+        ],
+    )
+    .await;
+    assert_eq!(stream.consumer_info(&intake).await.unwrap().num_pending, 2);
+    assert_eq!(stream.consumer_info("other").await.unwrap().num_pending, 2);
+}
 
 /// A NATS subject pattern matches `subject`.
 fn matches(pattern: &str, subject: &str) -> bool {
@@ -1518,7 +1664,15 @@ async fn seeded(hub: &Hub) -> jetstream::Context {
             }
         }
     }
-    for s in ["hgl.notes.seed", "hgl.owner.thread.seed", "hgl.usage.seed"] {
+    let screen = js.get_key_value(KV_SCREEN).await.unwrap();
+    screen.put("rule.seed", "seed".into()).await.unwrap();
+    screen.put("log.seed", "private".into()).await.unwrap();
+    for s in [
+        "hgl.notes.seed",
+        "hgl.notes.screen",
+        "hgl.owner.thread.seed",
+        "hgl.usage.seed",
+    ] {
         for _ in 0..2 {
             js.publish(s, "seed".into()).await.unwrap().await.unwrap();
         }
@@ -1596,8 +1750,13 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                                 .map(|m| String::from_utf8_lossy(&m.payload).into_owned())
                             }
                         };
-                        assert_eq!(get("links.a.b").await.as_deref(), Some("seed"), "{what}");
-                        assert_eq!(get("d.a.b.c").await, None, "{what}");
+                        let (key, private) = if bucket == KV_SCREEN {
+                            ("rule.seed", "log.seed")
+                        } else {
+                            ("links.a.b", "d.a.b.c")
+                        };
+                        assert_eq!(get(key).await.as_deref(), Some("seed"), "{what}");
+                        assert_eq!(get(private).await, None, "{what}");
                         unanswered(
                             &conn,
                             vec![
@@ -1682,18 +1841,49 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                             "{what}"
                         );
                     }
+                    Target::ProvisionedFeed { stream, consumer } => {
+                        let c = js
+                            .get_consumer_from_stream(consumer, stream)
+                            .await
+                            .expect(&what);
+                        let got = pull(&c, 2).await;
+                        assert_eq!(got.len(), 2, "{what}");
+                        for m in got {
+                            assert_eq!(m.subject.as_str(), Seat::screen().subject());
+                            m.double_ack().await.expect(&what);
+                        }
+                        assert_eq!(
+                            admin
+                                .get_stream(stream)
+                                .await
+                                .unwrap()
+                                .consumer_info(consumer)
+                                .await
+                                .unwrap()
+                                .num_ack_pending,
+                            0,
+                            "{what}"
+                        );
+                    }
                     Target::Subjects(_) => unreachable!(),
                 }
             }
             if a.writes() {
                 let subject = sample(&write_pattern(&row.target).unwrap(), &format!("ok-{role}"));
                 match &row.target {
-                    Target::Keys { bucket, .. } => {
+                    Target::Keys { bucket, .. } if bucket != KV_SCREEN => {
                         let key = subject.strip_prefix(&format!("$KV.{bucket}.")).unwrap();
                         js.get_key_value(bucket)
                             .await
                             .expect(&what)
                             .put(key, "ok".into())
+                            .await
+                            .expect(&what);
+                    }
+                    Target::Keys { .. } => {
+                        js.publish(local_subject(&subject), "ok".into())
+                            .await
+                            .expect(&what)
                             .await
                             .expect(&what);
                     }
@@ -1709,8 +1899,8 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
             }
         }
         // `doctor`'s `telemetry consumers` check lists the telemetry streams' consumers
-        // (hgl-ai#105); Slack reads no telemetry.
-        if role != Role::Slack {
+        // (hgl-ai#105); only roles with access to all of them run it.
+        if !matches!(role, Role::Slack | Role::Screen) {
             hgl_ai_install::hub::lasting_consumers(&js)
                 .await
                 .unwrap_or_else(|e| panic!("{who} ({role}): {e}"));
@@ -1769,21 +1959,28 @@ async fn accounts_refuse_every_write_outside_a_row() {
             requests.push((local_subject(&sample(w, &format!("ok-{role}"))), "x".into()));
         }
         let pullable = access_table().into_iter().find_map(|r| match r.target {
-            Target::Stream(s) if r.of(role).reads() => Some((s, format!("probe-{role}"))),
-            Target::Feed { stream, consumer } if r.of(role).reads() => Some((stream, consumer)),
+            Target::Stream(s) if r.of(role).reads() => Some((s, format!("probe-{role}"), true)),
+            Target::Feed { stream, consumer } if r.of(role).reads() => {
+                Some((stream, consumer, true))
+            }
+            Target::ProvisionedFeed { stream, consumer } if r.of(role).reads() => {
+                Some((stream, consumer, false))
+            }
             _ => None,
         });
-        let (stream, durable) = pullable.unwrap();
-        js.get_stream(&stream)
-            .await
-            .unwrap()
-            .create_consumer(consumer::pull::Config {
-                durable_name: Some(durable.clone()),
-                ack_policy: consumer::AckPolicy::Explicit,
-                ..Default::default()
-            })
-            .await
-            .unwrap();
+        let (stream, durable, create) = pullable.unwrap();
+        if create {
+            js.get_stream(&stream)
+                .await
+                .unwrap()
+                .create_consumer(consumer::pull::Config {
+                    durable_name: Some(durable.clone()),
+                    ack_policy: consumer::AckPolicy::Explicit,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+        }
         requests.push((
             format!(
                 "{}.CONSUMER.MSG.NEXT.{stream}.{durable}",
@@ -1974,7 +2171,11 @@ async fn accounts_ack_batch_and_leases_work_across_accounts() {
 /// before it had a user.
 #[tokio::test]
 async fn accounts_the_first_user_of_a_role_needs_one_reload() {
-    let new = [("lab1-builder", Role::Builder), ("hub-slack", Role::Slack)];
+    let new = [
+        ("lab1-builder", Role::Builder),
+        ("hub-slack", Role::Slack),
+        ("screen", Role::Screen),
+    ];
     let Some(hub) = Hub::accounts_without(&new.map(|n| n.0)) else {
         return;
     };
@@ -2009,6 +2210,17 @@ async fn accounts_the_first_user_of_a_role_needs_one_reload() {
         .await
         .unwrap();
     assert!(stored(&admin, &subject).await);
+    let (client, screen) = hub.js_of("screen").await;
+    let subject = local_subject("$JS.API.DIRECT.GET.KV_HGL_SCREEN.$KV.HGL_SCREEN.rule.seed");
+    assert_eq!(
+        client.request(subject, "".into()).await.unwrap().payload,
+        "seed"
+    );
+    let intake: consumer::PullConsumer = screen
+        .get_consumer_from_stream(Seat::screen().consumer(), "HGL_NOTES")
+        .await
+        .unwrap();
+    assert_eq!(intake.cached_info().num_pending, 2);
 }
 
 fn role_writes_locks(role: Role) -> bool {

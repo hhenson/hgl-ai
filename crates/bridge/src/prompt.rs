@@ -153,6 +153,8 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
                  the thread (OWN-4, OWN-10):",
                 n.by.as_deref().unwrap_or("owner")
             );
+        } else if n.sender.is_screen() {
+            s.push_str("From the screen, not a ruling.\n");
         }
         s.push_str(&truncate(n.body.trim_end(), budget));
         s.push('\n');
@@ -292,6 +294,12 @@ mod tests {
         o.by = None;
         let p = build(&ctx(None, &s), &[(2, 1, &o)]);
         assert!(p.contains("The owner says, through the console"));
+
+        let reply = Note::new(Seat::screen(), seat("w1"), Kind::Answer, "See #184.");
+        let p = build(&ctx(None, &s), &[(3, 1, &reply)]);
+        assert!(p.contains("answer from screen to w1"));
+        assert!(p.contains("From the screen, not a ruling.\nSee #184."));
+        assert!(!p.contains("Post a ruling"));
     }
 
     #[test]

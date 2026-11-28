@@ -141,11 +141,14 @@ hgl-ai server user ...`).
 | `builder` | a seat's, and the local build verdicts `HGL_STATE/verdict.*` (BUILD-15) |
 | `console` | `hgl.owner.thread.<id>`, `hgl.notes.owner.<seat>`, `tick` notes, `HGL_THREADS`, `decisions.log` |
 | `slack` | `hgl.owner.thread.<id>.slack.<team>.<channel>.<source>` and `HGL_SLACK` |
+| `screen` | publishes `hgl.notes.screen.<seat>` and `HGL_SCREEN/log.>`; pulls and acknowledges `inbox-screen`; reads `HGL_STATE`, `HGL_TREES` and `HGL_SCREEN/rule.>` |
 | `viewer` | nothing by subject (replies are not enforced until hgl-ai#141): reads and watches `HGL_HOSTS`, `HGL_TREES`, `HGL_METRICS`, `HGL_BUILD`, `HGL_USAGE`, and of `HGL_STATE` only `prs`, `backlog`, `landed.log`, `tasks`, `mode`, `hold` (the console's page, docs/owner.md §3); consumers only in the filtered create form; subscribes to `_INBOX_VIEWER.>` only; no other stream or bucket, no consumer delete (docs/design.md §9) |
 | `admin` | everything (`hgl-ai init`, `server install`, `build recipe import`) |
 
 The console keeps session state in `HGL_CONSOLE`. The Slack adapter reads its own
 delivery state, its durable `HGL_OWNER` feed and opening events by sequence.
+The controller writes `HGL_SCREEN` rules with the admin credential. The
+`SCREEN` account isolates JetStream replies on the role-account layout.
 The console can read the Slack permalink index.
 Seat, coordinator and builder users read `HGL_OWNER` through short-lived consumers.
 The `viewer` reads only the telemetry, as above.
