@@ -214,12 +214,44 @@ pub async fn run(
         )
         .await
         {
-            Ok(adapter) => break adapter,
-            Err(e) => pause(&mut slack_retry, Some(e), "Slack adapter startup").await,
+            Ok(adapter) => {
+                break adapter;
+            }
+            Err(e) => {
+                let delay = startup_failure(&bus, &mut slack_retry, &e).await;
+                sleep(delay).await;
+            }
         }
     };
     tokio::join!(adapter.outbound_loop(), adapter.socket_loop());
     Ok(())
+}
+
+// The API layer sanitizes its errors before they reach this point. Keep the
+// original error for Retry-After while recording the same chain that is logged.
+async fn startup_failure(bus: &Bus, retries: &mut Backoff, error: &anyhow::Error) -> Duration {
+    let delay = retries.delay(Some(error));
+    let message = format!("{error:#}");
+    tracing::warn!(?delay, "Slack adapter startup: {message}");
+    let _ = record_startup(bus, Some(message)).await;
+    delay
+}
+
+async fn record_startup(bus: &Bus, error: Option<String>) -> bool {
+    let value = error.as_deref().unwrap_or("ok");
+    if let Err(error) = bus.state_put(hgl_ai_proto::SLACK_STARTUP_KEY, value).await {
+        tracing::warn!("could not write Slack startup status to the hub: {error}");
+        return false;
+    }
+    true
+}
+
+// A refused or temporarily unavailable status write must not stall the adapter.
+async fn clear_startup(bus: &Bus) {
+    let mut retry = Backoff::default();
+    while !record_startup(bus, None).await {
+        sleep(retry.delay(None)).await;
+    }
 }
 
 fn retry_delay(retries: &mut Backoff, error: Option<anyhow::Error>, operation: &str) -> Duration {
@@ -467,19 +499,41 @@ impl<'a> Adapter<'a> {
         F: FnMut(Duration) -> Fut,
         Fut: std::future::Future<Output = ()>,
     {
-        let mut retries = Backoff::default();
-        loop {
-            let started = Instant::now();
-            let result = self.socket_session().await;
-            if started.elapsed() >= HEALTHY {
-                retries = Backoff::default();
+        let (connected, ready) = tokio::sync::oneshot::channel();
+        let status = async {
+            if ready.await.is_ok() {
+                clear_startup(self.bus).await;
             }
-            wait(retry_delay(&mut retries, result.err(), "Slack Socket Mode")).await;
-        }
+        };
+        let sessions = async {
+            let mut connected = Some(connected);
+            let mut retries = Backoff::default();
+            loop {
+                let started = Instant::now();
+                let result = self.socket_session(&mut connected).await;
+                if started.elapsed() >= HEALTHY {
+                    retries = Backoff::default();
+                }
+                let delay = match result {
+                    Err(error) if connected.is_some() => {
+                        startup_failure(self.bus, &mut retries, &error).await
+                    }
+                    result => retry_delay(&mut retries, result.err(), "Slack Socket Mode"),
+                };
+                wait(delay).await;
+            }
+        };
+        tokio::join!(sessions, status);
     }
 
-    async fn socket_session(&self) -> Result<()> {
+    async fn socket_session(
+        &self,
+        connected: &mut Option<tokio::sync::oneshot::Sender<()>>,
+    ) -> Result<()> {
         let mut socket = self.web.socket().await?;
+        if let Some(connected) = connected.take() {
+            let _ = connected.send(());
+        }
         while let Some(frame) = timeout(Duration::from_secs(120), socket.next())
             .await
             .context("Slack Socket Mode went quiet")?

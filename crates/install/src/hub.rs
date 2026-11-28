@@ -18,6 +18,8 @@ pub trait Hub {
     fn provision(&self, cfg: &Config) -> impl Future<Output = Result<(), BusError>>;
     /// Doctor: `Err` when unreachable, else the stream and buckets that are missing.
     fn health(&self, cfg: &Config) -> impl Future<Output = Result<Vec<String>, String>>;
+    /// Slack startup status: `None` if unrecorded, `ok` on success, otherwise the error.
+    fn slack_startup(&self, cfg: &Config) -> impl Future<Output = Result<Option<String>, String>>;
     /// Doctor: `Some(true)` when the hub lets this host's hub user subscribe to `_INBOX.>`,
     /// every client's replies (a `nats.conf` from before hgl-ai#111), `Some(false)` when it
     /// refuses. `None`: cannot tell (unreachable, no answer in time, the shared token, or a
@@ -92,6 +94,14 @@ impl Hub for BusHub {
 
     async fn provision(&self, cfg: &Config) -> Result<(), BusError> {
         Bus::connect(cfg).await?.provision().await
+    }
+
+    async fn slack_startup(&self, cfg: &Config) -> Result<Option<String>, String> {
+        let bus = Bus::connect(cfg).await.map_err(|e| e.to_string())?;
+        bus.state_get(hgl_ai_proto::SLACK_STARTUP_KEY)
+            .await
+            .map(|record| record.map(|entry| entry.value))
+            .map_err(|e| e.to_string())
     }
 
     /// Read-only: the bus API has no existence check that does not create, so
@@ -191,6 +201,7 @@ pub(crate) mod fake {
     pub struct FakeHub {
         pub reachable: bool,
         pub missing: Vec<String>,
+        pub slack_error: Option<String>,
         pub calls: RefCell<Vec<&'static str>>,
         /// What `durables` finds.
         pub durables: Vec<String>,
@@ -205,6 +216,7 @@ pub(crate) mod fake {
             FakeHub {
                 reachable: true,
                 missing: Vec::new(),
+                slack_error: Some("ok".into()),
                 durables: Vec::new(),
                 calls: RefCell::new(Vec::new()),
                 creds: RefCell::new(Vec::new()),
@@ -237,6 +249,11 @@ pub(crate) mod fake {
         }
         async fn provision(&self, cfg: &Config) -> Result<(), BusError> {
             self.answer("provision", cfg)
+        }
+        async fn slack_startup(&self, cfg: &Config) -> Result<Option<String>, String> {
+            self.answer("slack_startup", cfg)
+                .map(|()| self.slack_error.clone())
+                .map_err(|e| e.to_string())
         }
         async fn health(&self, cfg: &Config) -> Result<Vec<String>, String> {
             self.answer("health", cfg)

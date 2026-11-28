@@ -1606,6 +1606,9 @@ async fn accounts_every_role_reads_and_writes_its_rows() {
                     Target::AccountInfo => {
                         assert!(js.query_account().await.unwrap().streams > 0, "{what}");
                     }
+                    Target::StreamInfo(stream) => {
+                        js.get_stream(stream).await.expect(&what);
+                    }
                     Target::Keys { bucket, keys } if keys != ">" => {
                         // Some keys: a direct get by subject, and no more: no other key,
                         // no stream state (counts, key names), no consumer.

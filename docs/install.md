@@ -88,6 +88,8 @@ hgl-ai ...` (`server user add`, `doctor`).
 
 Use the existing Slack app with Socket Mode, `chat:write`, `groups:history`,
 `app_mentions:read`, and the `message.groups` and `app_mention` bot events.
+Do not grant `channels:history`, `im:history`, or `mpim:history`; the adapter
+requires private channel history only. Reinstall the app after changing scopes.
 Enable `settings.interactivity.is_enabled` in the
 app manifest for the answer and Close buttons. Socket Mode delivers their callbacks
 over the outbound connection. Install it in the workspace and invite it to the
@@ -113,7 +115,10 @@ A plain server reinstall retains the Slack service once enabled.
 
 The script provisions the Slack hub user and starts `hgl-ai-slack` as the server
 user alongside the console. The adapter opens outbound HTTPS and WebSocket
-connections. `server status` shows its service state and log location.
+connections. `server status` shows its service state and log location. `doctor`
+reports a recorded startup error and its fix. After upgrading an existing Slack
+install, rerun `hgl-ai server install --slack --keep-token --print-root-steps` and
+apply the reviewed root steps to refresh hub permissions and restart the services.
 
 ### Upgrading an install from before hgl-ai#63
 

@@ -335,6 +335,8 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             publish_allow: vec![
                 SLACK_OWNER_FILTER.into(),
                 format!("$KV.{KV_SLACK}.>"),
+                format!("$KV.{KV_STATE}.{}", hgl_ai_proto::SLACK_STARTUP_KEY),
+                format!("$JS.API.STREAM.INFO.{}", kv(KV_STATE)),
                 format!("$JS.API.STREAM.INFO.{slack_bucket}"),
                 format!("$JS.API.DIRECT.GET.{slack_bucket}.>"),
                 format!("$JS.API.STREAM.MSG.GET.{slack_bucket}"),
@@ -585,6 +587,8 @@ impl Access {
 pub enum Target {
     /// `$JS.API.INFO`: the hub's JetStream use and limits.
     AccountInfo,
+    /// Stream metadata, without message or consumer access.
+    StreamInfo(String),
     /// The keys of `bucket` matching `keys` (`>`: all). Read: get by key (a direct get
     /// by subject), and, for all keys, the stream's state, by sequence and through pull
     /// consumers. Write: put, create, update, delete.
@@ -657,6 +661,11 @@ pub fn access_table() -> Vec<Row> {
         ),
         row(all(KV_THREADS), [R, R, R, RW, No]),
         row(all(KV_STATE), [RW, RW, RW, R, No]),
+        row(
+            keys(KV_STATE, hgl_ai_proto::SLACK_STARTUP_KEY),
+            [No, No, No, No, W],
+        ),
+        row(Target::StreamInfo(kv(KV_STATE)), [No, No, No, No, R]),
         row(keys(KV_STATE, "decisions.log"), [No, No, No, W, No]),
         // The local build verdicts the merge gate reads (BUILD-15).
         row(all(KV_VERDICTS), [R, R, RW, R, No]),
@@ -715,6 +724,7 @@ impl Target {
         if access.reads() {
             match self {
                 Target::AccountInfo => out.push(api("INFO")),
+                Target::StreamInfo(stream) => out.push(api(&format!("STREAM.INFO.{stream}"))),
                 Target::Keys { bucket, keys } => {
                     let s = kv(bucket);
                     out.push(api_stream(&format!("DIRECT.GET.{s}.$KV.{bucket}.{keys}")));
@@ -1356,7 +1366,20 @@ mod tests {
                 "hgl.owner.thread.*",
             ]
         );
-        assert_eq!(writes(Role::Slack), ["$KV.HGL_SLACK.>", SLACK_OWNER_FILTER]);
+        assert_eq!(
+            writes(Role::Slack),
+            [
+                "$KV.HGL_SLACK.>",
+                "$KV.HGL_STATE.slack.startup",
+                SLACK_OWNER_FILTER
+            ]
+        );
+        assert!(has(Role::Slack, "$JS.API.STREAM.INFO.KV_HGL_STATE"));
+        assert!(
+            !role_services(Role::Slack)
+                .iter()
+                .any(|s| s.subject.starts_with("$JS.API.DIRECT.GET.KV_HGL_STATE"))
+        );
         // Seats read `HGL_OWNER` by sequence: no consumer, no feed, no ack.
         for r in [Role::Seat, Role::Coord, Role::Builder] {
             assert!(has(r, "$JS.API.STREAM.MSG.GET.HGL_OWNER"));
