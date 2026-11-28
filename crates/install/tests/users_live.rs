@@ -1515,9 +1515,6 @@ async fn consume(
     (answer, got)
 }
 
-/// What the hub holds that the viewer may not read: values of `HGL_STATE` outside the
-/// page's keys.
-
 /// The console's page reads and watches the telemetry buckets as `viewer`, and can do
 /// nothing else by subject: no write, no notes, no threads, no console state, no other
 /// stream, and of `HGL_STATE` only the page's keys. (Writes through replies are not
