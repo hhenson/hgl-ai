@@ -14,6 +14,21 @@ use hgl_ai_bus::Bus;
 use hgl_ai_proto::build::{BUILD_VERSION, BuildJob, BuildStatus, reply_seat};
 use hgl_ai_proto::{Kind, Note, Seat};
 
+fn short_path(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    let a: Vec<_> = cwd.components().collect();
+    let b: Vec<_> = path.components().collect();
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let mut relative = PathBuf::new();
+    for _ in common..a.len() {
+        relative.push("..");
+    }
+    for part in &b[common..] {
+        relative.push(part.as_os_str());
+    }
+    relative
+}
+
 struct Nats(Child, #[allow(dead_code)] tempfile::TempDir, String, String);
 
 impl Drop for Nats {
@@ -209,7 +224,7 @@ impl Rig {
         store::recipe_put(&bus, recipe, None).await.unwrap();
         let mut cfg = hgl_ai_config::Config::new("lab1");
         cfg.paths.work_root = root.join("work").display().to_string();
-        cfg.paths.data_dir = root.join("data").display().to_string();
+        cfg.paths.data_dir = short_path(&root.join("data")).display().to_string();
         cfg.builder.toolchains = vec!["git".into()];
         if o.remote {
             let state = root.join("winbox");

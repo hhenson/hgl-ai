@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use hgl_ai_proto::build::Platform;
+use sha2::{Digest, Sha256};
 
 use super::{
     ARTIFACT_FILES, ARTIFACT_LIMIT, Cancel, Checkout, Executor, HostError, HostOps, Out, Prep,
@@ -356,7 +357,7 @@ pub struct Conn {
 }
 
 impl Conn {
-    /// `dir` holds the control socket and the master's log; it is made with mode 0700.
+    /// `dir` holds the master's log and, when short enough, its control socket.
     pub fn new(
         label: &str,
         alias: &str,
@@ -367,13 +368,13 @@ impl Conn {
         std::fs::create_dir_all(dir)?;
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
-        let socket = dir.join(format!("{label}.sock"));
-        if socket.as_os_str().len() > 100 {
-            return Err(std::io::Error::other(format!(
-                "the control socket path {} is too long for a Unix socket",
-                socket.display()
-            )));
-        }
+        let socket = control_socket(
+            dir,
+            label,
+            std::env::var_os("XDG_RUNTIME_DIR")
+                .as_deref()
+                .map(Path::new),
+        )?;
         let (tx, _) = tokio::sync::watch::channel(false);
         Ok(Arc::new(Conn {
             label: label.to_string(),
@@ -633,6 +634,61 @@ impl Conn {
         self.stop_master();
         self.set(false, Some("closed".into()));
     }
+}
+
+fn control_socket(dir: &Path, label: &str, runtime: Option<&Path>) -> std::io::Result<PathBuf> {
+    let socket = dir.join(format!("{label}.sock"));
+    if socket.as_os_str().len() <= 100 {
+        return Ok(socket);
+    }
+    let runtime = runtime.filter(|p| p.is_absolute()).ok_or_else(|| {
+        std::io::Error::other("control socket path is too long and XDG_RUNTIME_DIR is unavailable")
+    })?;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let metadata = std::fs::metadata(runtime)?;
+    // SAFETY: geteuid has no preconditions.
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::other(
+            "XDG_RUNTIME_DIR must be a private directory owned by the current user",
+        ));
+    }
+    let sockets = runtime.join("hgl-ai");
+    let mut builder = std::fs::DirBuilder::new();
+    use std::os::unix::fs::DirBuilderExt;
+    builder.mode(0o700);
+    match builder.create(&sockets) {
+        Ok(()) => (),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(e) => return Err(e),
+    }
+    let metadata = std::fs::symlink_metadata(&sockets)?;
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(std::io::Error::other(
+            "control socket directory is not private",
+        ));
+    }
+    let socket = fallback_socket(&sockets, &std::fs::canonicalize(dir)?, label);
+    if socket.as_os_str().len() > 100 {
+        return Err(std::io::Error::other(
+            "XDG_RUNTIME_DIR is too long for a control socket",
+        ));
+    }
+    Ok(socket)
+}
+
+fn fallback_socket(sockets: &Path, dir: &Path, label: &str) -> PathBuf {
+    let mut hash = Sha256::new();
+    use std::os::unix::ffi::OsStrExt;
+    hash.update(dir.as_os_str().as_bytes());
+    hash.update([0]);
+    hash.update(label.as_bytes());
+    sockets.join(format!("{}.sock", hex::encode(&hash.finalize()[..16])))
 }
 
 impl Drop for Conn {
@@ -1240,6 +1296,21 @@ fn copy(mut r: impl Read, file: &Mutex<std::fs::File>) {
 
 #[cfg(test)]
 mod tests {
+    fn short_path(path: &Path) -> PathBuf {
+        let cwd = std::env::current_dir().unwrap();
+        let a: Vec<_> = cwd.components().collect();
+        let b: Vec<_> = path.components().collect();
+        let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+        let mut relative = PathBuf::new();
+        for _ in common..a.len() {
+            relative.push("..");
+        }
+        for part in &b[common..] {
+            relative.push(part.as_os_str());
+        }
+        relative
+    }
+
     use super::*;
 
     // What only a real Windows host checks: that PowerShell runs these scripts as
@@ -1285,6 +1356,29 @@ mod tests {
         assert!(d.command(&"x".repeat(MAX_COMMAND)).is_err());
     }
 
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn long_control_socket_uses_private_runtime_and_is_stable() {
+        let tmp = tempfile::tempdir().unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let runtime = Path::new("/proc/self/cwd").join(short_path(tmp.path()));
+        let dir = tmp.path().join("d".repeat(120));
+        std::fs::create_dir(&dir).unwrap();
+        let first = control_socket(&dir, "remote", Some(&runtime)).unwrap();
+        assert!(first.as_os_str().len() <= 100);
+        assert_eq!(
+            first,
+            control_socket(&dir, "remote", Some(&runtime)).unwrap()
+        );
+        assert_ne!(
+            first,
+            control_socket(&dir, "other", Some(&runtime)).unwrap()
+        );
+        assert!(control_socket(&dir, "remote", None).is_err());
+        std::os::unix::net::UnixListener::bind(&first).unwrap();
+    }
+
     /// A transfer that stalls (a FIFO no one writes) ends at its deadline, or at a cancel,
     /// with the session killed.
     #[test]
@@ -1297,7 +1391,7 @@ mod tests {
             "r1",
             state.to_str().unwrap(),
             fake,
-            &tmp.path().join("ssh"),
+            &short_path(&tmp.path().join("ssh")),
             Dialect::Posix,
         )
         .unwrap();

@@ -21,6 +21,21 @@ use hgl_ai_bus::Bus;
 use hgl_ai_proto::build::{BUILD_VERSION, BuildJob, BuildStatus, Platform, reply_seat};
 use hgl_ai_proto::{Kind, Note, Seat};
 
+fn short_path(path: &Path) -> PathBuf {
+    let cwd = std::env::current_dir().unwrap();
+    let a: Vec<_> = cwd.components().collect();
+    let b: Vec<_> = path.components().collect();
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let mut relative = PathBuf::new();
+    for _ in common..a.len() {
+        relative.push("..");
+    }
+    for part in &b[common..] {
+        relative.push(part.as_os_str());
+    }
+    relative
+}
+
 fn fake_ssh() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/support/fake-ssh")
 }
@@ -92,7 +107,7 @@ impl World {
             "win1",
             self.state.to_str().unwrap(),
             fake_ssh(),
-            &self.root.join("ssh"),
+            &short_path(&self.root.join("ssh")),
             Dialect::Posix,
         )
         .unwrap()
