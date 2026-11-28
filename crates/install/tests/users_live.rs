@@ -2159,9 +2159,13 @@ async fn doctor_boundary_fails_on_one_account_and_passes_on_accounts() {
             all - control as u64
         };
         let before = count().await;
-        // The probe never ages out of the canary (bot on #192).
+        // The probe never ages out of the canary (bot on #192); control writes carry a
+        // TTL; provisioning again keeps both.
+        hub.bus("hub-admin").await.provision().await.unwrap();
         let mut s = admin.get_stream(&canary).await.unwrap();
-        assert_eq!(s.info().await.unwrap().config.max_age, Duration::ZERO);
+        let config = s.info().await.unwrap().config.clone();
+        assert_eq!(config.max_age, Duration::ZERO);
+        assert!(config.allow_message_ttl);
         for (_, who) in ROLE_USERS {
             let cfg = hub.host_cfg(who);
             assert_eq!(

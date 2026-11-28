@@ -576,16 +576,6 @@ impl Bus {
                 Duration::ZERO,
             ),
             build::BUCKET,
-            // `hub boundary`: no age limit, so the probe never expires; control writes
-            // expire by their own TTL. A forbidden write that arrives (one account, about
-            // 100 bytes a doctor run) stays until purged.
-            (
-                KV_CANARY,
-                "hgl-ai role boundary canary; no role writes it",
-                stream::StorageType::File,
-                1,
-                Duration::ZERO,
-            ),
         ];
         for (bucket, description, storage, history, max_age) in buckets {
             self.js
@@ -601,23 +591,7 @@ impl Bus {
                 .await
                 .map_err(|e| nats(&format!("provisioning bucket {bucket}"), e))?;
         }
-        // `hub boundary`'s control writes carry a TTL (`Nats-TTL`); the probe has none.
-        let canary = format!("KV_{KV_CANARY}");
-        let mut config = self
-            .js
-            .get_stream(&canary)
-            .await
-            .map_err(|e| missing(&format!("stream {canary}"), e))?
-            .cached_info()
-            .config
-            .clone();
-        if !config.allow_message_ttl {
-            config.allow_message_ttl = true;
-            self.js
-                .update_stream(config)
-                .await
-                .map_err(|e| nats(&format!("provisioning bucket {KV_CANARY}"), e))?;
-        }
+        self.provision_canary().await?;
         // The canary's fixed probe message (`doctor`, `hub boundary`).
         self.js
             .get_key_value(KV_CANARY)
@@ -626,6 +600,54 @@ impl Bus {
             .put(CANARY_PROBE, CANARY_PROBE_VALUE.into())
             .await
             .map_err(|e| nats(&format!("writing {KV_CANARY}/{CANARY_PROBE}"), e))?;
+        Ok(())
+    }
+
+    /// `HGL_CANARY` (`doctor`, `hub boundary`): a bucket with no age limit, so its probe
+    /// never expires, that allows per-message TTLs, which its control writes carry. A
+    /// forbidden write that arrives (one account, about 100 bytes a doctor run) stays until
+    /// purged. Once TTLs are on the server refuses a bucket update that would turn them
+    /// off, as a bucket config does: from then the stream is updated directly.
+    async fn provision_canary(&self) -> Result<()> {
+        let name = format!("KV_{KV_CANARY}");
+        let description = "hgl-ai role boundary canary: only control.* is written by roles";
+        let current = self.js.get_stream(&name).await.ok();
+        let config = match current {
+            Some(s) if s.cached_info().config.allow_message_ttl => s.cached_info().config.clone(),
+            _ => {
+                self.js
+                    .create_or_update_key_value(kv::Config {
+                        bucket: KV_CANARY.to_string(),
+                        description: description.to_string(),
+                        storage: stream::StorageType::File,
+                        history: 1,
+                        max_age: Duration::ZERO,
+                        max_value_size: MAX_VALUE_BYTES as i32,
+                        ..Default::default()
+                    })
+                    .await
+                    .map_err(|e| nats(&format!("provisioning bucket {KV_CANARY}"), e))?;
+                self.js
+                    .get_stream(&name)
+                    .await
+                    .map_err(|e| missing(&format!("stream {name}"), e))?
+                    .cached_info()
+                    .config
+                    .clone()
+            }
+        };
+        let mut want = config.clone();
+        want.description = Some(description.to_string());
+        want.max_messages_per_subject = 1;
+        want.max_age = Duration::ZERO;
+        want.max_message_size = MAX_VALUE_BYTES as i32;
+        want.allow_message_ttl = true;
+        if want != config {
+            self.js
+                .update_stream(want)
+                .await
+                .map_err(|e| nats(&format!("provisioning bucket {KV_CANARY}"), e))?;
+        }
         Ok(())
     }
 
