@@ -250,8 +250,11 @@ fn builder_runs_a_remote_build_through_the_hub() {
         .unwrap();
     assert_eq!(o.status.code(), Some(3), "{}", text(&o));
 
+    let builder_home = hub.dir.0.join("builder-home");
+    std::fs::create_dir_all(&builder_home).unwrap();
     let builder = Proc(
         hub.cmd(&["builder", "run"])
+            .env("HOME", &builder_home)
             .env("HGL_AI_LOG", "info")
             .stdout(Stdio::null())
             .stderr(std::fs::File::create(hub.dir.0.join("builder.log")).unwrap())
@@ -341,7 +344,15 @@ fn builder_runs_a_remote_build_through_the_hub() {
     assert_eq!(e["message"], "unknown type name ‘widget’");
     assert_eq!(s["warnings"]["-Wunused-variable"], 1);
     let id = s["id"].as_str().unwrap().to_string();
-    let log_dir = PathBuf::from(s["log_dir"].as_str().unwrap());
+    assert_eq!(s["log_dir"], "");
+    assert!(
+        s["steps"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|step| step.get("log").is_none())
+    );
+    let log_dir = hub.dir.0.join("work/builder/logs/lab1").join(&id);
     let log = std::fs::read(log_dir.join("compile.log")).unwrap();
     let (a, b) = (
         e["start"].as_u64().unwrap() as usize,
@@ -372,6 +383,75 @@ fn builder_runs_a_remote_build_through_the_hub() {
         "{}",
         text(&o)
     );
+
+    // A requester with its own home and work root has no local builder logs. Poison
+    // the paths in the hub summary too: opening a path supplied by the summary must
+    // not accidentally make this test pass. The builder retains its own status file.
+    let requester = hub.dir.0.join("requester");
+    let requester_home = requester.join("home");
+    let requester_task = requester.join("task");
+    std::fs::create_dir_all(&requester_home).unwrap();
+    std::fs::create_dir_all(&requester_task).unwrap();
+    let mut cfg = hgl_ai_config::Config::load(&hub.config).unwrap();
+    cfg.host = "requester".into();
+    cfg.paths.work_root = requester.join("work").display().to_string();
+    cfg.paths.data_dir = requester.join("data").display().to_string();
+    let requester_config = requester.join("config.toml");
+    cfg.save(&requester_config).unwrap();
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let bus = runtime.block_on(async {
+        let token = std::fs::read_to_string(&cfg.hub.token_file).unwrap();
+        hgl_ai_bus::Bus::connect_url(&cfg.hub.url, Some(token.trim().to_string()))
+            .await
+            .unwrap()
+    });
+    let mut remote_summary = s.clone();
+    remote_summary["log_dir"] = requester.join("missing").display().to_string().into();
+    for step in remote_summary["steps"].as_array_mut().unwrap() {
+        if step["log"].is_string() {
+            step["log"] = requester.join("missing.log").display().to_string().into();
+        }
+    }
+    runtime
+        .block_on(bus.build_put(
+            &hgl_ai_proto::build::run_key(&id),
+            &serde_json::to_vec(&remote_summary).unwrap(),
+        ))
+        .unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .arg("--config")
+        .arg(&requester_config)
+        .args(["build", "log", &id, "compile", "--bytes", &range])
+        .current_dir(&requester)
+        .env("HOME", &requester_home)
+        .env("HGL_AI_TASK_DIR", &requester_task)
+        .env_remove("HGL_AI_SEAT")
+        .env_remove("HGL_AI_CONFIG")
+        .env_remove("HGL_AI_TURN")
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stdout).starts_with("main.c:3:5: error:"),
+        "{}",
+        text(&o)
+    );
+    let request = runtime
+        .block_on(bus.reply_wait(
+            &hgl_ai_proto::Seat::new("logs-lab1").unwrap(),
+            Duration::from_secs(1),
+        ))
+        .unwrap()
+        .expect("requester did not send a log request over the hub");
+    let request: serde_json::Value = serde_json::from_str(&request.body).unwrap();
+    assert_eq!(request["id"], id);
+    assert_eq!(request["step"], "compile");
+    runtime
+        .block_on(bus.build_put(
+            &hgl_ai_proto::build::run_key(&id),
+            &serde_json::to_vec(&s).unwrap(),
+        ))
+        .unwrap();
 
     // Cleanup is part of done: no checkout left, the clone kept.
     let work = hub.dir.0.join("work/builder");
@@ -554,6 +634,19 @@ fn builder_runs_a_remote_build_through_the_hub() {
     assert!(t0.elapsed() >= Duration::from_secs(3), "{:?}", t0.elapsed());
     let calls = hub.api_requests() - before;
     assert!(calls < 100, "{calls} hub requests in a 3s wait");
+
+    // A non-receipt on the reply subject must not hide a completed hub summary.
+    let mut fallback = s.clone();
+    fallback["id"] = stray.into();
+    fallback["status"] = "pass".into();
+    runtime
+        .block_on(bus.build_put(
+            &hgl_ai_proto::build::run_key(stray),
+            &serde_json::to_vec(&fallback).unwrap(),
+        ))
+        .unwrap();
+    let o = hub.run(&["build", "wait", stray, "--timeout", "3s"]);
+    assert_eq!(o.status.code(), Some(0), "{}", text(&o));
 
     // A local run with the hub's recipe.
     let logs = hub.dir.0.join("logs");
@@ -816,4 +909,72 @@ fn a_shell_checkout_survives_a_builder_starting() {
         std::thread::sleep(Duration::from_millis(50));
     }
     assert_eq!(std::fs::read_to_string(&result).unwrap(), "kept\n");
+}
+
+#[test]
+fn missing_detached_status_reports_dead_process() {
+    let dir = Scratch::new("dead");
+    let id = "20261127-230000-abcdef";
+    let run = dir.0.join(id);
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join("pid"), "0\n").unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .args(["build", "status", id, "--log-dir"])
+        .arg(&dir.0)
+        .env_remove("HGL_AI_TASK_DIR")
+        .env("HGL_AI_CONFIG", dir.0.join("missing"))
+        .output()
+        .unwrap();
+    assert_eq!(o.status.code(), Some(1), "{}", text(&o));
+    assert!(
+        String::from_utf8_lossy(&o.stderr).contains("stopped"),
+        "{}",
+        text(&o)
+    );
+}
+
+#[test]
+fn local_run_isolates_environment_without_a_task() {
+    let dir = Scratch::new("env");
+    let src = dir.0.join("src");
+    let build = dir.0.join("build");
+    let logs = dir.0.join("logs");
+    std::fs::create_dir_all(&src).unwrap();
+    let recipe = dir.0.join("recipe.toml");
+    std::fs::write(
+        &recipe,
+        r#"repo = "demo"
+[[step]]
+name = "env"
+run = '''printf '%s\n%s\n' "$TMPDIR" "$CARGO_TARGET_DIR"'''
+"#,
+    )
+    .unwrap();
+    let o = Command::new(env!("CARGO_BIN_EXE_hgl-ai"))
+        .args(["--json", "build", "run", "demo", "--recipe"])
+        .arg(&recipe)
+        .arg("--dir")
+        .arg(&src)
+        .arg("--build-dir")
+        .arg(&build)
+        .arg("--log-dir")
+        .arg(&logs)
+        .env_remove("HGL_AI_TASK_DIR")
+        .env("HGL_AI_CONFIG", dir.0.join("missing"))
+        .env("TMPDIR", &dir.0)
+        .env("CARGO_TARGET_DIR", dir.0.join("caller-target"))
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "{}", text(&o));
+    let summary: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    let run = logs.join(summary["id"].as_str().unwrap());
+    let actual = std::fs::read_to_string(run.join("env.log")).unwrap();
+    assert_eq!(
+        actual,
+        format!(
+            "{}\n{}\n",
+            run.join("tmp").display(),
+            build.join("target").display()
+        )
+    );
 }

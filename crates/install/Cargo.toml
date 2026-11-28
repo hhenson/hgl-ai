@@ -19,11 +19,11 @@ hex.workspace = true
 thiserror.workspace = true
 nkeys = "0.4"
 libc.workspace = true
+futures.workspace = true
+tokio.workspace = true
 
 [dev-dependencies]
 hgl-ai-build.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
-futures.workspace = true
 hgl-ai-owner.workspace = true
 chrono.workspace = true

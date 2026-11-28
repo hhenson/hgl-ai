@@ -33,3 +33,22 @@ memcap_gb = 64
 time = "40m"
 parser = "cargo"
 needs = ["tool:cargo"]
+
+[[step]]
+name = "web"
+# The console's telemetry page: npm ci, types, vitest, the build; and the checked-in
+# web/dist must be what the sources build to (the binary embeds it).
+run = '''
+if [ ! -d crates/console/web ] && [ -f recipes/hgl-ai.toml ] && ! grep -Eq '^[[:space:]]*name[[:space:]]*=[[:space:]]*["'"'"']web["'"'"']' recipes/hgl-ai.toml; then
+  echo 'skipped: no crates/console/web'
+else
+  cd crates/console/web && npm ci --no-audit --no-fund && npm run typecheck && npm test && npm run build && git diff --exit-code --stat -- dist && test -z "$(git status --porcelain -- dist)"
+fi
+'''
+platforms = ["linux", "macos"]
+memcap_gb = 32
+# Node and WASM reserve far more address space than they use.
+address_limit = false
+time = "15m"
+parser = "lines"
+needs = ["tool:node", "tool:npm"]

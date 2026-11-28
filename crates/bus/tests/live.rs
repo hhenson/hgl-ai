@@ -3,7 +3,7 @@
 //! printed, when `nats-server` is not on `PATH`.
 
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -15,7 +15,7 @@ use hgl_ai_proto::{
 
 struct Hub {
     child: Child,
-    _dir: tempfile::TempDir,
+    dir: tempfile::TempDir,
     url: String,
     token: String,
 }
@@ -33,28 +33,48 @@ impl Hub {
             std::process::id(),
             dir.path().display().to_string().len()
         );
-        let child = Command::new(bin)
-            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--auth", &token])
+        let child = Self::spawn(&bin, dir.path(), &token);
+        let mut hub = Hub {
+            child,
+            dir,
+            url: String::new(),
+            token,
+        };
+        hub.wait_for_port();
+        Some(hub)
+    }
+
+    fn spawn(bin: &Path, dir: &Path, token: &str) -> Child {
+        Command::new(bin)
+            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--auth", token])
             .arg("-sd")
-            .arg(dir.path().join("store"))
+            .arg(dir.join("store"))
             .arg("-l")
-            .arg(dir.path().join("nats.log"))
+            .arg(dir.join("nats.log"))
             .arg("--ports_file_dir")
-            .arg(dir.path())
+            .arg(dir)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("start nats-server");
-        let ports = dir.path().join(format!("nats-server_{}.ports", child.id()));
-        let mut hub = Hub {
-            child,
-            _dir: dir,
-            url: String::new(),
-            token,
-        };
+            .expect("start nats-server")
+    }
+
+    fn restart(&mut self) {
+        self.child.kill().expect("stop nats-server");
+        self.child.wait().expect("reap nats-server");
+        let bin = find_on_path("nats-server").expect("find nats-server for restart");
+        self.child = Self::spawn(&bin, self.dir.path(), &self.token);
+        self.wait_for_port();
+    }
+
+    fn wait_for_port(&mut self) {
+        let ports = self
+            .dir
+            .path()
+            .join(format!("nats-server_{}.ports", self.child.id()));
         let deadline = Instant::now() + Duration::from_secs(15);
-        hub.url = loop {
+        self.url = loop {
             let found = std::fs::read_to_string(&ports)
                 .ok()
                 .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -68,7 +88,6 @@ impl Hub {
             );
             std::thread::sleep(Duration::from_millis(50));
         };
-        Some(hub)
     }
 
     async fn bus(&self) -> Bus {
@@ -343,27 +362,108 @@ async fn same_body_to_other_recipients_or_tasks_is_not_a_duplicate() {
 }
 
 #[tokio::test]
-async fn broadcast_reaches_every_inbox() {
+async fn broadcasts_reach_only_inboxes_created_before_publish() {
     let Some(hub) = Hub::start() else { return };
     let bus = hub.ready().await;
-    let mut w1 = bus.inbox(&seat("w1")).await.unwrap();
-    let r = bus
-        .send(&note("claude", "all", "[claude] Landed"))
+    let w1 = seat("w1");
+    let w2 = seat("w2");
+    drop(bus.inbox(&w1).await.unwrap());
+    let mut old = note("claude", "all", "old broadcast");
+    old.created_at = "20990101T000000Z".into();
+    let old = bus.send(&old).await.unwrap();
+    let direct = bus
+        .send(&note("claude", "w2", "early unicast"))
         .await
         .unwrap();
-    // An inbox created after the broadcast still gets it.
-    let mut w2 = bus.inbox(&seat("w2")).await.unwrap();
-    for inbox in [&mut w1, &mut w2] {
-        let got = inbox.fetch(10, LONG).await.unwrap();
+    let older = bus
+        .send(&note("claude", "all", "another old broadcast"))
+        .await
+        .unwrap();
+    let owner = bus
+        .send(&note("owner", "w2", "early owner note"))
+        .await
+        .unwrap();
+    let peek = bus.peek(&w2, 10, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        peek.iter().map(|n| n.seq).collect::<Vec<_>>(),
+        [direct.seq, owner.seq]
+    );
+    drop(bus.inbox(&w2).await.unwrap());
+
+    let mut fresh = note("claude", "all", "fresh broadcast");
+    fresh.created_at = "20000101T000000Z".into();
+    let fresh = bus.send(&fresh).await.unwrap();
+    // The original cutoff survives reopening from another connection.
+    let reopened = hub.bus().await;
+    let mut first = reopened.inbox(&w1).await.unwrap();
+    let mut second = reopened.inbox(&w2).await.unwrap();
+    let peek = reopened.peek(&w2, 1, Duration::ZERO).await.unwrap();
+    assert_eq!(peek.len(), 1);
+    assert_eq!(peek[0].seq, direct.seq);
+    let peek = reopened.peek(&w2, 10, LONG).await.unwrap();
+    assert_eq!(
+        peek.iter().map(|n| n.seq).collect::<Vec<_>>(),
+        [direct.seq, owner.seq, fresh.seq]
+    );
+
+    let got = first.fetch(10, LONG).await.unwrap();
+    assert_eq!(
+        got.iter().map(|d| d.seq).collect::<Vec<_>>(),
+        [old.seq, older.seq, fresh.seq]
+    );
+    for d in got {
+        d.ack().await.unwrap();
+    }
+    for seq in [direct.seq, owner.seq, fresh.seq] {
+        let got = second.fetch(1, Duration::ZERO).await.unwrap();
         assert_eq!(got.len(), 1);
-        assert_eq!(got[0].seq, r.seq);
-        assert!(got[0].note.recipient.is_broadcast());
+        assert_eq!((got[0].seq, got[0].delivered), (seq, 1));
         got[0].ack().await.unwrap();
     }
+    assert!(second.fetch(1, Duration::ZERO).await.unwrap().is_empty());
+    let history = bus
+        .read_notes(&[Seat::broadcast()], 1, 10, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(
+        history.iter().map(|n| n.seq).collect::<Vec<_>>(),
+        [old.seq, older.seq, fresh.seq]
+    );
     assert!(
         bus.inbox(&Seat::broadcast()).await.is_err(),
         "`all` has no inbox"
     );
+    assert!(
+        bus.peek(&Seat::broadcast(), 1, Duration::ZERO)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn unread_broadcast_survives_hub_restart() {
+    let Some(mut hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let recipient = seat("w2");
+    bus.send(&note("claude", "all", "before inbox creation"))
+        .await
+        .unwrap();
+    drop(bus.inbox(&recipient).await.unwrap());
+    let unread = bus
+        .send(&note("claude", "all", "unread before restart"))
+        .await
+        .unwrap();
+    drop(bus);
+
+    hub.restart();
+    let bus = hub.bus().await;
+    let mut inbox = bus.inbox(&recipient).await.unwrap();
+    let got = inbox.fetch(10, Duration::ZERO).await.unwrap();
+    assert_eq!(
+        got.iter().map(|d| (d.seq, d.delivered)).collect::<Vec<_>>(),
+        [(unread.seq, 1)]
+    );
+    got[0].ack().await.unwrap();
 }
 
 #[tokio::test]
@@ -1025,20 +1125,19 @@ async fn peeks_spend_no_delivery_and_naks_never_drop() {
     let Some(hub) = Hub::start() else { return };
     let bus = hub.ready().await;
     let claude = seat("claude");
+    let mut inbox = bus.inbox(&claude).await.unwrap();
     let first = bus.send(&note("w1", "claude", "one")).await.unwrap();
     bus.send(&note("w1", "w2", "not for claude")).await.unwrap();
     let all = bus
         .send(&Note::new(seat("w1"), Seat::broadcast(), Kind::Note, "all"))
         .await
         .unwrap();
-    // No inbox yet: everything for the seat.
     for _ in 0..8 {
         let p = bus.peek(&claude, 10, SHORT).await.unwrap();
         let seqs: Vec<u64> = p.iter().map(|n| n.seq).collect();
         assert_eq!(seqs, [first.seq, all.seq]);
         assert_eq!(p[0].note.body.trim(), "one");
     }
-    let mut inbox = bus.inbox(&claude).await.unwrap();
     let got = inbox.fetch(10, LONG).await.unwrap();
     assert_eq!(got.len(), 2);
     assert_eq!(got[0].delivered, 1, "peeks spent no delivery");
@@ -1081,9 +1180,6 @@ async fn peeks_spend_no_delivery_and_naks_never_drop() {
         .await
         .unwrap();
     assert_eq!(info.config.max_deliver, -1);
-    let b = w4.fetch(1, LONG).await.unwrap();
-    assert_eq!(b[0].seq, all.seq, "the broadcast first");
-    b[0].ack().await.unwrap();
     for i in 1..=20u64 {
         let d = w4.fetch(1, LONG).await.unwrap();
         assert_eq!((d[0].seq, d[0].delivered), (n.seq, i));
@@ -1316,4 +1412,307 @@ async fn usage_history_never_repeats_an_observation() {
         .await
         .unwrap();
     assert_eq!(history.len(), 1);
+}
+
+/// A loopback proxy in front of the hub that holds back the hub's answer to the next
+/// publish on one subject, to stand for a slow PubAck.
+struct SlowAck {
+    url: String,
+    state: std::sync::Arc<std::sync::Mutex<SlowAckState>>,
+}
+
+#[derive(Default)]
+struct SlowAckState {
+    /// The subject whose next publish gets a late answer, and how late.
+    armed: Option<(String, Duration)>,
+    /// Reply subjects to hold back, with their delay.
+    held: Vec<(String, Duration)>,
+    /// Answers held back and then passed on.
+    late: usize,
+}
+
+impl SlowAck {
+    async fn start(hub: &str) -> SlowAck {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("nats://{}", listener.local_addr().unwrap());
+        let hub = hub.trim_start_matches("nats://").to_string();
+        let state = std::sync::Arc::<std::sync::Mutex<SlowAckState>>::default();
+        let st = state.clone();
+        tokio::spawn(async move {
+            while let Ok((client, _)) = listener.accept().await {
+                let server = tokio::net::TcpStream::connect(&hub).await.unwrap();
+                tokio::spawn(Self::serve(client, server, st.clone()));
+            }
+        });
+        SlowAck { url, state }
+    }
+
+    /// Hold back the hub's answer to the next publish on `subject` for `delay`.
+    fn delay_next(&self, subject: &str, delay: Duration) {
+        self.state.lock().unwrap().armed = Some((subject.to_string(), delay));
+    }
+
+    fn late(&self) -> usize {
+        self.state.lock().unwrap().late
+    }
+
+    async fn serve(
+        client: tokio::net::TcpStream,
+        server: tokio::net::TcpStream,
+        st: std::sync::Arc<std::sync::Mutex<SlowAckState>>,
+    ) {
+        use tokio::io::{AsyncWriteExt, BufReader};
+        let (cr, mut cw) = client.into_split();
+        let (sr, mut sw) = server.into_split();
+        let up = {
+            let st = st.clone();
+            async move {
+                let mut cr = BufReader::new(cr);
+                while let Some((frame, words)) = read_frame(&mut cr).await {
+                    if matches!(words[0].as_str(), "PUB" | "HPUB") && words.len() >= 4 {
+                        let mut s = st.lock().unwrap();
+                        if let Some((subject, delay)) = s.armed.take() {
+                            if words[1] == subject {
+                                s.held.push((words[2].clone(), delay));
+                            } else {
+                                s.armed = Some((subject, delay));
+                            }
+                        }
+                    }
+                    if sw.write_all(&frame).await.is_err() {
+                        break;
+                    }
+                }
+            }
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+        let down = async move {
+            let mut sr = BufReader::new(sr);
+            while let Some((frame, words)) = read_frame(&mut sr).await {
+                let held = matches!(words[0].as_str(), "MSG" | "HMSG")
+                    .then(|| {
+                        let mut s = st.lock().unwrap();
+                        let i = s.held.iter().position(|(r, _)| *r == words[1])?;
+                        Some(s.held.remove(i).1)
+                    })
+                    .flatten();
+                match held {
+                    Some(delay) => {
+                        let (tx, st) = (tx.clone(), st.clone());
+                        tokio::spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let _ = tx.send(frame);
+                            st.lock().unwrap().late += 1;
+                        });
+                    }
+                    None => {
+                        let _ = tx.send(frame);
+                    }
+                }
+            }
+        };
+        let write = async move {
+            while let Some(frame) = rx.recv().await {
+                if cw.write_all(&frame).await.is_err() {
+                    break;
+                }
+            }
+        };
+        tokio::join!(up, down, write);
+    }
+}
+
+/// One NATS protocol frame: its control line and, for a message, its payload.
+async fn read_frame(
+    r: &mut tokio::io::BufReader<tokio::net::tcp::OwnedReadHalf>,
+) -> Option<(Vec<u8>, Vec<String>)> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt};
+    let mut frame = Vec::new();
+    if r.read_until(b'\n', &mut frame).await.ok()? == 0 {
+        return None;
+    }
+    let words: Vec<String> = String::from_utf8_lossy(&frame)
+        .split_whitespace()
+        .map(String::from)
+        .collect();
+    let op = words.first()?.to_ascii_uppercase();
+    if matches!(op.as_str(), "PUB" | "HPUB" | "MSG" | "HMSG") {
+        let len: usize = words.last()?.parse().ok()?;
+        let mut payload = vec![0; len + 2];
+        r.read_exact(&mut payload).await.ok()?;
+        frame.extend(payload);
+    }
+    let mut words = words;
+    words[0] = op;
+    Some((frame, words))
+}
+
+/// A refresh whose PubAck comes after the caller's timeout dropped it, though the hub
+/// committed the write, keeps the lease: the next refresh takes the committed revision
+/// rather than reporting it lost (hgl-ai#132).
+#[tokio::test]
+async fn a_refresh_whose_answer_came_late_keeps_the_lease() {
+    let Some(hub) = Hub::start() else { return };
+    let direct = hub.ready().await;
+    let proxy = SlowAck::start(&hub.url).await;
+    let bus = Bus::connect_url(&proxy.url, Some(hub.token.clone()))
+        .await
+        .expect("connect through the proxy");
+    let name = "builder.slow-ack";
+    let mut lease = bus.lock_acquire(name, "builder-1 pid 1").await.unwrap();
+    let kv = hub.raw().await.get_key_value("HGL_LOCKS").await.unwrap();
+    let on_hub = async || kv.entry(name).await.unwrap().unwrap().revision;
+
+    // The caller gives up on the refresh; the hub commits it and answers late.
+    let before = lease.revision();
+    proxy.delay_next(
+        &format!("$KV.HGL_LOCKS.{name}"),
+        Duration::from_millis(1500),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), lease.refresh())
+            .await
+            .is_err(),
+        "the refresh was answered in time"
+    );
+    within(10, "the late answer is passed on", async || {
+        proxy.late() == 1
+    })
+    .await;
+    assert_eq!(
+        on_hub().await,
+        before + 1,
+        "the dropped refresh was committed"
+    );
+    assert_eq!(lease.revision(), before);
+
+    // The next refresh keeps it, at the hub's revision.
+    lease
+        .refresh()
+        .await
+        .expect("a late answer is not a lost lease");
+    assert_eq!(lease.revision(), on_hub().await);
+    assert_eq!(lease.revision(), before + 2);
+    lease.refresh().await.unwrap();
+    assert_eq!(lease.revision(), before + 3);
+    assert!(matches!(
+        direct.lock_acquire(name, "builder-2 pid 2").await,
+        Err(BusError::Held { holder, .. }) if holder == "builder-1 pid 1"
+    ));
+
+    // A lease another holder wrote over is still lost.
+    let other = direct
+        .lock_take_over(name, "builder-2 pid 2", "builder-1 pid 1")
+        .await
+        .unwrap();
+    assert!(matches!(
+        lease.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+    assert!(!lease.release().await.unwrap());
+    assert!(other.release().await.unwrap());
+}
+
+/// A release whose lease was moved on by a refresh the caller dropped (the hub committed
+/// it; its answer came late) still deletes the lease, rather than leaving it to expire
+/// after `max_age` (hgl-ai#134).
+#[tokio::test]
+async fn a_release_after_a_refresh_whose_answer_came_late_deletes_the_lease() {
+    let Some(hub) = Hub::start() else { return };
+    let direct = hub.ready().await;
+    let proxy = SlowAck::start(&hub.url).await;
+    let bus = Bus::connect_url(&proxy.url, Some(hub.token.clone()))
+        .await
+        .expect("connect through the proxy");
+    let name = "seat.slow-release";
+    let mut lease = bus.lock_acquire(name, "bridge-1 pid 1").await.unwrap();
+    let before = lease.revision();
+    proxy.delay_next(
+        &format!("$KV.HGL_LOCKS.{name}"),
+        Duration::from_millis(1500),
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(300), lease.refresh())
+            .await
+            .is_err(),
+        "the refresh was answered in time"
+    );
+    within(10, "the late answer is passed on", async || {
+        proxy.late() == 1
+    })
+    .await;
+    let kv = hub.raw().await.get_key_value("HGL_LOCKS").await.unwrap();
+    assert_eq!(
+        kv.entry(name).await.unwrap().unwrap().revision,
+        before + 1,
+        "the dropped refresh was committed"
+    );
+    assert_eq!(lease.revision(), before);
+
+    assert!(lease.release().await.unwrap(), "released, not leaked");
+    assert_eq!(direct.lock_get(name).await.unwrap(), None);
+    let next = direct.lock_acquire(name, "bridge-2 pid 2").await.unwrap();
+
+    // A lease another holder wrote over is not deleted by the old holder's release.
+    let taker = direct
+        .lock_take_over(name, "bridge-3 pid 3", "bridge-2 pid 2")
+        .await
+        .unwrap();
+    assert!(!next.release().await.unwrap());
+    assert_eq!(
+        direct.lock_get(name).await.unwrap().as_ref(),
+        Some(taker.record())
+    );
+    assert!(taker.release().await.unwrap());
+}
+
+/// Each acquisition has its own token, so a lease never mistakes another for its own: not
+/// one taken over by the same holder, nor one with the same holder and `acquired_at` (an
+/// expired lease re-acquired in the same second). Before the token the two ping-ponged,
+/// each refresh adopting the other's write (hgl-ai#134).
+#[tokio::test]
+async fn a_lease_with_the_same_holder_and_second_is_not_ours() {
+    let Some(hub) = Hub::start() else { return };
+    let bus = hub.ready().await;
+    let name = "builder.same-second";
+    let mut old = bus.lock_acquire(name, "builder-1 pid 1").await.unwrap();
+    assert_eq!(old.record().token.len(), 32);
+
+    // The same holder takes it over (a restart that found its own lease).
+    let mut new = bus
+        .lock_take_over(name, "builder-1 pid 1", "builder-1 pid 1")
+        .await
+        .unwrap();
+    assert_eq!(new.record().holder, old.record().holder);
+    assert_ne!(new.record().token, old.record().token);
+    assert!(matches!(
+        old.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+    new.refresh().await.unwrap();
+    assert!(matches!(
+        old.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+
+    // The same holder and second, another token: what a re-acquire of an expired lease
+    // in the same second writes. Written directly, so the second is the same for sure.
+    let kv = hub.raw().await.get_key_value("HGL_LOCKS").await.unwrap();
+    let twin = hgl_ai_proto::LockRecord {
+        token: "0".repeat(32),
+        ..new.record().clone()
+    };
+    let at = kv
+        .put(name, serde_json::to_vec(&twin).unwrap().into())
+        .await
+        .unwrap();
+    assert!(matches!(
+        new.refresh().await,
+        Err(BusError::LeaseLost { .. })
+    ));
+    assert!(!new.release().await.unwrap());
+    assert!(!old.release().await.unwrap());
+    let entry = kv.entry(name).await.unwrap().unwrap();
+    assert_eq!(entry.revision, at, "neither old lease wrote over it");
+    assert_eq!(bus.lock_get(name).await.unwrap(), Some(twin));
 }

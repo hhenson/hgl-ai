@@ -31,6 +31,7 @@ webauthn-rs = "0.6.2"
 hmac = "0.12"
 p256 = { version = "0.14", features = ["ecdsa", "pkcs8", "pem"] }
 ring = "0.17"
+include_dir = "0.7.4"
 
 [dev-dependencies]
 tempfile.workspace = true

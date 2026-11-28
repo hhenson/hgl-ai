@@ -120,9 +120,19 @@ fn fold(items: &[(String, Found)]) -> Vec<Diag> {
     out
 }
 
+/// Remove paths that only have meaning on the host that ran the build.
+pub fn portable(s: &Summary) -> Summary {
+    let mut copy = s.clone();
+    copy.log_dir.clear();
+    for step in &mut copy.steps {
+        step.log = None;
+    }
+    copy
+}
+
 /// The hub's copy: the first [`SHOWN`] errors and failures, messages shortened.
 pub fn bounded(s: &Summary) -> Summary {
-    let mut b = s.clone();
+    let mut b = portable(s);
     b.errors.truncate(SHOWN);
     b.tests.failures.truncate(SHOWN);
     for e in &mut b.errors {
@@ -372,10 +382,14 @@ fn render_at(s: &Summary, width: usize, shown: usize) -> String {
             shown_kinds.join(", ")
         );
     }
+    let location = if s.log_dir.is_empty() {
+        String::new()
+    } else {
+        format!("{} ", s.log_dir)
+    };
     let _ = writeln!(
         o,
-        "log: {} on {} (summary.json; a range: hgl-ai build log {} STEP|REPORT --bytes START-END)",
-        s.log_dir,
+        "log: {location}on {} (hgl-ai build log {} STEP|REPORT --bytes START-END)",
         s.proxy.as_deref().unwrap_or(&s.host),
         s.id
     );
@@ -416,6 +430,21 @@ mod tests {
             warnings_total: 0,
             warnings: BTreeMap::new(),
         }
+    }
+
+    #[test]
+    fn shared_summaries_omit_local_log_paths() {
+        let mut s = sample();
+        let mut step = StepSummary::new("test", StepStatus::Pass);
+        step.log = Some("/private/logs/test.log".into());
+        s.steps.push(step);
+        let hub = bounded(&s);
+        assert!(hub.log_dir.is_empty());
+        assert!(hub.steps[0].log.is_none());
+        let receipt: Summary = serde_json::from_str(&crate::store::receipt_body(&s)).unwrap();
+        assert!(receipt.log_dir.is_empty());
+        assert!(receipt.steps[0].log.is_none());
+        assert_eq!(s.steps[0].log.as_deref(), Some("/private/logs/test.log"));
     }
 
     #[test]
