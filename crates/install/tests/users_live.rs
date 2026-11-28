@@ -148,6 +148,28 @@ impl Hub {
     fn inbox(&self, who: &str) -> String {
         self.creds[who].inbox_prefix().unwrap()
     }
+
+    /// What `doctor` asks the hub (`hub inboxes`): may `who`'s credential, as a host's
+    /// `hub.token`, subscribe to `_INBOX.>`?
+    async fn shared_inbox(&self, who: &str, bare: bool) -> Option<bool> {
+        use hgl_ai_install::Hub as _;
+        let Credential::Nkey { seed, user, role } = self.creds[who].clone() else {
+            unreachable!()
+        };
+        let text = if bare {
+            seed
+        } else {
+            Credential::render_nkey(&user.unwrap(), &role.unwrap(), &seed)
+        };
+        let dir = self.conf.with_file_name(format!("probe-{who}-{bare}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("hub.token");
+        std::fs::write(&f, text).unwrap();
+        let mut cfg = hgl_ai_config::Config::new("t");
+        cfg.hub.url = self.url.clone();
+        cfg.hub.token_file = f.display().to_string();
+        hgl_ai_install::BusHub.shared_inbox(&cfg).await
+    }
 }
 
 fn seat(s: &str) -> Seat {
@@ -708,7 +730,8 @@ async fn no_user_sees_another_users_replies() {
         }
     }
 
-    // Nor may a seat put a reply in the console's inbox.
+    // A seat's direct publish to the console's inbox is refused. JetStream replies and
+    // consumer deliver subjects are not checked until hgl-ai#141.
     let c = hub.raw("console").await;
     let into = format!("{}.forged", hub.inbox("console"));
     let mut own = c.subscribe(into.clone()).await.unwrap();
@@ -735,6 +758,14 @@ async fn no_user_sees_another_users_replies() {
     )
     .await;
     assert!(!matches!(r, Ok(Ok(_))), "{r:?}");
+
+    // `doctor`'s probe: an upgraded hub refuses `_INBOX.>`; the admin and a bare seed
+    // cannot tell.
+    for who in ["build-1", "console", "hub-coord"] {
+        assert_eq!(hub.shared_inbox(who, false).await, Some(false), "{who}");
+    }
+    assert_eq!(hub.shared_inbox("hub-admin", false).await, None);
+    assert_eq!(hub.shared_inbox("build-1", true).await, None);
 }
 
 /// A client with its own inbox still works on a hub whose `nats.conf` predates them and
@@ -770,4 +801,8 @@ async fn own_inboxes_work_on_an_older_hub() {
             .unwrap()
             .is_some()
     );
+    // `doctor`'s probe sees the open `_INBOX.>`.
+    for who in ["build-1", "console"] {
+        assert_eq!(hub.shared_inbox(who, false).await, Some(true), "{who}");
+    }
 }
