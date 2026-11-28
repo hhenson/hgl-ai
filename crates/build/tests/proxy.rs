@@ -479,17 +479,32 @@ async fn until<F: std::future::Future<Output = bool>>(
 async fn receipt(
     bus: &Bus,
     reply: &Seat,
+    id: &str,
+    world: &World,
     wait: Duration,
     svc: &mut tokio::task::JoinHandle<Result<(), service::ServiceError>>,
 ) -> Note {
-    tokio::select! {
+    let failure = tokio::select! {
         result = svc => panic!("builder stopped while waiting for receipt to {reply}: {result:?}"),
-        result = tokio::time::timeout(wait, bus.reply_wait(reply, wait)) => {
-            result.expect("timed out waiting for receipt request")
-                .expect("reading receipt failed")
-                .unwrap_or_else(|| panic!("timed out waiting for receipt to {reply}"))
+        result = tokio::time::timeout(wait + Duration::from_secs(10), bus.reply_wait(reply, wait)) => {
+            match result {
+                Ok(Ok(Some(note))) => return note,
+                Ok(Ok(None)) => format!("timed out waiting for receipt to {reply}"),
+                Ok(Err(err)) => format!("reading receipt to {reply} failed: {err}"),
+                Err(_) => format!("timed out waiting for receipt request to {reply}"),
+            }
         }
-    }
+    };
+    let log = std::fs::read_to_string(world.state.join("log")).unwrap_or_default();
+    let tail: Vec<&str> = log.lines().rev().take(15).collect();
+    let (run, worker, builders) = tokio::join!(
+        tokio::time::timeout(Duration::from_secs(10), store::run_get(bus, id)),
+        tokio::time::timeout(Duration::from_secs(10), bus.state_get("builder.win1")),
+        tokio::time::timeout(Duration::from_secs(10), bus.builders())
+    );
+    panic!(
+        "{failure}; run {run:?}\nworker state {worker:?}\nbuilders {builders:?}\nremote log tail: {tail:#?}"
+    );
 }
 
 fn job(id: &str, head: &str) -> (Note, Seat) {
@@ -618,7 +633,15 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     );
     // The cleanup goes through on a later heartbeat; then the job is built.
     mode(0o755);
-    let r = receipt(&bus, &reply, Duration::from_secs(60), &mut svc).await;
+    let r = receipt(
+        &bus,
+        &reply,
+        "20261127-090000-aaaaaa",
+        &w,
+        Duration::from_secs(60),
+        &mut svc,
+    )
+    .await;
     assert!(
         !jobs.join("20261126-000000-000000").exists(),
         "the leftover is gone"
@@ -665,7 +688,15 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     w.down(true);
     tokio::time::sleep(Duration::from_millis(1500)).await;
     w.down(false);
-    let r = receipt(&bus, &reply, Duration::from_secs(90), &mut svc).await;
+    let r = receipt(
+        &bus,
+        &reply,
+        "20261127-090000-bbbbbb",
+        &w,
+        Duration::from_secs(90),
+        &mut svc,
+    )
+    .await;
     let s = store::parse_receipt(&r, "20261127-090000-bbbbbb").unwrap();
     assert_eq!(
         s.status,
@@ -700,7 +731,15 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     // The same request was taken before: its log directory holds it.
     std::fs::write(saved.join("request.json"), note.body.trim()).unwrap();
     bus.send(&note).await.unwrap();
-    let r = receipt(&bus, &reply, Duration::from_secs(30), &mut svc).await;
+    let r = receipt(
+        &bus,
+        &reply,
+        "20261127-090000-dddddd",
+        &w,
+        Duration::from_secs(30),
+        &mut svc,
+    )
+    .await;
     let got = store::parse_receipt(&r, "20261127-090000-dddddd").unwrap();
     assert_eq!(got.reason.as_deref(), Some("saved before the crash"));
     let log = std::fs::read_to_string(w.state.join("log")).unwrap();
