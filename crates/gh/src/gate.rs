@@ -260,10 +260,15 @@ pub struct Facts {
     /// How many commits `main` has that the head does not.
     pub behind: Option<u64>,
     pub bot: Option<BotView>,
+    /// The pull request's note comments, the fleet's ([`crate::bot::by_note_authors`]), read
+    /// with the bot's ([`Need::BotComments`]).
+    pub comments: Option<Vec<Comment>>,
     pub bot_reviews: Option<Vec<Review>>,
     /// Parents of the pull request's head.
     pub parents: Option<Vec<String>>,
     pub verdicts: Option<Vec<VerdictResult>>,
+    /// The recipe revision the verdicts are for, read once with them (BUILD-15).
+    pub recipe: Option<u64>,
     pub checks: Option<Vec<CheckRun>>,
     /// The pull request's files since the merge base, and `main`'s.
     pub mine: Option<FileList>,
@@ -315,6 +320,20 @@ pub struct Opts {
     /// than the landing lock's lease from the merge; else [`crate::merge::POLL_LIMIT`]
     /// from the merge ([`crate::merge::until`]).
     pub merge_until: Option<tokio::time::Instant>,
+    /// Merge only while the pull request is Ready at the head asked for, by its note
+    /// comments (WORK-6, [`crate::bot::ready_mark`]): the coordinator's landings, which
+    /// chose it by that. Read again right before the merge call, with the pull request:
+    /// a later `Sent back` or `Blocked`, or another head, stops it.
+    pub ready_at_head: bool,
+    /// Merge only on the local build verdicts (BUILD-15) for the head on the present
+    /// `main`: a repository that names none is refused, whatever its checks say (the
+    /// coordinator's landings, hgl-ai#123).
+    pub require_verdicts: bool,
+    /// Read `HGL_STATE/hold` again right before the merge call, and do not merge while it
+    /// holds (or when it cannot be read).
+    pub hold_at_merge: bool,
+    /// Who the landing record is written for ([`Progress::by`]); `None`: the controller.
+    pub record_by: Option<&'static str>,
     /// The steps the landing does after a merge: what a `PARTIAL` right after it names.
     pub after: AfterSteps,
 }
@@ -385,6 +404,7 @@ pub enum Kind {
     BotLimit,
     Behind,
     /// `gh land`: `HGL_STATE/hold` was still active at the deadline; the gate did not run.
+    /// [`Opts::hold_at_merge`]: a hold read right before the merge call; nothing merged.
     Hold,
     /// Dry run: the gate is satisfied and it would merge.
     WouldMerge,
@@ -430,11 +450,22 @@ pub struct Outcome {
     pub merge_commit: Option<String>,
     /// The head the gate judged.
     pub head: String,
+    /// A `PARTIAL` that refused credentials or the rate limit stopped: the caller's to act
+    /// on (the coordinator's round stops, the hold follows), not only to report.
+    pub cause: Option<Cause>,
+}
+
+/// Why a step after the merge did not run, where it is the caller's ([`Outcome::cause`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Cause {
+    Auth,
+    RateLimited,
 }
 
 impl Outcome {
     pub(crate) fn new(kind: Kind, line: String, retry: bool, head: &str) -> Outcome {
         Outcome {
+            cause: None,
             kind,
             line,
             retry,
@@ -469,6 +500,11 @@ impl Outcome {
             head,
         );
         o.merge_commit = merge.filter(|m| !m.is_empty()).map(String::from);
+        o.cause = match e {
+            Error::Auth(_) => Some(Cause::Auth),
+            Error::RateLimited(_) => Some(Cause::RateLimited),
+            _ => None,
+        };
         Ok(o)
     }
     pub fn to_json(&self) -> Value {
@@ -501,12 +537,39 @@ macro_rules! need {
 }
 
 /// The gate's decision over what is known so far.
+/// Whether the note comments leave the pull request Ready at `asked` (WORK-6): the latest
+/// note is `Ready` or `Approved` and a `Ready` at `asked` stands. `Err` says why not.
+pub fn ready_standing(comments: &[Comment], asked: &str) -> std::result::Result<(), String> {
+    let note = crate::bot::note_state(comments);
+    let standing = matches!(
+        note,
+        Some(crate::bot::NoteState::Ready | crate::bot::NoteState::Approved)
+    ) && crate::bot::ready_mark(comments, asked).at.is_some();
+    if standing {
+        return Ok(());
+    }
+    let latest = note.map_or("none".to_string(), |n| format!("{n:?}"));
+    Err(format!(
+        "not Ready at {} (latest note: {latest})",
+        short(asked)
+    ))
+}
+
 pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts) -> Step {
     let pr = &f.pr;
     let head = pr.head.as_str();
     let done =
         |kind: Kind, line: String, retry: bool| Step::Done(Outcome::new(kind, line, retry, head));
     let prefix = format!("{repo} #{} {}", pr.number, pr.branch);
+    // Merged into another branch: not a landing on `main`, and never a success (the pins
+    // or a recovery would take it for one).
+    if pr.merged && pr.base != "main" {
+        return done(
+            Kind::Blocked,
+            format!("{prefix} merged into {}, not main BLOCKED", pr.base),
+            false,
+        );
+    }
     if pr.merged {
         let mut o = Outcome::new(
             Kind::AlreadyMerged,
@@ -525,6 +588,16 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
         );
     }
     let main = need!(f.main, Need::Main).as_str();
+    if opts.ready_at_head && head != asked {
+        // Ready binds the head it names: a merge of it with `main` is another head, its
+        // Ready not given (the coordinator's landings).
+        let line = format!(
+            "{prefix} head {} is not the Ready head {}: head moved BLOCKED",
+            short(head),
+            short(asked)
+        );
+        return done(Kind::Blocked, line, false);
+    }
     if head != asked {
         let parents = need!(f.parents, Need::Parents);
         if !(parents.len() == 2 && parents[0] == asked && parents[1] == main) {
@@ -536,6 +609,18 @@ pub fn decide(f: &Facts, repo: &str, asked: &str, rules: &GateRules, opts: &Opts
             );
             return done(Kind::Blocked, line, false);
         }
+    }
+    if opts.ready_at_head {
+        let comments = need!(f.comments, Need::BotComments);
+        if let Err(why) = ready_standing(comments, asked) {
+            return done(Kind::Blocked, format!("{prefix} {why} BLOCKED"), false);
+        }
+    }
+    if opts.require_verdicts && rules.verdicts.is_empty() {
+        let line = format!(
+            "{prefix} names no local build verdict: a merge needs a builder's verdict for the head on main BLOCKED"
+        );
+        return done(Kind::Blocked, line, false);
     }
     let unresolved = *need!(f.unresolved, Need::Unresolved);
     let mut behind = *need!(f.behind, Need::Behind);
@@ -936,6 +1021,24 @@ async fn read_back<G: Gh>(
     Ok(pr)
 }
 
+/// Whether `pr` is merged as a landing at `head` intends: that head, into `main`.
+pub fn merged_as_intended(pr: &Pr, head: &str) -> bool {
+    pr.merged && pr.head.eq_ignore_ascii_case(head) && pr.base == "main"
+}
+
+/// Whether a landing's intent (a record with no merge) no longer stands, by the pull
+/// request now: merged other than as intended ([`merged_as_intended`]), closed, or open at
+/// another head.
+pub fn intent_obsolete(p: &Progress, pr: &Pr) -> bool {
+    if p.merge.is_some() {
+        return false;
+    }
+    if pr.merged {
+        return !merged_as_intended(pr, &p.head);
+    }
+    pr.state != "open" || !pr.head.eq_ignore_ascii_case(&p.head)
+}
+
 /// The head of `main` of a repository.
 pub async fn main_head<G: Gh>(gh: &G, s: &Settings, repo: &str) -> Result<String> {
     let v = exec::get(gh, &format!("repos/{}/git/ref/heads/main", s.full(repo))).await?;
@@ -1023,6 +1126,8 @@ async fn fill<G: Gh>(
                 exec::get_list(gh, &format!("repos/{r}/issues/{n}/comments?per_page=100")).await?;
             let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
             f.bot = Some(BotView::of(&s.review_bot, &comments, &[]));
+            // Ready is read from the fleet's comments only; the bot's view keeps them all.
+            f.comments = Some(crate::bot::by_note_authors(&comments, &s.note_authors));
         }
         Need::BotReviews => {
             let list =
@@ -1043,13 +1148,21 @@ async fn fill<G: Gh>(
         }
         Need::Verdicts => {
             let main = f.main.clone().unwrap_or_default();
+            // One revision for every verdict, checked again right before the merge call.
+            let recipe = match bus {
+                Some(b) => crate::builds::recipe_revision(b, repo).await?,
+                None => None,
+            };
             let mut out = Vec::new();
             for name in &s.gate_rules(repo).verdicts {
-                let st =
-                    crate::builds::verdict_state(bus, builds, repo, n, name, &head, &main).await?;
+                let st = crate::builds::verdict_state_at(
+                    bus, builds, repo, n, name, &head, &main, recipe,
+                )
+                .await?;
                 out.push((name.clone(), st));
             }
             f.verdicts = Some(out);
+            f.recipe = recipe;
         }
         Need::Checks => {
             let pages = exec::get_pages(
@@ -1083,7 +1196,13 @@ async fn fill<G: Gh>(
                 "application/vnd.github.v3.diff",
             )
             .await;
-            f.diff = Some(d.map_err(|e| e.to_string()));
+            // Refused credentials or the rate limit are the caller's, not this pull
+            // request's: they stop the gate rather than read as a diff that cannot be read.
+            f.diff = Some(match d {
+                Ok(d) => Ok(d),
+                Err(e @ (Error::Auth(_) | Error::RateLimited(_))) => return Err(e),
+                Err(e) => Err(e.to_string()),
+            });
         }
         Need::UpdateFiles => {
             let parent = f
@@ -1117,6 +1236,108 @@ async fn fill<G: Gh>(
         }
     }
     Ok(())
+}
+
+/// Right before the merge call, what [`Opts::ready_at_head`] and [`Opts::hold_at_merge`]
+/// ask read again: the pull request still open at `head`, still Ready at `asked`, and no
+/// `hold`. `Some` is the outcome that stops the merge; any doubt stops it.
+#[allow(clippy::too_many_arguments)]
+async fn before_merge<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: Option<&Bus>,
+    repo: &str,
+    number: u64,
+    asked: &str,
+    head: &str,
+    main: Option<&str>,
+    recipe: Option<u64>,
+    line: &str,
+    opts: &Opts,
+) -> Result<Option<Outcome>> {
+    let stop = |kind: Kind, why: String, retry: bool| {
+        Some(Outcome::new(
+            kind,
+            format!("{line} {why} {}", kind.word()),
+            retry,
+            head,
+        ))
+    };
+    if opts.ready_at_head || opts.require_verdicts {
+        let pr = fetch_pr(gh, s, repo, number).await?;
+        if pr.merged || pr.state != "open" || pr.head != head {
+            let why = format!(
+                "at the merge: {} at {}, not open at {}",
+                if pr.merged {
+                    "merged"
+                } else {
+                    pr.state.as_str()
+                },
+                short(&pr.head),
+                short(head)
+            );
+            return Ok(stop(Kind::Blocked, why, false));
+        }
+        // What the gate judged on: the pull request into `main`, and `main` at the commit
+        // the verdicts were built on. A retarget or a `main` that moved since is judged
+        // again.
+        if pr.base != "main" {
+            let why = format!("at the merge: the base is {}, not main", pr.base);
+            return Ok(stop(Kind::Blocked, why, false));
+        }
+        let now = main_head(gh, s, repo).await?;
+        if main != Some(now.as_str()) {
+            let why = format!(
+                "at the merge: main is at {}, not {} as judged",
+                short(&now),
+                short(main.unwrap_or("none"))
+            );
+            return Ok(stop(Kind::Wait, why, true));
+        }
+    }
+    if opts.ready_at_head {
+        let r = s.full(repo);
+        let list = exec::get_list(
+            gh,
+            &format!("repos/{r}/issues/{number}/comments?per_page=100"),
+        )
+        .await?;
+        let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
+        let comments = crate::bot::by_note_authors(&comments, &s.note_authors);
+        if let Err(why) = ready_standing(&comments, asked) {
+            return Ok(stop(Kind::Blocked, format!("at the merge: {why}"), false));
+        }
+    }
+    // The verdicts judged are for one recipe revision: a recipe published since (a step
+    // added, say) needs its own verdicts.
+    if let Some(judged) = recipe {
+        let now = match bus {
+            Some(b) => crate::builds::recipe_revision(b, repo).await?,
+            None => None,
+        };
+        if now != Some(judged) {
+            let why = format!(
+                "at the merge: the recipe is at revision {}, not r{judged} as judged",
+                now.map_or("none".to_string(), |r| format!("r{r}"))
+            );
+            return Ok(stop(Kind::Wait, why, true));
+        }
+    }
+    if opts.hold_at_merge {
+        let Some(b) = bus else {
+            return Ok(stop(Kind::Hold, format!("{NO_HUB}: hold unknown"), true));
+        };
+        if let Some(h) = b.state_get(crate::state::KEY_HOLD).await?
+            && crate::table::hold_active(&h.value, chrono::Utc::now())
+        {
+            return Ok(stop(
+                Kind::Hold,
+                format!("at the merge: hold until {}", h.value.trim()),
+                true,
+            ));
+        }
+    }
+    Ok(None)
 }
 
 /// Run the gate on `repo#number` for the head `asked`. With `act`, bring the branch up to
@@ -1174,6 +1395,8 @@ pub async fn evaluate<G: Gh>(
                     Ok(_) => {
                         Outcome::new(Kind::Updated, format!("{line} UPDATED"), true, &f.pr.head)
                     }
+                    // Refused credentials or the rate limit are the caller's, not a block.
+                    Err(e @ (Error::Auth(_) | Error::RateLimited(_))) => return Err(e),
                     Err(e) => Outcome::new(
                         Kind::Blocked,
                         format!("{line} update failed ({e}) BLOCKED"),
@@ -1183,12 +1406,32 @@ pub async fn evaluate<G: Gh>(
                 });
             }
             Step::Merge(line) => {
+                if let Some(o) = before_merge(
+                    gh,
+                    s,
+                    bus,
+                    repo,
+                    number,
+                    asked,
+                    &f.pr.head,
+                    f.main.as_deref(),
+                    // The revision the verdicts were judged under, where any were.
+                    f.recipe
+                        .filter(|_| f.verdicts.as_ref().is_some_and(|v| !v.is_empty())),
+                    &line,
+                    opts,
+                )
+                .await?
+                {
+                    return Ok(o);
+                }
                 if let Some(l) = lock {
                     l.confirm(&format!("merging {repo} #{number}")).await?;
                 }
                 // The intent first: a failure from here on leaves a record a retry resumes.
                 if let Some(b) = bus {
-                    progress::write(b, repo, number, &Progress::new(&f.pr.head, None)).await?;
+                    let p = Progress::new(&f.pr.head, None).by(opts.record_by);
+                    progress::write(b, repo, number, &p).await?;
                 }
                 // The lease as it is now, just confirmed: not as it was when the landing began.
                 let lease = match (lock, bus) {
@@ -1196,7 +1439,7 @@ pub async fn evaluate<G: Gh>(
                     _ => None,
                 };
                 let until = merge::until(tokio::time::Instant::now(), opts.merge_until, lease);
-                let res = merge::merge(
+                let res = match merge::merge_tracked(
                     gh,
                     &s.full(repo),
                     number,
@@ -1204,7 +1447,25 @@ pub async fn evaluate<G: Gh>(
                     until,
                     merge::POLL_EVERY,
                 )
-                .await?;
+                .await
+                {
+                    Ok(res) => res,
+                    // GitHub refused the request itself (credentials, rate limit): nothing
+                    // can merge from it, so its intent goes and blocks no other lander.
+                    Err(merge::Failed {
+                        error,
+                        maybe_accepted: false,
+                    }) => {
+                        if let Some(b) = bus
+                            && let Err(e) = progress::delete(b, repo, number).await
+                        {
+                            eprintln!("{repo} #{number}: removing the landing record: {e}");
+                        }
+                        return Err(*error);
+                    }
+                    // Accepted, or not known: the intent stays for a later attempt.
+                    Err(f) => return Err(*f.error),
+                };
                 let after = match read_back(gh, s, repo, number, res == Merge::Merged).await {
                     Ok(pr) => pr,
                     // GitHub reported it merged: the read after is a step after the merge.
@@ -1214,10 +1475,30 @@ pub async fn evaluate<G: Gh>(
                     }
                     Err(e) => return Err(e),
                 };
+                // Journaled only as this landing's merge: its head, into `main`. Another head
+                // or base merged (a refused request read back merged by someone else) is not.
+                if after.merged && !merged_as_intended(&after, &f.pr.head) {
+                    if let Some(b) = bus
+                        && let Err(e) = progress::delete(b, repo, number).await
+                    {
+                        eprintln!("{repo} #{number}: removing the landing record: {e}");
+                    }
+                    return Ok(Outcome::new(
+                        Kind::Blocked,
+                        format!(
+                            "{line} merged at {} into {}, not this landing's {} into main BLOCKED",
+                            short(&after.head),
+                            after.base,
+                            short(&f.pr.head)
+                        ),
+                        false,
+                        &f.pr.head,
+                    ));
+                }
                 if after.merged {
                     let m = after.merge_commit.clone().unwrap_or_default();
                     if let Some(b) = bus {
-                        let p = Progress::new(&f.pr.head, Some(m.clone()));
+                        let p = Progress::new(&f.pr.head, Some(m.clone())).by(opts.record_by);
                         if let Err(e) = progress::write(b, repo, number, &p).await {
                             let left = left_of(None, opts.after, &s.wrapper);
                             return Outcome::partial(repo, number, &f.pr.head, Some(&m), &left, e);
@@ -1297,9 +1578,11 @@ mod tests {
             unresolved: Some(0),
             behind: Some(0),
             bot: Some(bot_clean()),
+            comments: None,
             bot_reviews: None,
             parents: Some(vec!["p".repeat(40)]),
             verdicts: None,
+            recipe: None,
             checks: Some(vec![]),
             mine: None,
             theirs: None,
@@ -1325,6 +1608,120 @@ mod tests {
 
     fn rules() -> GateRules {
         settings().gate_rules(REPO)
+    }
+
+    fn note(body: &str, at: &str) -> Comment {
+        Comment {
+            author: "hhenson-hgl-bot".into(),
+            body: body.into(),
+            created_at: at.into(),
+            updated_at: at.into(),
+        }
+    }
+
+    /// The coordinator's landings (hgl-ai#123): Ready at the head asked for, by the note
+    /// comments the gate reads with the bot's, at the moment of the attempt.
+    #[test]
+    fn ready_at_the_head_asked_for() {
+        let opts = Opts {
+            ready_at_head: true,
+            ..Opts::default()
+        };
+        let mut f = allowed();
+        let merges = |f: &Facts| matches!(decide(f, REPO, HEAD, &rules(), &opts), Step::Merge(_));
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &rules(), &opts),
+            Step::Need(Need::BotComments)
+        ));
+        let ready = note(
+            "[claude] Ready: alpha#7 at 1f461fa7",
+            "2026-11-28T10:00:00Z",
+        );
+        f.comments = Some(vec![ready.clone()]);
+        assert!(merges(&f));
+        let approved = note("[codex] (controller) Approved", "2026-11-28T10:05:00Z");
+        f.comments = Some(vec![ready.clone(), approved.clone()]);
+        assert!(merges(&f));
+        // Sent back after Ready, or Ready at another head only: refused, saying why.
+        for later in [
+            note(
+                "[codex] (controller) Sent back at 1f461fa7",
+                "2026-11-28T10:10:00Z",
+            ),
+            note("[claude] Blocked: alpha#7", "2026-11-28T10:10:00Z"),
+        ] {
+            f.comments = Some(vec![ready.clone(), approved.clone(), later]);
+            let o = outcome(&f, &rules(), &opts);
+            assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+            assert!(o.line.contains("not Ready at 1f461fa7"), "{}", o.line);
+            assert!(!o.retry);
+        }
+        f.comments = Some(vec![note(
+            "[claude] Ready: alpha#7 at 2222aaaa",
+            "2026-11-28T10:00:00Z",
+        )]);
+        assert!(
+            outcome(&f, &rules(), &opts)
+                .line
+                .contains("latest note: Ready")
+        );
+        f.comments = Some(vec![]);
+        assert!(
+            outcome(&f, &rules(), &opts)
+                .line
+                .contains("latest note: none")
+        );
+        // The head moved to a merge of the Ready head with main: the parent's Ready is
+        // not this head's (r6). The controller's gate takes such a merge (ROLE-10).
+        f.comments = Some(vec![ready.clone()]);
+        let merge = "c".repeat(40);
+        f.pr.head = merge.clone();
+        f.parents = Some(vec![HEAD.to_string(), MAIN.to_string()]);
+        let o = outcome(&f, &rules(), &opts);
+        assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+        assert!(
+            o.line.contains("is not the Ready head 1f461fa7"),
+            "{}",
+            o.line
+        );
+        f.pr.head = HEAD.to_string();
+        f.parents = Some(vec!["p".repeat(40)]);
+        // Off (the controller's commands): the note comments are not the gate's to judge.
+        f.comments = Some(vec![]);
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &rules(), &Opts::default()),
+            Step::Merge(_)
+        ));
+    }
+
+    /// The coordinator's landings (hgl-ai#123, r6): a repository that names no local build
+    /// verdict is refused, whatever its checks; one that names them needs them.
+    #[test]
+    fn coordinator_needs_a_build_verdict() {
+        let opts = Opts {
+            require_verdicts: true,
+            ..Opts::default()
+        };
+        let f = allowed();
+        let mut r = rules();
+        r.verdicts.clear();
+        let o = outcome(&f, &r, &opts);
+        assert_eq!(o.kind, Kind::Blocked, "{}", o.line);
+        assert!(
+            o.line.contains("names no local build verdict"),
+            "{}",
+            o.line
+        );
+        assert!(!o.retry);
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &r, &Opts::default()),
+            Step::Merge(_)
+        ));
+        r.verdicts = vec!["linux".into()];
+        assert!(matches!(
+            decide(&f, REPO, HEAD, &r, &opts),
+            Step::Need(Need::Verdicts)
+        ));
     }
 
     fn outcome(f: &Facts, rules: &GateRules, opts: &Opts) -> Outcome {

@@ -33,7 +33,29 @@ pub struct Progress {
     /// hub drops the copies (PROTO-9).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub notes_at: Option<String>,
+    /// Who lands it: `coordinator` for the coordinator's landings (hgl-ai#123), which it
+    /// alone finishes and deletes; absent for the controller's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub by: Option<String>,
+    /// The coordinator's report of this landing, written before it is sent, so a resend
+    /// is the same note and the same `decisions.log` line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub report: Option<Report>,
+    /// The coordinator's `PARTIAL` note for this landing, the same way (`decision` empty).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partial: Option<Report>,
     pub updated_at: String,
+}
+
+/// A landing's report as the coordinator first wrote it.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct Report {
+    /// The note's `created_at` and the `decisions.log` line's stamp.
+    pub at: String,
+    /// The note's body.
+    pub note: String,
+    /// The `decisions.log` line, stamp included.
+    pub decision: String,
 }
 
 impl Progress {
@@ -43,8 +65,17 @@ impl Progress {
             merge,
             done: Vec::new(),
             notes_at: None,
+            by: None,
+            report: None,
+            partial: None,
             updated_at: hgl_ai_proto::utc_now_stamp(),
         }
+    }
+
+    /// The record written for `by` ([`Progress::by`]).
+    pub fn by(mut self, by: Option<&str>) -> Progress {
+        self.by = by.map(String::from);
+        self
     }
 
     pub fn has(&self, step: &str) -> bool {

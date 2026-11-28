@@ -19,9 +19,11 @@
 //! | [`tap`] | `gh tap release`, `gh tap formula`: the Homebrew tap |
 //! | [`verdict`] | `gh approve`, `gh sendback`: the controller's verdict on an exact head |
 
+pub mod autoland;
 pub mod backlog;
 pub mod bot;
 pub mod builds;
+pub mod candidates;
 pub mod coord;
 pub mod exec;
 pub mod gate;
@@ -128,6 +130,8 @@ pub struct Settings {
     pub branch_prefix: String,
     pub wrapper: String,
     pub review_bot: String,
+    /// Logins whose comments are read as note comments: `github.note_authors` and `owner`.
+    pub note_authors: Vec<String>,
     pub controller: Seat,
     pub coord_seat: Seat,
     pub coord_interval: Duration,
@@ -183,6 +187,12 @@ impl Settings {
             branch_prefix: g.branch_prefix.clone(),
             wrapper: g.wrapper.clone(),
             review_bot: g.review_bot.clone(),
+            note_authors: g
+                .note_authors
+                .iter()
+                .chain(std::iter::once(&g.owner))
+                .cloned()
+                .collect(),
             controller: Seat::new(g.controller.clone())?,
             coord_seat: Seat::new(g.coord_seat.clone())?,
             coord_interval: dur("github.coord_interval", &g.coord_interval)?,
@@ -222,6 +232,14 @@ impl Settings {
         }
     }
 
+    /// Whether the coordinator lands `repo`'s pull requests (`[github.gate.<repo>]
+    /// coordinator_lands`). Never for a repository the owner merges, whatever the
+    /// configuration says.
+    pub fn coordinator_lands(&self, repo: &str) -> bool {
+        !hgl_ai_config::github::owner_merged(repo)
+            && self.gates.get(repo).is_some_and(|g| g.coordinator_lands)
+    }
+
     /// `owner/name`
     pub fn full(&self, repo: &str) -> String {
         format!("{}/{}", self.owner, repo)
@@ -246,6 +264,8 @@ pub(crate) mod testutil {
         cfg.paths.data_dir = "/nonexistent/hgl-ai-test".into();
         let mut s = Settings::from_config(&cfg).unwrap();
         s.api_retry = Duration::from_millis(5);
+        // The fleet account of the fixtures.
+        s.note_authors.push("octo".into());
         s
     }
 
@@ -254,6 +274,15 @@ pub(crate) mod testutil {
     pub fn without_receipts(mut s: Settings, repos: &[&str]) -> Settings {
         for r in repos {
             s.gates.entry(r.to_string()).or_default().review_receipt = false;
+        }
+        s
+    }
+
+    /// `s` with `coordinator_lands` set to `on` for `repos`, bypassing the configuration's
+    /// check, as a hand-edited `[github.gate.<repo>]` would.
+    pub fn with_coordinator_lands(mut s: Settings, repos: &[&str], on: bool) -> Settings {
+        for r in repos {
+            s.gates.entry(r.to_string()).or_default().coordinator_lands = on;
         }
         s
     }

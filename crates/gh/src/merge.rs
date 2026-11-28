@@ -109,8 +109,39 @@ pub async fn merge<G: Gh>(
     deadline: Instant,
     every: Duration,
 ) -> Result<Merge> {
+    merge_tracked(gh, full, number, head, deadline, every)
+        .await
+        .map_err(|f| *f.error)
+}
+
+/// Why [`merge_tracked`] stopped with an error, and whether GitHub may have taken the
+/// request: `false` only when GitHub answered the request itself with refused credentials
+/// or a rate limit, so nothing can merge from it.
+#[derive(Debug)]
+pub struct Failed {
+    pub error: Box<Error>,
+    pub maybe_accepted: bool,
+}
+
+/// [`merge`], saying whether the request may have been accepted when it fails: a landing
+/// keeps its intent then, and drops it when GitHub refused the request outright.
+pub async fn merge_tracked<G: Gh>(
+    gh: &G,
+    full: &str,
+    number: u64,
+    head: &str,
+    deadline: Instant,
+    every: Duration,
+) -> std::result::Result<Merge, Failed> {
+    let unknown = |error: Error| Failed {
+        error: Box::new(error),
+        maybe_accepted: true,
+    };
     let path = format!("repos/{full}/pulls/{number}/merge-async");
-    let (out, shown) = exec::send_json(gh, "PUT", &path, &body(head)).await?;
+    // A run that did not report (gh failing to start, a timeout): the request may be in.
+    let (out, shown) = exec::send_json(gh, "PUT", &path, &body(head))
+        .await
+        .map_err(unknown)?;
     let answer: Option<Value> = serde_json::from_str(out.stdout.trim()).ok();
     let v = match answer {
         Some(v) if out.ok => v,
@@ -130,7 +161,10 @@ pub async fn merge<G: Gh>(
         }
         _ if !out.ok => {
             return match exec::failure(shown, &out) {
-                e @ (Error::Auth(_) | Error::RateLimited(_)) => Err(e),
+                error @ (Error::Auth(_) | Error::RateLimited(_)) => Err(Failed {
+                    error: Box::new(error),
+                    maybe_accepted: false,
+                }),
                 e => Ok(Merge::Refused(e.to_string())),
             };
         }
@@ -168,9 +202,10 @@ pub async fn merge<G: Gh>(
                 Some(done) => return Ok(done),
                 None => last = "pending".into(),
             },
-            // Not retried: the same credentials are refused again.
-            Err(e @ Error::Auth(_)) => return Ok(Merge::Pending(format!("{poll}: {e}"))),
-            // A 5xx, a timeout, a rate limit, an unreadable answer: asked again.
+            // Refused credentials or a rate limit are the caller's: the merge may still
+            // be under way, so the landing's intent stays and a later attempt finds it.
+            Err(e @ (Error::Auth(_) | Error::RateLimited(_))) => return Err(unknown(e)),
+            // A 5xx, a timeout, an unreadable answer: asked again.
             Err(e) => last = format!("unreadable ({e})"),
         }
     }
@@ -302,18 +337,25 @@ mod tests {
     async fn transient_poll_failures_are_asked_again() {
         let gh = accepted()
             .push_fail_once(POLL, "gh: Server Error (HTTP 502)")
-            .push_fail_once(POLL, "gh: API rate limit exceeded (HTTP 403)")
             .on(POLL, &answer("merged", "{\"message\":\"m\"}"));
         assert_eq!(
             run(&gh, Duration::from_secs(5)).await.unwrap(),
             Merge::Merged
         );
-        assert_eq!(calls(&gh, POLL), 3);
-        // Refused credentials stop the poll, and the merge may still happen: pending.
+        assert_eq!(calls(&gh, POLL), 2);
+        // Refused credentials or a rate limit stop the poll and go to the caller (r6): the
+        // merge may still happen, so the landing's intent stays. Neither is retried.
         let gh = accepted().fail(POLL, "gh: Bad credentials (HTTP 401)");
-        assert!(
-            matches!(run(&gh, Duration::from_secs(5)).await.unwrap(), Merge::Pending(m) if m.contains("credentials"))
-        );
+        assert!(matches!(
+            run(&gh, Duration::from_secs(5)).await,
+            Err(Error::Auth(_))
+        ));
+        assert_eq!(calls(&gh, POLL), 1);
+        let gh = accepted().fail(POLL, "gh: API rate limit exceeded (HTTP 403)");
+        assert!(matches!(
+            run(&gh, Duration::from_secs(5)).await,
+            Err(Error::RateLimited(_))
+        ));
         assert_eq!(calls(&gh, POLL), 1);
     }
 

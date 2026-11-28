@@ -99,6 +99,22 @@ impl Bus {
         .await
     }
 
+    /// Create `key` only if it is absent (a deleted key counts as absent): `Ok(false)` when
+    /// it exists, unchanged.
+    pub async fn build_create(&self, key: &str, value: &[u8]) -> Result<bool> {
+        check_kv_key(key)?;
+        super::check_value_size(key, value.len())?;
+        let store = self.build_store().await?;
+        self.guarded(&format!("$KV.{KV_BUILD}.{key}"), async {
+            match store.create(key, value.to_vec().into()).await {
+                Ok(_) => Ok(true),
+                Err(e) if e.kind() == kv::CreateErrorKind::AlreadyExists => Ok(false),
+                Err(e) => Err(nats(&format!("creating {key}"), e)),
+            }
+        })
+        .await
+    }
+
     /// Delete `key` and its history. A missing key is fine.
     pub async fn build_del(&self, key: &str) -> Result<()> {
         check_kv_key(key)?;

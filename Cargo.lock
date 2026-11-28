@@ -1445,6 +1445,7 @@ dependencies = [
  "hgl-ai-build",
  "hgl-ai-bus",
  "hgl-ai-config",
+ "hgl-ai-owner",
  "hgl-ai-proto",
  "regex",
  "serde",

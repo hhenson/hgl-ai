@@ -5,7 +5,8 @@
 //! check between rounds. Each round compares with the table on the hub. Every
 //! [`backlog::BACKLOG_EVERY`], the backlog round: `HGL_STATE/backlog` and the day's
 //! `HGL_METRICS` samples. Intake for triage runs on the same cadence and under the same
-//! `hold`, with its own cursor in `HGL_STATE/coord.intake`.
+//! `hold`, with its own cursor in `HGL_STATE/coord.intake`. After each pull request round,
+//! not under `hold`, the landings of repositories that opt in ([`autoland`]).
 //!
 //! Alerts are stored in `HGL_STATE/coord.alerts` before the table advances. Delivery
 //! is retried even while GitHub reads are paused or failing.
@@ -18,6 +19,7 @@ use hgl_ai_bus::Bus;
 use hgl_ai_proto::{Kind, Note, utc_now_stamp};
 use serde_json::Value;
 
+use crate::autoland::{self, AutoLand};
 use crate::backlog::{self, BACKLOG_EVERY};
 use crate::exec::{self, Gh};
 use crate::table::{self, Alert, HoldChange, PrInfo, RateLimit, Row, Table};
@@ -47,7 +49,13 @@ pub async fn round<G: Gh>(gh: &G, s: &Settings) -> Result<(Vec<PrInfo>, RateLimi
     }
     let vars: Vec<(&str, String)> = vars.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
     let pages = exec::graphql(gh, &q, &vars, false).await?;
-    table::parse_batch(&pages[0], &s.repos, &s.review_bot, &utc_now_stamp())
+    table::parse_batch(
+        &pages[0],
+        &s.repos,
+        &s.review_bot,
+        &s.note_authors,
+        &utc_now_stamp(),
+    )
 }
 
 /// The GraphQL reset time from the REST `rate_limit` endpoint (it costs nothing), when a
@@ -80,7 +88,7 @@ async fn write_hold(
 ) -> Result<()> {
     match change {
         HoldChange::Set(v) => {
-            store::put_latest(b, state::KEY_HOLD, v).await?;
+            let v = store::raise_hold(b, v).await?;
             tracing::warn!("GraphQL allowance {} left: hold until {v}", rate.remaining);
         }
         HoldChange::Clear => {
@@ -130,11 +138,10 @@ async fn on_rate_limit<G: Gh>(
     let v = table::hold_on_limit(graphql_reset(gh).await, last_rate, now);
     tracing::warn!("rate limited ({msg}): hold until {v}");
     match bus {
-        Some(b) => {
-            if let Err(e) = store::put_latest(b, state::KEY_HOLD, &v).await {
-                tracing::warn!("writing {}: {e}", state::KEY_HOLD);
-            }
-        }
+        Some(b) => match store::raise_hold(b, &v).await {
+            Ok(held) => return held,
+            Err(e) => tracing::warn!("writing {}: {e}", state::KEY_HOLD),
+        },
         None => {
             let _ = writeln!(out, "rate limited: would hold until {v}");
         }
@@ -268,6 +275,7 @@ pub async fn run<G: Gh>(
     let mut last_rate: Option<RateLimit> = None;
     let mut last_backlog: Option<Instant> = None;
     let mut last_intake: Option<Instant> = None;
+    let mut lands = AutoLand::new(s);
     loop {
         let now = Utc::now();
         let mut hold = match bus {
@@ -323,6 +331,7 @@ pub async fn run<G: Gh>(
                         for a in table::alerts(&prev, &infos) {
                             let _ = write!(out, "would alert {}: {}", s.controller, a.body());
                         }
+                        autoland::dry_run(s, &infos, out);
                         let _ = out.flush();
                         prev = t.rows;
                     }
@@ -350,6 +359,27 @@ pub async fn run<G: Gh>(
                     HoldChange::Set(v) => hold = Some(v),
                     HoldChange::Clear => hold = None,
                     HoldChange::Keep => {}
+                }
+                if let Some(b) = bus
+                    && !hold
+                        .as_deref()
+                        .is_some_and(|h| table::hold_active(h, Utc::now()))
+                {
+                    match lands.round(gh, s, b, &infos).await {
+                        Ok(()) => {}
+                        Err(Error::RateLimited(m)) => {
+                            hold = Some(
+                                on_rate_limit(gh, bus, last_rate.as_ref(), &m, Utc::now(), out)
+                                    .await,
+                            );
+                            if o.once {
+                                return Err(Error::RateLimited(m));
+                            }
+                        }
+                        Err(e @ Error::Auth(_)) => return Err(e),
+                        Err(e) if o.once => return Err(e),
+                        Err(e) => tracing::warn!("coordinator landings: {e}"),
+                    }
                 }
             }
             Err(Error::RateLimited(m)) => {

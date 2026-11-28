@@ -39,6 +39,20 @@ pub struct RepoGate {
     /// Regular expressions over check names that may still run but must not have failed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub relax_optional: Vec<String>,
+    /// The coordinator lands this repository's pull requests itself once every gate passes,
+    /// in Ready order (docs/work.md WORK-6). Default `false`: the controller lands them.
+    /// Refused for the specification repositories ([`OWNER_MERGED`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub coordinator_lands: bool,
+}
+
+/// Repositories whose pull requests the owner merges: `coordinator_lands` is refused for
+/// them whatever the configuration says. Compared case-insensitively ([`owner_merged`]).
+pub const OWNER_MERGED: &[&str] = &["hgl_spec", "hgl_core"];
+
+/// Whether the owner merges `repo` ([`OWNER_MERGED`], in any letter case).
+pub fn owner_merged(repo: &str) -> bool {
+    OWNER_MERGED.iter().any(|r| r.eq_ignore_ascii_case(repo))
 }
 
 fn yes() -> bool {
@@ -59,6 +73,7 @@ impl Default for RepoGate {
             relax_paths: Vec::new(),
             relax_required: Vec::new(),
             relax_optional: Vec::new(),
+            coordinator_lands: false,
         }
     }
 }
@@ -200,6 +215,7 @@ fn default_gates() -> BTreeMap<String, RepoGate> {
             "cpp (sanitize, sdk)",
         ]),
         relax_optional: strings(&[r"^test \((macos|windows)-latest\)$"]),
+        coordinator_lands: false,
     };
     let checks = |c: &[&str]| RepoGate {
         checks: strings(c),
@@ -242,6 +258,19 @@ fn default_pins() -> Vec<Pin> {
         via("hgl_spec", "spec/hgl_spec"),
         via("hgl_core", "spec/hgl_core"),
     ]
+}
+
+/// Refuse `coordinator_lands` for a repository the owner merges ([`OWNER_MERGED`]).
+pub fn validate_gates(gates: &BTreeMap<String, RepoGate>) -> Result<(), String> {
+    match gates
+        .iter()
+        .find(|(r, g)| g.coordinator_lands && owner_merged(r))
+    {
+        Some((r, _)) => Err(format!(
+            "github.gate.{r}: coordinator_lands is refused; the owner merges {r}"
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Check the GitHub service settings that the schema alone cannot.
@@ -328,5 +357,41 @@ mod tests {
         );
         assert!(toml::to_string(&g).unwrap().contains("verdicts"));
         assert!(!toml::to_string(&g).unwrap().contains("review_receipt"));
+    }
+
+    #[test]
+    fn coordinator_landing_is_opt_in() {
+        assert!(!RepoGate::default().coordinator_lands);
+        let g: RepoGate = toml::from_str("checks = [\"lint\"]").unwrap();
+        assert!(
+            !g.coordinator_lands,
+            "an entry that does not name it is off"
+        );
+        assert!(!toml::to_string(&g).unwrap().contains("coordinator_lands"));
+        let on: RepoGate = toml::from_str("coordinator_lands = true").unwrap();
+        assert!(on.coordinator_lands);
+        assert_eq!(
+            toml::to_string(&on).unwrap().trim(),
+            "coordinator_lands = true"
+        );
+        // No built-in entry opts in: only explicit configuration does.
+        let all = gates();
+        assert!(all.values().all(|g| !g.coordinator_lands), "{all:?}");
+        validate_gates(&all).unwrap();
+        for r in OWNER_MERGED
+            .iter()
+            .map(|r| r.to_string())
+            .chain(["HGL_SPEC".into(), "Hgl_Core".into()])
+        {
+            let mut g = all.clone();
+            g.insert(
+                r.to_string(),
+                toml::from_str("coordinator_lands = true").unwrap(),
+            );
+            let e = validate_gates(&g).unwrap_err();
+            assert!(e.contains(&format!("github.gate.{r}")), "{e}");
+            g.insert(r.to_string(), RepoGate::default());
+            validate_gates(&g).unwrap();
+        }
     }
 }

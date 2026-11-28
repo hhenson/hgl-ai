@@ -164,6 +164,7 @@ impl GateArgs {
                 merge_until: None,
                 // The landing sets it from its options.
                 after: Default::default(),
+                ..Opts::default()
             },
             closes: self.closes,
             what: self.what.clone(),
@@ -640,6 +641,7 @@ mod tests {
             retry: false,
             merge_commit: None,
             head: String::new(),
+            cause: None,
         };
         let l = Landing {
             outcome,

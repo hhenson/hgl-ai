@@ -78,6 +78,13 @@ read-only token (Metadata, Contents, Issues, Pull requests, Checks, Actions, Com
 statuses: read) for the repositories. The token step above stores it as the server
 user (`[github] token_file`); run that step again to replace it.
 
+Where `[github.gate.<repo>] coordinator_lands` is on, the coordinator also merges and
+comments there, so its token needs write access on those repositories, and only those:
+Contents, Pull requests and Issues: write (the merge, the branch update, the `landed`
+comment); its account must be allowed to bypass their rulesets, as the controller's is.
+A fine-grained token gives the same permissions on every repository it selects. Changing
+the token is the owner's step; leave `coordinator_lands` off until it is done.
+
 During the intake cutover, deploy and verify the coordinator's triage delivery
 before disabling the interim `hgl-intakewatch` timer.
 

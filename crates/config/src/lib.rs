@@ -193,6 +193,11 @@ pub struct Github {
         skip_serializing_if = "github::is_review_bot"
     )]
     pub review_bot: String,
+    /// GitHub logins whose pull request comments count as note comments (`Ready`,
+    /// `Approved`, `Sent back`, `Blocked`, `Landed`): the fleet's and the controller's
+    /// accounts. `owner` always counts; a comment by anyone else is not read as a note.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub note_authors: Vec<String>,
     /// The controller's seat (ROLE-2): it gets the bridge's and the coordinator's alerts
     /// and sends `landed` notes.
     #[serde(
@@ -295,6 +300,7 @@ impl Default for Github {
             branch_prefix: "codex/".into(),
             wrapper: "hgl-project".into(),
             review_bot: github::review_bot(),
+            note_authors: Vec::new(),
             controller: github::controller(),
             coord_seat: github::coord_seat(),
             coord_interval: github::coord_interval(),
@@ -657,6 +663,7 @@ impl Config {
         }
         self.controller()?;
         github::validate_pins(&self.github.pins).map_err(ConfigError::Invalid)?;
+        github::validate_gates(&self.github.gate).map_err(ConfigError::Invalid)?;
         if let Some(c) = &self.console {
             c.validate().map_err(ConfigError::Invalid)?;
         }

@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use hgl_ai_bus::Bus;
 use hgl_ai_proto::{Kind as NoteKind, Note, Seat, utc_now_stamp};
 
-use crate::bot::{Comment, ready_signers};
+use crate::bot::{Comment, by_note_authors, ready_signers};
 use crate::exec::{self, Gh};
 use crate::gate::{self, Kind, Opts, Outcome};
 use crate::lock::{LandLock, holder};
@@ -47,6 +47,13 @@ pub struct LandOpts {
     /// Ask builders for the local build verdicts the gate lacks (BUILD-15); `None`: only
     /// read them.
     pub builds: Option<std::sync::Arc<gate::GateBuilds>>,
+    /// `merge_locked`: keep the landing record once its steps are done, for a caller with
+    /// steps of its own that deletes it after them (the coordinator's reports).
+    pub keep_record: bool,
+    /// Finish the landing of a pull request found merged with no record of this landing
+    /// (merged by hand, or at a head other than the record's intent). Off for the
+    /// coordinator, which announces only what it merged.
+    pub adopt_merged: bool,
 }
 
 impl Default for LandOpts {
@@ -65,6 +72,8 @@ impl Default for LandOpts {
             trailer: None,
             footer: None,
             builds: None,
+            keep_record: false,
+            adopt_merged: true,
         }
     }
 }
@@ -108,6 +117,7 @@ async fn wait_for_table(
                     retry: false,
                     merge_commit: None,
                     head: head.to_string(),
+                    cause: None,
                 }));
             }
             TableWord::NotYet(why) => {
@@ -256,10 +266,15 @@ async fn land_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<(Landing, String)> {
+    let deadline = Instant::now() + o.timeout;
+    let hold = Some(deadline);
+    if let Some(outcome) = owned_elsewhere(gh, s, bus, repo, number, head, o, lock, hold).await? {
+        let after = Vec::new();
+        return Ok((Landing { outcome, after }, String::new()));
+    }
     if let Some(done) = resume_recorded(gh, s, bus, repo, number, o, lock).await? {
         return Ok(done);
     }
-    let deadline = Instant::now() + o.timeout;
     let gate_opts = with_deadline(s, repo, o, deadline);
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
     {
@@ -278,6 +293,7 @@ async fn land_locked<G: Gh>(
                 retry: false,
                 merge_commit: None,
                 head: head.to_string(),
+                cause: None,
             };
             return Ok((
                 Landing {
@@ -319,6 +335,68 @@ async fn land_locked<G: Gh>(
         tokio::time::sleep(o.interval).await;
     };
     settle(gh, s, bus, repo, number, outcome, o, lock).await
+}
+
+/// A landing record is finished and deleted only by whoever it is written for
+/// ([`Progress::by`]): the coordinator's by the coordinator, after its reports; the
+/// controller's by `gh land` or `gh merge-if-clean`. `Some` refuses another's.
+///
+/// Another's intent (no merge recorded) that no longer stands ([`gate::intent_obsolete`]:
+/// the pull request closed, open at another head, or merged other than as intended) is
+/// retired here, under the lock, so a stale intent never blocks the other lander.
+#[allow(clippy::too_many_arguments)]
+async fn owned_elsewhere<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: &Bus,
+    repo: &str,
+    number: u64,
+    head: &str,
+    o: &LandOpts,
+    lock: &LandLock,
+    hold: Option<Instant>,
+) -> Result<Option<Outcome>> {
+    let Some(p) = progress::read(bus, repo, number).await? else {
+        return Ok(None);
+    };
+    if p.by.as_deref() == o.gate.record_by {
+        return Ok(None);
+    }
+    if p.merge.is_none() {
+        // The read and the retirement wait while `hold` holds (ROLE-19): `gh land` waits
+        // until its deadline, `gh merge-if-clean` (one attempt) stops.
+        let until = match hold {
+            Some(deadline) => wait_for_hold(bus, deadline).await?,
+            None => bus
+                .state_get(state::KEY_HOLD)
+                .await?
+                .map(|h| h.value.trim().to_string())
+                .filter(|v| hold_active(v, chrono::Utc::now())),
+        };
+        if let Some(until) = until {
+            let line = format!(
+                "{repo} #{number}: hold until {until}; another's landing intent is not read HOLD"
+            );
+            return Ok(Some(Outcome::new(Kind::Hold, line, true, head)));
+        }
+        let pr = gate::fetch_pr(gh, s, repo, number).await?;
+        if gate::intent_obsolete(&p, &pr) {
+            lock.confirm("retiring a stale landing intent").await?;
+            progress::delete(bus, repo, number).await?;
+            eprintln!(
+                "{repo} #{number}: the {}'s intent at {} no longer stands; retired",
+                p.by.as_deref().unwrap_or("controller"),
+                short(&p.head)
+            );
+            return Ok(None);
+        }
+    }
+    let owner = p.by.as_deref().unwrap_or("controller");
+    let line = format!(
+        "{repo} #{number}: its landing record {} is the {owner}'s, which finishes it BLOCKED",
+        progress::key(repo, number)
+    );
+    Ok(Some(Outcome::new(Kind::Blocked, line, false, head)))
 }
 
 /// A landing whose record holds the merge commit: an earlier attempt merged and stopped
@@ -503,13 +581,40 @@ async fn settle_merged<G: Gh>(
         return Ok((Landing { outcome, after }, String::new()));
     }
     // Merged, and its landing not finished (an earlier attempt stopped right after
-    // the merge, or it was merged without one): finish it now.
+    // the merge, or it was merged without one): finish it now, if it is a landing on
+    // `main`, and as this landing's only when the record's intent is the head merged.
+    let pr = gate::fetch_pr(gh, s, repo, number).await?;
+    if pr.base != "main" {
+        // Not a landing on `main`: unsatisfied, never AlreadyMerged.
+        let outcome = Outcome::new(
+            Kind::Blocked,
+            format!(
+                "{repo} #{number} was merged into {}, not main BLOCKED",
+                pr.base
+            ),
+            false,
+            &pr.head,
+        );
+        let after = Vec::new();
+        return Ok((Landing { outcome, after }, String::new()));
+    }
+    let p = p.filter(|p| p.merge.is_some() || p.head.eq_ignore_ascii_case(&pr.head));
+    if p.is_none() && !o.adopt_merged {
+        let after = vec![format!(
+            "{repo} #{number} was merged at {} without this landing; left",
+            short(&pr.head)
+        )];
+        return Ok((
+            Landing {
+                outcome: outcome.clone(),
+                after,
+            },
+            String::new(),
+        ));
+    }
     let (merge, pr_head) = match &outcome.merge_commit {
         Some(m) => (m.clone(), outcome.head.clone()),
-        None => {
-            let pr = gate::fetch_pr(gh, s, repo, number).await?;
-            (pr.merge_commit.unwrap_or_default(), pr.head)
-        }
+        None => (pr.merge_commit.clone().unwrap_or_default(), pr.head.clone()),
     };
     let head = p
         .as_ref()
@@ -527,7 +632,7 @@ async fn settle_merged<G: Gh>(
     );
     resumed.merge_commit = Some(merge.clone());
     eprintln!("{}", resumed.line);
-    let p = p.unwrap_or_else(|| Progress::new(&head, Some(merge)));
+    let p = p.unwrap_or_else(|| Progress::new(&head, Some(merge)).by(o.gate.record_by));
     finish(gh, s, bus, repo, number, resumed, o, lock, Some(p)).await
 }
 
@@ -562,6 +667,10 @@ pub(crate) async fn merge_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<Landing> {
+    if let Some(outcome) = owned_elsewhere(gh, s, bus, repo, number, head, o, lock, None).await? {
+        let after = Vec::new();
+        return Ok(Landing { outcome, after });
+    }
     // The pins are not this command's: a `PARTIAL` does not name them.
     let o = &LandOpts {
         sync_pins: false,
@@ -595,7 +704,9 @@ pub(crate) async fn merge_locked<G: Gh>(
                 s.wrapper
             ));
         }
-        return drop_record(bus, repo, number, outcome, after).await;
+        if !o.keep_record {
+            return drop_record(bus, repo, number, outcome, after).await;
+        }
     }
     Ok(Landing { outcome, after })
 }
@@ -616,7 +727,8 @@ async fn finish<G: Gh>(
     prog: Option<Progress>,
 ) -> Result<(Landing, String)> {
     let merge = outcome.merge_commit.clone().unwrap_or_default();
-    let mut p = prog.unwrap_or_else(|| Progress::new(&outcome.head, Some(merge.clone())));
+    let mut p = prog
+        .unwrap_or_else(|| Progress::new(&outcome.head, Some(merge.clone())).by(o.gate.record_by));
     let mut after = Vec::new();
     match after_merge(
         gh, s, bus, repo, number, &outcome, o, lock, &mut p, &mut after,
@@ -773,10 +885,23 @@ async fn commented<G: Gh>(
         ),
     )
     .await?;
-    Ok(list
+    Ok(has_first_line(&list, &s.note_authors, first))
+}
+
+/// Whether a note author's comment among the REST `comments` has the first line `first`; a
+/// stranger's copy of the line does not count, or it could stop the landing's comment.
+fn has_first_line(comments: &[serde_json::Value], authors: &[String], first: &str) -> bool {
+    let comments: Vec<Comment> = comments.iter().map(Comment::from_rest).collect();
+    by_note_authors(&comments, authors)
         .iter()
-        .map(Comment::from_rest)
-        .any(|c| c.body.lines().next().map(str::trim) == Some(first.trim())))
+        .any(|c| c.body.lines().next().map(str::trim) == Some(first.trim()))
+}
+
+/// The seats that signed a note author's `Ready` comment among the REST `comments`; a
+/// stranger's `[codex] (w1) Ready` names no seat.
+fn note_signers(comments: &[serde_json::Value], authors: &[String]) -> Vec<String> {
+    let comments: Vec<Comment> = comments.iter().map(Comment::from_rest).collect();
+    ready_signers(&by_note_authors(&comments, authors))
 }
 
 /// Append the landing to `landed.log`, unless the line is there already (a resumed landing).
@@ -990,7 +1115,6 @@ pub(crate) async fn author_seats<G: Gh>(
         ),
     )
     .await?;
-    let comments: Vec<Comment> = list.iter().map(Comment::from_rest).collect();
     let pick = if current {
         state::current_seats
     } else {
@@ -1002,7 +1126,7 @@ pub(crate) async fn author_seats<G: Gh>(
         branch,
         issue.unwrap_or(number),
         &known,
-        &ready_signers(&comments),
+        &note_signers(&list, &s.note_authors),
     ))
 }
 
@@ -1046,6 +1170,27 @@ async fn send_landed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_note_authors_comments_name_seats_or_count_as_posted() {
+        let c = |login: &str, body: &str| serde_json::json!({"user": {"login": login}, "body": body, "created_at": "x"});
+        let fleet = vec!["fleet".to_string(), "owner".to_string()];
+        let first = "[claude] Landed: o/r#7 at 11111111 as 22222222";
+        let stranger = [
+            c("stranger", "[codex] (w1) Ready: o/r#7 at 11111111"),
+            c("stranger", first),
+        ];
+        assert!(note_signers(&stranger, &fleet).is_empty());
+        assert!(!has_first_line(&stranger, &fleet, first));
+        let own = [
+            c("fleet", "[codex] (w2) Ready: o/r#7 at 11111111"),
+            c("owner", first),
+        ];
+        assert_eq!(note_signers(&own, &fleet), ["w2"]);
+        assert!(has_first_line(&own, &fleet, first));
+        let both: Vec<_> = stranger.iter().chain(&own).cloned().collect();
+        assert_eq!(note_signers(&both, &fleet), ["w2"]);
+    }
     use crate::exec::fake::FakeGh;
     use crate::testutil::{fixture, settings, without_receipts};
 

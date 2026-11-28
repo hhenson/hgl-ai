@@ -18,6 +18,8 @@ use hgl_ai_proto::build::{
 };
 use hgl_ai_proto::{Seat, utc_now_stamp};
 
+use serde::{Deserialize, Serialize};
+
 use crate::{Error, Result};
 
 /// One local build verdict as the gate reads it, for this head on this `main` under the
@@ -41,8 +43,13 @@ pub enum VerdictState {
 pub const MAX_ASKS: u32 = 3;
 
 /// The gate build this command asked for last, for one verdict.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Asked {
+    /// The pull request, in a durable ask's value (its key alone may be ambiguous).
+    #[serde(default)]
+    repo: String,
+    #[serde(default)]
+    pr: u64,
     head: String,
     main: String,
     recipe: u64,
@@ -50,6 +57,20 @@ struct Asked {
     builder: String,
     /// Asks for this head, `main` and recipe so far.
     asks: u32,
+    /// A durable ask's delivery state: the job and its note's `created_at`, kept before the
+    /// send, so a requester that stopped before it knew the send went out sends the same
+    /// message again (the hub drops a copy) rather than wait for a job never published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    job: Option<BuildJob>,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    at: String,
+    /// The job note is published. An ask kept without it (an older value) counts as sent.
+    #[serde(default = "yes")]
+    sent: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 /// The gate builds one `gh land`, `gh merge-if-clean` or `build gate` has asked for. While
@@ -62,6 +83,10 @@ pub struct GateBuilds {
     /// Who asked, in the summaries.
     pub requester: String,
     asked: Mutex<BTreeMap<String, Asked>>,
+    /// The `HGL_STATE` key prefix each ask is also written under before it is sent, so a
+    /// restarted requester waits for the build it asked for rather than ask again (the
+    /// coordinator, a long-lived service); `None`: this command's memory only.
+    durable: Option<String>,
 }
 
 /// What one verdict needs: the gate's pull request, name, head, `main` and the recipe
@@ -98,7 +123,83 @@ impl GateBuilds {
             sender,
             requester: requester.into(),
             asked: Mutex::new(BTreeMap::new()),
+            durable: None,
         }
+    }
+
+    /// [`GateBuilds::new`] whose asks are kept on the hub under `prefix` too:
+    /// `<prefix><repo>.<pr>.<name>`, JSON of the build asked for last.
+    pub fn durable(sender: Seat, requester: impl Into<String>, prefix: &str) -> GateBuilds {
+        GateBuilds {
+            durable: Some(prefix.to_string()),
+            ..GateBuilds::new(sender, requester)
+        }
+    }
+
+    /// A durable ask's key for `w`, valid or `Err` why not.
+    fn ask_key(&self, w: &Want<'_>) -> Option<std::result::Result<String, String>> {
+        let p = self.durable.as_ref()?;
+        let k = format!("{p}{}.{}.{}", w.repo, w.pr, w.name);
+        Some(
+            hgl_ai_proto::check_state_key(&k)
+                .map(|_| k.clone())
+                .map_err(|_| format!("{k} is not a state key; the ask cannot be kept")),
+        )
+    }
+
+    /// The durable ask for `w`'s slot, into memory when memory has none (a restart).
+    async fn recall(&self, bus: &Bus, w: &Want<'_>) -> Result<()> {
+        let Some(Ok(k)) = self.ask_key(w) else {
+            return Ok(());
+        };
+        if self.slot_held(w) {
+            return Ok(());
+        }
+        let Some(e) = bus.state_get(&k).await? else {
+            return Ok(());
+        };
+        match serde_json::from_str::<Asked>(&e.value) {
+            Ok(a) if a.repo == w.repo && a.pr == w.pr => {
+                self.asked
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .entry(w.slot())
+                    .or_insert(a);
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("{k}: unreadable gate build ask ({err})"),
+        }
+        Ok(())
+    }
+
+    fn slot_held(&self, w: &Want<'_>) -> bool {
+        self.asked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains_key(&w.slot())
+    }
+
+    /// Forget every ask for `repo#pr`, in memory and on the hub: it landed or closed.
+    pub async fn forget(&self, bus: &Bus, repo: &str, pr: u64) -> Result<()> {
+        let slots = verdict_prefix(repo, pr);
+        self.asked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|k, _| !k.starts_with(&slots));
+        let Some(p) = &self.durable else {
+            return Ok(());
+        };
+        for k in bus.state_keys(&format!("{p}{repo}.{pr}.")).await? {
+            let ours = bus
+                .state_get(&k)
+                .await?
+                .and_then(|e| serde_json::from_str::<Asked>(&e.value).ok())
+                .is_some_and(|a| a.repo == repo && a.pr == pr);
+            if ours {
+                bus.state_del(&k).await?;
+            }
+        }
+        Ok(())
     }
 
     /// The build asked for `w`'s exact head, `main` and recipe, if any.
@@ -135,6 +236,11 @@ impl GateBuilds {
         let Some(b) = request::choose(&live, platform, None) else {
             return Ok(Err(format!("no live {platform} builder is registered")));
         };
+        let key = match self.ask_key(w) {
+            Some(Err(why)) => return Ok(Err(why)),
+            Some(Ok(k)) => Some(k),
+            None => None,
+        };
         let id = new_build_id();
         let job = BuildJob {
             v: BUILD_VERSION,
@@ -153,22 +259,102 @@ impl GateBuilds {
             notify: None,
             requester: self.requester.clone(),
         };
-        request::send(bus, self.sender.clone(), &b, &job)
-            .await
-            .map_err(store_err)?;
         let a = Asked {
+            repo: w.repo.to_string(),
+            pr: w.pr,
             head: w.head.to_string(),
             main: w.main.to_string(),
             recipe: w.recipe,
             id,
             builder: b.label.clone(),
             asks: asks + 1,
+            job: key.is_some().then(|| job.clone()),
+            at: if key.is_some() {
+                utc_now_stamp()
+            } else {
+                String::new()
+            },
+            sent: key.is_none(),
         };
+        let Some(k) = key else {
+            request::send(bus, self.sender.clone(), &b, &job)
+                .await
+                .map_err(store_err)?;
+            self.remember(w, &a);
+            return Ok(Ok(a));
+        };
+        // Kept, unsent, before it is sent: a restart at any point after finds it and either
+        // waits for the job or sends the same message again ([`GateBuilds::replay`]).
+        self.keep(bus, &k, &a).await?;
+        self.remember(w, &a);
+        Ok(Ok(self.deliver(bus, &k, w, a, &b).await?))
+    }
+
+    fn remember(&self, w: &Want<'_>, a: &Asked) {
         self.asked
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(w.slot(), a.clone());
-        Ok(Ok(a))
+    }
+
+    async fn keep(&self, bus: &Bus, key: &str, a: &Asked) -> Result<()> {
+        let text = serde_json::to_string(a).expect("an ask encodes");
+        crate::store::put_latest(bus, key, &text).await?;
+        Ok(())
+    }
+
+    /// Publish a durable ask's job with its kept `created_at`, then keep it sent. A failed
+    /// send leaves it unsent, for the next read to send again.
+    async fn deliver(
+        &self,
+        bus: &Bus,
+        key: &str,
+        w: &Want<'_>,
+        mut a: Asked,
+        b: &BuilderRecord,
+    ) -> Result<Asked> {
+        let Some(job) = a.job.clone() else {
+            return Ok(a);
+        };
+        request::send_at(bus, self.sender.clone(), b, &job, Some(&a.at))
+            .await
+            .map_err(store_err)?;
+        a.sent = true;
+        self.keep(bus, key, &a).await?;
+        self.remember(w, &a);
+        Ok(a)
+    }
+
+    /// A durable ask whose send is not known to have gone out: its builder has the job
+    /// (its summary is past `queued`), or the same message is sent again while that
+    /// builder takes jobs. Otherwise it stays unsent and is lost like any other.
+    async fn replay(
+        &self,
+        bus: &Bus,
+        builders: &[BuilderRecord],
+        w: &Want<'_>,
+        mut a: Asked,
+    ) -> Result<Asked> {
+        let Some(Ok(key)) = self.ask_key(w) else {
+            return Ok(a);
+        };
+        let run = hgl_ai_build::store::run_get(bus, &a.id)
+            .await
+            .map_err(store_err)?;
+        if run.is_some_and(|s| s.status != BuildStatus::Queued) {
+            a.sent = true;
+            self.keep(bus, &key, &a).await?;
+            self.remember(w, &a);
+            return Ok(a);
+        }
+        let Some(b) = builders
+            .iter()
+            .find(|b| b.label == a.builder && b.state == "active" && b.reachable)
+        else {
+            return Ok(a);
+        };
+        tracing::info!("{}: sending {} to {} again", key, a.id, a.builder);
+        self.deliver(bus, &key, w, a, b).await
     }
 }
 
@@ -230,14 +416,40 @@ pub async fn verdict_state(
     head: &str,
     main: &str,
 ) -> Result<VerdictState> {
+    let Some(b) = bus else {
+        return Ok(VerdictState::Missing(None));
+    };
+    let recipe = recipe_revision(b, repo).await?;
+    verdict_state_at(bus, builds, repo, pr, name, head, main, recipe).await
+}
+
+/// The revision of `repo`'s recipe on the hub, if it has one: the one a verdict is for
+/// (BUILD-15).
+pub async fn recipe_revision(bus: &Bus, repo: &str) -> Result<Option<u64>> {
+    Ok(hgl_ai_build::store::recipe_get(bus, repo, None)
+        .await
+        .map_err(store_err)?
+        .map(|r| r.revision))
+}
+
+/// [`verdict_state`] under the recipe revision `recipe` read once by the caller, so every
+/// verdict of one gate is for the same revision ([`recipe_revision`]).
+#[allow(clippy::too_many_arguments)]
+pub async fn verdict_state_at(
+    bus: Option<&Bus>,
+    builds: Option<&GateBuilds>,
+    repo: &str,
+    pr: u64,
+    name: &str,
+    head: &str,
+    main: &str,
+    recipe: Option<u64>,
+) -> Result<VerdictState> {
     let Some(bus) = bus else {
         return Ok(VerdictState::Missing(None));
     };
     // The gate needs the current recipe's verdict: an update asks again (BUILD-15).
-    let Some(recipe) = hgl_ai_build::store::recipe_get(bus, repo, None)
-        .await
-        .map_err(store_err)?
-    else {
+    let Some(recipe) = recipe else {
         return Ok(VerdictState::Missing(Some(format!(
             "no recipe for {repo} on the hub"
         ))));
@@ -248,7 +460,7 @@ pub async fn verdict_state(
         name,
         head,
         main,
-        recipe: recipe.revision,
+        recipe,
     };
     let key = w.key();
     let (raw, value) = read(bus, &key).await?;
@@ -276,7 +488,11 @@ pub async fn verdict_state(
     };
     let builders = bus.builders().await?;
     let now = utc_now_stamp();
-    let asked = builds.asked(&w);
+    builds.recall(bus, &w).await?;
+    let mut asked = builds.asked(&w);
+    if let Some(a) = asked.clone().filter(|a| !a.sent) {
+        asked = Some(builds.replay(bus, &builders, &w, a).await?);
+    }
     // Why the build to wait for is lost, and the builder that lost it; `None` with nothing
     // to wait for.
     let lost: Option<(String, Option<String>)> = if let Some(a) = &asked {
@@ -337,6 +553,12 @@ pub async fn verdict_state(
                         a.id, a.builder
                     )));
                 }
+            }
+            // Kept before the send and not sent, with its builder not taking jobs, or no
+            // summary at all: lost.
+            _ if !a.sent => Some((format!("{} was not sent to {}", a.id, a.builder), None)),
+            None if builds.durable.is_some() => {
+                Some((format!("{} was not sent to {}", a.id, a.builder), None))
             }
             // Queued (or its summary not kept): waiting while its builder takes jobs.
             _ if taking(&builders, &a.builder) => {

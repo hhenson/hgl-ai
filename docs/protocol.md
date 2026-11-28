@@ -7,7 +7,8 @@ this repository.
 
 - **PROTO-1 — GitHub is the record.** Issues, pull requests, reviews, checks
   and merges live on GitHub. A `ready`, `blocked`, `sendback`, `approved` or
-  `landed` note also gets one GitHub comment, posted once by its sender.
+  `landed` note also gets one GitHub comment, posted once by its sender. Only
+  comments by `[github] note_authors` and `owner` are read as these notes.
 - **PROTO-2 — The bus is transport.** NATS JetStream carries notes and shared
   state between agents and hosts. History is bounded (14 days); nothing that
   decides something lives only on the bus.
@@ -292,15 +293,16 @@ before hub users takes one shared token until it moves.
 
 | Key | Writer | Content |
 | --- | --- | --- |
-| `main` | controller | `updated <UTC>`, then `<repo> main <sha>` lines and the wrapper's pins. Rewritten after each merge. |
+| `main` | controller, coordinator service | `updated <UTC>`, then `<repo> main <sha>` lines and the wrapper's pins. Rewritten after each merge. |
 | `prs` | coordinator service | `# read <UTC>`, `# cost <n> remaining <n> resetAt <ISO>`, then rows `REPO NUMBER HEAD draft\|open BOT UNRESOLVED CHECKS UPDATED`. At most every 5 min; stale after 15 min. |
-| `landed.log` | controller | `<UTC> <repo> #<pr> <merge sha>` per merge. |
-| `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. |
+| `landed.log` | controller, coordinator service | `<UTC> <repo> #<pr> <merge sha>` per merge. |
+| `hold` | coordinator, controller | Present while the GitHub API allowance is spent; value is the reset time. Defer every call that can wait. The coordinator never shortens a hold it finds (a later time, or one with no time). |
 | `mode` | controller | `normal` (default) or `drain`: finish in-flight work, take nothing new. |
 | `backlog` | coordinator service | Open issues by label and the claimable queue (docs/owner.md §3). Every 15 min. |
 | `tasks` | coordinator service | The last note about each task with a worktree: rows `REPO ISSUE KIND SENDER RECIPIENT AT`, tab-separated, sorted. Read from the notes stream every 10 s; written when it changes. |
-| `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
-| `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
+| `decisions.log` | controller, console, coordinator service | The controller's decision log (OWN-8): newest 2000 lines. |
+| `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean`, coordinator service | JSON `{"head","merge","done","notes_at","by","report","partial","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. `by` is `coordinator` on the coordinator's landings, which alone finish them (`coord.note`, `coord.decision`, from the `report` kept in the record before it is sent; a `PARTIAL` once, `coord.partial`); it leaves every other record to the controller. |
+| `coord.ask.<repo>.<pr>.<name>` | coordinator service | JSON of the last gate build the coordinator asked for the verdict `name` (head, `main`, recipe revision, build id, builder, asks). Written before the job is sent, with the job, its note's `created_at` and `sent`, then again once the note is published. A restart waits for that build rather than ask again; an ask not known sent is sent again as the same message (the hub drops a copy) unless its builder already took the job; the queued summary is created only if absent, so a resend never sets back the builder's. Deleted when the landing is done or retired. |
 | `coord.alerts` | coordinator service | JSON array of pending alert notes and delivery metadata, saved before `prs` advances. Retries run during holds and GitHub read failures. The queue retains at most 100 entries within the state byte limit and reports oldest-entry drops. Five failed sends replace an alert with a dead-letter note for the controller. |
 | `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
@@ -347,6 +349,52 @@ is done, and the sync goes on to the pins. Its dry run reads the hub for them to
 request found merged with neither a record nor a `landed.log` line has every step
 done then. `main` is written only whole: a failed read is tried three times, then the
 landing fails; a repository with no `main` (HTTP 404) is left out with a warning.
+
+A merge is journaled (`merge` in the record) and announced only as the landing
+intended it: GitHub shows the pull request merged at the intent's head into
+`main`. A merge request refused and read back merged otherwise (another head,
+another base) is not this landing's; its intent is deleted. A pull request found
+merged into a base other than `main` has no landing to finish, and is never a
+success (`BLOCKED`, not `MERGED`): the pins do not take it for landed. A merge
+request GitHub refuses outright (refused credentials, the rate limit) deletes its
+intent; one that may have been accepted (a poll failing, a run with no answer) keeps
+it. The local build verdicts are judged under one recipe revision, read again right
+before the merge call: a recipe published since stops the merge. Only the comments of
+`[github] note_authors` (and `owner`) are note comments: Ready, its signer and
+the `landed` comment are read from them alone. Refused credentials and the rate
+limit, on any read or on the merge poll, go to the caller; they never read as one
+pull request's block.
+
+Where `[github.gate.<repo>] coordinator_lands` opts in, the coordinator service
+lands too, after each table round, reading `hold` again before each attempt. First
+it takes each `landing.<repo>.<pr>` of its own (`by: coordinator`) in such a
+repository whose merge is confirmed: recorded, or GitHub reports the pull request
+merged at the intent's head into `main`. Absence from the round's read is not
+taken as closed. An intent that no longer stands (closed, open at another head, or
+merged otherwise) is retired under the lock, unannounced, after GitHub is read again
+there; `gh land` and `gh merge-if-clean` retire another's such intent the same way
+rather than stop on it, once no `hold` holds (`gh land` waits for it; neither reads
+GitHub about the intent before). Its own records are finished in every repository:
+with `coordinator_lands` turned off it still finishes a confirmed merge, retires an
+intent whose pull request is open, and starts no new merge. Then it takes each Ready candidate (docs/work.md
+WORK-6), oldest first, unless its row shows a failed check, an unresolved thread,
+bot findings or the bot's limit. A landing record is finished only by whoever it
+is written for (`by`): the coordinator leaves the controller's, and `gh land` and
+`gh merge-if-clean` refuse the coordinator's. Each candidate gets one gate attempt
+under the landing lock, which it does not wait for. The gate also requires the local
+build verdicts for the head on the present `main` (a repository that names none is
+refused: checks alone never land), and the current head to be the Ready head (a
+merge of it with `main` is not). Right before the merge call it reads the pull
+request, its comments, `main` and `hold` again: another head, a base other than
+`main`, `main` moved since the gate judged it, a later `Sent back` or `Blocked`, or
+a hold stops it. A missing verdict is asked of a builder (`coord.ask.*`) and read in
+a later round. A
+landing it does or finishes has two more steps in its record, done under the lock
+before the record is deleted: `coord.note`, a `note` to the controller (`[coord]
+Landed: <repo>#<pr> at <head> as <merge>`, carrying the `landed` notes'
+`created_at`), then `coord.decision`, its `decisions.log` line; both are written
+into the record first. The wrapper's pins stay the controller's. Its GitHub token
+needs write access on the opted-in repositories only (docs/install.md).
 
 `HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream
 sequence of the note that ended the task for the seat. A later end replaces an

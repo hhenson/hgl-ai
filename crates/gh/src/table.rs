@@ -15,7 +15,10 @@ use std::collections::{BTreeMap, HashSet};
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
-use crate::bot::{BotState, BotView, Comment, NoteState, Review, note_state};
+use crate::bot::{
+    BotState, BotView, Comment, NoteState, Review, by_note_authors, note_state_across,
+    ready_mark_across,
+};
 use crate::{Error, Result, short};
 
 /// `CHECKS` of a row: the head commit's status check rollup.
@@ -158,6 +161,11 @@ impl Table {
 pub struct PrInfo {
     pub row: Row,
     pub note: Option<NoteState>,
+    /// `created_at` of the `Ready` comment at this head that still stands
+    /// ([`crate::bot::ready_mark`]): its place in Ready order (WORK-6).
+    pub ready_at: Option<String>,
+    /// `created_at` of the latest note comment that cleared Ready at this head.
+    pub ready_cleared: Option<String>,
     pub url: String,
     pub review_url: Option<String>,
 }
@@ -181,8 +189,8 @@ fragment R on Repository {{
     nodes {{
       number isDraft headRefOid headRefName baseRefName updatedAt url
       reviewThreads(first: 100) {{ totalCount nodes {{ isResolved }} }}
-      early: comments(first: 10) {{ nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
-      late: comments(last: 30) {{ nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
+      early: comments(first: {EARLY}) {{ totalCount nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
+      late: comments(last: {LATE}) {{ nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
       reviews(last: 30) {{ nodes {{ author {{ login }} commit {{ oid }} state url }} }}
       commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state }} }} }} }}
     }}
@@ -219,6 +227,7 @@ pub fn parse_batch(
     v: &Value,
     repos: &[String],
     bot: &str,
+    note_authors: &[String],
     read: &str,
 ) -> Result<(Vec<PrInfo>, RateLimit, Vec<String>)> {
     let data = v.get("data").ok_or_else(|| resp("no data"))?;
@@ -232,7 +241,7 @@ pub fn parse_batch(
         };
         let mut infos: Vec<PrInfo> = nodes(r, &["pullRequests"])
             .iter()
-            .filter_map(|p| pr_info(repo, p, bot, read))
+            .filter_map(|p| pr_info(repo, p, bot, note_authors, read))
             .collect();
         infos.sort_by_key(|i| i.row.number);
         out.extend(infos);
@@ -257,7 +266,39 @@ pub fn parse_rate(data: &Value) -> Result<RateLimit> {
     })
 }
 
-fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
+/// Comments read from each end of a pull request (`early`, `late` in [`batch_query`]).
+const EARLY: usize = 10;
+const LATE: usize = 30;
+
+/// When the comments read from both ends do not meet, the `createdAt` of the first `late`
+/// comment: the comments before it back to the `early` ones were not read. Without
+/// `totalCount`, both full windows count as a gap.
+fn unread_gap(p: &Value, read: usize) -> Option<String> {
+    let (early, late) = (nodes(p, &["early"]), nodes(p, &["late"]));
+    let total = p
+        .get("early")
+        .and_then(|e| e.get("totalCount"))
+        .and_then(Value::as_u64);
+    let gap = match total {
+        Some(t) => t > read as u64,
+        None => early.len() >= EARLY && late.len() >= LATE,
+    };
+    if !gap {
+        return None;
+    }
+    late.iter()
+        .filter_map(|c| c.get("createdAt").and_then(Value::as_str))
+        .min()
+        .map(String::from)
+}
+
+fn pr_info(
+    repo: &str,
+    p: &Value,
+    bot: &str,
+    note_authors: &[String],
+    read: &str,
+) -> Option<PrInfo> {
     let number = p.get("number")?.as_u64()?;
     let head = p.get("headRefOid")?.as_str()?.to_string();
     let unresolved = nodes(p, &["reviewThreads"])
@@ -279,6 +320,10 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
         .map(Review::from_graphql)
         .collect();
     let view = BotView::of(bot, &comments, &reviews);
+    // Only the fleet's own comments change a note state (anyone can comment).
+    let notes = by_note_authors(&comments, note_authors);
+    let gap = unread_gap(p, comments.len());
+    let mark = ready_mark_across(&notes, &head, gap.as_deref());
     let rollup = nodes(p, &["commits"])
         .first()
         .and_then(|c| c.get("commit"))
@@ -297,7 +342,9 @@ fn pr_info(repo: &str, p: &Value, bot: &str, read: &str) -> Option<PrInfo> {
             updated: read.to_string(),
             head: head.clone(),
         },
-        note: note_state(&comments),
+        note: note_state_across(&notes, gap.as_deref()),
+        ready_at: mark.at,
+        ready_cleared: mark.cleared,
         url: p
             .get("url")
             .and_then(Value::as_str)
@@ -526,7 +573,139 @@ mod tests {
     }
 
     fn batch() -> (Vec<PrInfo>, RateLimit, Vec<String>) {
-        parse_batch(&json("coord-batch.json"), &repos(), BOT, READ).unwrap()
+        parse_batch(&json("coord-batch.json"), &repos(), BOT, &fleet(), READ).unwrap()
+    }
+
+    /// The fixtures' fleet account.
+    fn fleet() -> Vec<String> {
+        vec!["octo".into()]
+    }
+
+    /// alpha#11 of the fixture with more late comments: `(author, body, created_at)`.
+    fn alpha11_with(extra: &[(&str, &str, &str)]) -> PrInfo {
+        let mut v = json("coord-batch.json");
+        let late = v
+            .pointer_mut("/data/r0/pullRequests/nodes")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["number"] == 11)
+            .unwrap()
+            .pointer_mut("/late/nodes")
+            .and_then(Value::as_array_mut)
+            .unwrap();
+        for (i, (author, body, at)) in extra.iter().enumerate() {
+            late.push(serde_json::json!({
+                "databaseId": 900_000 + i, "author": {"login": author}, "body": body,
+                "createdAt": at, "updatedAt": at,
+            }));
+        }
+        let (infos, ..) = parse_batch(&v, &repos(), BOT, &fleet(), READ).unwrap();
+        infos.into_iter().find(|i| i.row.number == 11).unwrap()
+    }
+
+    /// alpha#11 of the fixture as a round reads it when `early` reports `total` comments; its
+    /// `Ready` (the first comment) only in `early` when `total` is over 2.
+    fn alpha11_total(total: Option<u64>, extra: &[(&str, &str, &str)]) -> PrInfo {
+        let mut v = json("coord-batch.json");
+        let pr = v
+            .pointer_mut("/data/r0/pullRequests/nodes")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["number"] == 11)
+            .unwrap();
+        match total {
+            Some(t) => pr["early"]["totalCount"] = t.into(),
+            None => {
+                pr["early"].as_object_mut().unwrap().remove("totalCount");
+            }
+        }
+        let late = pr["late"]["nodes"].as_array_mut().unwrap();
+        if total.is_some_and(|t| t > 2) {
+            late.remove(0);
+        }
+        for (i, (author, body, at)) in extra.iter().enumerate() {
+            late.push(serde_json::json!({
+                "databaseId": 900_000 + i, "author": {"login": author}, "body": body,
+                "createdAt": at, "updatedAt": at,
+            }));
+        }
+        let (infos, ..) = parse_batch(&v, &repos(), BOT, &fleet(), READ).unwrap();
+        infos.into_iter().find(|i| i.row.number == 11).unwrap()
+    }
+
+    #[test]
+    fn an_unread_run_of_comments_clears_ready() {
+        let read = alpha11_total(None, &[]);
+        let n = 2; // the fixture's alpha#11 comments, each in both windows
+        assert_eq!(read.ready_at.as_deref(), Some("2026-01-05T09:00:00Z"));
+        assert_eq!(
+            alpha11_total(Some(n), &[]).ready_at,
+            read.ready_at,
+            "all read"
+        );
+        // More comments than were read: the first late comment starts after a gap.
+        let gapped = alpha11_total(Some(n + 1), &[]);
+        assert_eq!(gapped.ready_at, None);
+        assert_eq!(gapped.note, None, "the latest note may be in the gap");
+        let first_late = "2026-01-05T09:01:00Z";
+        assert_eq!(gapped.ready_cleared.as_deref(), Some(first_late));
+        // An approval after the gap does not bring the early Ready back; a Ready does.
+        let approved = [("octo", "[claude] Approved.", "2026-01-05T10:00:00Z")];
+        let after = alpha11_total(Some(99), &approved);
+        assert_eq!(
+            (after.note, after.ready_at),
+            (Some(NoteState::Approved), None)
+        );
+        let ready = [(
+            "octo",
+            "[codex] Ready: alpha#11 at 11111111",
+            "2026-01-05T11:00:00Z",
+        )];
+        assert_eq!(
+            alpha11_total(Some(99), &ready).ready_at.as_deref(),
+            Some("2026-01-05T11:00:00Z")
+        );
+    }
+
+    #[test]
+    fn only_the_fleets_comments_are_notes() {
+        const READY_AT: &str = "2026-01-05T09:00:00Z";
+        const T10: &str = "2026-01-05T10:00:00Z";
+        const T11: &str = "2026-01-05T11:00:00Z";
+        const BACK: &str = "[claude] Sent back: no";
+        const READY: &str = "[codex] Ready: alpha#11 at 11111111";
+        // The fixture's Ready is by the fleet account; read with another fleet, it is not.
+        let (infos, ..) = parse_batch(
+            &json("coord-batch.json"),
+            &repos(),
+            BOT,
+            &["x".into()],
+            READ,
+        )
+        .unwrap();
+        let alpha11 = infos.iter().find(|i| i.row.number == 11).unwrap();
+        assert_eq!((alpha11.note, &alpha11.ready_at), (None, &None));
+        // A stranger's later Sent back changes nothing; the fleet's clears Ready.
+        let foreign = alpha11_with(&[("stranger", BACK, T10)]);
+        assert_eq!(foreign.note, Some(NoteState::Ready));
+        assert_eq!(foreign.ready_at.as_deref(), Some(READY_AT));
+        assert_eq!(foreign.ready_cleared, None);
+        let own = alpha11_with(&[("octo", BACK, T10)]);
+        assert_eq!(own.note, Some(NoteState::Sendback));
+        assert_eq!(
+            (own.ready_at, own.ready_cleared.as_deref()),
+            (None, Some(T10))
+        );
+        // After the fleet's Sent back, a stranger's Ready at the head gives no place back;
+        // the fleet's does.
+        let foreign = alpha11_with(&[("octo", BACK, T10), ("stranger", READY, T11)]);
+        assert_eq!(foreign.note, Some(NoteState::Sendback));
+        assert_eq!(foreign.ready_at, None);
+        let own = alpha11_with(&[("octo", BACK, T10), ("octo", READY, T11)]);
+        assert_eq!(own.note, Some(NoteState::Ready));
+        assert_eq!(own.ready_at.as_deref(), Some(T11));
     }
 
     #[test]
@@ -555,6 +734,11 @@ mod tests {
             Some("https://github.com/o/alpha/pull/12#pullrequestreview-9")
         );
         assert_eq!(by(13).note, None);
+        // Ready order (WORK-6): the Ready comment at the head; an approval with no Ready
+        // comment read gives no place.
+        assert_eq!(by(11).ready_at.as_deref(), Some("2026-01-05T09:00:00Z"));
+        assert_eq!(by(12).ready_at, None);
+        assert_eq!(by(13).ready_at, None);
     }
 
     #[test]

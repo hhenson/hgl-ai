@@ -102,6 +102,15 @@ pub async fn run_put(bus: &Bus, s: &Summary) -> Result<(), StoreError> {
     Ok(())
 }
 
+/// [`run_put`] only if `run.<id>` is absent: `Ok(false)`, unchanged, when the builder (or
+/// an earlier send) wrote it already. A queued summary written again must never replace
+/// a later one.
+pub async fn run_create(bus: &Bus, s: &Summary) -> Result<bool, StoreError> {
+    let b = bounded(s);
+    let v = serde_json::to_vec(&b).map_err(|e| StoreError::Other(e.to_string()))?;
+    Ok(bus.build_create(&run_key(&s.id), &v).await?)
+}
+
 /// Write a gate build's verdict (BUILD-15) from its summary, or `running` (bounded by
 /// `until`) while it builds, in the key of what it judges: its head, the `main` commit it
 /// was asked to merge onto, and the recipe revision it runs ([`verdict_key`]). In that key
