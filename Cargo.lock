@@ -1323,6 +1323,7 @@ dependencies = [
  "hgl-ai-config",
  "hgl-ai-proto",
  "hgl-ai-tree",
+ "hgl-ai-usage",
  "libc",
  "serde",
  "serde_json",

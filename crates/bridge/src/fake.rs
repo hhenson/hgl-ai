@@ -8,7 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use hgl_ai_bus::{BusError, Result};
-use hgl_ai_proto::{HostRecord, Note, Seat, TaskKey, TreeRecord, ended_key};
+use hgl_ai_proto::{
+    HostRecord, Note, QuotaRefusal, Seat, TaskKey, TreeRecord, UsageRecord, ended_key,
+};
 use hgl_ai_tree::Registry;
 use tokio::sync::Notify;
 
@@ -34,6 +36,8 @@ struct Inner {
     queues: Mutex<HashMap<Seat, VecDeque<Queued>>>,
     notify: Notify,
     sent: Mutex<Vec<Note>>,
+    quota_refusals: Mutex<Vec<QuotaRefusal>>,
+    usage: Mutex<Vec<UsageRecord>>,
     state: Mutex<HashMap<String, String>>,
     hosts: Mutex<Vec<HostRecord>>,
     deleted_hosts: Mutex<Vec<String>>,
@@ -162,6 +166,14 @@ impl FakeBus {
 
     pub fn sent(&self) -> Vec<Note> {
         g(&self.0.sent).clone()
+    }
+
+    pub fn quota_refusals(&self) -> Vec<QuotaRefusal> {
+        g(&self.0.quota_refusals).clone()
+    }
+
+    pub fn usage(&self) -> Vec<UsageRecord> {
+        g(&self.0.usage).clone()
     }
 
     pub fn sent_containing(&self, text: &str) -> Vec<Note> {
@@ -353,6 +365,14 @@ impl BusApi for FakeBus {
             latest.insert(h.host.clone(), h.clone());
         }
         Ok(latest.into_values().collect())
+    }
+    async fn usage_put(&self, rec: UsageRecord) -> Result<()> {
+        g(&self.0.usage).push(rec);
+        Ok(())
+    }
+    async fn quota_refusal(&self, event: &QuotaRefusal, _: &str) -> Result<()> {
+        g(&self.0.quota_refusals).push(event.clone());
+        Ok(())
     }
     async fn lock_acquire(&self, name: &str, holder: &str) -> Result<FakeLease> {
         self.take_lease(name, holder, None)

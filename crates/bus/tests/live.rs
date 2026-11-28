@@ -1371,11 +1371,12 @@ async fn usage_labels_come_off_and_history_catches_up() {
     assert_eq!(count().await, 2, "sent once, the second deduplicated");
 }
 
-/// Bot round 2: an equal observation collected after the history's dedup window is not
-/// appended again; the history's last record for the key is checked, not the window.
+/// Quota refusals share the observation's subject. Recollecting an equal observation
+/// after them still leaves it in history only once, even past the dedup window.
 #[tokio::test]
 async fn usage_history_never_repeats_an_observation() {
     use hgl_ai_bus::UsagePut;
+    use hgl_ai_proto::QuotaRefusal;
     let Some(hub) = Hub::start() else { return };
     let bus = hub.ready().await;
     let js = hub.raw().await;
@@ -1391,10 +1392,28 @@ async fn usage_history_never_repeats_an_observation() {
     cfg.duplicate_window = Duration::from_millis(200);
     js.update_stream(&cfg).await.unwrap();
     let rec = usage("host-1", "20261127T100000Z");
+    let refusal = QuotaRefusal {
+        runtime: rec.runtime,
+        account: rec.account.clone(),
+        host: "host-1".into(),
+        seat: Seat::new("w1").unwrap(),
+        family: Family::Gpt,
+        model: "model".into(),
+        at: "20261127T101000Z".into(),
+    };
+    let first = bus.usage_quota_refusal(&refusal, "turn-a").await.unwrap();
+    assert_eq!(
+        bus.usage_quota_refusal(&refusal, "turn-a").await.unwrap(),
+        first
+    );
+    assert!(bus.usage().await.unwrap().is_empty());
     assert!(matches!(
         bus.usage_put(&rec).await.unwrap(),
         UsagePut::Written { .. }
     ));
+    bus.usage_quota_refusal(&refusal, "turn-b").await.unwrap();
+    bus.usage_quota_refusal(&refusal, "turn-c").await.unwrap();
+    assert_eq!(bus.usage().await.unwrap(), std::slice::from_ref(&rec));
     tokio::time::sleep(Duration::from_millis(500)).await;
     for _ in 0..2 {
         assert!(matches!(
@@ -1411,5 +1430,18 @@ async fn usage_history_never_repeats_an_observation() {
         )
         .await
         .unwrap();
-    assert_eq!(history.len(), 1);
+    assert_eq!(history.len(), 4);
+    assert_eq!(
+        serde_json::from_slice::<hgl_ai_proto::UsageRecord>(&history[1].payload).unwrap(),
+        rec
+    );
+    for msg in [&history[0], &history[2], &history[3]] {
+        assert_eq!(msg.subject, rec.subject());
+        let value: serde_json::Value = serde_json::from_slice(&msg.payload).unwrap();
+        assert_eq!(value["kind"], "quota_refusal");
+        assert_eq!(
+            serde_json::from_value::<QuotaRefusal>(value).unwrap(),
+            refusal
+        );
+    }
 }

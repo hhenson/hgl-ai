@@ -4,14 +4,18 @@
 
 use std::collections::BTreeMap;
 
-use async_nats::jetstream::context::Publish;
+use async_nats::jetstream::context::{Publish, PublishErrorKind};
 use async_nats::jetstream::kv;
-use async_nats::jetstream::stream::LastRawMessageErrorKind;
+use async_nats::jetstream::message::StreamMessage;
+use async_nats::jetstream::stream::{LastRawMessageErrorKind, Stream};
 use futures::StreamExt;
 use hgl_ai_proto::{
-    KV_USAGE, STREAM_USAGE, UsageLabel, UsageRecord, check_account, check_label, parse_stamp,
-    usage_label_key, utc_now_stamp,
+    KV_USAGE, QuotaRefusal, STREAM_USAGE, UsageLabel, UsageRecord, check_account, check_label,
+    parse_stamp, usage_label_key, utc_now_stamp,
 };
+
+/// Quota events link back to the last observation on the same subject, or 0 if none.
+const OBSERVATION_SEQUENCE: &str = "Hgl-Usage-Observation-Sequence";
 
 use crate::{
     APPEND_ATTEMPTS, Bus, BusError, MAX_VALUE_BYTES, Result, backoff, live_entry, missing, nats,
@@ -108,20 +112,97 @@ impl Bus {
         })
     }
 
-    /// Whether the history's last record for `rec`'s key is this observation. Read from
-    /// the stream, not left to its deduplication window, so an idle login collected days
-    /// later is not appended again.
-    async fn usage_in_history(&self, rec: &UsageRecord) -> Result<bool> {
-        let stream = self
-            .js
+    /// Publish a refusal without updating the latest usage record in KV.
+    pub async fn usage_quota_refusal(&self, event: &QuotaRefusal, turn_id: &str) -> Result<u64> {
+        event.validate()?;
+        let subject = event.subject();
+        let msg_id = format!("quota_refusal.{turn_id}.{}", event.at);
+        let payload = serde_json::to_vec(event)
+            .map_err(|e| nats(&format!("encoding quota refusal for {subject}"), e))?;
+        let stream = self.usage_stream().await?;
+        for attempt in 0..APPEND_ATTEMPTS {
+            let latest = usage_latest(&stream, &subject).await?;
+            let expected = latest.as_ref().map_or(0, |m| m.sequence);
+            let observation = latest.as_ref().map_or(0, observation_sequence);
+            // Check the subject head at publish so a racing observation is never hidden
+            // behind an event pointing to an older observation.
+            let publish = Publish::build()
+                .payload(payload.clone().into())
+                .message_id(&msg_id)
+                .header(OBSERVATION_SEQUENCE, observation.to_string())
+                .expected_last_subject_sequence(expected);
+            match self.publish_usage(&subject, publish, Some(expected)).await {
+                Err(BusError::Conflict { .. }) => tokio::time::sleep(backoff(attempt)).await,
+                r => return r,
+            }
+        }
+        Err(conflict(&subject, 0))
+    }
+
+    async fn usage_stream(&self) -> Result<Stream> {
+        self.js
             .get_stream(STREAM_USAGE)
             .await
-            .map_err(|e| missing(&format!("stream {STREAM_USAGE}"), e))?;
-        match stream.get_last_raw_message_by_subject(&rec.subject()).await {
-            Ok(m) => Ok(serde_json::from_slice::<UsageRecord>(&m.payload)
-                .is_ok_and(|h| h.observed_at == rec.observed_at)),
-            Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => Ok(false),
-            Err(e) => Err(nats(&format!("reading the history of {}", rec.key()), e)),
+            .map_err(|e| missing(&format!("stream {STREAM_USAGE}"), e))
+    }
+
+    /// Whether the latest retained observation for the key is this one, even when quota
+    /// events follow it or the deduplication window has elapsed.
+    async fn usage_in_history(&self, rec: &UsageRecord) -> Result<bool> {
+        let stream = self.usage_stream().await?;
+        let subject = rec.subject();
+        let Some(latest) = usage_latest(&stream, &subject).await? else {
+            return Ok(false);
+        };
+        let seq = observation_sequence(&latest);
+        let observed = match seq {
+            0 => return Ok(false),
+            n if n == latest.sequence => latest,
+            n => match stream.get_raw_message(n).await {
+                Ok(m) => m,
+                Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => return Ok(false),
+                Err(e) => return Err(nats(&format!("reading the history of {subject}"), e)),
+            },
+        };
+        Ok(observed.subject.as_str() == subject
+            && serde_json::from_slice::<UsageRecord>(&observed.payload)
+                .is_ok_and(|h| h.observed_at == rec.observed_at))
+    }
+
+    async fn publish_usage(
+        &self,
+        subject: &str,
+        publish: Publish,
+        expected: Option<u64>,
+    ) -> Result<u64> {
+        self.guarded(subject, async {
+            let ack = self
+                .js
+                .send_publish(subject.to_string(), publish)
+                .await
+                .map_err(|e| publish_error(subject, e))?
+                .await
+                .map_err(|e| match expected {
+                    Some(seq) if e.kind() == PublishErrorKind::WrongLastSequence => {
+                        conflict(subject, seq)
+                    }
+                    _ => publish_error(subject, e),
+                })?;
+            Ok(ack.sequence)
+        })
+        .await
+    }
+
+    /// The label in force for one account.
+    pub async fn usage_account_label(&self, account: &str) -> Result<Option<String>> {
+        check_account(account)?;
+        let store = self.store(&self.usage, KV_USAGE).await?;
+        let key = usage_label_key(account);
+        match live_entry(store, &key).await? {
+            Some(e) => serde_json::from_slice::<UsageLabel>(&e.value)
+                .map(|l| Some(l.label))
+                .map_err(|e| nats(&format!("reading usage {key}"), e)),
+            None => Ok(None),
         }
     }
 
@@ -134,17 +215,7 @@ impl Bus {
             rec.key(),
             rec.observed_at
         ));
-        let ack = self
-            .guarded(&subject, async {
-                self.js
-                    .send_publish(subject.clone(), publish)
-                    .await
-                    .map_err(|e| publish_error(&subject, e))?
-                    .await
-                    .map_err(|e| publish_error(&subject, e))
-            })
-            .await?;
-        Ok(ack.sequence)
+        self.publish_usage(&subject, publish, None).await
     }
 
     /// Every usage record, ordered by key, with the owner's labels in force (a label set
@@ -224,6 +295,20 @@ impl Bus {
         }
         Ok((records, labels))
     }
+}
+
+async fn usage_latest(stream: &Stream, subject: &str) -> Result<Option<StreamMessage>> {
+    match stream.get_last_raw_message_by_subject(subject).await {
+        Ok(m) => Ok(Some(m)),
+        Err(e) if e.kind() == LastRawMessageErrorKind::NoMessageFound => Ok(None),
+        Err(e) => Err(nats(&format!("reading the history of {subject}"), e)),
+    }
+}
+
+fn observation_sequence(m: &StreamMessage) -> u64 {
+    m.headers
+        .get(OBSERVATION_SEQUENCE)
+        .map_or(m.sequence, |h| h.as_str().parse().unwrap_or(0))
 }
 
 fn conflict(key: &str, expected: u64) -> BusError {

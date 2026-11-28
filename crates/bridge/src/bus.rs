@@ -5,7 +5,7 @@ use std::future::Future;
 use std::time::Duration;
 
 use hgl_ai_bus::Result;
-use hgl_ai_proto::{HostRecord, Note, Seat, TaskKey};
+use hgl_ai_proto::{HostRecord, Note, QuotaRefusal, Seat, TaskKey, UsageRecord};
 use hgl_ai_tree::Registry;
 
 pub trait BusApi: Registry + Send + Sync + 'static {
@@ -22,6 +22,12 @@ pub trait BusApi: Registry + Send + Sync + 'static {
     fn bridge_host(&self, seat: &Seat) -> impl Future<Output = Result<Option<String>>> + Send;
     /// The live host records (`HGL_HOSTS`).
     fn hosts(&self) -> impl Future<Output = Result<Vec<HostRecord>>> + Send;
+    fn usage_put(&self, rec: UsageRecord) -> impl Future<Output = Result<()>> + Send;
+    fn quota_refusal(
+        &self,
+        event: &QuotaRefusal,
+        turn_id: &str,
+    ) -> impl Future<Output = Result<()>> + Send;
     /// How long a lease lives without a refresh (`HGL_LOCKS`' `max_age`).
     fn lease_max_age(&self) -> impl Future<Output = Result<Duration>> + Send;
     /// Take the lease `name` in `HGL_LOCKS` (create-if-absent; `BusError::Held` when held).
@@ -107,6 +113,16 @@ impl BusApi for hgl_ai_bus::Bus {
     }
     async fn hosts(&self) -> Result<Vec<HostRecord>> {
         hgl_ai_bus::Bus::hosts(self).await
+    }
+    async fn usage_put(&self, mut rec: UsageRecord) -> Result<()> {
+        match self.usage_account_label(&rec.account).await {
+            Ok(label) => rec.label = label,
+            Err(e) => tracing::warn!(account = %rec.account, "reading the usage label: {e}"),
+        }
+        hgl_ai_bus::Bus::usage_put(self, &rec).await.map(drop)
+    }
+    async fn quota_refusal(&self, event: &QuotaRefusal, turn_id: &str) -> Result<()> {
+        self.usage_quota_refusal(event, turn_id).await.map(drop)
     }
     async fn lease_max_age(&self) -> Result<Duration> {
         hgl_ai_bus::Bus::locks_max_age(self).await

@@ -40,6 +40,9 @@ fn hgl(config: &Path, args: &[&str]) -> Command {
         .args(args)
         .env_remove("HGL_AI_SEAT")
         .env_remove("HGL_AI_CONFIG")
+        .env("CODEX_HOME", config.with_extension("codex-home"))
+        .env("HGL_AI_USAGE_CLAUDE", config.with_extension("claude-usage"))
+        .env("HGL_AI_USAGE_AGY", config.with_extension("agy-usage"))
         .stdin(Stdio::null());
     c
 }
@@ -365,6 +368,19 @@ fn the_bridge_serves_a_seat_against_a_live_hub() {
     cfg.save(&p).unwrap();
     assert!(hgl(&p, &["init"]).output().unwrap().status.success());
 
+    let codex_home = p.with_extension("codex-home");
+    std::fs::create_dir_all(codex_home.join("sessions")).unwrap();
+    std::fs::write(
+        codex_home.join("auth.json"),
+        include_str!("../../usage/fixtures/codex-auth.synthetic.json"),
+    )
+    .unwrap();
+    std::fs::write(
+        codex_home.join("sessions/rollout-test.jsonl"),
+        include_str!("../../usage/fixtures/codex-rollout.jsonl"),
+    )
+    .unwrap();
+
     // A fake `codex`: records its working directory, prints a real capture.
     let bin = d.0.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
@@ -418,6 +434,17 @@ fn the_bridge_serves_a_seat_against_a_live_hub() {
     until("the turn ran in the tree", 30, &bridge_log, || {
         std::fs::read_to_string(&calls).is_ok_and(|c| c.trim() == src.display().to_string())
     });
+    until(
+        "the bridge published the Codex observation",
+        20,
+        &bridge_log,
+        || {
+            let o = hgl(&p, &["--json", "usage", "show"]).output().unwrap();
+            serde_json::from_slice::<hgl_ai_proto::UsageRecord>(&o.stdout).is_ok_and(|rec| {
+                rec.runtime == Runtime::Codex && rec.host == "test-host" && !rec.buckets.is_empty()
+            })
+        },
+    );
     until(
         "the tree is registered in HGL_TREES",
         20,

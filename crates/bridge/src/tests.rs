@@ -98,6 +98,13 @@ fn harness() -> H {
     opts.in_progress_every = Duration::from_millis(100);
     opts.heartbeat_every = Duration::from_millis(100);
     opts.report_every = Duration::from_secs(3600);
+    opts.usage_sources = hgl_ai_usage::Sources {
+        claude: bin.join("claude-usage"),
+        agy: bin.join("agy-usage"),
+        codex_home: Some(root.join("codex-home")),
+        agy_home: Some(root.join("agy-home")),
+        timeout: Duration::from_secs(10),
+    };
     opts.seat_retry = Duration::from_millis(100);
     opts.turn_timeout = Duration::from_secs(20);
     opts.shutdown_grace = Duration::from_millis(300);
@@ -1058,6 +1065,13 @@ async fn assign_then_sendback_resumes_then_landed_cleans_up() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
     let h = harness();
+    let home = h.opts.usage_sources.codex_home.as_ref().unwrap();
+    std::fs::create_dir(home).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        r#"{"tokens":{"account_id":"codex-account"}}"#,
+    )
+    .unwrap();
     h.script(
         "codex",
         &format!("cat '{}'; exit 1", fixture("codex-quota.synthetic.jsonl")),
@@ -1070,6 +1084,21 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
     );
     // Held, not naked: the refusal spends no delivery (PROTO-8).
     eventually("acked once moved", || h.bus.events(a) == [Ev::Ack]).await;
+    eventually("refusal published without a usage observation", || {
+        h.bus.quota_refusals().len() == 1
+    })
+    .await;
+    let refusals = h.bus.quota_refusals();
+    let refusal = &refusals[0];
+    assert_eq!(refusal.runtime, Runtime::Codex);
+    assert_eq!(
+        refusal.account,
+        hgl_ai_proto::account_fingerprint("codex-account")
+    );
+    assert_eq!(refusal.seat, seat("w1"));
+    assert_eq!(refusal.family, Family::Gpt);
+    assert_eq!(refusal.model, "gpt-6.2-astra");
+    assert!(h.bus.usage().is_empty());
     let moved = h
         .bus
         .sent_containing("moved from codex gpt/gpt-6.2-astra to agy claude/claude-opus-5-5");
@@ -1095,6 +1124,61 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
     })
     .await;
     stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn usage_runs_periodically_and_only_for_the_finished_turns_runtime() {
+    let mut h = harness();
+    h.opts.usage_every = Duration::from_millis(500);
+    let usage_sources = &h.opts.usage_sources;
+    let agy_home = usage_sources.agy_home.as_ref().unwrap();
+    std::fs::create_dir_all(agy_home.join("log")).unwrap();
+    std::fs::write(
+        agy_home.join("log/cli-test.log"),
+        "applyAuthResult: email=example@example.test\n",
+    )
+    .unwrap();
+    let probe = &usage_sources.agy;
+    std::fs::write(probe, "#!/bin/sh\nprintf 'Gemini Models\\tFive Hour Limit Remaining\\t80%%\\t1970-01-01T00:00:00Z\\n'\n").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(probe, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let (tx, j) = h.start(&["w1"]);
+    eventually("two periodic agy probes", || h.bus.usage().len() >= 2).await;
+    stop(tx, j).await;
+
+    // With the next tick far off, a Codex turn adds only a Codex observation.
+    h.opts.usage_every = Duration::from_secs(900);
+    let home = h.opts.usage_sources.codex_home.as_ref().unwrap();
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    std::fs::write(
+        home.join("auth.json"),
+        r#"{"tokens":{"account_id":"codex-account"}}"#,
+    )
+    .unwrap();
+    h.script(
+        "codex",
+        &format!(
+            "cat > '{}' <<'EOF'\n{{\"timestamp\":\"2026-11-27T10:00:00Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"token_count\",\"rate_limits\":{{\"primary\":{{\"used_percent\":20,\"window_minutes\":300}}}}}}}}\nEOF\ncat '{}'",
+            home.join("sessions/rollout-test.jsonl").display(),
+            fixture("codex-ok.jsonl")
+        ),
+    );
+    let before = h.bus.usage().len();
+    let (tx, j) = h.start(&["w1"]);
+    let a = h.bus.push(
+        "w1",
+        note(Kind::Assign, "w1", 3, "[claude] Assign: demo#3 Three"),
+    );
+    eventually("turn acknowledged", || h.bus.events(a) == [Ev::Ack]).await;
+    eventually("post-turn Codex observation", || {
+        h.bus.usage().len() > before
+    })
+    .await;
+    stop(tx, j).await;
+    let usage = h.bus.usage();
+    assert_eq!(usage.len(), before + 1);
+    assert_eq!(usage[before].runtime, Runtime::Codex);
+    assert!(h.bus.quota_refusals().is_empty());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
