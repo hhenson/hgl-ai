@@ -3187,3 +3187,33 @@ async fn closed_drops_a_queued_high_priority_turn() {
     assert_eq!(h.calls("codex").len(), 1);
     stop(tx, j).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn grouped_notes_keep_stream_order_after_late_delivery() {
+    let h = harness();
+    let gate = h.calls.join("go");
+    h.script("codex", &format!("case \"$(pwd)\" in *demo-11*) while [ ! -e '{}' ]; do sleep 0.05; done;; esac\ncat '{}'", gate.display(), fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let busy = h.bus.push("w1", note(Kind::Assign, "w1", 11, "busy"));
+    eventually("busy turn", || h.calls("codex").len() == 1).await;
+    let older = note(Kind::Assign, "w1", 12, "older-marker");
+    let a = h.bus.push("nobody", older.clone());
+    let b = h
+        .bus
+        .push("w1", note(Kind::Question, "w1", 12, "newer-marker"));
+    eventually("newer queued", || h.bus.progressed(b)).await;
+    h.bus.redeliver("w1", a, older);
+    eventually("older queued", || h.bus.progressed(a)).await;
+    std::fs::write(&gate, "go").unwrap();
+    eventually("both acked", || {
+        h.bus.events(busy) == [Ev::Ack]
+            && h.bus.events(a) == [Ev::Ack]
+            && h.bus.events(b) == [Ev::Ack]
+    })
+    .await;
+    let calls = h.calls("codex");
+    assert!(
+        calls[1].stdin.find("older-marker").unwrap() < calls[1].stdin.find("newer-marker").unwrap()
+    );
+    stop(tx, j).await;
+}

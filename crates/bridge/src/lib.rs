@@ -1187,6 +1187,8 @@ impl<B: BusApi> Bridge<B> {
             }
         }
         st.pending = rest;
+        // A deferred or redelivered note may have arrived after a newer one.
+        group.sort_by_key(|d| d.seq());
         if let Target::Tree { task, review } = &target {
             // A turn of the task after its end is a restart: the tree is its now, not a
             // removal still owed (older notes of the task are moot, so these are later).
