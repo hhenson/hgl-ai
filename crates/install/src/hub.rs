@@ -36,13 +36,18 @@ impl Hub for BusHub {
     /// this looks the streams and buckets up directly.
     async fn health(&self, cfg: &Config) -> Result<Vec<String>, String> {
         let path = cfg.token_file().map_err(|e| e.to_string())?;
-        let opts = match hgl_ai_bus::read_credential(&path).map_err(|e| e.to_string())? {
+        let cred = hgl_ai_bus::read_credential(&path).map_err(|e| e.to_string())?;
+        let inbox = cred.as_ref().and_then(hgl_ai_bus::Credential::inbox_prefix);
+        let mut opts = match cred {
             Some(hgl_ai_bus::Credential::Token(t)) => async_nats::ConnectOptions::with_token(t),
             Some(hgl_ai_bus::Credential::Nkey { seed, .. }) => {
                 async_nats::ConnectOptions::with_nkey(seed)
             }
             None => async_nats::ConnectOptions::new(),
         };
+        if let Some(p) = inbox {
+            opts = opts.custom_inbox_prefix(p);
+        }
         let client = opts
             .connection_timeout(Duration::from_secs(5))
             .connect(cfg.hub.url.as_str())

@@ -37,6 +37,13 @@ pub const KV_METRICS: &str = "HGL_METRICS";
 /// The console's own state (sign-in sessions, the pending `p2` batch); only the console
 /// reads or writes it.
 pub const KV_CONSOLE: &str = "HGL_CONSOLE";
+/// A hub user's inbox prefix (hgl-ai#111): `_INBOX.<nkey>`, its public NKey. Its JetStream
+/// and KV replies and deliveries go there, and `nats.conf` lets each user subscribe to its
+/// own prefix only, so no client sees another's. It stays under `_INBOX.`, which a hub
+/// whose `nats.conf` predates it allows every client: upgrade clients first, then the hub.
+pub fn user_inbox(nkey: &str) -> String {
+    format!("_INBOX.{nkey}")
+}
 /// The Slack adapter's delivery state and thread mappings.
 pub const KV_SLACK: &str = "HGL_SLACK";
 /// Owner words (OWN-5).

@@ -1367,6 +1367,7 @@ dependencies = [
  "futures",
  "hgl-ai-config",
  "hgl-ai-proto",
+ "nkeys",
  "serde",
  "serde_json",
  "tempfile",

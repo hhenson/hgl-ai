@@ -144,6 +144,12 @@ delivery state, its durable `HGL_OWNER` feed and opening events by sequence.
 The console can read the Slack permalink index.
 Seat, coordinator and builder users read `HGL_OWNER` through short-lived consumers.
 
+Each user's replies go to its own inbox, `_INBOX.<public key>`, and that is all it may
+subscribe to: no user reads another's JetStream or KV replies (the console's sessions,
+threads, notes). A client before this used the shared `_INBOX.>`, which the hub then
+refuses. Upgrade the clients first (their inbox works on an older hub too), then rerun
+`hgl-ai server install`; until then `doctor` on the hub warns `hub inboxes`.
+
 ```sh
 hgl-ai server user add build-1 --role seat         # writes hub-users/build-1.cred
 hgl-ai server user add build-2 --role seat --nkey U...   # a host's own key; no secret here

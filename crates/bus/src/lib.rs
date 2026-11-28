@@ -299,6 +299,10 @@ impl Bus {
         let who = cred
             .as_ref()
             .map_or_else(|| "no credential".to_string(), Credential::describe);
+        // A hub user may subscribe to its own inbox prefix only (hgl-ai#111).
+        if let Some(p) = cred.as_ref().and_then(Credential::inbox_prefix) {
+            opts = opts.custom_inbox_prefix(p);
+        }
         match cred {
             Some(Credential::Token(t)) => opts = opts.token(t),
             Some(Credential::Nkey { seed, .. }) => opts = opts.nkey(seed),

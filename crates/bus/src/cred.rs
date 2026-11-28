@@ -59,6 +59,18 @@ impl Credential {
         }
     }
 
+    /// The inbox prefix this client uses (hgl-ai#111): a hub user's own,
+    /// [`hgl_ai_proto::user_inbox`] of the public key of its seed, which a bare seed (no
+    /// `role` line) has too. `None` for the shared token, whose hub has no permissions.
+    pub fn inbox_prefix(&self) -> Option<String> {
+        match self {
+            Credential::Token(_) => None,
+            Credential::Nkey { seed, .. } => nkeys::KeyPair::from_seed(seed)
+                .ok()
+                .map(|k| hgl_ai_proto::user_inbox(&k.public_key())),
+        }
+    }
+
     pub fn is_token(&self) -> bool {
         matches!(self, Credential::Token(_))
     }
@@ -146,6 +158,20 @@ pub fn read_credential(path: &Path) -> Result<Option<Credential>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A hub user's inbox is its public key's, with or without the `role` line (hgl-ai#111).
+    #[test]
+    fn inbox_of_the_public_key() {
+        let kp = nkeys::KeyPair::new_user();
+        let seed = kp.seed().unwrap();
+        let want = format!("_INBOX.{}", kp.public_key());
+        let full = parse_credential(&Credential::render_nkey("w1", "seat", &seed)).unwrap();
+        let bare = parse_credential(&seed).unwrap();
+        for c in [full, bare] {
+            assert_eq!(c.unwrap().inbox_prefix().as_deref(), Some(want.as_str()));
+        }
+        assert_eq!(Credential::Token("t".into()).inbox_prefix(), None);
+    }
 
     #[test]
     fn tokens_and_users() {

@@ -223,12 +223,19 @@ pub fn fingerprint(nkey: &str) -> String {
         .join("-")
 }
 
-/// A role's permissions: publish allow and deny, subscribe allow. `None`: no limits (admin).
+/// A role's publish permissions, allow and deny. `None`: no limits (admin). What a user
+/// may subscribe to is its own: [`subscribe_allow`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Permissions {
     pub publish_allow: Vec<String>,
     pub publish_deny: Vec<String>,
-    pub subscribe_allow: Vec<String>,
+}
+
+/// What the user with public key `nkey` may subscribe to: its own inbox prefix
+/// ([`hgl_ai_proto::user_inbox`]), never `_INBOX.>`, where every client's JetStream and KV
+/// replies would be (the console's sessions, threads, notes; hgl-ai#111).
+pub fn subscribe_allow(nkey: &str) -> Vec<String> {
+    vec![format!("{}.>", hgl_ai_proto::user_inbox(nkey))]
 }
 
 fn kv(bucket: &str) -> String {
@@ -273,7 +280,6 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$JS.ACK.{STREAM_OWNER}.{SLACK_FEED}.>"),
             ],
             publish_deny: Vec::new(),
-            subscribe_allow: vec!["_INBOX.>".into()],
         });
     }
     // Reads everyone needs: stream and bucket lookups, direct gets, consumer state,
@@ -400,7 +406,6 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     Some(Permissions {
         publish_allow: allow,
         publish_deny: deny,
-        subscribe_allow: vec!["_INBOX.>".into()],
     })
 }
 
@@ -409,30 +414,31 @@ fn conf_list(items: &[String]) -> String {
     format!("[{}]", quoted.join(", "))
 }
 
-/// The `authorization { ... }` block of `nats.conf` for these users.
+/// The `authorization { ... }` block of `nats.conf` for these users: a publish block per
+/// role (`SEAT_PUBLISH`), and per user that and its own inbox to subscribe to.
 pub fn render_authorization(reg: &Registry) -> String {
     let mut s = String::from("authorization {\n");
     let used: std::collections::BTreeSet<Role> = reg.users.iter().map(|u| u.role).collect();
     let mut vars = BTreeMap::new();
     for role in used {
         let Some(p) = permissions(role) else { continue };
-        let var = role.as_str().to_ascii_uppercase();
+        let var = format!("{}_PUBLISH", role.as_str().to_ascii_uppercase());
         let mut publish = format!("allow = {}", conf_list(&p.publish_allow));
         if !p.publish_deny.is_empty() {
             publish.push_str(&format!(", deny = {}", conf_list(&p.publish_deny)));
         }
-        s.push_str(&format!(
-            "  {var} = {{\n    publish = {{ {publish} }}\n    subscribe = {{ allow = {} }}\n  }}\n",
-            conf_list(&p.subscribe_allow)
-        ));
+        s.push_str(&format!("  {var} = {{ {publish} }}\n"));
         vars.insert(role, var);
     }
     s.push_str("  users = [\n");
     for u in &reg.users {
         match vars.get(&u.role) {
             Some(v) => s.push_str(&format!(
-                "    {{ nkey: \"{}\", permissions: ${v} }}  # {} ({})\n",
-                u.nkey, u.name, u.role
+                "    {{ nkey: \"{}\", permissions: {{ publish: ${v}, subscribe: {{ allow: {} }} }} }}  # {} ({})\n",
+                u.nkey,
+                conf_list(&subscribe_allow(&u.nkey)),
+                u.name,
+                u.role
             )),
             None => s.push_str(&format!(
                 "    {{ nkey: \"{}\" }}  # {} ({})\n",
@@ -612,10 +618,15 @@ mod tests {
             reg.issue(n, r, false).unwrap();
         }
         let block = render_authorization(&reg);
+        let hub = &reg.get("hub").unwrap().nkey;
         assert!(
-            block.contains("permissions: $SEAT }  # hub (seat)"),
+            block.contains(&format!(
+                "permissions: {{ publish: $SEAT_PUBLISH, subscribe: {{ allow: [\"_INBOX.{hub}.>\"] }} }} }}  # hub (seat)"
+            )),
             "{block}"
         );
+        // Every user its own inbox; none `_INBOX.>` (hgl-ai#111).
+        assert!(!block.contains("\"_INBOX.>\""), "{block}");
         assert!(block.contains("# hub-admin (admin)"));
         let Some(bin) =
             crate::sys::which_in(&std::env::var("PATH").unwrap_or_default(), "nats-server")

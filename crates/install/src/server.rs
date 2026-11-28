@@ -1004,9 +1004,10 @@ mod tests {
         assert!(!users::cred_path(&f.env.config_dir(), "host-2").exists());
         let conf =
             std::fs::read_to_string(f.env.home.join(".local/share/hgl-ai/nats.conf")).unwrap();
+        // Its inbox is its key's, so its bare seed finds it (hgl-ai#111).
         assert!(conf.contains(&format!(
-            "{{ nkey: \"{}\", permissions: $SEAT }}  # host-2 (seat)",
-            kp.public_key()
+            "{{ nkey: \"{k}\", permissions: {{ publish: $SEAT_PUBLISH, subscribe: {{ allow: [\"_INBOX.{k}.>\"] }} }} }}  # host-2 (seat)",
+            k = kp.public_key()
         )));
         assert!(f.output().contains(&users::fingerprint(&kp.public_key())));
         assert!(!user_remove(&f, "build-1").unwrap());

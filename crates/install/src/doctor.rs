@@ -747,6 +747,23 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 },
             )
         });
+        // A `nats.conf` written before per-user inboxes lets every user read every
+        // client's JetStream and KV replies (hgl-ai#111).
+        if c.server
+            .as_ref()
+            .is_some_and(|s| s.auth == hgl_ai_config::HubAuth::Users)
+        {
+            let conf = env.expand(&c.paths.data_dir).join("nats.conf");
+            if let Ok(text) = sys.read_to_string(&conf)
+                && text.contains("\"_INBOX.>\"")
+            {
+                out.push(Check::warn(
+                    "hub inboxes",
+                    "nats.conf lets every hub user read every client's replies (`_INBOX.>`)",
+                    "once every client runs this version, rerun `hgl-ai server install` (docs/install.md, Hub users)",
+                ));
+            }
+        }
         out.push(match hub.health(c).await {
             Err(e) => Check::fail(
                 "hub",
@@ -1733,6 +1750,35 @@ mod tests {
         assert!(
             !cs.iter()
                 .any(|c| c.name == "console credential" && c.level == Level::Warn)
+        );
+    }
+
+    /// A hub whose `nats.conf` still lets every user subscribe to `_INBOX.>` (hgl-ai#111).
+    #[tokio::test]
+    async fn warns_on_a_shared_inbox() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.server = Some(hgl_ai_config::Server::default());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let conf = f.env.expand(&cfg.paths.data_dir).join("nats.conf");
+        std::fs::create_dir_all(conf.parent().unwrap()).unwrap();
+        let mut reg = crate::users::Registry::default();
+        reg.issue("build-1", crate::users::Role::Seat, false)
+            .unwrap();
+        let users = crate::nats::Auth::Users(&reg);
+        let new = crate::nats::render_conf("127.0.0.1", 4222, Path::new("/s"), &users);
+        std::fs::write(&conf, &new).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(!cs.iter().any(|c| c.name == "hub inboxes"), "{cs:?}");
+        let nkey = &reg.get("build-1").unwrap().nkey;
+        std::fs::write(&conf, new.replace(&format!("_INBOX.{nkey}.>"), "_INBOX.>")).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        let c = cs.iter().find(|c| c.name == "hub inboxes").unwrap();
+        assert_eq!(c.level, Level::Warn);
+        assert!(
+            c.fix.as_deref().unwrap().contains("server install"),
+            "{c:?}"
         );
     }
 
