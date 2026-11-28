@@ -954,7 +954,7 @@ fn a_partitioned_bridge_stops_its_seat_before_the_lease_expires() {
         &token,
         "host-a",
         &format!(
-            "if [ ! -e '{p}' ]; then echo $$ > '{p}'; exec sleep 120; fi\ncat '{f}'",
+            "if [ ! -e '{p}' ]; then echo $$ > '{p}.new' && mv '{p}.new' '{p}'; exec sleep 120; fi\ncat '{f}'",
             p = pid.display(),
             f = fixture.display()
         ),

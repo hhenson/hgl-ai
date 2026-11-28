@@ -172,10 +172,18 @@ pub async fn land<G: Gh>(
         },
         what,
     ) = held?;
+    let pinned = o.sync_pins && s.pin_sources().contains(&repo);
+    if outcome.kind == Kind::Partial && pinned {
+        after.push(format!(
+            "the {} pins are not raised: the same command raises them once the landing is finished",
+            s.wrapper
+        ));
+    }
     if !outcome.kind.landed() {
         return Ok(Landing { outcome, after });
     }
-    if o.sync_pins && s.pin_sources().contains(&repo) {
+    let merge = outcome.merge_commit.clone();
+    if pinned {
         let po = pins::PinOpts {
             what: format!("{what} ({}#{number})", s.full(repo)),
             trailer: o.trailer.clone(),
@@ -183,20 +191,55 @@ pub async fn land<G: Gh>(
             ..pins::PinOpts::default()
         };
         // Boxed: a pin pull request is landed by `land` itself.
-        let r = Box::pin(pins::sync(gh, s, Some(bus), &po, false)).await?;
+        let r = match Box::pin(pins::sync(gh, s, Some(bus), &po, false)).await {
+            Ok(r) => r,
+            Err(e) => {
+                let left = format!("the {} pins are", s.wrapper);
+                let outcome =
+                    Outcome::partial(repo, number, &outcome.head, merge.as_deref(), &left, e)?;
+                return Ok(Landing { outcome, after });
+            }
+        };
         after.push(r.line());
         if !r.ok() {
             // The record stays with the pins not done: the same command finishes them.
             outcome.kind = Kind::Partial;
+            let at = merge
+                .as_deref()
+                .filter(|m| !m.is_empty())
+                .map(|m| format!(" at {}", short(m)))
+                .unwrap_or_default();
             outcome.line = format!(
-                "{repo} #{number} is merged, but the {} pins are not raised ({}); run the same `hgl-ai gh land` again to finish PARTIAL",
+                "{repo} #{number} is merged{at}, but the {} pins are not raised ({}); run the same `hgl-ai gh land` again to finish PARTIAL",
                 s.wrapper,
                 r.line()
             );
             return Ok(Landing { outcome, after });
         }
     }
-    progress::delete(bus, repo, number).await?;
+    drop_record(bus, repo, number, outcome, after).await
+}
+
+/// Every step after the merge is done: delete the landing's record. A failed delete is
+/// `PARTIAL`, so a retry deletes it rather than leave it for a later run to find.
+async fn drop_record(
+    bus: &Bus,
+    repo: &str,
+    number: u64,
+    outcome: Outcome,
+    after: Vec<String>,
+) -> Result<Landing> {
+    if let Err(e) = progress::delete(bus, repo, number).await {
+        let outcome = Outcome::partial(
+            repo,
+            number,
+            &outcome.head,
+            outcome.merge_commit.as_deref(),
+            &format!("its record {} is", progress::key(repo, number)),
+            e,
+        )?;
+        return Ok(Landing { outcome, after });
+    }
     Ok(Landing { outcome, after })
 }
 
@@ -217,7 +260,7 @@ async fn land_locked<G: Gh>(
         return Ok(done);
     }
     let deadline = Instant::now() + o.timeout;
-    let gate_opts = with_deadline(&o.gate, deadline);
+    let gate_opts = with_deadline(s, repo, o, deadline);
     if let Some(outcome) = wait_for_table(bus, repo, number, head, o.gate.triaged, deadline).await?
     {
         let after = Vec::new();
@@ -279,7 +322,10 @@ async fn land_locked<G: Gh>(
 }
 
 /// A landing whose record holds the merge commit: an earlier attempt merged and stopped
-/// before every step after the merge was done. Finish them, without the gate.
+/// before every step after the merge was done. Finish them, without the gate. With no
+/// record and a `landed.log` line, the landing is finished (another attempt finished it
+/// while this one waited for the lock): `AlreadyMerged`, without the gate, whose table and
+/// bot limit no longer apply to it.
 async fn resume_recorded<G: Gh>(
     gh: &G,
     s: &Settings,
@@ -290,7 +336,7 @@ async fn resume_recorded<G: Gh>(
     lock: &LandLock,
 ) -> Result<Option<(Landing, String)>> {
     let Some(p) = progress::read(bus, repo, number).await? else {
-        return Ok(None);
+        return landed_earlier(gh, s, bus, repo, number).await;
     };
     // Only the intent: whether the merge happened is GitHub's to say (the gate asks).
     let Some(merge) = p.merge.clone() else {
@@ -307,17 +353,65 @@ async fn resume_recorded<G: Gh>(
     );
     outcome.merge_commit = Some(merge);
     eprintln!("{}", outcome.line);
-    let (after, what) = after_merge(gh, s, bus, repo, number, &outcome, o, lock, Some(p)).await?;
-    Ok(Some((Landing { outcome, after }, what)))
+    Ok(Some(
+        finish(gh, s, bus, repo, number, outcome, o, lock, Some(p)).await?,
+    ))
+}
+
+/// A landing with no record whose `landed.log` line is there: finished. The head is the
+/// pull request's, the one merged: the caller's may be older (the gate updated the branch
+/// before the merge).
+async fn landed_earlier<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: &Bus,
+    repo: &str,
+    number: u64,
+) -> Result<Option<(Landing, String)>> {
+    let Some(merge) = progress::landed_merge(bus, repo, number).await? else {
+        return Ok(None);
+    };
+    let head = gate::fetch_pr(gh, s, repo, number).await?.head;
+    let mut outcome = Outcome::new(
+        Kind::AlreadyMerged,
+        format!(
+            "{repo} #{number} at {} landed earlier at {} already MERGED",
+            short(&head),
+            short(&merge)
+        ),
+        false,
+        &head,
+    );
+    outcome.merge_commit = Some(merge);
+    let after = vec![format!(
+        "landed earlier: {repo} #{number} is in {}",
+        state::KEY_LANDED
+    )];
+    Ok(Some((Landing { outcome, after }, String::new())))
 }
 
 /// The gate's options with the landing's `deadline`, which bounds the poll of an accepted
 /// merge (with the lock's lease, taken at the merge: [`crate::merge::until`]).
-fn with_deadline(gate: &gate::Opts, deadline: Instant) -> gate::Opts {
+fn with_deadline(s: &Settings, repo: &str, o: &LandOpts, deadline: Instant) -> gate::Opts {
     gate::Opts {
         merge_until: Some(tokio::time::Instant::from_std(deadline)),
-        ..*gate
+        after: steps(s, repo, o),
+        ..o.gate
     }
+}
+
+/// The steps after a merge that a landing with `o` does in `repo`.
+fn steps(s: &Settings, repo: &str, o: &LandOpts) -> gate::AfterSteps {
+    gate::AfterSteps {
+        notes: o.notify,
+        comment: o.comment,
+        pins: o.sync_pins && s.pin_sources().contains(&repo),
+    }
+}
+
+/// What a landing with `o` has left in `repo`, from its record `p`.
+fn left_of(s: &Settings, repo: &str, p: Option<&Progress>, o: &LandOpts) -> String {
+    gate::left_of(p, steps(s, repo, o), &s.wrapper)
 }
 
 /// After the gate decided, under the lock: a merge's steps; a pull request found merged
@@ -335,49 +429,21 @@ async fn settle<G: Gh>(
 ) -> Result<(Landing, String)> {
     match outcome.kind {
         Kind::Merged => {
-            let p = progress::read(bus, repo, number).await?;
-            let (after, what) = after_merge(gh, s, bus, repo, number, &outcome, o, lock, p).await?;
-            Ok((Landing { outcome, after }, what))
+            let p = match progress::read(bus, repo, number).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let left = left_of(s, repo, None, o);
+                    return stopped(repo, number, &outcome, &left, e);
+                }
+            };
+            finish(gh, s, bus, repo, number, outcome, o, lock, p).await
         }
         Kind::AlreadyMerged => {
-            let p = progress::read(bus, repo, number).await?;
-            if p.is_none() && progress::landed(bus, repo, number, None).await? {
-                let after = vec![format!(
-                    "landed earlier: {repo} #{number} is in {}",
-                    state::KEY_LANDED
-                )];
-                return Ok((Landing { outcome, after }, String::new()));
+            match settle_merged(gh, s, bus, repo, number, &outcome, o, lock).await {
+                Ok(done) => Ok(done),
+                // Merged, and what its landing has done not read.
+                Err(e) => stopped(repo, number, &outcome, "its landing is", e),
             }
-            // Merged, and its landing not finished (an earlier attempt stopped right after
-            // the merge, or it was merged without one): finish it now.
-            let pr = gate::fetch_pr(gh, s, repo, number).await?;
-            let merge = pr.merge_commit.clone().unwrap_or_default();
-            let head = p
-                .as_ref()
-                .map(|p| p.head.clone())
-                .filter(|h| !h.is_empty())
-                .unwrap_or_else(|| pr.head.clone());
-            let mut resumed = Outcome::new(
-                Kind::Resumed,
-                format!(
-                    "{repo} #{number} is merged at {} and its landing was not finished; finishing it MERGED",
-                    short(&merge)
-                ),
-                false,
-                &head,
-            );
-            resumed.merge_commit = Some(merge.clone());
-            eprintln!("{}", resumed.line);
-            let p = p.unwrap_or_else(|| Progress::new(&head, Some(merge)));
-            let (after, what) =
-                after_merge(gh, s, bus, repo, number, &resumed, o, lock, Some(p)).await?;
-            Ok((
-                Landing {
-                    outcome: resumed,
-                    after,
-                },
-                what,
-            ))
         }
         _ => Ok((
             Landing {
@@ -387,6 +453,82 @@ async fn settle<G: Gh>(
             String::new(),
         )),
     }
+}
+
+/// [`Outcome::partial`] for an `outcome` that stopped with `e` before its steps after the
+/// merge began.
+fn stopped(
+    repo: &str,
+    number: u64,
+    outcome: &Outcome,
+    left: &str,
+    e: Error,
+) -> Result<(Landing, String)> {
+    let outcome = Outcome::partial(
+        repo,
+        number,
+        &outcome.head,
+        outcome.merge_commit.as_deref(),
+        left,
+        e,
+    )?;
+    Ok((
+        Landing {
+            outcome,
+            after: Vec::new(),
+        },
+        String::new(),
+    ))
+}
+
+/// [`settle`] of a pull request the gate found merged.
+#[allow(clippy::too_many_arguments)]
+async fn settle_merged<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: &Bus,
+    repo: &str,
+    number: u64,
+    outcome: &Outcome,
+    o: &LandOpts,
+    lock: &LandLock,
+) -> Result<(Landing, String)> {
+    let p = progress::read(bus, repo, number).await?;
+    if p.is_none() && progress::landed(bus, repo, number, None).await? {
+        let after = vec![format!(
+            "landed earlier: {repo} #{number} is in {}",
+            state::KEY_LANDED
+        )];
+        let outcome = outcome.clone();
+        return Ok((Landing { outcome, after }, String::new()));
+    }
+    // Merged, and its landing not finished (an earlier attempt stopped right after
+    // the merge, or it was merged without one): finish it now.
+    let (merge, pr_head) = match &outcome.merge_commit {
+        Some(m) => (m.clone(), outcome.head.clone()),
+        None => {
+            let pr = gate::fetch_pr(gh, s, repo, number).await?;
+            (pr.merge_commit.unwrap_or_default(), pr.head)
+        }
+    };
+    let head = p
+        .as_ref()
+        .map(|p| p.head.clone())
+        .filter(|h| !h.is_empty())
+        .unwrap_or(pr_head);
+    let mut resumed = Outcome::new(
+        Kind::Resumed,
+        format!(
+            "{repo} #{number} is merged at {} and its landing was not finished; finishing it MERGED",
+            short(&merge)
+        ),
+        false,
+        &head,
+    );
+    resumed.merge_commit = Some(merge.clone());
+    eprintln!("{}", resumed.line);
+    let p = p.unwrap_or_else(|| Progress::new(&head, Some(merge)));
+    finish(gh, s, bus, repo, number, resumed, o, lock, Some(p)).await
 }
 
 /// One gate attempt under the landing lock (`gh merge-if-clean`), and after a merge the same
@@ -420,11 +562,16 @@ pub(crate) async fn merge_locked<G: Gh>(
     o: &LandOpts,
     lock: &LandLock,
 ) -> Result<Landing> {
+    // The pins are not this command's: a `PARTIAL` does not name them.
+    let o = &LandOpts {
+        sync_pins: false,
+        ..o.clone()
+    };
     let (Landing { outcome, mut after }, _) =
         match resume_recorded(gh, s, bus, repo, number, o, lock).await? {
             Some(done) => done,
             None => {
-                let gate_opts = with_deadline(&o.gate, Instant::now() + o.timeout);
+                let gate_opts = with_deadline(s, repo, o, Instant::now() + o.timeout);
                 let outcome = gate::evaluate(
                     gh,
                     s,
@@ -448,9 +595,41 @@ pub(crate) async fn merge_locked<G: Gh>(
                 s.wrapper
             ));
         }
-        progress::delete(bus, repo, number).await?;
+        return drop_record(bus, repo, number, outcome, after).await;
     }
     Ok(Landing { outcome, after })
+}
+
+/// The steps after a merge ([`after_merge`]) for `outcome`, from the record `prog`. A step
+/// that fails gives `PARTIAL` naming the steps left and the lines of those done, the record
+/// kept for the same command to finish them; an unreachable hub stays the error.
+#[allow(clippy::too_many_arguments)]
+async fn finish<G: Gh>(
+    gh: &G,
+    s: &Settings,
+    bus: &Bus,
+    repo: &str,
+    number: u64,
+    outcome: Outcome,
+    o: &LandOpts,
+    lock: &LandLock,
+    prog: Option<Progress>,
+) -> Result<(Landing, String)> {
+    let merge = outcome.merge_commit.clone().unwrap_or_default();
+    let mut p = prog.unwrap_or_else(|| Progress::new(&outcome.head, Some(merge.clone())));
+    let mut after = Vec::new();
+    match after_merge(
+        gh, s, bus, repo, number, &outcome, o, lock, &mut p, &mut after,
+    )
+    .await
+    {
+        Ok(what) => Ok((Landing { outcome, after }, what)),
+        Err(e) => {
+            let left = left_of(s, repo, Some(&p), o);
+            let outcome = Outcome::partial(repo, number, &outcome.head, Some(&merge), &left, e)?;
+            Ok((Landing { outcome, after }, String::new()))
+        }
+    }
 }
 
 /// The steps after a merge, each under the landing lock and recorded as done in the
@@ -468,14 +647,13 @@ pub(crate) async fn after_merge<G: Gh>(
     outcome: &Outcome,
     o: &LandOpts,
     lock: &LandLock,
-    prog: Option<Progress>,
-) -> Result<(Vec<String>, String)> {
+    p: &mut Progress,
+    after: &mut Vec<String>,
+) -> Result<String> {
     let merge = outcome.merge_commit.clone().unwrap_or_default();
     let resumed = outcome.kind == Kind::Resumed;
-    let mut p = prog.unwrap_or_else(|| Progress::new(&outcome.head, Some(merge.clone())));
     p.merge = Some(merge.clone());
     let merged = format!("{repo} #{number} is merged at {}", short(&merge));
-    let mut after = Vec::new();
     let mut recorded = false;
     // The merged pull request: its title for `landed.log`, its branch for the notes.
     let pr = gate::fetch_pr(gh, s, repo, number).await?;
@@ -489,7 +667,7 @@ pub(crate) async fn after_merge<G: Gh>(
         .await?;
         append_landed(bus, repo, number, &merge, &pr.title).await?;
         p.mark(progress::LANDED_LOG);
-        progress::write(bus, repo, number, &p).await?;
+        progress::write(bus, repo, number, p).await?;
         recorded = true;
     }
     if !p.has(progress::MAIN) {
@@ -503,7 +681,7 @@ pub(crate) async fn after_merge<G: Gh>(
         .await?;
         store::put_latest(bus, state::KEY_MAIN, &text).await?;
         p.mark(progress::MAIN);
-        progress::write(bus, repo, number, &p).await?;
+        progress::write(bus, repo, number, p).await?;
         recorded = true;
     }
     if recorded {
@@ -537,7 +715,7 @@ pub(crate) async fn after_merge<G: Gh>(
             None => {
                 let at = utc_now_stamp();
                 p.notes_at = Some(at.clone());
-                progress::write(bus, repo, number, &p).await?;
+                progress::write(bus, repo, number, p).await?;
                 at
             }
         };
@@ -563,7 +741,7 @@ pub(crate) async fn after_merge<G: Gh>(
             .await?,
         );
         p.mark(progress::NOTES);
-        progress::write(bus, repo, number, &p).await?;
+        progress::write(bus, repo, number, p).await?;
     }
     if o.comment && !p.has(progress::COMMENT) {
         let first = body.lines().next().unwrap_or_default();
@@ -575,9 +753,9 @@ pub(crate) async fn after_merge<G: Gh>(
             after.push(format!("commented on {repo}#{number}"));
         }
         p.mark(progress::COMMENT);
-        progress::write(bus, repo, number, &p).await?;
+        progress::write(bus, repo, number, p).await?;
     }
-    Ok((after, what))
+    Ok(what)
 }
 
 /// Whether the pull request has a comment whose first line is `first`.
@@ -928,6 +1106,89 @@ mod tests {
             .fail("beta/git/ref/heads/main", "gh: Not Found (HTTP 404)");
         let t = main_text(&gh, &s).await.unwrap();
         assert!(!t.contains("beta"), "{t}");
+    }
+
+    /// hgl-ai#7: what a `PARTIAL` names as left, and an unreachable hub that stays the
+    /// error (exit 10).
+    #[test]
+    fn a_partial_names_what_is_left() {
+        let o = LandOpts::default();
+        let s = crate::testutil::settings();
+        let left_of = |p: Option<&Progress>, o: &LandOpts| left_of(&s, "alpha", p, o);
+        assert_eq!(
+            left_of(None, &o),
+            "landed.log, main, the landed notes and the comment are"
+        );
+        let mut p = Progress::new(HEAD, Some("m".into()));
+        p.mark(progress::LANDED_LOG);
+        p.mark(progress::MAIN);
+        assert_eq!(
+            left_of(Some(&p), &o),
+            "the landed notes and the comment are"
+        );
+        p.mark(progress::NOTES);
+        assert_eq!(left_of(Some(&p), &o), "the comment is");
+        p.mark(progress::COMMENT);
+        assert_eq!(left_of(Some(&p), &o), "its record is");
+        let quiet = LandOpts {
+            notify: false,
+            comment: false,
+            ..LandOpts::default()
+        };
+        assert_eq!(left_of(None, &quiet), "landed.log and main are");
+        // The gate's `PARTIAL` right after the merge names the same steps.
+        let g = with_deadline(&s, "alpha", &quiet, Instant::now()).after;
+        assert_eq!(
+            gate::left_of(None, g, &s.wrapper),
+            "landed.log and main are"
+        );
+        // A repository the wrapper's pins follow: `gh land` raises them too.
+        assert_eq!(
+            super::left_of(&s, "hgl-compiler", Some(&p), &o),
+            "the hgl-project pins are"
+        );
+        assert_eq!(
+            super::left_of(&s, "hgl-compiler", None, &quiet),
+            "landed.log, main and the hgl-project pins are"
+        );
+
+        let merge = "01e99ea5e46457bac035ca8a2699b6b6575b32ed";
+        let e = Error::Response {
+            what: "x".into(),
+            msg: "HTTP 502".into(),
+        };
+        let out = Outcome::partial("alpha", 7, HEAD, Some(merge), "main is", e).unwrap();
+        assert_eq!(out.kind, Kind::Partial);
+        assert!(!out.kind.satisfied() && !out.kind.landed() && !out.retry);
+        assert_eq!(out.merge_commit.as_deref(), Some(merge));
+        assert_eq!(
+            out.line,
+            "alpha #7 is merged at 01e99ea5, but main is not done (unexpected GitHub response from x: HTTP 502); run the same command again to finish PARTIAL"
+        );
+        let out = Outcome::partial(
+            "alpha",
+            7,
+            HEAD,
+            Some(""),
+            "main is",
+            Error::Invalid("e".into()),
+        )
+        .unwrap();
+        assert!(
+            out.line.starts_with("alpha #7 is merged, but"),
+            "{}",
+            out.line
+        );
+        assert_eq!(out.merge_commit, None);
+        let gone = Error::Bus(hgl_ai_bus::BusError::Unreachable {
+            url: "nats://hub".into(),
+            reason: "refused".into(),
+        });
+        let e = Outcome::partial("alpha", 7, HEAD, Some(merge), "main is", gone).unwrap_err();
+        assert!(
+            matches!(e, Error::Bus(hgl_ai_bus::BusError::Unreachable { .. })),
+            "{e}"
+        );
     }
 
     #[tokio::test]

@@ -277,11 +277,10 @@ before hub users takes one shared token until it moves.
 ```json
 {"v": 1, "id": "20261127-083000-3fa9c1", "repo": "hgl-compiler", "head": "8a5c...", "host": "lab1",
  "platform": "linux", "executor": "local", "status": "fail", "steps": [{"name": "test", "status": "fail",
- "exit": 101, "wall_ms": 81000, "cpu_ms": 302000, "peak_bytes": 3650000000, "cap_bytes": 34359738368,
- "log": ".../test.log"}], "errors": [{"step": "test", "file": "src/lib.rs", "line": 10, "col": 5,
+ "exit": 101, "wall_ms": 81000, "cpu_ms": 302000, "peak_bytes": 3650000000, "cap_bytes": 34359738368}], "errors": [{"step": "test", "file": "src/lib.rs", "line": 10, "col": 5,
  "code": "E0308", "message": "mismatched types", "count": 1, "start": 1234, "end": 2345}],
  "errors_total": 1, "tests": {"passed": 120, "failed": 2, "skipped": 3, "failures": [...]},
- "warnings_total": 4, "warnings": {"unused_variables": 3, "dead_code": 1}, "log_dir": "..."}
+ "warnings_total": 4, "warnings": {"unused_variables": 3, "dead_code": 1}, "log_dir": ""}
 ```
 
   `status` is `pass`, `fail`, `not-run` (a missing prerequisite), or `stopped`.
@@ -318,9 +317,16 @@ implementor branch is attributed to the fleet. Other PRs are flagged for
 controller routing. Empty rounds send no note. Pending notes are retried with
 the same message ID.
 
-`HGL_LOCKS` holds leases, `{"holder", "acquired_at"}`, created only if absent,
-rewritten every minute while held, deleted by their holder; one not rewritten
-within `max_age` expires. `builder.<label>` is held by the one process serving that builder (`docs/build.md`).
+`HGL_LOCKS` holds leases, `{"holder", "acquired_at", "token"}`, created only if
+absent, rewritten every minute while held, deleted by their holder; one not
+rewritten within `max_age` expires. `token` is random per acquisition (and
+take-over), so a lease's value is its own even against the same holder in the same
+second; a reader treats a record without one (an older writer) as token `""`. A
+rewrite or delete is a compare-and-set at the holder's revision; one that finds the
+key moved and the record, token included, still its own (a rewrite whose answer it
+never saw) takes that revision once, so only another record, or none, is a lost
+lease.
+`builder.<label>` is held by the one process serving that builder (`docs/build.md`).
 `lock.land.<repo>` is the landing lock: `gh land`,
 `gh merge-if-clean` and `gh release watch` hold it from before the gate until
 the merge, `landed.log`, `main` and the `landed` notes are done.
@@ -329,11 +335,18 @@ Each step after the merge (`landed.log`, `main`, the `landed` notes, the comment
 then, for `gh land`, the pins) is recorded in `landing.<repo>.<pr>` as it is done.
 The same command run again finds the pull request merged and does only the steps
 not done: no second `landed.log` line, the notes with their first `created_at`, no
-second comment. It reports success only when all are done; pins that did not land
-give `PARTIAL` (exit 3). A pull request found merged with neither a record nor a
-`landed.log` line has every step done then. `main` is written only whole: a failed
-read is tried three times, then the landing fails; a repository with no `main`
-(HTTP 404) is left out with a warning.
+second comment. It reports success only when all are done. A step after the merge
+that fails (pins that did not land, a GitHub error, a failed hub write, a lost landing
+lock) gives `PARTIAL` (exit 3): the merge commit, the steps not done, the error, and
+"run the same command again to finish"; the record is kept. Without `--json` the
+lines of the steps done follow it. An unreachable hub is still exit 10. Before it
+reads the pins, `gh pins sync` (and so `gh land`) finishes the landing of any pin pull
+request (its branch the pin branch) whose record shows it merged, or that GitHub shows
+merged; it is not left behind pins that read current. One another sync finished first
+is done, and the sync goes on to the pins. Its dry run reads the hub for them too. A pull
+request found merged with neither a record nor a `landed.log` line has every step
+done then. `main` is written only whole: a failed read is tried three times, then the
+landing fails; a repository with no `main` (HTTP 404) is left out with a warning.
 
 `HGL_ENDED/<seat>.<repo>-<issue>` holds `{"seq", "ended_at"}`: the stream
 sequence of the note that ended the task for the seat. A later end replaces an
