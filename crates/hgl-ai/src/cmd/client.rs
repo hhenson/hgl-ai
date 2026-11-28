@@ -47,6 +47,9 @@ struct InstallArgs {
     /// Do not install the builder service.
     #[arg(long)]
     no_builder: bool,
+    /// Record the OS user running a separately installed builder.
+    #[arg(long, conflicts_with = "no_builder")]
+    builder_user: Option<String>,
     /// Print what would change; change nothing.
     #[arg(long)]
     dry_run: bool,
@@ -65,6 +68,7 @@ pub async fn run(ctx: &Ctx, args: Args) -> anyhow::Result<i32> {
                 work_root: a.work_root,
                 linger: a.linger,
                 builder: !a.no_builder,
+                builder_user: a.builder_user,
             };
             let out = client::install(pick(a.dry_run), &BusHub, &o)
                 .await
