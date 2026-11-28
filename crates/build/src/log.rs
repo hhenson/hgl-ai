@@ -9,6 +9,7 @@ use std::path::{Component, Path};
 use std::time::Duration;
 
 pub const MAX: u64 = 64 << 10;
+const MAX_STATUS: u64 = 4 << 20;
 #[derive(Serialize, Deserialize)]
 struct Request {
     id: String,
@@ -49,12 +50,17 @@ pub fn read(
         .iter()
         .find(|s| s.name == step && s.log.is_some())
     {
+        if !single_component(&s.name) {
+            return Err("invalid step name".into());
+        }
         format!("{}.log", s.name)
-    } else if summary
-        .steps
-        .iter()
-        .any(|s| s.artifacts.iter().any(|a| a == step))
-    {
+    } else if summary.steps.iter().any(|s| {
+        single_component(&s.name)
+            && s.artifacts.iter().any(|a| a == step)
+            && Path::new(step)
+                .strip_prefix(Path::new("artifacts").join(&s.name))
+                .is_ok_and(|p| !p.as_os_str().is_empty())
+    }) {
         step.to_string()
     } else {
         return Err("file is not named by the build summary".into());
@@ -84,6 +90,28 @@ pub fn read(
         .read_to_end(&mut data)
         .map_err(|e| e.to_string())?;
     Ok(data)
+}
+
+fn single_component(name: &str) -> bool {
+    let mut parts = Path::new(name).components();
+    matches!(parts.next(), Some(Component::Normal(_)))
+        && parts.next().is_none()
+        && name != "."
+        && !name.contains('/')
+}
+
+fn read_status(dir: &Path) -> Option<Summary> {
+    let file = open_file(dir, Path::new(crate::store::STATUS_FILE)).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() > MAX_STATUS {
+        return None;
+    }
+    let mut data = Vec::new();
+    file.take(MAX_STATUS + 1).read_to_end(&mut data).ok()?;
+    if data.len() as u64 > MAX_STATUS {
+        return None;
+    }
+    serde_json::from_slice(&data).ok()
 }
 
 // Resolve each component under a held directory descriptor; never follow a symlink,
@@ -172,8 +200,20 @@ pub async fn serve(
     let addr = address(&lane.label).map_err(|e| e.to_string())?;
     let mut inbox = bus.inbox(&addr).await.map_err(|e| e.to_string())?;
     while !*stop.borrow() {
-        let deliveries = tokio::select! { r = inbox.fetch(1, Duration::from_secs(2)) => r.map_err(|e| e.to_string())?, _ = stop.changed() => continue };
+        let got = tokio::select! { r = inbox.fetch(1, Duration::from_secs(2)) => r, _ = stop.changed() => continue };
+        let deliveries = match got {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(builder = %lane.label, "reading the log inbox: {e}");
+                tokio::select! { _ = tokio::time::sleep(Duration::from_secs(2)) => {}, _ = stop.changed() => {} }
+                continue;
+            }
+        };
         for d in deliveries {
+            if d.note.recipient != addr || d.note.kind != Kind::Note {
+                let _ = d.ack().await;
+                continue;
+            }
             let req: Request = match serde_json::from_str(d.note.body.trim()) {
                 Ok(r) => r,
                 Err(_) => {
@@ -189,7 +229,7 @@ pub async fn serve(
                 continue;
             }
             let dir = lane.logs.join(&req.id);
-            let result = crate::store::read_status(&dir)
+            let result = read_status(&dir)
                 .ok_or_else(|| "build log is unavailable".to_string())
                 .and_then(|s| {
                     if s.id == req.id && s.host == lane.label {
@@ -222,4 +262,58 @@ pub async fn serve(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hgl_ai_proto::build::{StepStatus, StepSummary};
+
+    fn summary() -> Summary {
+        serde_json::from_value(serde_json::json!({
+            "v": 1, "id": "id", "repo": "repo", "host": "host", "platform": "linux",
+            "executor": "local", "status": "pass", "started_at": "now", "log_dir": "", "steps": []
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn untrusted_summary_cannot_expand_file_access() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("artifacts/check")).unwrap();
+        std::fs::write(dir.path().join("artifacts/check/report"), b"ok").unwrap();
+        std::fs::write(dir.path().join("secret"), b"secret").unwrap();
+        let mut s = summary();
+        let mut step = StepSummary::new("check", StepStatus::Pass);
+        step.log = Some("ignored".into());
+        step.artifacts = vec![
+            "artifacts/check/report".into(),
+            "secret".into(),
+            "artifacts/other/report".into(),
+        ];
+        s.steps.push(step);
+        assert_eq!(
+            read(dir.path(), &s, Some("artifacts/check/report"), None).unwrap(),
+            b"ok"
+        );
+        assert!(read(dir.path(), &s, Some("secret"), None).is_err());
+        assert!(read(dir.path(), &s, Some("artifacts/other/report"), None).is_err());
+        s.steps[0].name = "nested/step".into();
+        assert!(read(dir.path(), &s, Some("nested/step"), None).is_err());
+    }
+
+    #[test]
+    fn status_must_be_a_bounded_regular_file_without_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = dir.path().join(crate::store::STATUS_FILE);
+        let other = dir.path().join("other");
+        std::fs::write(&other, serde_json::to_vec(&summary()).unwrap()).unwrap();
+        std::os::unix::fs::symlink(&other, &status).unwrap();
+        assert!(read_status(dir.path()).is_none());
+        std::fs::remove_file(&status).unwrap();
+        std::fs::write(&status, vec![b' '; MAX_STATUS as usize + 1]).unwrap();
+        assert!(read_status(dir.path()).is_none());
+        std::fs::write(&status, serde_json::to_vec(&summary()).unwrap()).unwrap();
+        assert!(read_status(dir.path()).is_some());
+    }
 }
