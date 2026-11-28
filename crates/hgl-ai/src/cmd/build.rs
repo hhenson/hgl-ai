@@ -4,6 +4,7 @@
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context as _, bail};
@@ -16,8 +17,8 @@ use hgl_ai_bus::Bus;
 use hgl_ai_config::Config;
 use hgl_ai_proto::Seat;
 use hgl_ai_proto::build::{
-    BUILD_VERSION, BuildJob, BuildStatus, Platform, Summary, check_build_id, new_build_id,
-    reply_seat,
+    BUILD_VERSION, BuildJob, BuildStatus, Platform, StepStatus, Summary, check_build_id,
+    new_build_id, reply_seat,
 };
 use hgl_ai_tree::Git;
 
@@ -328,18 +329,21 @@ fn print_summary(ctx: &Ctx, s: &Summary) {
 }
 
 /// Stop `cancel` at SIGINT or SIGTERM.
-fn cancel_on_signal(cancel: Cancel) {
+fn cancel_on_signal(cancel: Cancel) -> Arc<AtomicBool> {
+    let term_seen = Arc::new(AtomicBool::new(false));
+    let seen = term_seen.clone();
+    use tokio::signal::unix::{SignalKind, signal};
+    let Ok(mut term) = signal(SignalKind::terminate()) else {
+        return term_seen;
+    };
     tokio::spawn(async move {
-        use tokio::signal::unix::{SignalKind, signal};
-        let Ok(mut term) = signal(SignalKind::terminate()) else {
-            return;
-        };
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {}
-            _ = term.recv() => {}
+            _ = term.recv() => { seen.store(true, Ordering::SeqCst); }
         }
         cancel.cancel();
     });
+    term_seen
 }
 
 fn pid_alive(pid: i32) -> bool {
@@ -505,7 +509,7 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
         log_dir: run_dir.clone(),
     };
     let cancel = Cancel::default();
-    cancel_on_signal(cancel.clone());
+    let term_seen = cancel_on_signal(cancel.clone());
     let bus = bus.map(Arc::new);
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Summary>();
     let fwd = {
@@ -533,7 +537,30 @@ async fn run_local(ctx: &Ctx, a: RunArgs) -> anyhow::Result<i32> {
     .await
     .context("the build stopped")?;
     let _ = fwd.await;
-    let s = driven.summary;
+    let mut s = driven.summary;
+    // A turn's reaper signals both the build and its step. The step can exit before
+    // the signal task gets scheduled, so give an incoming TERM a chance to arrive.
+    if s.steps.iter().any(|step| step.exit == Some(143)) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if term_seen.load(Ordering::SeqCst)
+        && std::env::var_os("HGL_AI_TURN").is_some_and(|v| !v.is_empty())
+    {
+        for step in &mut s.steps {
+            if step.status == StepStatus::Fail && step.exit == Some(143) && step.limit.is_none() {
+                step.status = StepStatus::Stopped;
+                step.reason = Some("turn ended".into());
+            }
+        }
+        s.status = summary::overall(&s.steps);
+        if matches!(
+            s.status,
+            BuildStatus::Pass | BuildStatus::Running | BuildStatus::Stopped
+        ) {
+            s.status = BuildStatus::Stopped;
+            s.reason = Some("turn ended".into());
+        }
+    }
     store::write_final(&run_dir, &s)?;
     if let Some(b) = &bus {
         if let Err(e) = store::run_put(b, &s).await {
