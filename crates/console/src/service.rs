@@ -343,20 +343,83 @@ const P2_KEY: &str = "p2.pending";
 /// The key of the undelivered `p1` notifications in `HGL_CONSOLE`.
 const P1_KEY: &str = "p1.unsent";
 
-// Keep changes ordered: in particular, a later sign-out must not be followed by an
-// earlier failed session write. Do not discard a failed deletion.
-async fn retry_persist<F, Fut, E>(mut write: F, delay: Duration)
-where
-    F: FnMut() -> Fut,
-    Fut: std::future::Future<Output = Result<(), E>>,
-    E: std::fmt::Display,
+// One write per key at a time; newer snapshots supersede failed writes. Independent
+// keys can progress while another key is being retried.
+async fn persist_loop<T, K, F, Fut, E>(
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<T>,
+    key: K,
+    write: F,
+    delay: Duration,
+) where
+    T: Clone + Send + 'static,
+    K: Fn(&T) -> String,
+    F: Fn(T) -> Fut + Clone + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), E>> + Send,
+    E: std::fmt::Display + Send + 'static,
 {
+    let mut pending = std::collections::HashMap::<String, Option<T>>::new();
+    let mut running = tokio::task::JoinSet::new();
+    let mut open = true;
     loop {
-        match write().await {
-            Ok(()) => return,
-            Err(e) => tracing::warn!("keeping the console's state on the hub: {e}; retrying"),
+        tokio::select! {
+            item = rx.recv(), if open => match item {
+                Some(item) => {
+                    let k = key(&item);
+                    if let Some(slot) = pending.get_mut(&k) {
+                        *slot = Some(item);
+                    } else {
+                        pending.insert(k.clone(), None);
+                        spawn_persist(&mut running, k, item, write.clone(), delay);
+                    }
+                }
+                None => open = false,
+            },
+            result = running.join_next(), if !running.is_empty() => {
+                let (k, item, ok) = result.expect("worker exists").expect("persistence worker panicked");
+                let next = pending.get_mut(&k).expect("active key").take();
+                if let Some(next) = next.or_else(|| (!ok).then_some(item)) {
+                    spawn_persist(&mut running, k, next, write.clone(), delay);
+                } else {
+                    pending.remove(&k);
+                }
+            }
+            else => break,
         }
-        tokio::time::sleep(delay).await;
+    }
+}
+
+fn spawn_persist<T, F, Fut, E>(
+    running: &mut tokio::task::JoinSet<(String, T, bool)>,
+    key: String,
+    item: T,
+    write: F,
+    delay: Duration,
+) where
+    T: Clone + Send + 'static,
+    F: Fn(T) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = Result<(), E>> + Send,
+    E: std::fmt::Display + Send + 'static,
+{
+    running.spawn(async move {
+        let ok = match write(item.clone()).await {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("keeping the console's state on the hub: {e}; retrying");
+                drop(e);
+                tokio::time::sleep(delay).await;
+                false
+            }
+        };
+        (key, item, ok)
+    });
+}
+
+fn persist_key(p: &crate::auth::Persist) -> &str {
+    use crate::auth::Persist;
+    match p {
+        Persist::Put(k, _) | Persist::Del(k) => k,
+        Persist::P2(_) => P2_KEY,
+        Persist::P1(_) => P1_KEY,
     }
 }
 
@@ -393,7 +456,7 @@ pub async fn restore(app: &Arc<App>, bus: &Arc<Bus>) {
         Ok(None) => {}
         Err(e) => tracing::warn!("reading the undelivered p1 notifications: {e}"),
     }
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tracing::info!("{} sessions kept on the hub", stored.len());
     app.auth.attach(stored, tx);
     let pending = app.pending_p2.lock().expect("pending").clone();
@@ -405,25 +468,25 @@ pub async fn restore(app: &Arc<App>, bus: &Arc<Bus>) {
         app.auth.persist(crate::auth::Persist::P1(unsent));
     }
     let b = bus.clone();
-    tokio::spawn(async move {
-        use crate::auth::Persist;
-        while let Some(p) = rx.recv().await {
-            retry_persist(
-                || async {
-                    match &p {
-                        Persist::Put(k, s) => b.console_put(k, s).await,
-                        Persist::Del(k) => b.console_del(k).await,
-                        Persist::P2(v) if v.is_empty() => b.console_del(P2_KEY).await,
-                        Persist::P2(v) => b.console_put(P2_KEY, v).await,
-                        Persist::P1(v) if v.is_empty() => b.console_del(P1_KEY).await,
-                        Persist::P1(v) => b.console_put(P1_KEY, v).await,
-                    }
-                },
-                RECONNECT,
-            )
-            .await;
-        }
-    });
+    tokio::spawn(persist_loop(
+        rx,
+        |p| persist_key(p).to_owned(),
+        move |p| {
+            let b = b.clone();
+            async move {
+                use crate::auth::Persist;
+                match &p {
+                    Persist::Put(k, s) => b.console_put(k, s).await,
+                    Persist::Del(k) => b.console_del(k).await,
+                    Persist::P2(v) if v.is_empty() => b.console_del(P2_KEY).await,
+                    Persist::P2(v) => b.console_put(P2_KEY, v).await,
+                    Persist::P1(v) if v.is_empty() => b.console_del(P1_KEY).await,
+                    Persist::P1(v) => b.console_put(P1_KEY, v).await,
+                }
+            }
+        },
+        RECONNECT,
+    ));
 }
 
 /// Connect to the hub (retrying), then start the background work.
@@ -525,20 +588,33 @@ pub(crate) mod tests {
     use super::*;
 
     #[tokio::test]
-    async fn persistence_retries_until_the_hub_accepts_the_change() {
-        let attempts = std::sync::atomic::AtomicUsize::new(0);
-        retry_persist(
-            || async {
-                if attempts.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
-                    Err("hub unavailable")
-                } else {
-                    Ok(())
+    async fn persistence_isolates_keys_and_replaces_failed_snapshots() {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(&str, &str)>();
+        let (seen_tx, mut seen_rx) = tokio::sync::mpsc::unbounded_channel();
+        let worker = tokio::spawn(persist_loop(
+            rx,
+            |p| p.0.to_owned(),
+            move |p| {
+                let seen = seen_tx.clone();
+                async move {
+                    seen.send(p).unwrap();
+                    if p.1 == "oversized" {
+                        Err("too large")
+                    } else {
+                        Ok(())
+                    }
                 }
             },
-            Duration::from_millis(1),
-        )
-        .await;
-        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 3);
+            Duration::from_millis(30),
+        ));
+        tx.send(("p1", "oversized")).unwrap();
+        assert_eq!(seen_rx.recv().await.unwrap(), ("p1", "oversized"));
+        tx.send(("p1", "smaller")).unwrap();
+        tx.send(("session", "revoked")).unwrap();
+        assert_eq!(seen_rx.recv().await.unwrap(), ("session", "revoked"));
+        assert_eq!(seen_rx.recv().await.unwrap(), ("p1", "smaller"));
+        drop(tx);
+        worker.await.unwrap();
     }
 
     /// One app's fold, for its own test: tests run at once, each on its own hub, and
