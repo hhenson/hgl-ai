@@ -680,3 +680,69 @@ fn usage_collect_show_label() {
     let bad = hub.run(&["usage", "label", "nothex", "x"]);
     assert_eq!(bad.status.code(), Some(1), "{}", err(&bad));
 }
+
+#[test]
+fn high_priority_is_restricted_to_controller_and_triage_assignments() {
+    let Some(hub) = Hub::start("priority-auth") else {
+        return;
+    };
+    ok(&hub.run(&["init"]));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let bus = hgl_ai_bus::Bus::connect_url(&hub.url, Some(hub.token()))
+            .await
+            .unwrap();
+        bus.host_put(&HostRecord {
+            host: "triage-host".into(),
+            seats: vec![SeatRecord {
+                seat: Seat::new("t1").unwrap(),
+                role: Role::Triage,
+                runtime: Runtime::Codex,
+                family: Family::Gpt,
+                model: "test".into(),
+            }],
+            memcap_gb: 64,
+            work_root_free_gb: 100,
+            updated_at: hgl_ai_proto::utc_now_stamp(),
+        })
+        .await
+        .unwrap();
+    });
+    let send = |from: &str, to: &str, kind: &str| {
+        hub.run(&[
+            "note",
+            "send",
+            "--from",
+            from,
+            "--to",
+            to,
+            "--kind",
+            kind,
+            "--repo",
+            "demo",
+            "--issue",
+            "1",
+            "--head",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--priority",
+            "high",
+            "--body",
+            "test",
+        ])
+    };
+    ok(&send("controller", "w1", "review"));
+    ok(&send("t1", "w1", "assign"));
+    ok(&send("triage", "w1", "assign"));
+    for (from, to, kind) in [
+        ("w1", "w2", "assign"),
+        ("w1", "w1", "assign"),
+        ("controller", "controller", "review"),
+        ("t1", "w1", "review"),
+    ] {
+        let result = send(from, to, kind);
+        assert!(!result.status.success(), "{from} {to} {kind}");
+        assert!(err(&result).contains("high priority"));
+    }
+    let peek = ok(&hub.run(&["note", "peek", "w1"]));
+    assert_eq!(peek.matches("priority=high").count(), 3, "{peek}");
+}

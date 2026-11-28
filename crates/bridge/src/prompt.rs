@@ -149,6 +149,9 @@ pub fn build(c: &Context, notes: &[Item]) -> String {
         if let Some(c) = n.class {
             let _ = write!(s, ", class {c}");
         }
+        if n.priority != hgl_ai_proto::NotePriority::Normal {
+            let _ = write!(s, ", priority {}", n.priority);
+        }
         let _ = writeln!(
             s,
             ", created {} (seq {seq}, delivery {delivered}) ---",

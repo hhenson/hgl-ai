@@ -1179,3 +1179,132 @@ fn pending_review_priority_orders_live_turns() {
         ]
     );
 }
+
+#[test]
+fn startup_drains_live_backlog_before_dispatch() {
+    let d = Scratch::new("priority-startup");
+    let Some(hub) = Hub::start(&d.0) else { return };
+    let g = git(&d.0);
+    let (_, seed) = remote(&g, &d.0, "demo");
+    let head = g
+        .run(&seed, ["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    let token = d.0.join("hub.token");
+    std::fs::write(&token, format!("{}\n", hub.token)).unwrap();
+    let (mut cfg, p) = config(&d.0, &hub.url, &token);
+    cfg.seats.push(SeatConfig {
+        name: Seat::new("r1").unwrap(),
+        role: Role::Reviewer,
+        binding: Binding {
+            runtime: Runtime::Codex,
+            family: None,
+            tier: Some(Tier::Fast),
+            model: None,
+            effort: None,
+        },
+        fallback: vec![],
+        memcap_gb: Some(4),
+        headless: false,
+    });
+    cfg.save(&p).unwrap();
+    assert!(hgl(&p, &["init"]).output().unwrap().status.success());
+    let send = |kind: &str, issue: &str, high: bool| {
+        let mut args = vec![
+            "note", "send", "--from", "claude", "--to", "r1", "--kind", kind, "--repo", "demo",
+            "--issue", issue, "--body", "test",
+        ];
+        if kind == "review" {
+            args.extend(["--head", &head]);
+        }
+        if high {
+            args.extend(["--priority", "high"]);
+        }
+        let o = hgl(&p, &args).output().unwrap();
+        assert!(o.status.success(), "{}", err(&o));
+    };
+    // Simulate a bridge crash with the high note delivered but unacknowledged.
+    send("review", "99", true);
+    // Exceed JetStream's default max_ack_pending as well as the bridge channel.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let bus = hgl_ai_bus::Bus::connect(&cfg).await.unwrap();
+        let mut old = bus
+            .inbox_with(
+                &Seat::new("r1").unwrap(),
+                hgl_ai_bus::InboxOptions {
+                    ack_wait: Duration::from_secs(4),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let held = old.fetch(1, Duration::from_secs(2)).await.unwrap();
+        assert_eq!(held[0].note.issue, 99);
+        // Release it later, as JetStream does when a crashed holder's timer expires.
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            held[0].nak(Duration::ZERO).await.unwrap();
+        });
+        drop(old);
+        for i in 10000..11002 {
+            let mut n = hgl_ai_proto::Note::new(
+                Seat::new("claude").unwrap(),
+                Seat::new("r1").unwrap(),
+                hgl_ai_proto::Kind::Review,
+                "normal",
+            );
+            n.repo = Some("demo".into());
+            n.issue = i;
+            n.head = Some(head.clone());
+            bus.send(&n).await.unwrap();
+        }
+    });
+    send("review", "88", true);
+    send("closed", "88", false);
+    let bin = d.0.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let calls = d.0.join("calls");
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("../bridge/fixtures/codex-ok.jsonl");
+    let script = format!(
+        "#!/bin/sh\npwd >> '{}'\ncat '{}'\n",
+        calls.display(),
+        fixture.display()
+    );
+    std::fs::write(bin.join("codex"), script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(bin.join("codex"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let mut bridge = hgl(&p, &["bridge", "run", "--seat", "r1"]);
+    isolate(&mut bridge, &d.0);
+    let log = std::fs::File::create(d.0.join("bridge.log")).unwrap();
+    let _daemon = Daemon(
+        bridge
+            .env("PATH", path)
+            .env("HGL_AI_LOG", "info")
+            .stdout(Stdio::null())
+            .stderr(log)
+            .spawn()
+            .unwrap(),
+    );
+    let bridge_log = || std::fs::read_to_string(d.0.join("bridge.log")).unwrap_or_default();
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !calls.exists(),
+        "started while the older delivery was outstanding: {}",
+        bridge_log()
+    );
+    until("first queued turn", 90, &bridge_log, || calls.exists());
+    let got = std::fs::read_to_string(calls).unwrap();
+    assert!(
+        got.lines().next().unwrap().contains("demo-99-review"),
+        "{got}\n{}",
+        bridge_log()
+    );
+    assert!(!got.contains("demo-88-review"), "{got}");
+}

@@ -65,6 +65,10 @@ pub trait LeaseApi: Send + Sync + 'static {
 
 pub trait InboxApi: Send + 'static {
     type Delivery: DeliveryApi;
+    /// Pre-existing unacknowledged deliveries still awaiting redelivery.
+    fn startup_pending(&self) -> usize {
+        0
+    }
     fn fetch(
         &mut self,
         max: usize,
@@ -143,6 +147,9 @@ impl LeaseApi for hgl_ai_bus::Lease {
 
 impl InboxApi for hgl_ai_bus::Inbox {
     type Delivery = hgl_ai_bus::Delivery;
+    fn startup_pending(&self) -> usize {
+        hgl_ai_bus::Inbox::startup_pending(self)
+    }
     async fn fetch(&mut self, max: usize, wait: Duration) -> Result<Vec<Self::Delivery>> {
         hgl_ai_bus::Inbox::fetch(self, max, wait).await
     }

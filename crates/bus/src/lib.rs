@@ -45,6 +45,7 @@ pub mod cred;
 mod feed;
 mod usage;
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -607,6 +608,9 @@ impl Bus {
                 ack_policy: AckPolicy::Explicit,
                 ack_wait: opts.ack_wait,
                 max_deliver: opts.max_deliver,
+                // Bridges must be able to hold the complete backlog while choosing a
+                // turn, including an ending note beyond JetStream's default limit.
+                max_ack_pending: -1,
                 filter_subjects: vec![
                     seat.subject(),
                     Seat::broadcast().subject(),
@@ -618,14 +622,17 @@ impl Bus {
             .map_err(|e| nats(&format!("opening the inbox of {seat}"), e))?;
         // After a hub restart, CREATE can report the reload time as `created`.
         // INFO refreshes the cached creation time used to skip old broadcasts.
-        consumer
+        let startup_pending = consumer
             .info()
             .await
-            .map_err(|e| nats(&format!("reading the inbox of {seat}"), e))?;
+            .map_err(|e| nats(&format!("reading the inbox of {seat}"), e))?
+            .num_ack_pending;
         Ok(Inbox {
             seat: seat.clone(),
             consumer,
             client: self.client.clone(),
+            startup_pending,
+            startup_seen: HashSet::new(),
         })
     }
 
@@ -1240,9 +1247,17 @@ pub struct Inbox {
     seat: Seat,
     consumer: jetstream::consumer::PullConsumer,
     client: async_nats::Client,
+    startup_pending: usize,
+    startup_seen: HashSet<u64>,
 }
 
 impl Inbox {
+    /// Deliveries already outstanding when this consumer was opened. They can be
+    /// temporarily invisible until their acknowledgement timers expire after a crash.
+    pub fn startup_pending(&self) -> usize {
+        self.startup_pending
+    }
+
     pub fn seat(&self) -> &Seat {
         &self.seat
     }
@@ -1311,8 +1326,25 @@ impl Inbox {
                 Err(e) => return Err(nats(&format!("reading the inbox of {}", self.seat), e)),
             };
             received += 1;
+            let startup_info = if self.startup_pending > 0 {
+                let info = msg
+                    .info()
+                    .map_err(|e| nats("reading message metadata", e))?;
+                Some((info.stream_sequence, info.delivered))
+            } else {
+                None
+            };
             if let Some(d) = self.accept(msg).await? {
                 out.push(d);
+            }
+            if let Some((seq, delivered)) = startup_info
+                && self.startup_seen.insert(seq)
+                && delivered > 1
+            {
+                self.startup_pending -= 1;
+                if self.startup_pending == 0 {
+                    self.startup_seen.clear();
+                }
             }
         }
         Ok(received)

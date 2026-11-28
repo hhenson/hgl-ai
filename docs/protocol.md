@@ -124,7 +124,11 @@ before hub users takes one shared token until it moves.
 ```
 
 - Pending turns may carry `priority` (`normal` or `high`; absent means `normal`).
-  `hgl-ai note send --priority high` chooses a high-priority eligible turn first.
+  The controller can send `--priority high`; triage can do so on assignments.
+  A sender cannot prioritize its own turn. Unauthorized priority is ignored by
+  the bridge; high-priority eligible turns otherwise start first. At startup
+  the bridge drains the inbox and waits for earlier unacknowledged deliveries
+  to be redelivered (up to their acknowledgment timeout) before selecting.
   Sendbacks and reviews of an existing review tree precede new work; ties retain
   stream order. Gate checks and task endings still apply.
 

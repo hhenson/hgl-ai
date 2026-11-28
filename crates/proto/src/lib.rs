@@ -466,6 +466,12 @@ impl Note {
         Ok(())
     }
 
+    /// High priority is reserved for the controller and triage assignments, never self-sent.
+    pub fn may_prioritize(&self, controller: &Seat, is_triage: bool, seat: &Seat) -> bool {
+        self.sender != *seat
+            && (self.sender == *controller || (is_triage && self.kind == Kind::Assign))
+    }
+
     /// The subject the note travels on: `hgl.notes.<recipient>`, or for a note from the
     /// owner `hgl.notes.owner.<recipient>`, which only the console may publish (OWN-5).
     pub fn subject(&self) -> String {
@@ -484,6 +490,8 @@ impl Note {
         let issue = self.issue.to_string();
         // `class=` cannot be a handle (no `=` in one), so it never reads as `by`.
         let class = self.class.map(|c| format!("class={c}"));
+        let priority =
+            (self.priority != NotePriority::Normal).then(|| format!("priority={}", self.priority));
         for field in [
             Some(self.recipient.as_str()),
             Some(self.kind.as_str()),
@@ -497,6 +505,7 @@ impl Note {
         // `by` only when set, so notes without it keep the ids they always had.
         .chain(self.by.as_deref().map(Some))
         .chain(class.as_deref().map(Some))
+        .chain(priority.as_deref().map(Some))
         {
             // Tagged and length-prefixed: no two envelopes encode alike.
             match field {
@@ -807,6 +816,22 @@ mod tests {
 
         let b = Note::new(Seat::broadcast(), seat("w1"), Kind::Note, "x");
         assert!(b.validate().is_err());
+    }
+
+    #[test]
+    fn priority_changes_message_id_and_authorization() {
+        let mut n = Note::new(seat("boss"), seat("w1"), Kind::Assign, "work");
+        let normal = n.msg_id();
+        n.priority = NotePriority::High;
+        assert_ne!(n.msg_id(), normal);
+        assert_eq!(n.msg_id(), n.clone().msg_id());
+        assert!(n.may_prioritize(&seat("boss"), false, &seat("w1")));
+        assert!(!n.may_prioritize(&seat("boss"), false, &seat("boss")));
+        n.sender = seat("triage");
+        assert!(n.may_prioritize(&seat("boss"), true, &seat("w1")));
+        n.kind = Kind::Review;
+        assert!(!n.may_prioritize(&seat("boss"), true, &seat("w1")));
+        assert!(!n.may_prioritize(&seat("boss"), false, &seat("w1")));
     }
 
     #[test]

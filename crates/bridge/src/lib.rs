@@ -628,17 +628,43 @@ impl<B: BusApi> Bridge<B> {
     ) -> LoopEnd {
         let mut lost = seat.lost.subscribe();
         let mut end = LoopEnd { lost: None };
-        let (tx, mut rx) = mpsc::channel::<B::Delivery>(64);
-        let fetcher = tokio::spawn(self.clone().fetch_loop(seat.name().clone(), tx));
+        let (tx, mut rx) = mpsc::channel::<Option<B::Delivery>>(64);
+        let (sync_tx, sync_rx) = mpsc::unbounded_channel();
+        let fetcher = tokio::spawn(self.clone().fetch_loop(seat.name().clone(), tx, sync_rx));
         let mut st: SeatState<B::Delivery> = SeatState::new();
         let mut stopping = false;
+        let mut caught_up = false;
+        let mut sync_pending = false;
         // Removals owed from before (a restart) are tried at once.
         let mut cleanup_at = Instant::now();
         let every = self.opts.in_progress_every;
         let mut tick = tokio::time::interval_at(Instant::now() + every, every);
         loop {
             if !stopping && st.running.is_none() {
-                st.running = self.start_next(seat, &mut st).await;
+                // A marker follows a nonblocking drain of JetStream, including batches
+                // beyond the channel capacity. Process all buffered events before deciding.
+                while let Ok(event) = rx.try_recv() {
+                    match event {
+                        Some(d) => {
+                            caught_up = false;
+                            self.on_delivery(seat, Arc::new(d), &mut st).await;
+                        }
+                        None => {
+                            caught_up = true;
+                            sync_pending = false;
+                        }
+                    }
+                }
+                if !st.pending.is_empty() && !caught_up && !sync_pending && sync_tx.send(()).is_ok()
+                {
+                    sync_pending = true;
+                }
+                if caught_up {
+                    st.running = self.start_next(seat, &mut st).await;
+                    if st.running.is_some() {
+                        caught_up = false;
+                    }
+                }
             }
             if stopping && st.running.is_none() {
                 break;
@@ -670,7 +696,11 @@ impl<B: BusApi> Bridge<B> {
                     stop_turn(&st.running, Stop::Graceful(Duration::ZERO));
                 }
                 d = rx.recv(), if !stopping => match d {
-                    Some(d) => self.on_delivery(seat, Arc::new(d), &mut st).await,
+                    Some(Some(d)) => {
+                        caught_up = false;
+                        self.on_delivery(seat, Arc::new(d), &mut st).await;
+                    }
+                    Some(None) => { caught_up = true; sync_pending = false; },
                     None => {
                         // The fetcher failed: stop as at shutdown.
                         tracing::error!(seat = %seat.name(), "the inbox fetcher ended; stopping the seat");
@@ -705,8 +735,10 @@ impl<B: BusApi> Bridge<B> {
         }
         fetcher.abort();
         let _ = fetcher.await;
-        while let Ok(d) = rx.try_recv() {
-            st.pending.push(Arc::new(d));
+        while let Ok(event) = rx.try_recv() {
+            if let Some(d) = event {
+                st.pending.push(Arc::new(d));
+            }
         }
         let held = st
             .pending
@@ -725,7 +757,12 @@ impl<B: BusApi> Bridge<B> {
     /// Fetch the seat's inbox into `tx` until the seat loop aborts it (or drops the receiver).
     /// It does not watch the shutdown itself: ending on its own, it would close the channel
     /// and race the seat loop's own shutdown branch, which stops the running turn.
-    async fn fetch_loop(self: Arc<Self>, seat: Seat, tx: mpsc::Sender<B::Delivery>) {
+    async fn fetch_loop(
+        self: Arc<Self>,
+        seat: Seat,
+        tx: mpsc::Sender<Option<B::Delivery>>,
+        mut sync: mpsc::UnboundedReceiver<()>,
+    ) {
         let pause = Duration::from_secs(5);
         let mut inbox = loop {
             match self.bus.inbox(&seat).await {
@@ -734,11 +771,28 @@ impl<B: BusApi> Bridge<B> {
             }
             tokio::time::sleep(pause).await;
         };
+        let mut draining = false;
         loop {
-            match inbox.fetch(self.opts.fetch_max, self.opts.fetch_wait).await {
+            if sync.try_recv().is_ok() {
+                draining = true;
+            }
+            // A crashed bridge can leave older deliveries invisible until ack_wait. Do
+            // not declare catch-up while those pre-existing deliveries are outstanding.
+            let wait = if draining && inbox.startup_pending() == 0 {
+                Duration::ZERO
+            } else {
+                self.opts.fetch_wait.min(Duration::from_secs(1))
+            };
+            match inbox.fetch(self.opts.fetch_max, wait).await {
+                Ok(ds) if ds.is_empty() && draining && inbox.startup_pending() == 0 => {
+                    if tx.send(None).await.is_err() {
+                        return;
+                    }
+                    draining = false;
+                }
                 Ok(ds) => {
                     for d in ds {
-                        if tx.send(d).await.is_err() {
+                        if tx.send(Some(d)).await.is_err() {
                             return;
                         }
                     }
@@ -1141,6 +1195,29 @@ impl<B: BusApi> Bridge<B> {
         } else {
             Vec::new()
         };
+        let controller = self.cfg.controller().expect("validated controller");
+        let triage_seats: HashSet<Seat> = if st.pending.iter().any(|d| {
+            d.note().priority == hgl_ai_proto::NotePriority::High && d.note().kind == Kind::Assign
+        }) {
+            self.bus
+                .hosts()
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .flat_map(|h| h.seats)
+                .filter(|s| s.role == Role::Triage)
+                .map(|s| s.seat)
+                .chain(
+                    self.cfg
+                        .seats
+                        .iter()
+                        .filter(|s| s.role == Role::Triage)
+                        .map(|s| s.name.clone()),
+                )
+                .collect()
+        } else {
+            HashSet::new()
+        };
         // Rank whole eligible turns: sendbacks and reviews of an existing review tree
         // precede new work, then high priority precedes normal. Ties keep stream order.
         let mut best: Option<(usize, bool, bool, u64)> = None;
@@ -1165,7 +1242,12 @@ impl<B: BusApi> Bridge<B> {
                                 .any(|r| r.seat == *seat.name() && r.task == task && r.review)
                                 || self.trees.existing(seat.name(), &task, true).is_some()
                         }));
-                high |= note.priority == hgl_ai_proto::NotePriority::High;
+                high |= note.priority == hgl_ai_proto::NotePriority::High
+                    && note.may_prioritize(
+                        &controller,
+                        note.sender.as_str() == "triage" || triage_seats.contains(&note.sender),
+                        seat.name(),
+                    );
             }
             if best.is_none_or(|(_, f, h, seq)| {
                 (followup, high) > (f, h) || ((followup, high) == (f, h) && first < seq)
@@ -1682,6 +1764,9 @@ fn describe_note(seq: u64, n: &Note) -> String {
     }
     if let Some(x) = n.class {
         h.push_str(&format!(" class={x}"));
+    }
+    if n.priority != hgl_ai_proto::NotePriority::Normal {
+        h.push_str(&format!(" priority={}", n.priority));
     }
     format!("{h} at {}\n{}", n.created_at, n.body)
 }

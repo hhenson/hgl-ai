@@ -163,7 +163,33 @@ async fn send(ctx: &Ctx, a: SendArgs) -> anyhow::Result<i32> {
     note.base = a.base;
     note.class = a.class;
     note.validate()?;
-    let bus = Bus::connect(&ctx.load_config()?).await?;
+    let cfg = ctx.load_config()?;
+    if note.priority == NotePriority::High && note.sender == note.recipient {
+        bail!("high priority cannot be sent to yourself");
+    }
+    let bus = Bus::connect(&cfg).await?;
+    if note.priority == NotePriority::High {
+        let controller = cfg.controller()?;
+        let local_triage = note.sender.as_str() == "triage"
+            || cfg
+                .seats
+                .iter()
+                .any(|s| s.name == note.sender && s.role == hgl_ai_proto::Role::Triage);
+        let triage = if local_triage || note.sender == controller {
+            local_triage
+        } else {
+            bus.hosts()
+                .await?
+                .iter()
+                .flat_map(|h| &h.seats)
+                .any(|s| s.seat == note.sender && s.role == hgl_ai_proto::Role::Triage)
+        };
+        if !note.may_prioritize(&controller, triage, &note.recipient) {
+            bail!(
+                "high priority is reserved for the controller and triage assignments, never self-sent"
+            );
+        }
+    }
     let r = bus.send(&note).await?;
     if ctx.json {
         println!(
@@ -521,6 +547,9 @@ fn header(d: &Delivery, seat: &Seat) -> String {
     if let Some(x) = n.class {
         h.push_str(&format!(" class={x}"));
     }
+    if n.priority != NotePriority::Normal {
+        h.push_str(&format!(" priority={}", n.priority));
+    }
     if d.delivered > 1 {
         h.push_str(&format!(" delivered={}", d.delivered));
     }
@@ -560,7 +589,10 @@ mod tests {
         a.repo = Some("hgl-ai".into());
         a.issue = 17;
         a.class = Some(TaskClass::Simple);
-        let d = Delivery::detached(14, 1, a);
+        let d = Delivery::detached(14, 1, a.clone());
+        let mut high = a;
+        high.priority = NotePriority::High;
+        assert!(header(&Delivery::detached(15, 1, high), &seat("w1")).contains(" priority=high "));
         assert_eq!(
             header(&d, &seat("w1")),
             "--- seq=14 from=triage kind=assign hgl-ai#17 class=simple at 20261127T041100Z"

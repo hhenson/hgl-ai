@@ -3217,3 +3217,88 @@ async fn grouped_notes_keep_stream_order_after_late_delivery() {
     );
     stop(tx, j).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn startup_drains_all_batches_before_selecting_or_starting_closed_tasks() {
+    let mut h = harness();
+    h.opts.fetch_max = 2;
+    let head = h
+        .git
+        .run(&h.seed, ["rev-parse", "HEAD"])
+        .unwrap()
+        .trim()
+        .to_string();
+    h.script(
+        "claude",
+        &format!(
+            "while [ ! -e '{}' ]; do sleep 0.05; done\ncat '{}'",
+            h.calls.join("go").display(),
+            fixture("claude-ok.jsonl")
+        ),
+    );
+    for i in 1..=70 {
+        let mut n = note(Kind::Review, "r1", i, "normal");
+        n.head = Some(head.clone());
+        h.bus.push("r1", n);
+    }
+    let mut high = note(Kind::Review, "r1", 99, "high");
+    high.head = Some(head.clone());
+    high.priority = hgl_ai_proto::NotePriority::High;
+    let high_seq = h.bus.push("r1", high);
+    let mut moot = note(Kind::Review, "r1", 88, "moot");
+    moot.head = Some(head);
+    let moot_seq = h.bus.push("r1", moot);
+    let closed = h.bus.push("r1", note(Kind::Closed, "r1", 88, "closed"));
+    let (tx, j) = h.start(&["r1"]);
+    eventually("closed processed before starting", || {
+        h.bus.events(closed) == [Ev::Ack]
+    })
+    .await;
+    eventually("priority turn started", || !h.calls("claude").is_empty()).await;
+    assert!(h.calls("claude")[0].cwd.contains("demo-99-review"));
+    assert_eq!(h.bus.events(moot_seq), [Ev::Ack]);
+    assert!(!h.work().join("r1/demo-88-review").exists());
+    assert!(h.bus.events(high_seq).is_empty());
+    std::fs::write(h.calls.join("go"), "go").unwrap();
+    eventually("priority acked", || h.bus.events(high_seq) == [Ev::Ack]).await;
+    stop(tx, j).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn unauthorized_high_priority_does_not_reorder_a_seat() {
+    let h = harness();
+    let gate = h.calls.join("go");
+    h.script("codex", &format!("case \"$(pwd)\" in *demo-11*) while [ ! -e '{}' ]; do sleep 0.05; done;; esac\ncat '{}'", gate.display(), fixture("codex-ok.jsonl")));
+    let (tx, j) = h.start(&["w1"]);
+    let busy = h.bus.push("w1", note(Kind::Assign, "w1", 11, "busy"));
+    eventually("busy", || h.calls("codex").len() == 1).await;
+    let normal = h.bus.push("w1", note(Kind::Assign, "w1", 12, "normal"));
+    let mut forged = note(Kind::Assign, "w1", 13, "forged");
+    forged.sender = seat("w1");
+    forged.priority = hgl_ai_proto::NotePriority::High;
+    let high = h.bus.push("w1", forged);
+    eventually("queued", || {
+        h.bus.progressed(normal) && h.bus.progressed(high)
+    })
+    .await;
+    std::fs::write(gate, "go").unwrap();
+    eventually("finished", || {
+        h.bus.events(busy) == [Ev::Ack]
+            && h.bus.events(normal) == [Ev::Ack]
+            && h.bus.events(high) == [Ev::Ack]
+    })
+    .await;
+    let calls = h.calls("codex");
+    assert!(calls[1].cwd.contains("demo-12"));
+    assert!(calls[2].cwd.contains("demo-13"));
+    stop(tx, j).await;
+}
+
+#[test]
+fn high_priority_is_visible_in_bridge_headers() {
+    let mut n = note(Kind::Assign, "w1", 4, "work");
+    let normal = crate::describe_note(4, &n);
+    assert!(!normal.contains("priority="));
+    n.priority = hgl_ai_proto::NotePriority::High;
+    assert!(crate::describe_note(4, &n).contains(" priority=high "));
+}

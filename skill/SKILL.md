@@ -13,7 +13,7 @@ prompt: never poll.
 ## Commands
 
 ```
-hgl-ai note send --to SEAT --kind KIND [--repo R] [--issue N] [--head SHA] [--class C] [--priority normal|high] --body-file F
+hgl-ai note send --to SEAT --kind KIND [--repo R] [--issue N] [--head SHA] [--class C] --body-file F
 hgl-ai note wait SEAT [--timeout DUR]   interactive controller only: block, print, ack
 hgl-ai state get KEY                    main, prs, landed.log, hold, mode
 hgl-ai hosts                            live hosts and their seats
