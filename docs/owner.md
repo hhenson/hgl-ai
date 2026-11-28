@@ -133,8 +133,8 @@ questions that are still open. The first batch reads the previous hour and takes
 over any pending `p2` notifications. The digest includes previews and links to the
 console's status reports, decisions and questions.
 
-The console stores each nonempty batch in `HGL_OWNER` before delivery. The last
-batch checkpoints the sources across restarts. The Slack adapter keeps its
+The console checkpoints the first window and each nonempty batch in `HGL_OWNER`.
+The last checkpoint lets the console catch up after a restart. The Slack adapter keeps its
 status delivery receipts in `HGL_SLACK` and delivers status independently of Q&A.
 Messages in the status channel have no owner effect.
 

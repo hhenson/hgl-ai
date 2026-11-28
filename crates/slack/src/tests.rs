@@ -1373,8 +1373,27 @@ async fn status_feed_recovers_a_post_without_blocking_qa() {
         let mut status = adapter.open_status_feed("CSTATUS").await.unwrap();
         let mut qa = adapter.open_feed().await.unwrap();
         let console = hub.bus("console").await;
+        let checkpoint = Digest {
+            v: event::EVENT_VERSION,
+            through: through - 3600,
+            decision_tip: None,
+            reports: vec![],
+            decisions: vec![],
+            questions: vec![],
+            more_reports: 0,
+            more_decisions: 0,
+            more_questions: 0,
+        };
+        let checkpoint = console
+            .publish_event_after(&subject, &serde_json::to_vec(&checkpoint).unwrap(), 0)
+            .await
+            .unwrap();
+        let empty = next(&mut status).await;
+        adapter.deliver_digest("CSTATUS", &empty).await.unwrap();
+        empty.ack().await.unwrap();
+        assert!(fake.items().is_empty());
         console
-            .publish_event_after(&subject, &payload, 0)
+            .publish_event_after(&subject, &payload, checkpoint.seq)
             .await
             .unwrap();
         console

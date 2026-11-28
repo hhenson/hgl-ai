@@ -78,18 +78,30 @@ pub(crate) async fn round(
 
     let mut reports = VecDeque::new();
     let mut report_count = 0;
-    let mut questions = if last.is_none() {
+    let mut migrated = if last.is_none() {
         legacy.iter().cloned().collect::<BTreeMap<_, _>>()
     } else {
         BTreeMap::new()
+    };
+    let mut questions = BTreeMap::new();
+    // On first activation, check which pending questions actually belong to later
+    // windows. Their Ask events remain in the stream and will be picked up then.
+    let scan_before = if migrated.is_empty() {
+        through
+    } else {
+        DateTime::<Utc>::MAX_UTC
     };
     let status_subject = event::status_subject();
     bus.owner_window(
         vec![status_subject.clone(), format!("{CONSOLE_PREFIX}.thread.*")],
         since,
-        through,
+        scan_before,
         |message| {
+            let in_window = message.time < through;
             if message.subject == status_subject {
+                if !in_window {
+                    return;
+                }
                 let Ok(status) = serde_json::from_slice::<Status>(&message.payload) else {
                     return;
                 };
@@ -119,12 +131,19 @@ pub(crate) async fn round(
                 && ask.priority == Priority::P2
                 && ask.validate().is_ok()
             {
-                questions.entry(event.id).or_insert(ask.title);
+                if in_window {
+                    questions.entry(event.id).or_insert(ask.title);
+                } else {
+                    migrated.remove(&event.id);
+                }
             }
         },
     )
     .await?;
 
+    for (id, title) in migrated {
+        questions.entry(id).or_insert(title);
+    }
     let mut open = Vec::new();
     let mut open_count = 0;
     for (id, title) in questions {
@@ -154,7 +173,8 @@ pub(crate) async fn round(
         decisions,
         questions: open,
     };
-    if batch.is_empty() {
+    let has_content = !batch.is_empty();
+    if !has_content && last.is_some() {
         return Ok(false);
     }
     let bytes = serde_json::to_vec(&batch).map_err(|e| owner::Error::Invalid(e.to_string()))?;
@@ -172,7 +192,7 @@ pub(crate) async fn round(
             &legacy.into_iter().map(|(id, _)| id).collect::<Vec<_>>(),
         );
     }
-    Ok(true)
+    Ok(has_content)
 }
 
 fn new_decisions(

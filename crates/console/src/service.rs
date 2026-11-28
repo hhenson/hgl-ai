@@ -1296,4 +1296,77 @@ pub(crate) mod tests {
                 .unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn empty_slack_checkpoint_keeps_new_and_migrated_p2_across_downtime() {
+        use hgl_ai_owner::digest::{self, Digest};
+
+        let Some((_srv, url, token)) = hub() else {
+            eprintln!("skipped: nats-server is not on PATH");
+            return;
+        };
+        let bus = Bus::connect_url(&url, Some(token)).await.unwrap();
+        bus.provision().await.unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let first = app(dir.path());
+        let subject = digest::subject("TTEST", "CSTATUS");
+        let cutoff = DateTime::from_timestamp(Utc::now().timestamp() - 1, 0).unwrap();
+        let ask = |title: &str| owner::Ask {
+            title: title.into(),
+            priority: Priority::P2,
+            issue: None,
+            context: String::new(),
+            question: "What should happen?".into(),
+            options: vec![],
+            suggested: None,
+        };
+
+        let migrated = owner::ask(&bus, &first.controller, ask("Already queued"))
+            .await
+            .unwrap();
+        first
+            .pending_p2
+            .lock()
+            .unwrap()
+            .push((migrated.clone(), "Already queued".into()));
+        assert!(
+            !crate::digest::round(&first, &bus, &subject, cutoff)
+                .await
+                .unwrap()
+        );
+        let checkpoint = bus.owner_event_last(&subject).await.unwrap().unwrap();
+        let empty: Digest = serde_json::from_slice(&checkpoint.payload).unwrap();
+        assert!(empty.is_empty());
+        assert_eq!(empty.through, cutoff.timestamp());
+        assert!(p2_batch(&first).is_none());
+        drop(first);
+
+        let queued_during_downtime =
+            owner::ask(&bus, &Seat::new("triage").unwrap(), ask("While down"))
+                .await
+                .unwrap();
+        let restarted = app(dir.path());
+        let next = cutoff + P2_BATCH * 3;
+        assert!(
+            crate::digest::round(&restarted, &bus, &subject, next)
+                .await
+                .unwrap()
+        );
+        let message = bus.owner_event_last(&subject).await.unwrap().unwrap();
+        let batch: Digest = serde_json::from_slice(&message.payload).unwrap();
+        let ids: std::collections::BTreeSet<_> = batch
+            .questions
+            .into_iter()
+            .map(|question| question.id)
+            .collect();
+        assert_eq!(
+            ids,
+            [migrated, queued_during_downtime].into_iter().collect()
+        );
+        assert!(
+            !crate::digest::round(&restarted, &bus, &subject, next + P2_BATCH)
+                .await
+                .unwrap()
+        );
+    }
 }
