@@ -2,7 +2,7 @@
 //! `gh land`, `gh merge-if-clean` and `build gate` ask a builder of each verdict's platform
 //! to build the head merged onto the `main` the gate saw, under the current recipe, and
 //! read the verdict the builder writes in the key of exactly that (head, `main`, recipe
-//! revision): `HGL_STATE/verdict.<repo>.<pr>.<name>.<pair>` (docs/protocol.md §8). A build
+//! revision): `HGL_VERDICTS/verdict.<repo>.<pr>.<name>.<pair>` (docs/protocol.md §8). A build
 //! of anything else writes another key, so it can never displace the one the gate reads; a
 //! `main` that moved or a recipe that changed is another key, asked for again. The
 //! requester writes no verdict: the builder's hub user alone may.
@@ -196,11 +196,15 @@ fn taking(builders: &[BuilderRecord], label: &str) -> bool {
 
 /// The value in `key`: its text and what it says.
 async fn read(bus: &Bus, key: &str) -> Result<(String, Option<VerdictValue>)> {
-    let raw = bus
-        .state_get(key)
-        .await?
-        .map(|e| e.value.trim().to_string())
-        .unwrap_or_default();
+    let raw = match bus.verdict_get(key).await? {
+        Some(e) => e.value,
+        None => bus
+            .state_get(key)
+            .await?
+            .map(|e| e.value)
+            .unwrap_or_default(),
+    };
+    let raw = raw.trim().to_string();
     let v = VerdictValue::parse(&raw);
     Ok((raw, v))
 }

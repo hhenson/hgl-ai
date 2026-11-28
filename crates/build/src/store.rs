@@ -146,6 +146,9 @@ pub async fn verdict_put(
     v.main = base.clone();
     let key = verdict_key(&job.repo, job.issue, name, &job.head, base, recipe);
     let text = v.render();
+    // The legacy key arbitrates with builders that have not upgraded yet. Mirror its
+    // winning value into the new bucket, including an already final verdict.
+    let mut accepted = false;
     for _ in 0..16 {
         let cur = bus.state_get(&key).await?;
         let old = cur.as_ref().and_then(|e| VerdictValue::parse(&e.value));
@@ -153,19 +156,57 @@ pub async fn verdict_put(
             .as_ref()
             .is_some_and(|o| o.judged() && o.is_for(&job.head, base))
         {
-            return Ok(false);
+            accepted = true;
+            break;
         }
         match bus
             .state_update(&key, &text, cur.map(|e| e.revision).unwrap_or(0))
             .await
         {
-            Ok(_) => return Ok(true),
+            Ok(_) => {
+                accepted = true;
+                break;
+            }
+            Err(BusError::Conflict { .. }) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    if !accepted {
+        return Err(StoreError::Other(format!(
+            "{key} kept changing; not written"
+        )));
+    }
+    for _ in 0..16 {
+        let legacy = bus.state_get(&key).await?;
+        let Some(legacy) = legacy else {
+            return Ok(false);
+        };
+        let current = bus.verdict_get(&key).await?;
+        if current.as_ref().is_some_and(|e| e.value == legacy.value) {
+            return Ok(legacy.value == text);
+        }
+        if current
+            .as_ref()
+            .and_then(|e| VerdictValue::parse(&e.value))
+            .is_some_and(|o| o.judged() && o.is_for(&job.head, base))
+        {
+            return Ok(false);
+        }
+        match bus
+            .verdict_update(
+                &key,
+                &legacy.value,
+                current.map(|e| e.revision).unwrap_or(0),
+            )
+            .await
+        {
+            Ok(_) => return Ok(legacy.value == text),
             Err(BusError::Conflict { .. }) => continue,
             Err(e) => return Err(e.into()),
         }
     }
     Err(StoreError::Other(format!(
-        "{key} kept changing; not written"
+        "{key} kept changing; not mirrored"
     )))
 }
 
@@ -208,10 +249,14 @@ pub async fn verdicts_purge(
         }
     }
     let keys = bus.state_keys(&verdict_prefix(repo, pr)).await?;
+    let new_keys = bus.verdict_keys(&verdict_prefix(repo, pr)).await?;
     for k in &keys {
         bus.state_del(k).await?;
     }
-    Ok(Some(keys.len()))
+    for k in &new_keys {
+        bus.verdict_del(k).await?;
+    }
+    Ok(Some(keys.len() + new_keys.len()))
 }
 
 /// Sweep the verdict keys: those the hub wrote more than `max_age` seconds before `now`
@@ -236,6 +281,17 @@ pub async fn verdicts_sweep(
             prs.insert(p);
         }
     }
+    for k in bus.verdict_keys("verdict.").await? {
+        let Some(e) = bus.verdict_get(&k).await? else {
+            continue;
+        };
+        if now - e.created > max_age {
+            bus.verdict_del(&k).await?;
+            n += 1;
+        } else if let Some(p) = verdict_pr(&k) {
+            prs.insert(p);
+        }
+    }
     if let Some(ended) = ended {
         for (repo, pr) in prs {
             n += verdicts_purge(bus, ended, &repo, pr).await?.unwrap_or(0);
@@ -249,9 +305,9 @@ pub async fn verdicts_sweep(
 /// probe key `verdict._probe.0.<host>`, no repository's, written and deleted.
 pub async fn may_write_verdicts(bus: &Bus, host: &str) -> Result<bool, StoreError> {
     let key = format!("verdict._probe.0.{host}");
-    match bus.state_put(&key, "probe").await {
+    match bus.verdict_put(&key, "probe").await {
         Ok(_) => {
-            bus.state_del(&key).await?;
+            bus.verdict_del(&key).await?;
             Ok(true)
         }
         Err(BusError::Denied { .. }) => Ok(false),

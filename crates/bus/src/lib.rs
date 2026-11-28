@@ -69,6 +69,7 @@ use tokio::sync::OnceCell;
 
 mod build;
 pub use build::BUILD_HISTORY;
+use hgl_ai_proto::build::KV_VERDICTS;
 
 #[derive(Debug, thiserror::Error)]
 pub enum BusError {
@@ -239,6 +240,7 @@ pub struct Bus {
     /// Woken on each violation, so a refused publish fails at once.
     denied_tick: Arc<tokio::sync::Notify>,
     state: OnceCell<kv::Store>,
+    verdicts: OnceCell<kv::Store>,
     hosts: OnceCell<kv::Store>,
     trees: OnceCell<kv::Store>,
     locks: OnceCell<kv::Store>,
@@ -317,6 +319,7 @@ impl Bus {
             denied,
             denied_tick,
             state: OnceCell::new(),
+            verdicts: OnceCell::new(),
             hosts: OnceCell::new(),
             trees: OnceCell::new(),
             locks: OnceCell::new(),
@@ -523,6 +526,13 @@ impl Bus {
                 "hgl-ai subscription usage per login",
                 stream::StorageType::File,
                 1,
+                Duration::ZERO,
+            ),
+            (
+                KV_VERDICTS,
+                "hgl-ai local build verdicts",
+                stream::StorageType::File,
+                STATE_HISTORY,
                 Duration::ZERO,
             ),
             build::BUCKET,
@@ -911,6 +921,140 @@ impl Bus {
         let mut out = Vec::new();
         while let Some(k) = keys.next().await {
             let k = k.map_err(|e| nats("listing state keys", e))?;
+            if k.starts_with(prefix) {
+                out.push(k);
+            }
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    }
+
+    pub async fn verdict_get(&self, key: &str) -> Result<Option<StateEntry>> {
+        check_state_key(key)?;
+        let store = self.store(&self.verdicts, KV_VERDICTS).await?;
+        match live_entry(store, key).await? {
+            Some(e) => {
+                check_value_size(key, e.value.len())?;
+                let value = String::from_utf8(e.value.to_vec())
+                    .map_err(|_| BusError::Nats(format!("verdict {key} is not UTF-8")))?;
+                Ok(Some(StateEntry {
+                    value,
+                    revision: e.revision,
+                    created: e.created.unix_timestamp(),
+                }))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Put `value` whatever the key holds; an empty value deletes the key (§8).
+    /// Returns the new revision (0 on delete). A blind write: writers of shared
+    /// keys use [`Bus::verdict_create`] or [`Bus::verdict_update`].
+    pub async fn verdict_put(&self, key: &str, value: &str) -> Result<u64> {
+        if value.is_empty() {
+            self.verdict_del(key).await?;
+            return Ok(0);
+        }
+        check_state_key(key)?;
+        check_value_size(key, value.len())?;
+        let store = self.store(&self.verdicts, KV_VERDICTS).await?;
+        self.guarded(&format!("$KV.{KV_VERDICTS}.{key}"), async {
+            store
+                .put(key, value.as_bytes().to_vec().into())
+                .await
+                .map_err(|e| nats(&format!("writing verdict {key}"), e))
+        })
+        .await
+    }
+
+    /// Create `key` only if it is absent (a deleted key counts as absent).
+    /// Fails with [`BusError::Conflict`] (`expected: 0`) when it exists.
+    pub async fn verdict_create(&self, key: &str, value: &str) -> Result<u64> {
+        check_state_key(key)?;
+        if value.is_empty() {
+            return Err(BusError::Nats(format!(
+                "verdict {key}: an empty value deletes; nothing to create"
+            )));
+        }
+        check_value_size(key, value.len())?;
+        let store = self.store(&self.verdicts, KV_VERDICTS).await?;
+        self.guarded(&format!("$KV.{KV_VERDICTS}.{key}"), async {
+            store
+                .create(key, value.as_bytes().to_vec().into())
+                .await
+                .map_err(|e| match e.kind() {
+                    kv::CreateErrorKind::AlreadyExists => BusError::Conflict {
+                        key: key.to_string(),
+                        expected: 0,
+                    },
+                    _ => nats(&format!("creating verdict {key}"), e),
+                })
+        })
+        .await
+    }
+
+    /// Replace `key` only if it is still at `expected_revision` (compare-and-set);
+    /// `expected_revision == 0` means "only if absent" ([`Bus::verdict_create`]).
+    /// An empty value deletes, under the same condition, and returns 0.
+    /// Fails with [`BusError::Conflict`] when another writer got there first.
+    pub async fn verdict_update(
+        &self,
+        key: &str,
+        value: &str,
+        expected_revision: u64,
+    ) -> Result<u64> {
+        if expected_revision == 0 {
+            return self.verdict_create(key, value).await;
+        }
+        check_state_key(key)?;
+        check_value_size(key, value.len())?;
+        let store = self.store(&self.verdicts, KV_VERDICTS).await?;
+        let conflict = |e: kv::UpdateError| match e.kind() {
+            kv::UpdateErrorKind::WrongLastRevision => BusError::Conflict {
+                key: key.to_string(),
+                expected: expected_revision,
+            },
+            _ => nats(&format!("writing verdict {key}"), e),
+        };
+        self.guarded(&format!("$KV.{KV_VERDICTS}.{key}"), async {
+            if value.is_empty() {
+                store
+                    .purge_expect_revision(key, Some(expected_revision))
+                    .await
+                    .map_err(conflict)?;
+                return Ok(0);
+            }
+            store
+                .update(key, value.as_bytes().to_vec().into(), expected_revision)
+                .await
+                .map_err(conflict)
+        })
+        .await
+    }
+
+    pub async fn verdict_del(&self, key: &str) -> Result<()> {
+        check_state_key(key)?;
+        let store = self.store(&self.verdicts, KV_VERDICTS).await?;
+        self.guarded(&format!("$KV.{KV_VERDICTS}.{key}"), async {
+            store
+                .purge(key)
+                .await
+                .map_err(|e| nats(&format!("deleting verdict {key}"), e))
+        })
+        .await
+    }
+
+    /// The live keys of `HGL_VERDICTS` that start with `prefix`, sorted.
+    pub async fn verdict_keys(&self, prefix: &str) -> Result<Vec<String>> {
+        let store = self.store(&self.verdicts, KV_VERDICTS).await?;
+        let mut keys = store
+            .keys()
+            .await
+            .map_err(|e| nats("listing verdict keys", e))?;
+        let mut out = Vec::new();
+        while let Some(k) = keys.next().await {
+            let k = k.map_err(|e| nats("listing verdict keys", e))?;
             if k.starts_with(prefix) {
                 out.push(k);
             }

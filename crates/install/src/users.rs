@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use hgl_ai_bus::Credential;
-use hgl_ai_proto::build::KV_BUILD;
+use hgl_ai_proto::build::{KV_BUILD, KV_VERDICTS};
 use hgl_ai_proto::{
     CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SLACK, KV_STATE,
     KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SLACK_FEED,
@@ -290,8 +290,16 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     .map(String::from)
     .to_vec();
     let buckets = [
-        KV_STATE, KV_HOSTS, KV_TREES, KV_LOCKS, KV_ENDED, KV_THREADS, KV_METRICS, KV_USAGE,
+        KV_STATE,
+        KV_HOSTS,
+        KV_TREES,
+        KV_LOCKS,
+        KV_ENDED,
+        KV_THREADS,
+        KV_METRICS,
+        KV_USAGE,
         KV_BUILD,
+        KV_VERDICTS,
     ];
     // The usage history (PROTO-24) is read by every role through short-lived consumers.
     let mut streams: Vec<String> = vec![STREAM_NOTES.to_string(), STREAM_USAGE.to_string()];
@@ -325,6 +333,9 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             // which every builder runs, only the admin user writes: seats share their
             // host's credential, so no seat may (docs/build.md BUILD-1).
             allow.push(format!("$KV.{KV_BUILD}.run.>"));
+            if role == Role::Builder {
+                allow.push(format!("$KV.{KV_VERDICTS}.>"));
+            }
             if role == Role::Coord {
                 allow.push(format!("$KV.{KV_METRICS}.>"));
             }

@@ -1401,3 +1401,29 @@ async fn a_lost_running_with_a_queued_replacement_is_asked_once() {
     }
     r.stop().await;
 }
+
+/// The new bucket takes precedence, with a fallback for legacy builders.
+#[tokio::test]
+async fn verdict_bucket_precedes_legacy_state() {
+    use crate::builds::VerdictState;
+    let Some(r) = GateRig::start(false).await else {
+        return;
+    };
+    let key = r.key(&r.head, &r.m1).await;
+    let pass = format!("{} {} pass 20261127-120000-aaaaaa lab1 r1", r.head, r.m1);
+    let fail = format!(
+        "{} {} fail 20261127-120000-bbbbbb lab1 r1 failed",
+        r.head, r.m1
+    );
+    r.b.state_put(&key, &pass).await.unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Pass(pass)
+    );
+    r.b.verdict_put(&key, &fail).await.unwrap();
+    assert_eq!(
+        r.state(None, &r.head, &r.m1).await,
+        VerdictState::Fail(fail)
+    );
+    r.stop().await;
+}

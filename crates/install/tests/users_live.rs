@@ -499,8 +499,17 @@ async fn only_builders_write_verdicts() {
         .state_put(key, &format!("{h} {h} pass 20261127-120000-aaaaaa lab1"))
         .await
         .unwrap();
+    builder.verdict_put(key, "new verdict").await.unwrap();
     for who in ["build-1", "hub-coord", "console"] {
         let b = hub.bus(who).await;
+        assert_eq!(
+            b.verdict_get(key).await.unwrap().unwrap().value,
+            "new verdict"
+        );
+        denied(b.verdict_put(key, "forged").await);
+        denied(b.verdict_create("verdict.other.1.linux", "forged").await);
+        denied(b.verdict_update(key, "forged", 1).await);
+        denied(b.verdict_del(key).await);
         denied(b.state_put(key, &format!("{h} {h} pass forged")).await);
         denied(
             b.state_update(key, &format!("{h} {h} pass forged"), 1)
@@ -550,7 +559,7 @@ async fn only_builders_write_verdicts() {
     }
     assert!(
         admin
-            .state_get("verdict._probe.0.lab1")
+            .verdict_get("verdict._probe.0.lab1")
             .await
             .unwrap()
             .is_none()
