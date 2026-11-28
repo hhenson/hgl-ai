@@ -78,6 +78,9 @@ read-only token (Metadata, Contents, Issues, Pull requests, Checks, Actions, Com
 statuses: read) for the repositories. The token step above stores it as the server
 user (`[github] token_file`); run that step again to replace it.
 
+During the intake cutover, deploy and verify the coordinator's triage delivery
+before disabling the interim `hgl-intakewatch` timer.
+
 The server user's own commands run with `sudo -u hgl-ai env HOME=/var/lib/hgl-ai
 hgl-ai ...` (`server user add`, `doctor`).
 

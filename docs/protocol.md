@@ -300,10 +300,20 @@ before hub users takes one shared token until it moves.
 | `decisions.log` | controller, console | The controller's decision log (OWN-8): newest 2000 lines. |
 | `landing.<repo>.<pr>` | `gh land`, `gh merge-if-clean` | JSON `{"head","merge","done","notes_at","updated_at"}`: what a landing has done. Written under the landing lock from right before the merge call; deleted when every step is done. |
 | `coord.alerts` | coordinator service | JSON array of the alert notes not sent yet; each is sent again every round until its send succeeds. |
+| `coord.intake` | coordinator service | JSON scan time, recent opening event IDs, and any pending triage note. The cursor and pending note are written together before delivery. |
 | `verdict.<repo>.<pr>.<name>.<pair>` | builder service (`builder` hub user only) | `<head> <main> pass\|fail\|not-run\|running <build id> <builder> r<recipe rev> [until=<UTC>] [reason]`: a gate build of `head` merged onto the `main` commit, on the platform `name` names, under recipe revision `rev`; `<pair>` is 24 hex digits of SHA-256 over `<head> <main> r<rev>` (docs/build.md BUILD-15). `pass` and `fail` are final in their key; `until` bounds `running`. The gate reads only the key of the pull request's head, the current `main` and the current recipe. Purged by a builder once GitHub reports the pull request merged or closed; swept 15 days after the hub wrote it. |
 
 `BOT` is `clean`, `findings`, `running`, `none` or `limit`. `CHECKS` is
 `pass`, `fail`, `pending` or `none`.
+
+Intake scans open issues and PRs across `[github].repos` every 15 minutes under
+`hold`. The first scan looks back 15 minutes. Later scans resume from the saved
+time with a 15-minute overlap to catch updates during pagination. GitHub
+readiness labels, assignees, review requests, assignment notes and registered
+work suppress duplicate intake. A same-repository PR with a registered
+implementor branch is attributed to the fleet. Other PRs are flagged for
+controller routing. Empty rounds send no note. Pending notes are retried with
+the same message ID.
 
 `HGL_LOCKS` holds leases, `{"holder", "acquired_at"}`, created only if absent,
 rewritten every minute while held, deleted by their holder; one not rewritten
