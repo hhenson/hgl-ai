@@ -13,7 +13,7 @@ use crate::coord::{self, CoordOpts};
 use crate::exec::fake::FakeGh;
 use crate::lock::LandLock;
 use crate::table::Table;
-use crate::testutil::{fixture, settings, without_receipts};
+use crate::testutil::{empty_intake, fixture, intake_node, settings, without_receipts};
 use crate::{Error, land, state, store};
 
 struct Hub {
@@ -131,6 +131,7 @@ async fn a_round_writes_the_table_alerts_and_hold() {
     let gh = FakeGh::default()
         .on("auth status", "")
         .on("query Backlog", &fixture("backlog-batch.json"))
+        .on("query Intake", &empty_intake(3).to_string())
         .on("graphql", &fixture("coord-batch.json"));
     let o = CoordOpts {
         once: true,
@@ -170,6 +171,7 @@ async fn a_round_writes_the_table_alerts_and_hold() {
     let gh = FakeGh::default()
         .on("auth status", "")
         .on("query Backlog", &fixture("backlog-batch.json"))
+        .on("query Intake", &empty_intake(3).to_string())
         .on("graphql", &low);
     coord::run(&gh, &s, Some(&b), &o, &mut Vec::new())
         .await
@@ -186,6 +188,7 @@ async fn a_round_writes_the_table_alerts_and_hold() {
     let gh = FakeGh::default()
         .on("auth status", "")
         .on("query Backlog", &fixture("backlog-batch.json"))
+        .on("query Intake", &empty_intake(3).to_string())
         .on("graphql", &low);
     coord::run(&gh, &s, Some(&b), &o, &mut Vec::new())
         .await
@@ -213,6 +216,7 @@ async fn a_backlog_round_writes_the_queue_and_the_day() {
         FakeGh::default()
             .on("auth status", "")
             .on("query Backlog", &fixture("backlog-batch.json"))
+            .on("query Intake", &empty_intake(3).to_string())
             .on("graphql", &fixture("coord-batch.json"))
     };
     coord::run(&both(), &s, Some(&b), &o, &mut Vec::new())
@@ -244,6 +248,7 @@ async fn a_backlog_round_writes_the_queue_and_the_day() {
     let gh = FakeGh::default()
         .on("auth status", "")
         .on("query Backlog", &more)
+        .on("query Intake", &empty_intake(3).to_string())
         .on("graphql", &fixture("coord-batch.json"));
     coord::run(&gh, &s, Some(&b), &o, &mut Vec::new())
         .await
@@ -597,6 +602,183 @@ fn js_api(url: &str, subject: &str) -> String {
     }
 }
 
+#[tokio::test]
+async fn intake_suppresses_handled_items_and_only_announces_a_later_reopen() {
+    use chrono::{TimeDelta, Utc};
+    use hgl_ai_proto::{TaskKey, TreeRecord};
+    use serde_json::json;
+
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut s = settings();
+    s.repos = ["alpha", "beta", "gamma"].map(String::from).to_vec();
+    b.tree_put(&TreeRecord {
+        host: "host".into(),
+        seat: Seat::new("w1").unwrap(),
+        task: TaskKey {
+            repo: "beta".into(),
+            issue: 30,
+        },
+        review: false,
+        path: "work".into(),
+        branch: Some("codex/q30-fleet".into()),
+        created_at: hgl_ai_proto::utc_now_stamp(),
+        size_bytes: 0,
+        families: Vec::new(),
+        class: None,
+        class_seq: None,
+        seq: None,
+        handoff_seq: None,
+    })
+    .await
+    .unwrap();
+    let recent = Utc::now() - TimeDelta::minutes(1);
+    let old = recent - TimeDelta::days(3);
+    let mut handoff = hgl_ai_proto::Note::new(
+        s.controller.clone(),
+        Seat::new("w2").unwrap(),
+        Kind::Assign,
+        "Assigned before the bridge registered its tree",
+    );
+    handoff.repo = Some("alpha".into());
+    handoff.issue = 26;
+    b.send(&handoff).await.unwrap();
+    let mut labelled = intake_node(22, recent, recent);
+    labelled["labels"]["nodes"] = json!([{ "name": "codex-priority" }]);
+    let mut assigned = intake_node(23, recent, recent);
+    assigned["assignees"]["totalCount"] = json!(1);
+    let mut external = intake_node(24, old, recent);
+    external["timelineItems"]["nodes"] = json!([{ "id": "reopen-24", "createdAt": recent }]);
+    external["labels"]["nodes"] = json!([{ "name": "spec-refine" }]);
+    let mut routed = intake_node(25, recent, recent);
+    routed["reviewRequests"] = json!({ "totalCount": 1 });
+    let mut fleet = intake_node(31, recent, recent);
+    fleet["headRefName"] = json!("codex/q30-fleet");
+    let mut fork = intake_node(32, recent, recent);
+    fork["headRefName"] = json!("codex/q30-fleet");
+    fork["isCrossRepository"] = json!(true);
+
+    let mut response = empty_intake(3);
+    response["data"]["r0"]["items"]["nodes"] = json!([
+        intake_node(21, recent, recent),
+        labelled,
+        assigned,
+        intake_node(26, recent, recent)
+    ]);
+    response["data"]["r1"]["items"]["nodes"] = json!([external, routed]);
+    response["data"]["r2"]["items"]["nodes"] = json!([intake_node(30, recent, recent)]);
+    response["data"]["r3"]["items"]["nodes"] = json!([fleet, fork]);
+    let fake = |response: &serde_json::Value| {
+        FakeGh::default()
+            .on("auth status", "")
+            .on("query Backlog", &fixture("backlog-batch.json"))
+            .on("query Intake", &response.to_string())
+            .on("graphql", &fixture("coord-batch.json"))
+    };
+    let opts = CoordOpts {
+        once: true,
+        dry_run: false,
+        interval: coord::MIN_INTERVAL,
+    };
+    let triage = Seat::new("triage").unwrap();
+    let notes = || b.read_notes(std::slice::from_ref(&triage), 1, 20, Duration::ZERO);
+
+    let state = || async {
+        let entry = b.state_get(crate::intake::KEY).await.unwrap().unwrap();
+        serde_json::from_str::<serde_json::Value>(&entry.value).unwrap()
+    };
+    coord::run(&fake(&response), &s, Some(&b), &opts, &mut Vec::new())
+        .await
+        .unwrap();
+    let actual = notes().await.unwrap();
+    assert_eq!(actual.len(), 1);
+    let note = &actual[0].note;
+    let body = note.body.as_str();
+    assert_eq!(note.kind, Kind::Note);
+    assert_eq!(note.sender, s.coord_seat);
+    assert_eq!(body.lines().count(), 5, "{body}");
+    assert!(body.contains("alpha#21 [new issue]"), "{body}");
+    assert!(body.contains("alpha#24 [reopened PR] by contributor [spec-refine] [external, controller routes review to another model family]"), "{body}");
+    assert!(body.contains("beta#31 [new PR] by contributor —"), "{body}");
+    assert!(
+        body.contains("beta#32 [new PR] by contributor [external"),
+        "{body}"
+    );
+    assert!(state().await["pending"].is_null());
+
+    // A restart with the same events is silent. A later reopen of an already
+    // announced item gets its own notification, even within the scan overlap.
+    coord::run(&fake(&response), &s, Some(&b), &opts, &mut Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(notes().await.unwrap().len(), 1);
+    response["data"]["r0"]["items"]["nodes"][0]["timelineItems"]["nodes"] =
+        json!([{ "id": "reopen-21", "createdAt": recent + TimeDelta::seconds(1) }]);
+    coord::run(&fake(&response), &s, Some(&b), &opts, &mut Vec::new())
+        .await
+        .unwrap();
+    let actual = notes().await.unwrap();
+    assert_eq!(actual.len(), 2);
+    assert_eq!(actual[1].note.body.lines().count(), 2);
+    assert!(actual[1].note.body.contains("alpha#21 [reopened issue]"));
+}
+
+#[tokio::test]
+async fn intake_retries_pending_delivery_and_checks_history_after_the_duplicate_window() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let triage = Seat::new("triage").unwrap();
+    let mut note = hgl_ai_proto::Note::new(
+        Seat::new("coord").unwrap(),
+        triage.clone(),
+        Kind::Note,
+        "[coord] Intake (ROLE-3)\n- alpha#21",
+    );
+    let cursor = |note: &hgl_ai_proto::Note| serde_json::json!({ "through": null, "seen": {}, "pending": note });
+    b.state_create(crate::intake::KEY, &cursor(&note).to_string())
+        .await
+        .unwrap();
+    let reply = js_api(&h.url, "$JS.API.STREAM.DELETE.HGL_NOTES");
+    assert!(reply.contains("\"success\":true"), "{reply}");
+    let round = crate::intake::Round::load(Some(&b), chrono::Utc::now())
+        .await
+        .unwrap();
+    assert!(round.from().is_none(), "retry before starting a new scan");
+    assert!(round.retry(&b).await.is_err(), "the stream was deleted");
+    b.provision().await.unwrap();
+    let round = crate::intake::Round::load(Some(&b), chrono::Utc::now())
+        .await
+        .unwrap();
+    round.retry(&b).await.unwrap();
+
+    let entry = b.state_get(crate::intake::KEY).await.unwrap().unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&entry.value).unwrap()["pending"].is_null());
+    note.created_at = "20260101T000000Z".into();
+    b.state_update(
+        crate::intake::KEY,
+        &cursor(&note).to_string(),
+        entry.revision,
+    )
+    .await
+    .unwrap();
+    // Publish with another ID so JetStream's current duplicate cache cannot
+    // mask a duplicate send from recovery.
+    b.send_with_id(&note, "published-before-restart")
+        .await
+        .unwrap();
+    let round = crate::intake::Round::load(Some(&b), chrono::Utc::now())
+        .await
+        .unwrap();
+    round.retry(&b).await.unwrap();
+    let notes = b
+        .read_notes(&[triage], 1, 20, Duration::ZERO)
+        .await
+        .unwrap();
+    assert_eq!(notes.len(), 2);
+    let entry = b.state_get(crate::intake::KEY).await.unwrap().unwrap();
+    assert!(serde_json::from_str::<serde_json::Value>(&entry.value).unwrap()["pending"].is_null());
+}
+
 /// Carbon's check 8b (hgl-ai#8): a round whose alerts cannot be sent (the notes stream is
 /// gone) keeps them on the hub, and the next run sends them, though the table it compares
 /// with no longer shows the change.
@@ -614,6 +796,7 @@ async fn an_alert_whose_send_failed_is_sent_by_the_next_round() {
         FakeGh::default()
             .on("auth status", "")
             .on("query Backlog", &fixture("backlog-batch.json"))
+            .on("query Intake", &empty_intake(3).to_string())
             .on("graphql", &fixture("coord-batch.json"))
     };
     let o = CoordOpts {
@@ -1701,4 +1884,56 @@ async fn a_landing_before_a_rate_limit_is_still_reported() {
     assert!(a.take_reports().is_empty(), "taken once");
     let log = hgl_ai_owner::decisions_tail(&b, 10).await.unwrap();
     assert_eq!(log.len(), 1, "{log:?}");
+}
+
+/// `tasks` with no task is never written empty (an empty create fails every round), and
+/// a text left from a task that is gone is cleared.
+#[tokio::test]
+async fn tasks_without_a_task_write_nothing() {
+    let Some(h) = hub() else { return };
+    let b = bus(&h).await;
+    let mut idx = crate::tasks::NotesIndex::default();
+    let mut written = None;
+    for _ in 0..2 {
+        crate::tasks::keep(&b, &mut idx, &mut written)
+            .await
+            .unwrap();
+    }
+    assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
+
+    let mut n = hgl_ai_proto::Note::new(
+        Seat::new("controller").unwrap(),
+        Seat::new("w1").unwrap(),
+        Kind::Assign,
+        "x",
+    );
+    n.repo = Some("alpha".into());
+    n.issue = 7;
+    b.send(&n).await.unwrap();
+    let tree: hgl_ai_proto::TreeRecord = serde_json::from_value(serde_json::json!({
+        "host": "lab1", "seat": "w1", "task": {"repo": "alpha", "issue": 7},
+        "path": "/w", "created_at": "20261128T000000Z",
+    }))
+    .unwrap();
+    b.tree_put(&tree).await.unwrap();
+    crate::tasks::keep(&b, &mut idx, &mut written)
+        .await
+        .unwrap();
+    let held = b.state_get(state::KEY_TASKS).await.unwrap().unwrap().value;
+    assert!(
+        held.starts_with("alpha\t7\tassign\tcontroller\tw1\t"),
+        "{held}"
+    );
+
+    b.tree_del(&tree.key()).await.unwrap();
+    crate::tasks::keep(&b, &mut idx, &mut written)
+        .await
+        .unwrap();
+    assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
+    // A new run (nothing written yet) finds nothing to clear.
+    let mut written = None;
+    crate::tasks::keep(&b, &mut idx, &mut written)
+        .await
+        .unwrap();
+    assert!(b.state_get(state::KEY_TASKS).await.unwrap().is_none());
 }

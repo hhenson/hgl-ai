@@ -5,7 +5,7 @@
 //! sends the `receipt`, and removes the checkout. It advertises itself in
 //! `HGL_HOSTS/builder.<label>` with its health, and honours `drain` and `retire`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -452,6 +452,22 @@ async fn lane_loop(
         Ok(i) => (Some(i), None),
         Err(e) => (None, Some(ServiceError::from(e))),
     };
+    let log_error = Arc::new(Mutex::new(None));
+    let log_server = inbox.as_ref().map(|_| {
+        let (bus, lane, stop, stop_tx, log_error) = (
+            bus.clone(),
+            lane.clone(),
+            shutdown.clone(),
+            stop_tx.clone(),
+            log_error.clone(),
+        );
+        tokio::spawn(async move {
+            if let Err(e) = crate::log::serve(bus, lane, stop).await {
+                *log_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(e);
+                let _ = stop_tx.send(true);
+            }
+        })
+    });
     let running: Arc<Mutex<Vec<Cancel>>> = Arc::new(Mutex::new(Vec::new()));
     let mut jobs = tokio::task::JoinSet::new();
     let idle = Arc::new(Notify::new());
@@ -586,6 +602,10 @@ async fn lane_loop(
         c.cancel();
     }
     while jobs.join_next().await.is_some() {}
+    if let Some(log_server) = log_server {
+        log_server.abort();
+        let _ = log_server.await;
+    }
     hb.abort();
     let _ = hb.await;
     let _ = conn_stop_tx.send(true);
@@ -614,6 +634,12 @@ async fn lane_loop(
     if let Some(why) = lost.lock().unwrap_or_else(|e| e.into_inner()).take() {
         return Err(ServiceError::Other(format!(
             "builder {}: the lease {why}",
+            lane.label
+        )));
+    }
+    if let Some(e) = log_error.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        return Err(ServiceError::Other(format!(
+            "builder {}: log service failed: {e}",
             lane.label
         )));
     }
@@ -1061,6 +1087,18 @@ pub fn lanes(
     cfg: &hgl_ai_config::Config,
     ssh_program: PathBuf,
 ) -> Result<Vec<Arc<Lane>>, ServiceError> {
+    lanes_with(cfg, ssh_program, ssh::Conn::new)
+}
+
+/// Construct lanes using the supplied connection factory.
+pub fn lanes_with<F>(
+    cfg: &hgl_ai_config::Config,
+    ssh_program: PathBuf,
+    connect: F,
+) -> Result<Vec<Arc<Lane>>, ServiceError>
+where
+    F: Fn(&str, &str, PathBuf, &Path, ssh::Dialect) -> std::io::Result<Arc<ssh::Conn>>,
+{
     use hgl_ai_proto::build::builder_inbox;
     let err = |e: &dyn std::fmt::Display| ServiceError::Other(e.to_string());
     let work_root = cfg.work_root().map_err(|e| err(&e))?;
@@ -1090,7 +1128,7 @@ pub fn lanes(
         let label = r.label(&cfg.host);
         let dialect = ssh::Dialect::parse(&r.shell)
             .ok_or_else(|| ServiceError::Other(format!("shell {:?}", r.shell)))?;
-        let conn = ssh::Conn::new(
+        let conn = connect(
             &label,
             &r.ssh,
             ssh_program.clone(),

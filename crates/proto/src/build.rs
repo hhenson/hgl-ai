@@ -354,9 +354,11 @@ pub fn builder_key(label: &str) -> String {
 }
 
 /// An address of the build machinery: a builder's inbox (`builder-*`) or a build's reply
-/// address (`r-*`). No configured seat takes such a name.
+/// address (`r-*`), or log inbox (`logs-*`). No configured seat takes such a name.
 pub fn is_build_address(seat: &Seat) -> bool {
-    seat.as_str().starts_with("builder-") || seat.as_str().starts_with("r-")
+    seat.as_str().starts_with("builder-")
+        || seat.as_str().starts_with("r-")
+        || seat.as_str().starts_with("logs-")
 }
 
 /// A seat a build receipt may go to (`notify`): a configured seat's name, not `all`,
@@ -814,6 +816,8 @@ mod tests {
         n.issue = 0;
         assert!(no_pr.check(&n).unwrap_err().contains("pull request"));
         assert!(is_build_address(&Seat::new("builder-lab1").unwrap()));
+        assert!(is_build_address(&Seat::new("logs-lab1").unwrap()));
+        assert!(!may_receive_receipts(&Seat::new("logs-lab1").unwrap()));
         assert!(!may_receive_receipts(&Seat::console()));
     }
 
