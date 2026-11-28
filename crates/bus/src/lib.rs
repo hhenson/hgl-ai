@@ -59,9 +59,9 @@ use futures::StreamExt;
 use hgl_ai_config::Config;
 use hgl_ai_proto::{
     BROADCAST, CONSOLE_PREFIX, EndedRecord, HostRecord, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS,
-    KV_METRICS, KV_SCREEN, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, LockRecord, Note,
-    OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, TaskKey,
-    TreeRecord, USAGE_PREFIX, ended_key, utc_now_stamp,
+    KV_METRICS, KV_PRECHECK, KV_SCREEN, KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE,
+    LockRecord, Note, OWNER_PREFIX, STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat,
+    TaskKey, TreeRecord, USAGE_PREFIX, ended_key, utc_now_stamp,
 };
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -537,6 +537,13 @@ impl Bus {
                 "hgl-ai subscription usage per login",
                 stream::StorageType::File,
                 1,
+                Duration::ZERO,
+            ),
+            (
+                KV_PRECHECK,
+                "hgl-ai pre-check rules and counters",
+                stream::StorageType::File,
+                STATE_HISTORY,
                 Duration::ZERO,
             ),
             build::BUCKET,
@@ -1775,6 +1782,69 @@ fn publish_error(subject: &str, e: jetstream::context::PublishError) -> BusError
             BusError::Nats(format!("no stream takes {subject}; run `hgl-ai init`"))
         }
         _ => nats(&format!("publishing to {subject}"), e),
+    }
+}
+
+impl Bus {
+    /// Read the rule list on the isolated account layout, including its JetStream revision.
+    pub async fn precheck_rules_get(&self) -> Result<Option<(String, u64)>> {
+        let subject = format!(
+            "{}.DIRECT.GET.KV_{KV_PRECHECK}.$KV.{KV_PRECHECK}.rules",
+            hgl_ai_proto::HUB_API_PREFIX
+        );
+        self.guarded(&subject, async {
+            let msg = self
+                .client
+                .request(subject.clone(), "".into())
+                .await
+                .map_err(|e| nats("reading pre-check rules", e))?;
+            if msg.status == Some(async_nats::StatusCode::NOT_FOUND) {
+                return Ok(None);
+            }
+            if let Some(status) = msg.status {
+                return Err(BusError::Nats(format!("reading pre-check rules: {status}")));
+            }
+            check_value_size("precheck rules", msg.payload.len())?;
+            let rev = msg
+                .headers
+                .as_ref()
+                .and_then(|h| h.get(async_nats::header::NATS_SEQUENCE))
+                .and_then(|v| v.as_str().parse().ok())
+                .ok_or_else(|| BusError::Nats("pre-check rules missing revision".into()))?;
+            let value = String::from_utf8(msg.payload.to_vec())
+                .map_err(|_| BusError::Nats("pre-check rules are not UTF-8".into()))?;
+            Ok(Some((value, rev)))
+        })
+        .await
+    }
+
+    /// Compare-and-set the rule list; the owner-held credential can publish only here.
+    pub async fn precheck_rules_set(&self, value: &str, expected: u64) -> Result<u64> {
+        check_value_size("precheck rules", value.len())?;
+        let subject = format!("{}.$KV.{KV_PRECHECK}.rules", hgl_ai_proto::HUB_API_PREFIX);
+        let mut headers = async_nats::HeaderMap::new();
+        headers.insert(
+            async_nats::header::NATS_EXPECTED_LAST_SUBJECT_SEQUENCE,
+            async_nats::HeaderValue::from(expected),
+        );
+        self.guarded(&subject, async {
+            let ack = self
+                .js
+                .publish_with_headers(subject.clone(), headers, value.to_owned().into())
+                .await
+                .map_err(|e| nats("writing pre-check rules", e))?;
+            ack.await.map(|a| a.sequence).map_err(|e| {
+                if e.kind() == jetstream::context::PublishErrorKind::WrongLastSequence {
+                    BusError::Conflict {
+                        key: "precheck rules".into(),
+                        expected,
+                    }
+                } else {
+                    nats("writing pre-check rules", e)
+                }
+            })
+        })
+        .await
     }
 }
 

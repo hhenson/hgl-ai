@@ -66,6 +66,8 @@ enum Command {
     Usage(cmd::usage::Args),
     /// Build and test by recipe, here or on a builder of another platform.
     Build(cmd::build::Args),
+    /// Read and update the hub pre-check rules.
+    Precheck(cmd::precheck::Args),
     /// The builder service and the fleet's builders.
     Builder(cmd::builder::Args),
 }
@@ -107,6 +109,7 @@ async fn main() {
         Command::Slack(a) => cmd::slack::run(&ctx, a).await,
         Command::Usage(a) => cmd::usage::run(&ctx, a).await,
         Command::Build(a) => cmd::build::run(&ctx, a).await,
+        Command::Precheck(a) => cmd::precheck::run(&ctx, a).await,
         Command::Builder(a) => cmd::builder::run(&ctx, a).await,
     };
     let code = match res {

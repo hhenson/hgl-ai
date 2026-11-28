@@ -14,10 +14,10 @@ use std::str::FromStr;
 use hgl_ai_bus::Credential;
 use hgl_ai_proto::build::KV_BUILD;
 use hgl_ai_proto::{
-    CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_SCREEN, KV_SLACK,
-    KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX, SCREEN_LOG_KEYS,
-    SCREEN_NOTES_PREFIX, SCREEN_RULE_KEYS, SLACK_FEED, SLACK_OWNER_FILTER, STREAM_NOTES,
-    STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, USAGE_PREFIX, VIEWER_INBOX,
+    CONSOLE_PREFIX, KV_CONSOLE, KV_ENDED, KV_HOSTS, KV_LOCKS, KV_METRICS, KV_PRECHECK, KV_SCREEN,
+    KV_SLACK, KV_STATE, KV_THREADS, KV_TREES, KV_USAGE, OWNER_NOTES_PREFIX, OWNER_PREFIX,
+    SCREEN_LOG_KEYS, SCREEN_NOTES_PREFIX, SCREEN_RULE_KEYS, SLACK_FEED, SLACK_OWNER_FILTER,
+    STREAM_NOTES, STREAM_OWNER, STREAM_USAGE, SUBJECT_PREFIX, Seat, USAGE_PREFIX, VIEWER_INBOX,
     VIEWER_STATE_KEYS,
 };
 use serde::{Deserialize, Serialize};
@@ -54,12 +54,15 @@ pub enum Role {
     /// The controller's rule writer and screen log reader.
     #[serde(rename = "screen-rules")]
     ScreenRules,
+    /// Owner-held pre-check rule writer.
+    #[serde(rename = "precheck-rules")]
+    PrecheckRules,
     /// Everything: provisioning the stream and buckets (`hgl-ai init`, `server install`).
     Admin,
 }
 
 impl Role {
-    pub const ALL: [Role; 9] = [
+    pub const ALL: [Role; 10] = [
         Role::Seat,
         Role::Coord,
         Role::Builder,
@@ -68,6 +71,7 @@ impl Role {
         Role::Slack,
         Role::Screen,
         Role::ScreenRules,
+        Role::PrecheckRules,
         Role::Admin,
     ];
 
@@ -81,6 +85,7 @@ impl Role {
             Role::Slack => "slack",
             Role::Screen => "screen",
             Role::ScreenRules => "screen-rules",
+            Role::PrecheckRules => "precheck-rules",
             Role::Admin => "admin",
         }
     }
@@ -100,7 +105,7 @@ impl FromStr for Role {
             .find(|r| r.as_str() == s)
             .ok_or_else(|| {
                 format!(
-                    "unknown hub role {s:?}: seat, coord, builder, console, viewer, slack, screen, screen-rules or admin"
+                    "unknown hub role {s:?}: seat, coord, builder, console, viewer, slack, screen, screen-rules, precheck-rules or admin"
                 )
             })
     }
@@ -337,7 +342,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     match role {
         Role::Admin => return None,
         Role::Viewer => return Some(viewer()),
-        Role::Screen | Role::ScreenRules => {
+        Role::Screen | Role::ScreenRules | Role::PrecheckRules => {
             return Some(Permissions {
                 publish_allow: role_services(role).into_iter().map(|s| s.subject).collect(),
                 publish_deny: Vec::new(),
@@ -470,7 +475,12 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             allow.push(format!("$KV.{KV_STATE}.decisions.log"));
             allow.push(format!("$KV.{KV_CONSOLE}.>"));
         }
-        Role::Viewer | Role::Slack | Role::Screen | Role::ScreenRules | Role::Admin => {
+        Role::Viewer
+        | Role::Slack
+        | Role::Screen
+        | Role::ScreenRules
+        | Role::PrecheckRules
+        | Role::Admin => {
             unreachable!()
         }
     }
@@ -563,7 +573,7 @@ pub const KV_VERDICTS: &str = "HGL_VERDICTS";
 pub const CONSOLE_FEED: &str = "console";
 
 /// The roles with an account of their own: the access table's columns.
-pub const ACCOUNT_ROLES: [Role; 7] = [
+pub const ACCOUNT_ROLES: [Role; 8] = [
     Role::Seat,
     Role::Coord,
     Role::Builder,
@@ -571,6 +581,7 @@ pub const ACCOUNT_ROLES: [Role; 7] = [
     Role::Slack,
     Role::Screen,
     Role::ScreenRules,
+    Role::PrecheckRules,
 ];
 
 impl Role {
@@ -584,6 +595,7 @@ impl Role {
             Role::Slack => "SLACK",
             Role::Screen => "SCREEN",
             Role::ScreenRules => "SCREEN_RULES",
+            Role::PrecheckRules => "PRECHECK_RULES",
             // Not rendered yet: the viewer's account and imports are hgl-ai#148.
             Role::Viewer => "VIEWER",
             Role::Admin => HUB_ACCOUNT,
@@ -657,90 +669,107 @@ pub fn access_table() -> Vec<Row> {
     let all = |b: &str| keys(b, ">");
     let subj = |s: String| Target::Subjects(s);
     let row = |target: Target, access: [Access; ACCOUNT_ROLES.len()]| Row { target, access };
-    // Columns: seat, coord, builder, console, slack, screen, screen-rules.
+    // Columns: seat, coord, builder, console, slack, screen, screen-rules, precheck-rules.
     vec![
-        row(Target::AccountInfo, [R, R, R, R, R, R, No]),
+        row(Target::AccountInfo, [R, R, R, R, R, R, No, No]),
         // Notes: seats, the coordinator and builders send them; the console its `tick`.
         row(
             subj(format!("{SUBJECT_PREFIX}.*")),
-            [W, W, W, W, No, No, No],
+            [W, W, W, W, No, No, No, No],
         ),
         row(
             subj(format!("{OWNER_NOTES_PREFIX}.*")),
-            [No, No, No, W, No, No, No],
+            [No, No, No, W, No, No, No, No],
         ),
         row(
             Target::Stream(STREAM_NOTES.into()),
-            [R, R, R, R, No, No, No],
+            [R, R, R, R, No, No, No, No],
         ),
         row(
             subj(format!("{SCREEN_NOTES_PREFIX}.*")),
-            [No, No, No, No, No, W, No],
+            [No, No, No, No, No, W, No, No],
         ),
         row(
             Target::ProvisionedFeed {
                 stream: STREAM_NOTES.into(),
                 consumer: Seat::screen().consumer(),
             },
-            [No, No, No, No, No, R, No],
+            [No, No, No, No, No, R, No, No],
         ),
         // Agents to the owner; the owner's thread events (Slack only its own).
         row(
             subj(format!("{CONSOLE_PREFIX}.>")),
-            [W, W, W, No, No, No, No],
+            [W, W, W, No, No, No, No, No],
         ),
         row(
             subj(format!("{OWNER_PREFIX}.thread.*")),
-            [No, No, No, W, No, No, No],
+            [No, No, No, W, No, No, No, No],
         ),
-        row(subj(SLACK_OWNER_FILTER.into()), [No, No, No, No, W, No, No]),
+        row(
+            subj(SLACK_OWNER_FILTER.into()),
+            [No, No, No, No, W, No, No, No],
+        ),
         row(
             Target::BySequence(STREAM_OWNER.into()),
-            [R, R, R, R, R, No, No],
+            [R, R, R, R, R, No, No, No],
         ),
         row(
             Target::Feed {
                 stream: STREAM_OWNER.into(),
                 consumer: CONSOLE_FEED.into(),
             },
-            [No, No, No, R, No, No, No],
+            [No, No, No, R, No, No, No, No],
         ),
         row(
             Target::Feed {
                 stream: STREAM_OWNER.into(),
                 consumer: SLACK_FEED.into(),
             },
-            [No, No, No, No, R, No, No],
+            [No, No, No, No, R, No, No, No],
         ),
-        row(all(KV_THREADS), [R, R, R, RW, No, No, No]),
-        row(all(KV_STATE), [RW, RW, RW, R, No, R, No]),
-        row(keys(KV_STATE, "decisions.log"), [No, No, No, W, No, No, No]),
+        row(all(KV_THREADS), [R, R, R, RW, No, No, No, No]),
+        row(all(KV_STATE), [RW, RW, RW, R, No, R, No, No]),
+        row(
+            keys(KV_STATE, "decisions.log"),
+            [No, No, No, W, No, No, No, No],
+        ),
         // The local build verdicts the merge gate reads (BUILD-15).
-        row(all(KV_VERDICTS), [R, R, RW, R, No, No, No]),
-        row(all(KV_HOSTS), [RW, RW, RW, R, No, No, No]),
-        row(all(KV_TREES), [RW, RW, RW, R, No, R, No]),
-        row(all(KV_LOCKS), [RW, RW, RW, R, No, No, No]),
-        row(all(KV_ENDED), [RW, RW, RW, R, No, No, No]),
+        row(all(KV_VERDICTS), [R, R, RW, R, No, No, No, No]),
+        row(all(KV_HOSTS), [RW, RW, RW, R, No, No, No, No]),
+        row(all(KV_TREES), [RW, RW, RW, R, No, R, No, No]),
+        row(all(KV_LOCKS), [RW, RW, RW, R, No, No, No, No]),
+        row(all(KV_ENDED), [RW, RW, RW, R, No, No, No, No]),
         // Usage records and their history (PROTO-23, PROTO-24).
-        row(all(KV_USAGE), [RW, RW, RW, R, No, No, No]),
-        row(subj(format!("{USAGE_PREFIX}.>")), [W, W, W, No, No, No, No]),
+        row(all(KV_USAGE), [RW, RW, RW, R, No, No, No, No]),
+        row(
+            subj(format!("{USAGE_PREFIX}.>")),
+            [W, W, W, No, No, No, No, No],
+        ),
         row(
             Target::Stream(STREAM_USAGE.into()),
-            [R, R, R, R, No, No, No],
+            [R, R, R, R, No, No, No, No],
         ),
         // Build runs; the recipes every builder runs are the admin's (BUILD-1).
-        row(all(KV_BUILD), [R, R, R, R, No, No, No]),
-        row(keys(KV_BUILD, "run.>"), [W, W, W, No, No, No, No]),
-        row(all(KV_METRICS), [R, RW, R, R, No, No, No]),
-        row(all(KV_CONSOLE), [No, No, No, RW, No, No, No]),
+        row(all(KV_BUILD), [R, R, R, R, No, No, No, No]),
+        row(keys(KV_BUILD, "run.>"), [W, W, W, No, No, No, No, No]),
+        row(all(KV_METRICS), [R, RW, R, R, No, No, No, No]),
+        row(all(KV_CONSOLE), [No, No, No, RW, No, No, No, No]),
         // The console reads the permalink index; delivery state is the adapter's.
-        row(keys(KV_SLACK, "links.*.*"), [No, No, No, R, No, No, No]),
-        row(all(KV_SLACK), [No, No, No, No, RW, No, No]),
+        row(keys(KV_SLACK, "links.*.*"), [No, No, No, R, No, No, No, No]),
+        row(all(KV_SLACK), [No, No, No, No, RW, No, No, No]),
         row(
             keys(KV_SCREEN, SCREEN_RULE_KEYS),
-            [No, No, No, No, No, R, W],
+            [No, No, No, No, No, R, W, No],
         ),
-        row(keys(KV_SCREEN, SCREEN_LOG_KEYS), [No, No, No, No, No, W, R]),
+        row(
+            keys(KV_SCREEN, SCREEN_LOG_KEYS),
+            [No, No, No, No, No, W, R, No],
+        ),
+        row(keys(KV_PRECHECK, "rules"), [R, R, R, No, No, R, No, W]),
+        row(
+            keys(KV_PRECHECK, "counter.>"),
+            [R, RW, R, No, No, R, No, No],
+        ),
     ]
 }
 
@@ -1243,6 +1272,7 @@ mod tests {
             ("hub-slack", Role::Slack),
             ("screen", Role::Screen),
             ("screen-rules", Role::ScreenRules),
+            ("precheck-rules", Role::PrecheckRules),
             ("hub-admin", Role::Admin),
         ] {
             reg.issue(n, r, false).unwrap();
@@ -1417,6 +1447,7 @@ mod tests {
         );
         let mut coord = writes(Role::Seat);
         coord.insert(4, "$KV.HGL_METRICS.>".into());
+        coord.insert(5, "$KV.HGL_PRECHECK.counter.>".into());
         assert_eq!(writes(Role::Coord), coord);
         let mut builder = writes(Role::Seat);
         builder.insert(7, "$KV.HGL_VERDICTS.>".into());
@@ -1518,7 +1549,10 @@ mod tests {
                     "{r}: {s:?}"
                 );
             }
-            if !matches!(r, Role::Slack | Role::Screen | Role::ScreenRules) {
+            if !matches!(
+                r,
+                Role::Slack | Role::Screen | Role::ScreenRules | Role::PrecheckRules
+            ) {
                 for b in VIEWER_BUCKETS {
                     assert!(has(r, &format!("$JS.API.CONSUMER.LIST.KV_{b}")), "{r}: {b}");
                 }
@@ -1550,6 +1584,7 @@ mod tests {
             Role::Slack,
             Role::Screen,
             Role::ScreenRules,
+            Role::PrecheckRules,
         ] {
             assert!(!conf.contains(&format!("{}_PUBLISH", r.account())), "{r}");
         }
