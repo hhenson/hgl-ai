@@ -58,7 +58,7 @@ enum Cmd {
 }
 
 #[derive(clap::Args)]
-#[group(id = "text", required = true, multiple = false, args = ["body", "body_file"])]
+#[command(group = clap::ArgGroup::new("text").required(true).args(["body", "body_file"]))]
 struct VerdictArgs {
     repo: String,
     pr: u64,
