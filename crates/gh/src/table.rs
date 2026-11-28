@@ -16,7 +16,7 @@ use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::Value;
 
 use crate::bot::{
-    BotState, BotView, Comment, NoteState, Review, is_note_author, note_state, ready_mark,
+    BotState, BotView, Comment, NoteState, Review, is_note_author, note_state, ready_mark_across,
 };
 use crate::{Error, Result, short};
 
@@ -188,8 +188,8 @@ fragment R on Repository {{
     nodes {{
       number isDraft headRefOid headRefName baseRefName updatedAt url
       reviewThreads(first: 100) {{ totalCount nodes {{ isResolved }} }}
-      early: comments(first: 10) {{ nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
-      late: comments(last: 30) {{ nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
+      early: comments(first: {EARLY}) {{ totalCount nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
+      late: comments(last: {LATE}) {{ nodes {{ databaseId author {{ login }} body createdAt updatedAt }} }}
       reviews(last: 30) {{ nodes {{ author {{ login }} commit {{ oid }} state url }} }}
       commits(last: 1) {{ nodes {{ commit {{ oid statusCheckRollup {{ state }} }} }} }}
     }}
@@ -265,6 +265,32 @@ pub fn parse_rate(data: &Value) -> Result<RateLimit> {
     })
 }
 
+/// Comments read from each end of a pull request (`early`, `late` in [`batch_query`]).
+const EARLY: usize = 10;
+const LATE: usize = 30;
+
+/// When the comments read from both ends do not meet, the `createdAt` of the first `late`
+/// comment: the comments before it back to the `early` ones were not read. Without
+/// `totalCount`, both full windows count as a gap.
+fn unread_gap(p: &Value, read: usize) -> Option<String> {
+    let (early, late) = (nodes(p, &["early"]), nodes(p, &["late"]));
+    let total = p
+        .get("early")
+        .and_then(|e| e.get("totalCount"))
+        .and_then(Value::as_u64);
+    let gap = match total {
+        Some(t) => t > read as u64,
+        None => early.len() >= EARLY && late.len() >= LATE,
+    };
+    if !gap {
+        return None;
+    }
+    late.iter()
+        .filter_map(|c| c.get("createdAt").and_then(Value::as_str))
+        .min()
+        .map(String::from)
+}
+
 fn pr_info(
     repo: &str,
     p: &Value,
@@ -299,7 +325,7 @@ fn pr_info(
         .filter(|c| is_note_author(&c.author, note_authors))
         .cloned()
         .collect();
-    let mark = ready_mark(&notes, &head);
+    let mark = ready_mark_across(&notes, &head, unread_gap(p, comments.len()).as_deref());
     let rollup = nodes(p, &["commits"])
         .first()
         .and_then(|c| c.get("commit"))
@@ -578,6 +604,66 @@ mod tests {
         }
         let (infos, ..) = parse_batch(&v, &repos(), BOT, &fleet(), READ).unwrap();
         infos.into_iter().find(|i| i.row.number == 11).unwrap()
+    }
+
+    /// alpha#11 of the fixture as a round reads it when `early` reports `total` comments; its
+    /// `Ready` (the first comment) only in `early` when `total` is over 2.
+    fn alpha11_total(total: Option<u64>, extra: &[(&str, &str, &str)]) -> PrInfo {
+        let mut v = json("coord-batch.json");
+        let pr = v
+            .pointer_mut("/data/r0/pullRequests/nodes")
+            .and_then(Value::as_array_mut)
+            .unwrap()
+            .iter_mut()
+            .find(|p| p["number"] == 11)
+            .unwrap();
+        match total {
+            Some(t) => pr["early"]["totalCount"] = t.into(),
+            None => {
+                pr["early"].as_object_mut().unwrap().remove("totalCount");
+            }
+        }
+        let late = pr["late"]["nodes"].as_array_mut().unwrap();
+        if total.is_some_and(|t| t > 2) {
+            late.remove(0);
+        }
+        for (i, (author, body, at)) in extra.iter().enumerate() {
+            late.push(serde_json::json!({
+                "databaseId": 900_000 + i, "author": {"login": author}, "body": body,
+                "createdAt": at, "updatedAt": at,
+            }));
+        }
+        let (infos, ..) = parse_batch(&v, &repos(), BOT, &fleet(), READ).unwrap();
+        infos.into_iter().find(|i| i.row.number == 11).unwrap()
+    }
+
+    #[test]
+    fn an_unread_run_of_comments_clears_ready() {
+        let read = alpha11_total(None, &[]);
+        let n = 2; // the fixture's alpha#11 comments, each in both windows
+        assert_eq!(read.ready_at.as_deref(), Some("2026-01-05T09:00:00Z"));
+        assert_eq!(
+            alpha11_total(Some(n), &[]).ready_at,
+            read.ready_at,
+            "all read"
+        );
+        // More comments than were read: the first late comment starts after a gap.
+        let gapped = alpha11_total(Some(n + 1), &[]);
+        assert_eq!(gapped.ready_at, None);
+        let first_late = "2026-01-05T09:01:00Z";
+        assert_eq!(gapped.ready_cleared.as_deref(), Some(first_late));
+        // An approval after the gap does not bring the early Ready back; a Ready does.
+        let approved = [("octo", "[claude] Approved.", "2026-01-05T10:00:00Z")];
+        assert_eq!(alpha11_total(Some(99), &approved).ready_at, None);
+        let ready = [(
+            "octo",
+            "[codex] Ready: alpha#11 at 11111111",
+            "2026-01-05T11:00:00Z",
+        )];
+        assert_eq!(
+            alpha11_total(Some(99), &ready).ready_at.as_deref(),
+            Some("2026-01-05T11:00:00Z")
+        );
     }
 
     #[test]

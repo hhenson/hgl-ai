@@ -4,7 +4,8 @@
 //! its latest note comment is `ready` or `approved`, and it is Ready at its head: a `Ready`
 //! comment at the head that no later note comment cleared ([`crate::bot::ready_mark`]), or
 //! else the latest `ready` note to the controller at that exact head (HGL_NOTES), when it is
-//! later than any comment that cleared Ready. Ready order is the time of that comment or
+//! later than any comment that cleared Ready. On a pull request whose comments were not all
+//! read (the round reads both ends), the unread run counts as clearing Ready. Ready order is the time of that comment or
 //! note, oldest first; equal times keep the round's order (repositories as configured, then
 //! by number).
 //!
