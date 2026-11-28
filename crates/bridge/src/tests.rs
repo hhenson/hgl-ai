@@ -661,6 +661,79 @@ async fn cli_removal_waits_for_report_before_deregistering() {
     stop(tx, j).await;
 }
 
+/// A CLI holding the second tree's file lock removes it after the report lists it.
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn report_checks_tree_after_taking_registry_file_lock() {
+    use hgl_ai_tree::Registry;
+
+    let h = harness();
+    let trees = Trees::new(&h.cfg, h.git.clone()).unwrap();
+    for issue in [41, 42] {
+        let task = TaskKey {
+            repo: "demo".into(),
+            issue,
+        };
+        trees
+            .create(
+                &seat("w1"),
+                &task,
+                &hgl_ai_tree::Create::Implement {
+                    title: format!("Task {issue}"),
+                    base: None,
+                },
+            )
+            .unwrap();
+    }
+    let key = "build-1.w1.demo-42";
+    let listed = trees.list().unwrap();
+    let second = listed.iter().find(|t| t.record.key() == key).unwrap();
+    h.bus.tree_merge(&second.record).await.unwrap();
+    assert!(h.bus.trees().contains_key(key));
+    let held = FileLock::registry(&h.cfg.data_dir().unwrap(), key)
+        .await
+        .unwrap();
+    let deps = Deps {
+        closed: Arc::new(|_: &str, _: u64, _: bool| None),
+        title: h.title.clone(),
+        disk: h.disk.clone(),
+    };
+    let bridge = Arc::new(Bridge::new(
+        h.cfg.clone(),
+        h.bus.clone(),
+        trees,
+        deps,
+        h.opts.clone(),
+    ));
+    let reporting = {
+        let bridge = bridge.clone();
+        tokio::spawn(async move { bridge.report().await })
+    };
+    eventually("report waits on the second tree's file lock", || {
+        crate::lock(&bridge.registry)
+            .get(key)
+            .is_some_and(|m| m.try_lock().is_err())
+    })
+    .await;
+    let task = TaskKey {
+        repo: "demo".into(),
+        issue: 42,
+    };
+    let trees = Trees::new(&h.cfg, h.git.clone()).unwrap();
+    trees.remove(&seat("w1"), &task, false).unwrap().unwrap();
+    h.bus.tree_del(key).await.unwrap();
+    drop(held);
+    tokio::time::timeout(Duration::from_secs(5), reporting)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(h.bus.trees().contains_key("build-1.w1.demo-41"));
+    assert!(
+        !h.bus.trees().contains_key(key),
+        "report recreated the removed tree's record"
+    );
+}
+
 /// hgl-ai#58: the report lists two trees; while it writes the first, `closed` removes the
 /// second. The report, checking before each write, does not register the second again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
