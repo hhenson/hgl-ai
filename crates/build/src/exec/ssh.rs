@@ -208,6 +208,22 @@ impl Dialect {
         }
     }
 
+    fn cache_size(self, path: &str) -> String {
+        let p = self.quote(path);
+        match self {
+            Dialect::PowerShell => format!(
+                "if (!(Test-Path -LiteralPath {p})) {{ 0; exit 0 }}\n\
+                 $size = (Get-ChildItem -LiteralPath {p} -File -Force -Recurse -ErrorAction Stop | Measure-Object -Property Length -Sum).Sum\n\
+                 [uint64]$size"
+            ),
+            Dialect::Posix => format!(
+                "if [ ! -e {p} ]; then echo 0; exit 0; fi\n\
+                 size=$(du -sk {p}) || exit 1\n\
+                 printf '%s\\n' \"$size\" | awk '{{ printf \"%.0f\\n\", $1 * 1024 }}'"
+            ),
+        }
+    }
+
     /// Prints `SIZE PATH` for each file in `dir` matching the one-segment `pattern`.
     pub fn list(self, dir: &str, pattern: &str) -> String {
         match self {
@@ -1194,6 +1210,24 @@ impl Executor for Ssh {
         self.reachable()?;
         self.kill_orphans()?;
         self.remove(&format!("{}/jobs", self.work_dir))
+    }
+
+    fn cargo_cache_path(&self, slot: &str) -> String {
+        format!("{}/cargo-cache/{}/{slot}", self.work_dir, self.platform)
+    }
+
+    fn cargo_cache_size(&self, path: &str) -> Result<u64, HostError> {
+        let out = self.exec(&self.dialect.cache_size(path), SHORT)?;
+        if out.ok
+            && let Ok(bytes) = out.stdout.trim().parse()
+        {
+            return Ok(bytes);
+        }
+        Err(HostError::Failed(format!("measuring Cargo cache {path}")))
+    }
+
+    fn remove_cargo_cache(&self, path: &str) -> Result<(), HostError> {
+        self.remove(path)
     }
 
     fn probe(&self, tools: &[String]) -> Result<Probe, HostError> {

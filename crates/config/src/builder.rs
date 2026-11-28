@@ -22,6 +22,9 @@ pub struct Builder {
     /// Builds at a time on this host.
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub concurrency: u32,
+    /// Maximum retained Cargo intermediates on this builder, in GiB. Zero disables it.
+    #[serde(default = "cache_gib", skip_serializing_if = "is_default_cache_gib")]
+    pub cargo_cache_gib: u32,
     /// SDK name to its prefix on this host: `needs = ["sdk:hgraph"]` is met when it is
     /// set, and steps see it as `HGL_SDK_HGRAPH`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -46,6 +49,7 @@ impl Default for Builder {
         Builder {
             local: true,
             concurrency: 1,
+            cargo_cache_gib: cache_gib(),
             sdk: BTreeMap::new(),
             toolchains: default_toolchains(),
             remote: Vec::new(),
@@ -77,6 +81,9 @@ pub struct Remote {
     pub label: Option<String>,
     #[serde(default = "one", skip_serializing_if = "is_one")]
     pub concurrency: u32,
+    /// Maximum retained Cargo intermediates on this remote, in GiB. Zero disables it.
+    #[serde(default = "cache_gib", skip_serializing_if = "is_default_cache_gib")]
+    pub cargo_cache_gib: u32,
     /// SDK prefixes on the remote, as `[builder.sdk]` for this host.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub sdk: BTreeMap<String, String>,
@@ -101,6 +108,12 @@ fn one() -> u32 {
 }
 fn is_one(n: &u32) -> bool {
     *n == 1
+}
+fn cache_gib() -> u32 {
+    32
+}
+fn is_default_cache_gib(n: &u32) -> bool {
+    *n == cache_gib()
 }
 fn powershell() -> String {
     "powershell".into()
@@ -187,6 +200,7 @@ sdk = { hgraph = "~/sdk/hgraph" }
 platform = "windows"
 ssh = "winbox"
 work_dir = "C:/hgl-ai/work"
+cargo_cache_gib = 7
 "#,
         )
         .unwrap();
@@ -194,6 +208,8 @@ work_dir = "C:/hgl-ai/work"
         assert_eq!(b.remote[0].shell, "powershell");
         assert_eq!(b.remote[0].label("lab1"), "lab1-windows");
         assert!(b.local);
+        assert_eq!(b.cargo_cache_gib, 32);
+        assert_eq!(b.remote[0].cargo_cache_gib, 7);
         let mut bad = b.clone();
         bad.remote[0].shell = "cmd".into();
         assert!(validate(&bad, "lab1").is_err());

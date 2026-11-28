@@ -107,6 +107,7 @@ struct Opts {
     locks_max_age: Option<Duration>,
     proxy: bool,
     remote: bool,
+    concurrency: Option<u32>,
     /// Runs on the hub before the service starts.
     before: Option<Before>,
     /// The service's hub user may not write verdicts (a seat's).
@@ -211,6 +212,9 @@ impl Rig {
         cfg.paths.work_root = root.join("work").display().to_string();
         cfg.paths.data_dir = root.join("data").display().to_string();
         cfg.builder.toolchains = vec!["git".into()];
+        if let Some(concurrency) = o.concurrency {
+            cfg.builder.concurrency = concurrency;
+        }
         if o.remote {
             let state = root.join("winbox");
             std::fs::create_dir_all(&state).unwrap();
@@ -346,6 +350,116 @@ impl Rig {
     async fn stop(mut self) {
         self.halt().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cargo_cache_reuses_dependencies_and_isolates_parallel_heads() {
+    let cargo_version = Command::new("cargo").arg("--version").output().unwrap();
+    assert!(cargo_version.status.success());
+    let version = String::from_utf8(cargo_version.stdout).unwrap();
+    if version
+        .split_whitespace()
+        .nth(1)
+        .is_some_and(|v| v.starts_with("1.89.") || v.starts_with("1.90."))
+    {
+        eprintln!("skipped: Cargo 1.91 is needed for separate build and target dirs");
+        return;
+    }
+    let Some(r) = Rig::start_with(Opts {
+        concurrency: Some(2),
+        ..Opts::default()
+    })
+    .await
+    else {
+        return;
+    };
+    let dep = r.root.join("dep");
+    let seed = r.root.join("seed");
+    std::fs::create_dir_all(dep.join("src")).unwrap();
+    git(&dep, &["init", "-q"]);
+    std::fs::write(
+        dep.join("Cargo.toml"),
+        "[package]\nname = \"cache-dep\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dep.join("src/lib.rs"),
+        "pub fn prefix() -> &'static str { \"head=\" }",
+    )
+    .unwrap();
+    git(&dep, &["add", "."]);
+    git(&dep, &["commit", "-qm", "dependency"]);
+    std::fs::create_dir_all(seed.join("src")).unwrap();
+    std::fs::write(
+        seed.join("Cargo.toml"),
+        format!(
+            "[package]\nname = \"probe\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\
+             [dependencies]\ncache-dep = {{ git = \"file://{}\" }}\n",
+            dep.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        seed.join("src/main.rs"),
+        r#"fn main() { print!("{}{}", cache_dep::prefix(), include_str!("../f.txt")); }"#,
+    )
+    .unwrap();
+    let mut heads = Vec::new();
+    for name in ["base", "first", "second"] {
+        std::fs::write(seed.join("f.txt"), name).unwrap();
+        git(&seed, &["add", "."]);
+        git(&seed, &["commit", "-qm", name]);
+        heads.push(git(&seed, &["rev-parse", "HEAD"]));
+    }
+    git(&seed, &["push", "-q", "origin", "main"]);
+
+    let sync = r.root.join("sync");
+    std::fs::create_dir(&sync).unwrap();
+    let recipe = format!(
+        r#"
+repo = "demo"
+env = {{ CARGO_HOME = {:?}, SYNC = {:?} }}
+[[step]]
+name = "compile"
+run = 'test ! -e "$CARGO_TARGET_DIR/debug/probe" && cargo build -v --color never'
+memcap_gb = 4
+[[step]]
+name = "test"
+run = '''
+head=$(cat f.txt)
+if [ "$head" != base ]; then
+    touch "$SYNC/$head"
+    while [ ! -e "$SYNC/first" ] || [ ! -e "$SYNC/second" ]; do sleep 0.1; done
+fi
+test "$("$CARGO_TARGET_DIR/debug/probe")" = "head=$head"
+'''
+time = "30s"
+"#,
+        r.root.join("cargo-home"),
+        sync
+    );
+    store::recipe_put(&r.bus, &recipe, None).await.unwrap();
+    let submit = |head: &str| r.job(&hgl_ai_proto::build::new_build_id(), head);
+    let base = submit(&heads[0]);
+    r.send(&base).await;
+    let receipt = r.receipt(&base.id).await;
+    assert_eq!(receipt.status, BuildStatus::Pass, "{receipt:?}");
+
+    let first = submit(&heads[1]);
+    let second = submit(&heads[2]);
+    r.send(&first).await;
+    r.send(&second).await;
+    let mut warm = 0;
+    for job in [first, second] {
+        let receipt = r.receipt(&job.id).await;
+        assert_eq!(receipt.status, BuildStatus::Pass, "{receipt:?}");
+        let log = std::fs::read_to_string(Path::new(&receipt.log_dir).join("compile.log")).unwrap();
+        warm += usize::from(log.contains("Fresh cache-dep"));
+    }
+    assert_eq!(warm, 1, "one build reused the base build's dependency");
+    let jobs = r.root.join("work/builder/jobs");
+    assert_eq!(std::fs::read_dir(jobs).unwrap().count(), 0);
+    r.stop().await;
 }
 
 /// A gate build of `head` merged onto `main` for pull request 7.

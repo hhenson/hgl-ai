@@ -2,6 +2,7 @@
 //! executors (this host, or a remote over ssh driven by a proxy builder), the build
 //! driver, and the builder service that takes `build` jobs from the bus.
 
+mod cache;
 pub mod driver;
 pub mod exec;
 pub mod lock;

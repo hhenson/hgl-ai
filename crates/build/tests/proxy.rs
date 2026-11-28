@@ -510,7 +510,13 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
     let bus = Arc::new(Bus::connect_url(&n.2, Some(n.3.clone())).await.unwrap());
     bus.provision().await.unwrap();
     let w = World::new();
-    let recipe = "repo = \"demo\"\n[[step]]\nname = \"build\"\nrun = \"test -f main.c && sleep ${HOLD:-0}\"\ntime = \"2m\"\n";
+    let recipe = r#"
+repo = "demo"
+[[step]]
+name = "build"
+run = 'test -f main.c && mkdir -p "$CARGO_BUILD_BUILD_DIR" && echo warm > "$CARGO_BUILD_BUILD_DIR/marker"'
+time = "2m"
+"#;
     store::recipe_put(&bus, recipe, None).await.unwrap();
 
     let mut cfg = hgl_ai_config::Config::new("lab1");
@@ -634,9 +640,27 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         "the remote job directory is gone: {:?}",
         w.jobs()
     );
+    let cache = w.remote.join("cargo-cache/windows");
+    let slot = std::fs::read_dir(&cache).unwrap().next().unwrap().unwrap();
+    assert_eq!(
+        std::fs::read_to_string(slot.path().join("marker")).unwrap(),
+        "warm\n"
+    );
 
     // A drop during the step: retried once on reconnect, not a failure.
-    let hold = "repo = \"demo\"\nenv = { HOLD = \"3\" }\n[[step]]\nname = \"build\"\nrun = \"test -f main.c && sleep ${HOLD:-0}\"\ntime = \"2m\"\n";
+    let hold = r#"
+repo = "demo"
+[[step]]
+name = "build"
+run = '''
+test -f main.c || exit 1
+if [ -n "${CARGO_BUILD_BUILD_DIR:-}" ]; then
+    test -f "$CARGO_BUILD_BUILD_DIR/marker" || exit 1
+fi
+sleep 3
+'''
+time = "2m"
+"#;
     store::recipe_put(&bus, hold, None).await.unwrap();
     let (note, reply) = job("20261127-090000-bbbbbb", &w.head);
     bus.send(&note).await.unwrap();
@@ -674,6 +698,7 @@ async fn proxy_builder_holds_jobs_while_unreachable_retries_a_drop_and_cleans_up
         "retried after the reconnect: {s:?}"
     );
     assert!(w.jobs().is_empty(), "{:?}", w.jobs());
+    assert_eq!(std::fs::read_dir(cache).unwrap().count(), 0);
     // The retry checked out in a directory of its own, which no stale cleanup of the
     // first attempt can remove (Carbon's second review of #12, finding 5).
     let log = std::fs::read_to_string(w.state.join("log")).unwrap();

@@ -198,6 +198,11 @@ pub trait Executor: Send + Sync {
     fn cleanup(&self, ws: &Workspace) -> Result<(), HostError>;
     /// Remove every job directory left by an earlier run of this builder.
     fn clean_all(&self) -> Result<(), HostError>;
+    /// Absolute directory for a slot's Cargo intermediates on this executor's host.
+    fn cargo_cache_path(&self, slot: &str) -> String;
+    /// Size of a slot in bytes, or zero when Cargo did not create it.
+    fn cargo_cache_size(&self, path: &str) -> Result<u64, HostError>;
+    fn remove_cargo_cache(&self, path: &str) -> Result<(), HostError>;
     fn probe(&self, tools: &[String]) -> Result<Probe, HostError>;
     /// An interactive shell in the checkout, with the build's environment.
     fn shell(&self, ws: &Workspace, env: &[(String, String)]) -> std::io::Result<i32>;

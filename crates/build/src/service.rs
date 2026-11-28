@@ -17,6 +17,7 @@ use hgl_ai_proto::build::{
 use hgl_ai_proto::{Kind, Seat, utc_now_stamp};
 use tokio::sync::{Notify, watch};
 
+use crate::cache::{Cache, Lease};
 use crate::driver::{self, Meta, Options};
 use crate::exec::{Cancel, Checkout, Executor, Prep, Probe, Workspace, ssh};
 use crate::store;
@@ -82,11 +83,12 @@ pub struct Lane {
     gate: Mutex<Gate>,
     probe: Mutex<Probe>,
     /// Workspaces whose cleanup waits for the remote to come back.
-    stale: Mutex<Vec<Workspace>>,
+    stale: Mutex<Vec<(Workspace, Option<Lease>)>>,
     /// One stale cleanup pass at a time.
     stale_pass: tokio::sync::Mutex<()>,
     /// Job directories of builds running now; no cleanup touches them.
     live: Mutex<std::collections::BTreeSet<String>>,
+    cargo_cache: Option<Arc<Cache>>,
     /// This host's id (`<data_dir>/host-id`), in the lease's holder.
     pub host_id: String,
 }
@@ -115,12 +117,19 @@ impl Lane {
             stale: Mutex::new(Vec::new()),
             stale_pass: tokio::sync::Mutex::new(()),
             live: Mutex::new(std::collections::BTreeSet::new()),
+            cargo_cache: None,
             host_id: String::new(),
         }
     }
 
     pub fn with_host_id(mut self, id: String) -> Lane {
         self.host_id = id;
+        self
+    }
+
+    fn with_cargo_cache(mut self, index_root: &std::path::Path, gib: u32) -> Lane {
+        let key = format!("{}.{}", self.label, self.exec.platform());
+        self.cargo_cache = Some(Arc::new(Cache::new(index_root, key, gib)));
         self
     }
 
@@ -395,8 +404,16 @@ async fn lane_loop(
                 let reachable = lane.reachable();
                 if reachable && !lane.cleaned.load(Ordering::SeqCst) {
                     // Leftovers of an earlier run of this builder, before any job is taken.
-                    let ex = lane.exec.clone();
-                    match blocking(move || ex.clean_all()).await {
+                    let l = lane.clone();
+                    match blocking(move || -> Result<(), crate::exec::HostError> {
+                        l.exec.clean_all()?;
+                        if let Some(cache) = &l.cargo_cache {
+                            cache.prune(l.exec.as_ref());
+                        }
+                        Ok(())
+                    })
+                    .await
+                    {
                         Ok(()) => lane.cleaned.store(true, Ordering::SeqCst),
                         Err(e) => {
                             tracing::warn!(builder = %lane.label, "startup cleanup: {e:?}; no job is taken until it is done")
@@ -638,9 +655,8 @@ async fn read_gate(bus: &Bus, label: &str) -> Gate {
 /// heartbeat and a retrying job both call this), never one a job is using.
 async fn retry_stale(lane: &Arc<Lane>) {
     let _one = lane.stale_pass.lock().await;
-    let stale: Vec<Workspace> =
-        std::mem::take(&mut *lane.stale.lock().unwrap_or_else(|e| e.into_inner()));
-    for ws in stale {
+    let stale = std::mem::take(&mut *lane.stale.lock().unwrap_or_else(|e| e.into_inner()));
+    for (ws, lease) in stale {
         let live = ws.job.as_ref().is_some_and(|j| {
             lane.live
                 .lock()
@@ -652,11 +668,21 @@ async fn retry_stale(lane: &Arc<Lane>) {
         }
         let ex = lane.exec.clone();
         let w = ws.clone();
-        if blocking(move || ex.cleanup(&w)).await.is_err() {
+        let lease = blocking(move || {
+            if ex.cleanup(&w).is_err() {
+                return Err(lease);
+            }
+            if let Some(lease) = lease {
+                lease.finish(ex.as_ref(), false);
+            }
+            Ok(())
+        })
+        .await;
+        if let Err(lease) = lease {
             lane.stale
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(ws);
+                .push((ws, lease));
         }
     }
 }
@@ -748,7 +774,30 @@ async fn run_job(
             c.id = format!("{}-r1", job.id);
         }
         let ex = lane.exec.clone();
-        let ws = match blocking(move || ex.prepare(&c)).await {
+        let cache = lane.cargo_cache.clone().filter(|_| !retried);
+        let (prepared, lease) = blocking(move || {
+            let lease = cache.and_then(|cache| match cache.reserve(&c.repo, ex.as_ref()) {
+                Ok(lease) => lease,
+                Err(e) => {
+                    tracing::warn!("reserving the Cargo cache for {}: {e}", c.repo);
+                    None
+                }
+            });
+            if let Some(lease) = &lease {
+                c.id = lease.checkout_id();
+            }
+            match ex.prepare(&c) {
+                Ok(ws) => (Ok(ws), lease),
+                Err(e) => {
+                    if let Some(lease) = lease {
+                        lease.finish(ex.as_ref(), false);
+                    }
+                    (Err(e), None)
+                }
+            }
+        })
+        .await;
+        let ws = match prepared {
             Ok(ws) => {
                 if let Some(j) = &ws.job {
                     lane.live
@@ -811,10 +860,14 @@ async fn run_job(
                 }
             }
         }
+        let mut env = driver::build_env(&job.id, &ws);
+        if let Some(lease) = &lease {
+            env.push(("CARGO_BUILD_BUILD_DIR".into(), lease.path.clone()));
+        }
         let opts = Options {
             only: job.steps.clone(),
             keep_going: job.keep_going,
-            env: driver::build_env(&job.id, &ws),
+            env,
             log_dir: log_dir.clone(),
         };
         let (ex, w, recipe, m, c) = (
@@ -839,12 +892,23 @@ async fn run_job(
                 .remove(j);
         }
         let (ex, w) = (lane.exec.clone(), ws.clone());
-        if let Err(e) = blocking(move || ex.cleanup(&w)).await {
+        let keep = !driven.unreachable && driven.summary.status == BuildStatus::Pass;
+        if let Err((e, lease)) = blocking(move || {
+            if let Err(e) = ex.cleanup(&w) {
+                return Err((e, lease));
+            }
+            if let Some(lease) = lease {
+                lease.finish(ex.as_ref(), keep);
+            }
+            Ok(())
+        })
+        .await
+        {
             tracing::warn!(builder = %lane.label, "cleaning up {}: {e:?}; retrying when the remote answers", job.id);
             lane.stale
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .push(ws);
+                .push((ws, lease));
         }
         if driven.unreachable {
             if retried {
@@ -1063,10 +1127,12 @@ pub fn lanes(
 ) -> Result<Vec<Arc<Lane>>, ServiceError> {
     use hgl_ai_proto::build::builder_inbox;
     let err = |e: &dyn std::fmt::Display| ServiceError::Other(e.to_string());
-    let work_root = cfg.work_root().map_err(|e| err(&e))?;
+    let work_root =
+        std::path::absolute(cfg.work_root().map_err(|e| err(&e))?).map_err(|e| err(&e))?;
     let data_dir = cfg.data_dir().map_err(|e| err(&e))?;
     let root = work_root.join("builder");
     let logs = root.join("logs");
+    let cache_index = root.join("cargo-cache-index");
     let host_id = hgl_ai_bridge::holder::host_id(&data_dir);
     let mut out = Vec::new();
     if cfg.builder.local {
@@ -1083,7 +1149,8 @@ pub fn lanes(
                 cfg.builder.concurrency,
                 logs.join(&cfg.host),
             )
-            .with_host_id(host_id.clone()),
+            .with_host_id(host_id.clone())
+            .with_cargo_cache(&cache_index, cfg.builder.cargo_cache_gib),
         ));
     }
     for r in &cfg.builder.remote {
@@ -1115,7 +1182,8 @@ pub fn lanes(
                 logs.join(&label),
             )
             .remote(&cfg.host, conn, kick)
-            .with_host_id(host_id.clone()),
+            .with_host_id(host_id.clone())
+            .with_cargo_cache(&cache_index, r.cargo_cache_gib),
         ));
     }
     if out.is_empty() {
