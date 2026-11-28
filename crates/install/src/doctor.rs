@@ -691,9 +691,17 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         ));
     }
 
+    let no_seats = cfg.as_ref().is_some_and(|c| c.seats.is_empty());
+    let builder_only = cfg
+        .as_ref()
+        .is_some_and(|c| c.seats.is_empty() && c.server.is_none() && client_user.is_none());
     if let Some(c) = cfg.as_ref().filter(|_| client_user.is_none()) {
-        let tp = env.expand(&c.hub.token_file);
-        let shown = &c.hub.token_file;
+        let shown = if builder_only {
+            c.builder.credential.as_ref().unwrap_or(&c.hub.token_file)
+        } else {
+            &c.hub.token_file
+        };
+        let tp = env.expand(shown);
         let cred = token::read_credential(sys, &tp);
         let what = match &cred {
             Ok(Some(c)) => c.describe(),
@@ -747,7 +755,9 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                 },
             )
         });
-        out.push(match hub.health(c).await {
+        let mut health_cfg = c.clone();
+        health_cfg.hub.token_file = env.expand(shown).display().to_string();
+        out.push(match hub.health(&health_cfg).await {
             Err(e) => Check::fail(
                 "hub",
                 format!("unreachable at {}: {e}", c.hub.url),
@@ -769,18 +779,6 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             .as_ref()
             .is_some_and(|s| s.units == hgl_ai_config::Units::System)
     });
-    // A configuration with no seats has no agent-side services or tools.
-    let no_seats = cfg.as_ref().is_some_and(|c| c.seats.is_empty());
-    let builder_only = no_seats
-        && sys
-            .read_to_string(&env.config_path)
-            .ok()
-            .and_then(|text| {
-                text.parse::<toml::Value>()
-                    .ok()
-                    .map(|v| v.get("builder").is_some())
-            })
-            .unwrap_or(false);
     let no_client = server_side || client_user.is_some() || no_seats;
     let path = client_path(sys);
     let clis: Vec<(Runtime, std::path::PathBuf)> = if no_client {
@@ -862,16 +860,51 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
         for (s, install) in svcs {
             let name = format!("service {}", s.short());
             if s == Service::Builder
-                && let Some(user) = c
-                    .builder
-                    .user
-                    .as_deref()
-                    .filter(|u| Some(*u) != me.as_deref())
+                && let Some(user) = c.builder.user.as_deref()
             {
-                let system_state = service::system_state(sys, s);
-                if system_state == State::NotInstalled {
+                // Query the system manager once, including its configured service user.
+                let result = match env.os {
+                    crate::Os::Linux => sys
+                        .query(
+                            &Cmd::new("systemctl")
+                                .args([
+                                    "--no-ask-password",
+                                    "show",
+                                    "-p",
+                                    "LoadState,ActiveState,User",
+                                    &s.unit(),
+                                ])
+                                .timeout(PROBE),
+                        )
+                        .ok()
+                        .filter(|o| o.ok()),
+                    crate::Os::MacOs => None,
+                };
+                if let Some(o) = &result
+                    && o.stdout.lines().any(|l| l.trim() == "LoadState=loaded")
+                {
+                    let matches_user = o.stdout.lines().any(|l| l.trim() == format!("User={user}"));
+                    let active = o.stdout.lines().any(|l| l.trim() == "ActiveState=active");
+                    out.push(if !matches_user {
+                        Check::fail(
+                            name,
+                            format!("system service user does not match {user}"),
+                            "correct the system service User",
+                        )
+                    } else if active {
+                        Check::ok(name, format!("running (system, user {user})"))
+                    } else {
+                        Check::fail(
+                            name,
+                            format!("not running (system, user {user})"),
+                            format!("check the builder service as {user}"),
+                        )
+                    });
+                    continue;
+                }
+                if Some(user) != me.as_deref() {
                     let uid = sys
-                        .query(&Cmd::new("id").args(["-u", user]))
+                        .query(&Cmd::new("id").args(["-u", user]).timeout(PROBE))
                         .ok()
                         .filter(|o| o.ok())
                         .map(|o| o.stdout.trim().to_string());
@@ -881,6 +914,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                                 "--user",
                                 "--machine",
                                 &format!("{user}@"),
+                                "--no-ask-password",
                                 "show",
                                 "-p",
                                 "LoadState,ActiveState",
@@ -889,7 +923,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
                             crate::Os::MacOs => Cmd::new("launchctl")
                                 .args(["print", &format!("gui/{uid}/{}", s.label())]),
                         };
-                        sys.query(&cmd).ok().filter(|o| o.ok())
+                        sys.query(&cmd.timeout(PROBE)).ok().filter(|o| o.ok())
                     });
                     out.push(match result {
                         Some(o)
@@ -921,6 +955,7 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             };
             let use_system = system(s)
                 || (s == Service::Builder
+                    && c.builder.user.is_none()
                     && local == State::NotInstalled
                     && service::system_state(sys, s) != State::NotInstalled);
             let st = if use_system {
@@ -1066,11 +1101,15 @@ pub async fn run(sys: &dyn System, hub: &impl Hub) -> Vec<Check> {
             .ok()
             .filter(|o| o.ok())
             .and_then(|o| o.stdout.trim().parse::<u32>().ok());
-        out.push(match (sys.mode(&path), sys.owner_uid(&path), uid) {
-            (Ok(mode), Ok(owner), Some(me)) if mode == 0o600 && owner == me => Check::ok(
-                "builder credential",
-                format!("{credential} (mode 600, own)"),
-            ),
+        out.push(match (std::fs::symlink_metadata(&path), uid) {
+            (Ok(meta), Some(me))
+                if meta.is_file() && meta.mode() & 0o7777 == 0o600 && meta.uid() == me =>
+            {
+                Check::ok(
+                    "builder credential",
+                    format!("{credential} (mode 600, own)"),
+                )
+            }
             _ => Check::fail(
                 "builder credential",
                 format!("{credential} must be owned by this user with mode 600"),
@@ -1281,7 +1320,13 @@ mod tests {
             std::fs::Permissions::from_mode(0o600),
         )
         .unwrap();
-        let cs = run(&f, &FakeHub::up()).await;
+        let hub = FakeHub::up();
+        let cs = run(&f, &hub).await;
+        assert!(!any_fail(&cs), "{cs:?}");
+        assert_eq!(
+            hub.creds.borrow()[0],
+            f.env.home.join("builder.cred").display().to_string()
+        );
         for name in ["service bridge", "cli codex", "skill codex", "tmux", "gh"] {
             assert!(!cs.iter().any(|c| c.name == name), "unexpected {name}");
         }
@@ -1292,6 +1337,55 @@ mod tests {
         assert!(
             cs.iter()
                 .any(|c| c.name == "service builder" && c.level == Level::Ok)
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_classification_uses_config_and_checks_regular_credential() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = Config::new("build-1");
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        assert!(
+            !std::fs::read_to_string(&f.env.config_path)
+                .unwrap()
+                .contains("[builder]")
+        );
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(!cs.iter().any(|c| c.name == "gh"));
+        cfg.server = Some(hgl_ai_config::Server::default());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(cs.iter().any(|c| c.name == "gh"));
+        cfg.server = None;
+        cfg.builder.credential = Some("~/builder.cred".into());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        let uid = std::fs::metadata(&f.env.home).unwrap().uid();
+        f.on(move |c| {
+            if c.program == "id" {
+                Output::success(format!("{uid}\n"))
+            } else {
+                Output::success("")
+            }
+        });
+        let target = f.env.home.join("real.cred");
+        let credential = f.env.home.join("builder.cred");
+        std::fs::write(&target, "token").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o600)).unwrap();
+        symlink(&target, &credential).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(
+            cs.iter()
+                .any(|c| c.name == "builder credential" && c.level == Level::Fail)
+        );
+        std::fs::remove_file(&credential).unwrap();
+        std::fs::rename(&target, &credential).unwrap();
+        std::fs::set_permissions(&credential, std::fs::Permissions::from_mode(0o4600)).unwrap();
+        let cs = run(&f, &FakeHub::up()).await;
+        assert!(
+            cs.iter()
+                .any(|c| c.name == "builder credential" && c.level == Level::Fail)
         );
     }
 
@@ -1317,6 +1411,68 @@ mod tests {
         assert!(cs.iter().any(|c| c.name == "service builder"
             && c.level == Level::Ok
             && c.detail.contains("user builder")));
+    }
+
+    #[tokio::test]
+    async fn configured_builder_prefers_system_and_checks_user() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.builder.user = Some("builder".into());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        for (state, user, expected) in [
+            ("active", "builder", Level::Ok),
+            ("active", "other", Level::Fail),
+            ("inactive", "builder", Level::Fail),
+        ] {
+            let output = format!("LoadState=loaded\nActiveState={state}\nUser={user}\n");
+            f.on(move |c| {
+                if c.program == "systemctl"
+                    && c.args.iter().any(|a| a == "LoadState,ActiveState,User")
+                {
+                    assert!(c.args.iter().any(|a| a == "--no-ask-password"));
+                    assert_eq!(c.timeout, Some(PROBE));
+                    Output::success(&output)
+                } else {
+                    Output::success("")
+                }
+            });
+            let cs = run(&f, &FakeHub::up()).await;
+            assert!(
+                cs.iter()
+                    .any(|c| c.name == "service builder" && c.level == expected),
+                "{cs:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn unreachable_other_user_manager_warns_and_stopped_fails() {
+        let d = tempfile::tempdir().unwrap();
+        let f = healthy(d.path());
+        let mut cfg = crate::load_config(&f, &f.env).unwrap().unwrap();
+        cfg.builder.user = Some("builder".into());
+        crate::save_config(&f, &f.env, &cfg).unwrap();
+        for (reachable, expected) in [(false, Level::Warn), (true, Level::Fail)] {
+            f.on(
+                move |c| match (c.program.as_str(), c.args.first().map(String::as_str)) {
+                    ("id", Some("-un")) => Output::success("agents\n"),
+                    ("id", _) => Output::success("1001\n"),
+                    ("systemctl", Some("--user")) if reachable => {
+                        Output::success("LoadState=loaded\nActiveState=inactive\n")
+                    }
+                    ("systemctl", Some("--user")) => Output::failure(1, "unreachable"),
+                    ("systemctl", _) => Output::success("LoadState=not-found\n"),
+                    _ => Output::success(""),
+                },
+            );
+            let cs = run(&f, &FakeHub::up()).await;
+            assert!(
+                cs.iter()
+                    .any(|c| c.name == "service builder" && c.level == expected),
+                "{cs:?}"
+            );
+        }
     }
 
     #[tokio::test]

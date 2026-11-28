@@ -62,7 +62,9 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ClientOpts) -> Result
     let created = existing.is_none();
     let mut cfg = existing.unwrap_or_else(|| Config::new(o.host.clone()));
     cfg.host = o.host.clone();
-    cfg.builder.user = o.builder_user.clone();
+    if let Some(user) = &o.builder_user {
+        cfg.builder.user = Some(user.clone());
+    }
     cfg.hub.url = o.hub.clone();
     let token_dst = env.client_token_path();
     cfg.hub.token_file = env.contract(&token_dst);
@@ -137,10 +139,10 @@ pub async fn install(sys: &dyn System, hub: &impl Hub, o: &ClientOpts) -> Result
     let data_dir = env.expand(&cfg.paths.data_dir);
     service::install(sys, &Spec::hgl_ai(Service::Bridge, sys, &data_dir))?;
     done(sys, "service: bridge started");
-    if let Some(user) = &o.builder_user {
+    if let Some(user) = &cfg.builder.user {
         sys.say(&format!("builder: install and start the service separately as {user}; remove any old client-user builder service"));
     }
-    if o.builder && o.builder_user.is_none() {
+    if o.builder && cfg.builder.user.is_none() {
         service::install(sys, &Spec::hgl_ai(Service::Builder, sys, &data_dir))?;
         done(sys, "service: builder started");
     }
@@ -253,6 +255,8 @@ mod tests {
         );
         assert!(!service::unit_path(&f.env, Service::Builder).exists());
         assert!(service::unit_path(&f.env, Service::Bridge).exists());
+        let checks = crate::doctor::run(&f, &FakeHub::up()).await;
+        assert!(!checks.iter().any(|c| c.name == "gh"));
     }
 
     #[tokio::test]
@@ -321,6 +325,7 @@ mod tests {
         let f = fake(d.path());
         let mut cfg = Config::new("old");
         cfg.limits.memcap_gb = 128;
+        cfg.builder.user = Some("builder".into());
         cfg.server = Some(hgl_ai_config::Server::default());
         crate::save_config(&f, &f.env, &cfg).unwrap();
         let o = ClientOpts {
@@ -338,6 +343,13 @@ mod tests {
             ("build-1", 128, "~/w")
         );
         assert!(c.server.is_some(), "the hub's section survives");
+        assert_eq!(c.builder.user.as_deref(), Some("builder"));
+        assert!(
+            !f.env
+                .home
+                .join(".config/systemd/user/hgl-ai-builder.service")
+                .exists()
+        );
     }
 
     #[tokio::test]
