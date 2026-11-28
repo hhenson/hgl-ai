@@ -349,7 +349,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
         });
     }
     // Reads everyone needs: stream and bucket lookups, direct gets, consumer state,
-    // flow control of the ordered consumers that list a bucket's keys.
+    // and flow control for older clients' ordered consumers.
     let mut allow: Vec<String> = [
         "$JS.API.INFO",
         "$JS.API.STREAM.INFO.*",
@@ -374,6 +374,9 @@ pub fn permissions(role: Role) -> Option<Permissions> {
     }
     for s in &streams {
         allow.extend(consumers_on(s));
+    }
+    for b in buckets {
+        allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{}.*", kv(b)));
     }
     // `doctor` lists the consumers on the telemetry streams (durables the viewer made).
     allow.extend(VIEWER_BUCKETS.map(|b| format!("$JS.API.CONSUMER.LIST.{}", kv(b))));
@@ -405,8 +408,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
             // The local build verdicts the merge gate reads: only a builder's user writes
             // them, from the builds it ran (BUILD-15); a seat's is refused (hgl-ai#16).
             let verdicts = format!("$KV.{KV_STATE}.{VERDICT_PREFIX}>");
-            // Read `HGL_OWNER` (`status list`) through short-lived consumers, which take no
-            // acknowledgement; the console's durable feed stays the console's.
+            // Legacy clients still read `HGL_OWNER` through short-lived consumers.
             allow.push(format!("$JS.API.CONSUMER.CREATE.{STREAM_OWNER}"));
             allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{STREAM_OWNER}.*"));
             deny.extend(owner);
@@ -451,6 +453,7 @@ pub fn permissions(role: Role) -> Option<Permissions> {
                 format!("$KV.{KV_THREADS}.>"),
             ]);
             allow.extend(pull_from(STREAM_OWNER));
+            allow.push(format!("$JS.API.CONSUMER.MSG.NEXT.{}.*", kv(KV_CONSOLE)));
             allow.push(format!("$KV.{KV_STATE}.decisions.log"));
             allow.push(format!("$KV.{KV_CONSOLE}.>"));
         }

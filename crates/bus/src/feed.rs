@@ -3,12 +3,15 @@
 //! `HGL_THREADS` and `HGL_METRICS` buckets. The meaning of the events is the `owner`
 //! crate's; this module moves bytes.
 
-use std::time::Duration;
+use std::{collections::BTreeMap, time::Duration};
 
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, pull};
 use async_nats::jetstream::{
-    self, AckKind,
+    self, AckKind, ErrorCode,
     context::{Publish, PublishErrorKind},
+    message::StreamMessage,
+    response::Response,
+    stream::{DirectGetErrorKind, RawMessage, RawMessageErrorKind, Stream},
 };
 use futures::StreamExt;
 use hgl_ai_proto::{
@@ -19,8 +22,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use crate::{
-    Bus, BusError, MAX_NOTE_BYTES, Result, SendReceipt, check_kv_key, list_json, live_entry,
-    missing, nats, publish_error, put_json,
+    Bus, BusError, HUB_API_PREFIX, MAX_NOTE_BYTES, Result, SendReceipt, check_kv_key, keys,
+    kv_read, list_json, live_entry, missing, nats, publish_error, put_json,
 };
 
 /// One message of a stream, as a feed or a history read returns it.
@@ -83,6 +86,19 @@ fn to_msg(m: jetstream::Message, keep: bool) -> Result<StreamMsg> {
     })
 }
 
+fn raw_msg(m: StreamMessage) -> StreamMsg {
+    StreamMsg {
+        seq: m.sequence,
+        subject: m.subject.to_string(),
+        time: chrono::DateTime::from_timestamp(m.time.unix_timestamp(), m.time.nanosecond())
+            .unwrap_or(chrono::DateTime::UNIX_EPOCH),
+        payload: m.payload.to_vec(),
+        handle: None,
+    }
+}
+
+const OWNER_GET: &str = "STREAM.MSG.GET.HGL_OWNER";
+
 /// A durable consumer of `HGL_OWNER` (the console's): every event once, in order, one
 /// in flight at a time.
 pub struct Feed {
@@ -118,25 +134,85 @@ impl Bus {
             .get_stream_no_info(STREAM_OWNER)
             .await
             .map_err(|e| nats("opening the owner stream", e))?;
-        let message = self
-            .guarded(&format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"), async {
-                stream
-                    .get_raw_message(seq)
-                    .await
-                    .map_err(|e| nats("reading an owner event", e))
+        self.owner_raw(&stream, seq, None)
+            .await?
+            .map(raw_msg)
+            .ok_or_else(|| {
+                nats(
+                    "reading an owner event",
+                    format!("no message at sequence {seq}"),
+                )
             })
-            .await?;
-        Ok(StreamMsg {
-            seq,
-            subject: message.subject.to_string(),
-            time: chrono::DateTime::from_timestamp(
-                message.time.unix_timestamp(),
-                message.time.nanosecond(),
-            )
-            .unwrap_or(chrono::DateTime::UNIX_EPOCH),
-            payload: message.payload.to_vec(),
-            handle: None,
+    }
+
+    async fn owner_raw<I>(
+        &self,
+        stream: &Stream<I>,
+        seq: u64,
+        filter: Option<&str>,
+    ) -> Result<Option<StreamMessage>> {
+        self.guarded(&self.api_subject(OWNER_GET), async {
+            let message = match filter {
+                Some(filter) => stream.get_first_raw_message_by_subject(filter, seq).await,
+                None => stream.get_raw_message(seq).await,
+            };
+            match message {
+                Ok(m) => Ok(Some(m)),
+                Err(e) if e.kind() == RawMessageErrorKind::NoMessageFound => Ok(None),
+                Err(e) => Err(nats(&format!("reading owner event {seq}"), e)),
+            }
         })
+        .await
+    }
+
+    /// The first match at or after `since`. Older JetStream servers accept the
+    /// subject and sequence form, so the caller can apply the time cutoff there.
+    async fn first_owner_match(
+        &self,
+        stream: &Stream,
+        filter: &str,
+        since: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Option<StreamMessage>> {
+        let state = &stream.cached_info().state;
+        if (since.timestamp(), since.timestamp_subsec_nanos())
+            > (
+                state.first_timestamp.unix_timestamp(),
+                state.first_timestamp.nanosecond(),
+            )
+        {
+            #[derive(serde::Deserialize)]
+            struct Reply {
+                message: RawMessage,
+            }
+            let request = serde_json::json!({
+                "start_time": since.to_rfc3339(),
+                "next_by_subj": filter,
+            });
+            let response: Response<Reply> = self
+                .guarded(&self.api_subject(OWNER_GET), async {
+                    self.js
+                        .request(OWNER_GET, &request)
+                        .await
+                        .map_err(|e| nats("finding owner history by time", e))
+                })
+                .await?;
+            match response {
+                Response::Ok(reply) => {
+                    return StreamMessage::try_from(reply.message)
+                        .map(Some)
+                        .map_err(|e| nats("decoding an owner event", e));
+                }
+                Response::Err { error } if error.error_code() == ErrorCode::NO_MESSAGE_FOUND => {
+                    return Ok(None);
+                }
+                Response::Err { error } if error.error_code() == ErrorCode::INVALID_JSON => {}
+                Response::Err { error } => {
+                    return Err(nats("finding owner history by time", error));
+                }
+            }
+        }
+        self.owner_raw(stream, state.first_sequence, Some(filter))
+            .await
     }
 
     /// Publish one owner-channel event to `subject` (under `hgl.owner.` or `hgl.console.`)
@@ -238,7 +314,7 @@ impl Bus {
     }
 
     /// The messages of `stream` on `filter` stored since `since`, oldest first, at most
-    /// `max` (the newest `max` when there are more). A short-lived consumer, acked by none.
+    /// `max` (the newest `max` when there are more). Nothing is acknowledged.
     pub async fn history(
         &self,
         stream: &str,
@@ -258,11 +334,17 @@ impl Bus {
         since: chrono::DateTime<chrono::Utc>,
         max: usize,
     ) -> Result<Vec<StreamMsg>> {
+        if max == 0 {
+            return Ok(Vec::new());
+        }
         let s = self
             .js
             .get_stream(stream)
             .await
             .map_err(|e| missing(&format!("stream {stream}"), e))?;
+        if stream == STREAM_OWNER {
+            return self.owner_history(&s, &filters, since, max).await;
+        }
         let start = time::OffsetDateTime::from_unix_timestamp(since.timestamp())
             .unwrap_or(time::OffsetDateTime::UNIX_EPOCH);
         let mut config = pull::Config {
@@ -307,6 +389,48 @@ impl Bus {
         Ok(out.into())
     }
 
+    async fn owner_history(
+        &self,
+        stream: &Stream,
+        filters: &[String],
+        since: chrono::DateTime<chrono::Utc>,
+        max: usize,
+    ) -> Result<Vec<StreamMsg>> {
+        let state = &stream.cached_info().state;
+        if state.messages == 0 {
+            return Ok(Vec::new());
+        }
+        // JetStream jumps to matching subjects, skipping holes and unrelated payloads.
+        // Keep only the newest unique sequences from the snapshot, even if filters overlap.
+        let mut newest = BTreeMap::new();
+        let cutoff = (since.timestamp(), since.timestamp_subsec_nanos());
+        for filter in filters
+            .iter()
+            .map(String::as_str)
+            .chain(filters.is_empty().then_some(">"))
+        {
+            let filter = if filter.is_empty() { ">" } else { filter };
+            let mut next = self.first_owner_match(stream, filter, since).await?;
+            while let Some(message) = next {
+                let seq = message.sequence;
+                if seq > state.last_sequence {
+                    break;
+                }
+                if (message.time.unix_timestamp(), message.time.nanosecond()) >= cutoff {
+                    newest.insert(seq, message);
+                    if newest.len() > max {
+                        newest.pop_first();
+                    }
+                }
+                if seq == state.last_sequence {
+                    break;
+                }
+                next = self.owner_raw(stream, seq + 1, Some(filter)).await?;
+            }
+        }
+        Ok(newest.into_values().map(raw_msg).collect())
+    }
+
     /// One thread record and its revision.
     pub async fn thread_get<T: DeserializeOwned>(&self, id: &str) -> Result<Option<(T, u64)>> {
         let store = self.store(&self.threads, KV_THREADS).await?;
@@ -315,8 +439,35 @@ impl Bus {
 
     /// A Slack delivery record or reverse thread mapping, with its revision.
     pub async fn slack_get<T: DeserializeOwned>(&self, key: &str) -> Result<Option<(T, u64)>> {
+        if self.api_prefix == HUB_API_PREFIX && key.starts_with("links.") {
+            return self.slack_link(key).await;
+        }
         let store = self.store(&self.slack, KV_SLACK).await?;
         get_record(store, key).await
+    }
+
+    async fn slack_link<T: DeserializeOwned>(&self, key: &str) -> Result<Option<(T, u64)>> {
+        check_kv_key(key)?;
+        // The console can see link keys, but has no STREAM.INFO for the Slack bucket.
+        let stream_name = format!("KV_{KV_SLACK}");
+        let stream = self
+            .js
+            .get_stream_no_info(&stream_name)
+            .await
+            .map_err(|e| nats("opening the Slack link index", e))?;
+        let subject = format!("$KV.{KV_SLACK}.{key}");
+        let api = self.api_subject(&format!("DIRECT.GET.{stream_name}.{subject}"));
+        self.guarded(&api, async {
+            match stream.direct_get_last_for_subject(&subject).await {
+                Ok(m) if kv_read::is_put(Some(&m.headers)) => {
+                    decode_record(key, &m.payload, m.sequence).map(Some)
+                }
+                Ok(_) => Ok(None),
+                Err(e) if e.kind() == DirectGetErrorKind::NotFound => Ok(None),
+                Err(e) => Err(nats(&format!("reading {key}"), e)),
+            }
+        })
+        .await
     }
 
     /// Change a Slack delivery record or create a reverse thread mapping.
@@ -356,7 +507,7 @@ impl Bus {
             key: id.to_string(),
             expected: expected_revision,
         };
-        let subject = format!("$KV.{bucket}.{id}");
+        let subject = self.kv_subject(bucket, id);
         self.guarded(&subject, async {
             if expected_revision == 0 {
                 store
@@ -382,14 +533,14 @@ impl Bus {
     /// Every thread record, ordered by id.
     pub async fn threads<T: DeserializeOwned>(&self) -> Result<Vec<T>> {
         let store = self.store(&self.threads, KV_THREADS).await?;
-        list_json(store).await
+        list_json(self, store).await
     }
 
     /// Write `HGL_METRICS/<repo>.<date>` (the coordinator's daily sample).
     pub async fn metrics_put(&self, s: &MetricsSample) -> Result<()> {
         let store = self.store(&self.metrics, KV_METRICS).await?;
         self.guarded(
-            &format!("$KV.{KV_METRICS}.{}", s.key()),
+            &self.kv_subject(KV_METRICS, &s.key()),
             put_json(store, &s.key(), s),
         )
         .await
@@ -398,7 +549,7 @@ impl Bus {
     /// Write `HGL_CONSOLE/<key>` (the console's own state).
     pub async fn console_put<T: Serialize>(&self, key: &str, v: &T) -> Result<()> {
         let store = self.store(&self.console, KV_CONSOLE).await?;
-        self.guarded(&format!("$KV.{KV_CONSOLE}.{key}"), put_json(store, key, v))
+        self.guarded(&self.kv_subject(KV_CONSOLE, key), put_json(store, key, v))
             .await
     }
 
@@ -430,16 +581,7 @@ impl Bus {
         prefix: &str,
     ) -> Result<Vec<(String, T)>> {
         let store = self.store(&self.console, KV_CONSOLE).await?;
-        let mut keys = store.keys().await.map_err(|e| nats("listing keys", e))?;
-        let mut names = Vec::new();
-        while let Some(k) = keys.next().await {
-            let k = k.map_err(|e| nats("listing keys", e))?;
-            if k.starts_with(prefix) {
-                names.push(k);
-            }
-        }
-        names.sort();
-        names.dedup();
+        let names = keys(self, store, |key| key.starts_with(prefix)).await?;
         let mut out = Vec::new();
         for k in names {
             let Some(e) = live_entry(store, &k).await? else {
@@ -456,7 +598,7 @@ impl Bus {
     /// Every metrics sample, ordered by key (repository, then day).
     pub async fn metrics(&self) -> Result<Vec<MetricsSample>> {
         let store = self.store(&self.metrics, KV_METRICS).await?;
-        list_json(store).await
+        list_json(self, store).await
     }
 }
 
@@ -467,8 +609,12 @@ async fn get_record<T: DeserializeOwned>(
     check_kv_key(key)?;
     match live_entry(store, key).await? {
         None => Ok(None),
-        Some(entry) => serde_json::from_slice(&entry.value)
-            .map(|value| Some((value, entry.revision)))
-            .map_err(|error| BusError::Nats(format!("{key} is unreadable: {error}"))),
+        Some(entry) => decode_record(key, &entry.value, entry.revision).map(Some),
     }
+}
+
+fn decode_record<T: DeserializeOwned>(key: &str, value: &[u8], revision: u64) -> Result<(T, u64)> {
+    serde_json::from_slice(value)
+        .map(|value| (value, revision))
+        .map_err(|error| BusError::Nats(format!("{key} is unreadable: {error}")))
 }

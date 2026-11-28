@@ -1198,6 +1198,7 @@ async fn quota_refusal_naks_fails_over_and_tells_the_controller() {
         memcap_gb: 64,
         work_root_free_gb: 500,
         updated_at: hgl_ai_proto::utc_now_stamp(),
+        accounts_capable: false,
     });
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
@@ -2016,6 +2017,7 @@ async fn a_seat_another_hosts_bridge_serves_is_not_served() {
         memcap_gb: 64,
         work_root_free_gb: 500,
         updated_at: hgl_ai_proto::utc_now_stamp(),
+        accounts_capable: false,
     });
     let (tx, j) = h.start(&["w1"]);
     let n = h.bus.push(
@@ -2478,6 +2480,7 @@ async fn a_failover_that_breaks_role_9_is_not_taken() {
         memcap_gb: 64,
         work_root_free_gb: 500,
         updated_at: hgl_ai_proto::utc_now_stamp(),
+        accounts_capable: false,
     });
     let (tx, j) = h.start(&["w1"]);
     let a = h.bus.push(
@@ -2989,6 +2992,7 @@ async fn same_family_fallback_after_refusal_still_checks_reviewers() {
         memcap_gb: 64,
         work_root_free_gb: 500,
         updated_at: hgl_ai_proto::utc_now_stamp(),
+        accounts_capable: false,
     });
     let (tx, j) = h.start(&["w1"]);
     let seq = h.bus.push(
@@ -3043,6 +3047,7 @@ async fn recorded_authors_are_checked_for_failover() {
         memcap_gb: 64,
         work_root_free_gb: 500,
         updated_at: hgl_ai_proto::utc_now_stamp(),
+        accounts_capable: false,
     });
     let (tx, j) = h.start(&["w1"]);
     let seq = h.bus.push(

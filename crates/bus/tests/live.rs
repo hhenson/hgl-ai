@@ -1,28 +1,40 @@
-//! Live tests against a real `nats-server -js` started per test on a free
-//! loopback port with a token and a temporary store. Skipped, with the reason
-//! printed, when `nats-server` is not on `PATH`.
+//! Live tests against a real nats-server with a temporary store, on both account
+//! layouts and with a shared token. Skipped when nats-server is absent from PATH.
 
+use std::collections::BTreeMap;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use async_nats::jetstream;
-use hgl_ai_bus::{Bus, BusError, InboxOptions, ProvisionOptions};
+use futures::StreamExt;
+use hgl_ai_bus::{Bus, BusError, Credential, InboxOptions, ProvisionOptions, parse_credential};
+use hgl_ai_install::nats::{Auth, render_conf};
+use hgl_ai_install::users::{Registry, Role as HubRole};
 use hgl_ai_proto::{
-    Family, HostRecord, Kind, Note, Role, Runtime, Seat, SeatRecord, TaskKey, TreeRecord,
+    Family, HUB_API_PREFIX, HostRecord, KV_LOCKS, Kind, Note, Role, Runtime, SLACK_FEED,
+    SLACK_OWNER_FILTER, STREAM_OWNER, Seat, SeatRecord, TaskKey, TreeRecord,
 };
 
 struct Hub {
     child: Child,
     dir: tempfile::TempDir,
     url: String,
-    token: String,
+    credentials: BTreeMap<HubRole, String>,
+}
+
+#[derive(Clone, Copy)]
+enum Layout {
+    Token,
+    Users,
+    OldUsers,
+    Accounts,
 }
 
 impl Hub {
     /// Start a hub on a port it picks itself, or print why not and return `None`.
-    fn start() -> Option<Hub> {
+    fn start(layout: Layout) -> Option<Hub> {
         let Some(bin) = find_on_path("nats-server") else {
             eprintln!("skipped: nats-server is not on PATH");
             return None;
@@ -33,22 +45,57 @@ impl Hub {
             std::process::id(),
             dir.path().display().to_string().len()
         );
-        let child = Self::spawn(&bin, dir.path(), &token);
+        let mut registry = Registry::default();
+        let credentials = [
+            (HubRole::Admin, "admin"),
+            (HubRole::Seat, "agent"),
+            (HubRole::Coord, "coord"),
+            (HubRole::Builder, "builder"),
+            (HubRole::Console, "console"),
+            (HubRole::Slack, "slack"),
+        ]
+        .into_iter()
+        .map(|(role, user)| {
+            let credential = match layout {
+                Layout::Token => token.clone(),
+                _ => registry.issue(user, role, false).unwrap(),
+            };
+            (role, credential)
+        })
+        .collect();
+        let auth = match layout {
+            Layout::Token => Auth::Token(&token),
+            Layout::Users | Layout::OldUsers => Auth::Users(&registry),
+            Layout::Accounts => Auth::Accounts(&registry),
+        };
+        let store = dir.path().join("store");
+        std::fs::create_dir(&store).unwrap();
+        let mut conf = render_conf("127.0.0.1", 0, &store, &auth);
+        if matches!(layout, Layout::OldUsers) {
+            let grant = ", \"$JS.API.CONSUMER.MSG.NEXT.KV_";
+            while let Some(start) = conf.find(grant) {
+                let end = start + grant.len();
+                let end = end + conf[end..].find('"').unwrap() + 1;
+                conf.replace_range(start..end, "");
+            }
+        }
+        std::fs::write(dir.path().join("nats.conf"), conf).unwrap();
+        let child = Self::spawn(&bin, dir.path());
         let mut hub = Hub {
             child,
             dir,
             url: String::new(),
-            token,
+            credentials,
         };
         hub.wait_for_port();
         Some(hub)
     }
 
-    fn spawn(bin: &Path, dir: &Path, token: &str) -> Child {
+    fn spawn(bin: &Path, dir: &Path) -> Child {
         Command::new(bin)
-            .args(["-js", "-a", "127.0.0.1", "-p", "-1", "--auth", token])
-            .arg("-sd")
-            .arg(dir.join("store"))
+            .arg("-c")
+            .arg(dir.join("nats.conf"))
+            .args(["-p", "-1"])
             .arg("-l")
             .arg(dir.join("nats.log"))
             .arg("--ports_file_dir")
@@ -64,7 +111,7 @@ impl Hub {
         self.child.kill().expect("stop nats-server");
         self.child.wait().expect("reap nats-server");
         let bin = find_on_path("nats-server").expect("find nats-server for restart");
-        self.child = Self::spawn(&bin, self.dir.path(), &self.token);
+        self.child = Self::spawn(&bin, self.dir.path());
         self.wait_for_port();
     }
 
@@ -91,23 +138,42 @@ impl Hub {
     }
 
     async fn bus(&self) -> Bus {
-        Bus::connect_url(&self.url, Some(self.token.clone()))
+        self.as_role(HubRole::Seat).await
+    }
+
+    async fn as_role(&self, role: HubRole) -> Bus {
+        self.connect_at(&self.url, role).await
+    }
+
+    async fn connect_at(&self, url: &str, role: HubRole) -> Bus {
+        Bus::connect_with(url, parse_credential(&self.credentials[&role]).unwrap())
             .await
             .expect("connect")
     }
 
     async fn ready(&self) -> Bus {
-        let bus = self.bus().await;
-        bus.provision().await.expect("provision");
-        bus
+        self.as_role(HubRole::Admin)
+            .await
+            .provision()
+            .await
+            .expect("provision");
+        self.bus().await
     }
 
     async fn raw(&self) -> jetstream::Context {
-        let c = async_nats::ConnectOptions::with_token(self.token.clone())
-            .connect(&self.url)
-            .await
-            .expect("raw connect");
-        jetstream::new(c)
+        jetstream::new(self.admin_client().await)
+    }
+
+    async fn admin_client(&self) -> async_nats::Client {
+        let cred = parse_credential(&self.credentials[&HubRole::Admin])
+            .unwrap()
+            .unwrap();
+        let opts = match &cred {
+            Credential::Token(token) => async_nats::ConnectOptions::with_token(token.clone()),
+            Credential::Nkey { seed, .. } => async_nats::ConnectOptions::with_nkey(seed.clone())
+                .custom_inbox_prefix(cred.inbox_prefix().unwrap()),
+        };
+        opts.connect(&self.url).await.expect("raw connect")
     }
 }
 
@@ -135,9 +201,25 @@ fn note(from: &str, to: &str, body: &str) -> Note {
 const SHORT: Duration = Duration::from_millis(300);
 const LONG: Duration = Duration::from_secs(5);
 
-#[tokio::test]
-async fn provision_is_idempotent_and_corrects_settings() {
-    let Some(hub) = Hub::start() else { return };
+macro_rules! live_cases {
+    ($($module:ident: $layout:ident),+; $cases:tt) => {$(
+        mod $module {
+            use super::*;
+            live_cases!(@cases $layout $cases);
+        }
+    )+};
+    (@cases $layout:ident { $($case:ident),+ $(,)? }) => {$(
+        #[tokio::test]
+        async fn $case() {
+            super::$case(Layout::$layout).await;
+        }
+    )+};
+}
+
+async fn provision_is_idempotent_and_corrects_settings(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let js = hub.raw().await;
     // A stream that exists with the wrong retention is brought to §3.
     js.create_stream(jetstream::stream::Config {
@@ -148,7 +230,7 @@ async fn provision_is_idempotent_and_corrects_settings() {
     })
     .await
     .unwrap();
-    let bus = hub.bus().await;
+    let bus = hub.as_role(HubRole::Admin).await;
     bus.provision().await.unwrap();
     bus.provision().await.unwrap();
 
@@ -207,9 +289,10 @@ async fn provision_is_idempotent_and_corrects_settings() {
     );
 }
 
-#[tokio::test]
-async fn send_fetch_ack() {
-    let Some(hub) = Hub::start() else { return };
+async fn send_fetch_ack(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let mut inbox = bus.inbox(&seat("claude")).await.unwrap();
     let mut n = note("w1", "claude", "[codex] Ready: hgl-compiler#980");
@@ -233,17 +316,19 @@ async fn send_fetch_ack() {
     assert!(inbox.fetch(10, SHORT).await.unwrap().is_empty());
 }
 
-#[tokio::test]
-async fn connect_with_config_reads_the_token_file() {
-    let Some(hub) = Hub::start() else { return };
+async fn connect_with_config_reads_the_token_file(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let dir = tempfile::tempdir().unwrap();
     let token_file = dir.path().join("hub.token");
-    std::fs::write(&token_file, format!("{}\n", hub.token)).unwrap();
+    std::fs::write(&token_file, &hub.credentials[&HubRole::Seat]).unwrap();
     let mut cfg = hgl_ai_config::Config::new("test-host");
     cfg.hub.url = hub.url.clone();
     cfg.hub.token_file = token_file.display().to_string();
     let bus = Bus::connect(&cfg).await.unwrap();
-    bus.provision().await.unwrap();
+    hub.ready().await;
+    bus.state_put("config", "connected").await.unwrap();
     assert_eq!(bus.url(), hub.url);
 
     cfg.hub.token_file = dir.path().join("missing").display().to_string();
@@ -253,9 +338,10 @@ async fn connect_with_config_reads_the_token_file() {
     ));
 }
 
-#[tokio::test]
-async fn fetch_returns_at_the_first_note_and_respects_max() {
-    let Some(hub) = Hub::start() else { return };
+async fn fetch_returns_at_the_first_note_and_respects_max(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let mut inbox = bus.inbox(&seat("w3")).await.unwrap();
     let sender = hub.bus().await;
@@ -292,9 +378,10 @@ async fn fetch_returns_at_the_first_note_and_respects_max() {
     rest[0].ack().await.unwrap();
 }
 
-#[tokio::test]
-async fn duplicate_send_is_reported() {
-    let Some(hub) = Hub::start() else { return };
+async fn duplicate_send_is_reported(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let n = note("w1", "claude", "same body");
     let a = bus.send(&n).await.unwrap();
@@ -309,9 +396,10 @@ async fn duplicate_send_is_reported() {
 
 /// PROTO-9: one body from one sender in the same second, to two recipients and for two
 /// tasks (what `gh land` sends), is four notes, not one and three duplicates.
-#[tokio::test]
-async fn same_body_to_other_recipients_or_tasks_is_not_a_duplicate() {
-    let Some(hub) = Hub::start() else { return };
+async fn same_body_to_other_recipients_or_tasks_is_not_a_duplicate(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let mut w1 = bus.inbox(&seat("w1")).await.unwrap();
     let mut w2 = bus.inbox(&seat("w2")).await.unwrap();
@@ -361,9 +449,10 @@ async fn same_body_to_other_recipients_or_tasks_is_not_a_duplicate() {
     }
 }
 
-#[tokio::test]
-async fn broadcasts_reach_only_inboxes_created_before_publish() {
-    let Some(hub) = Hub::start() else { return };
+async fn broadcasts_reach_only_inboxes_created_before_publish(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let w1 = seat("w1");
     let w2 = seat("w2");
@@ -379,7 +468,9 @@ async fn broadcasts_reach_only_inboxes_created_before_publish() {
         .send(&note("claude", "all", "another old broadcast"))
         .await
         .unwrap();
-    let owner = bus
+    let owner = hub
+        .as_role(HubRole::Console)
+        .await
         .send(&note("owner", "w2", "early owner note"))
         .await
         .unwrap();
@@ -440,9 +531,10 @@ async fn broadcasts_reach_only_inboxes_created_before_publish() {
     );
 }
 
-#[tokio::test]
-async fn unread_broadcast_survives_hub_restart() {
-    let Some(mut hub) = Hub::start() else { return };
+async fn unread_broadcast_survives_hub_restart(layout: Layout) {
+    let Some(mut hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let recipient = seat("w2");
     bus.send(&note("claude", "all", "before inbox creation"))
@@ -466,9 +558,10 @@ async fn unread_broadcast_survives_hub_restart() {
     got[0].ack().await.unwrap();
 }
 
-#[tokio::test]
-async fn nak_redelivers_with_the_count_incremented() {
-    let Some(hub) = Hub::start() else { return };
+async fn nak_redelivers_with_the_count_incremented(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let mut inbox = bus.inbox(&seat("w4")).await.unwrap();
     bus.send(&note("claude", "w4", "retry me")).await.unwrap();
@@ -489,9 +582,10 @@ async fn nak_redelivers_with_the_count_incremented() {
     third[0].ack().await.unwrap();
 }
 
-#[tokio::test]
-async fn in_progress_holds_a_note_past_ack_wait() {
-    let Some(hub) = Hub::start() else { return };
+async fn in_progress_holds_a_note_past_ack_wait(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let opts = InboxOptions {
         ack_wait: Duration::from_secs(1),
@@ -523,9 +617,10 @@ async fn in_progress_holds_a_note_past_ack_wait() {
     again[0].ack().await.unwrap();
 }
 
-#[tokio::test]
-async fn malformed_messages_are_terminated() {
-    let Some(hub) = Hub::start() else { return };
+async fn malformed_messages_are_terminated(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let opts = InboxOptions {
         ack_wait: Duration::from_secs(1),
@@ -564,9 +659,10 @@ async fn malformed_messages_are_terminated() {
     assert_eq!((info.num_pending, info.num_ack_pending), (0, 0));
 }
 
-#[tokio::test]
-async fn state_put_get_delete_with_revisions() {
-    let Some(hub) = Hub::start() else { return };
+async fn state_put_get_delete_with_revisions(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     assert_eq!(bus.state_get("prs").await.unwrap(), None);
     let r1 = bus
@@ -602,9 +698,10 @@ async fn state_put_get_delete_with_revisions() {
     ));
 }
 
-#[tokio::test]
-async fn hosts_and_trees_round_trip() {
-    let Some(hub) = Hub::start() else { return };
+async fn hosts_and_trees_round_trip(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     assert!(bus.hosts().await.unwrap().is_empty());
     let host = HostRecord {
@@ -619,14 +716,25 @@ async fn hosts_and_trees_round_trip() {
         memcap_gb: 64,
         work_root_free_gb: 812,
         updated_at: "20261127T083000Z".into(),
+        accounts_capable: true,
     };
     let other = HostRecord {
         host: "build-0".into(),
         seats: vec![],
+        accounts_capable: false,
         ..host.clone()
     };
     bus.host_put(&host).await.unwrap();
-    bus.host_put(&other).await.unwrap();
+    let mut legacy = serde_json::to_value(&other).unwrap();
+    legacy.as_object_mut().unwrap().remove("accounts_capable");
+    hub.raw()
+        .await
+        .get_key_value(hgl_ai_proto::KV_HOSTS)
+        .await
+        .unwrap()
+        .put(&other.host, serde_json::to_vec(&legacy).unwrap().into())
+        .await
+        .unwrap();
     assert_eq!(
         bus.hosts().await.unwrap(),
         vec![other.clone(), host.clone()]
@@ -701,9 +809,10 @@ async fn hosts_and_trees_round_trip() {
     assert_eq!(bus.trees().await.unwrap(), vec![a.clone()]);
 }
 
-#[tokio::test]
-async fn refused_or_absent_hub_is_unreachable() {
-    let Some(hub) = Hub::start() else { return };
+async fn refused_or_absent_hub_is_unreachable(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let wrong = Bus::connect_url(&hub.url, Some("wrong".into())).await;
     assert!(
         matches!(wrong, Err(BusError::Unreachable { .. })),
@@ -725,9 +834,10 @@ async fn refused_or_absent_hub_is_unreachable() {
     );
 }
 
-#[tokio::test]
-async fn unprovisioned_hub_says_to_run_init() {
-    let Some(hub) = Hub::start() else { return };
+async fn unprovisioned_hub_says_to_run_init(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.bus().await;
     let hint = |r: Result<(), BusError>| {
         let e = r.unwrap_err().to_string();
@@ -739,9 +849,10 @@ async fn unprovisioned_hub_says_to_run_init() {
     hint(bus.hosts().await.map(|_| ()));
 }
 
-#[tokio::test]
-async fn compare_and_set() {
-    let Some(hub) = Hub::start() else { return };
+async fn compare_and_set(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let r1 = bus.state_create("main", "updated x\n").await.unwrap();
     assert!(matches!(
@@ -777,9 +888,10 @@ async fn compare_and_set() {
     assert_eq!(bus.state_get("main").await.unwrap().unwrap().revision, r);
 }
 
-#[tokio::test]
-async fn concurrent_tree_merges_lose_nothing() {
-    let Some(hub) = Hub::start() else { return };
+async fn concurrent_tree_merges_lose_nothing(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     hub.ready().await;
     let rec = TreeRecord {
         host: "build-1".into(),
@@ -821,9 +933,10 @@ async fn concurrent_tree_merges_lose_nothing() {
     assert_eq!(got.families.len(), 3, "{:?}", got.families);
 }
 
-#[tokio::test]
-async fn concurrent_appends_keep_every_line() {
-    let Some(hub) = Hub::start() else { return };
+async fn concurrent_appends_keep_every_line(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     hub.ready().await;
     let mut buses = Vec::new();
     for _ in 0..4 {
@@ -859,9 +972,10 @@ async fn concurrent_appends_keep_every_line() {
     assert!(value.ends_with('\n'));
 }
 
-#[tokio::test]
-async fn oversized_notes_are_refused_and_terminated() {
-    let Some(hub) = Hub::start() else { return };
+async fn oversized_notes_are_refused_and_terminated(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let big = note("w1", "claude", &"x".repeat(hgl_ai_bus::MAX_NOTE_BYTES));
     let err = bus.send(&big).await.unwrap_err().to_string();
@@ -887,9 +1001,10 @@ async fn oversized_notes_are_refused_and_terminated() {
     );
 }
 
-#[tokio::test]
-async fn bridge_host_names_the_serving_host() {
-    let Some(hub) = Hub::start() else { return };
+async fn bridge_host_names_the_serving_host(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     assert_eq!(bus.bridge_host(&seat("w3")).await.unwrap(), None);
     let host = HostRecord {
@@ -904,6 +1019,7 @@ async fn bridge_host_names_the_serving_host() {
         memcap_gb: 64,
         work_root_free_gb: 812,
         updated_at: "20261127T083000Z".into(),
+        accounts_capable: false,
     };
     bus.host_put(&host).await.unwrap();
     assert_eq!(
@@ -915,9 +1031,10 @@ async fn bridge_host_names_the_serving_host() {
 
 const LAND: &str = "lock.land.hgl-compiler";
 
-#[tokio::test]
-async fn one_of_two_concurrent_acquirers_holds_the_lease() {
-    let Some(hub) = Hub::start() else { return };
+async fn one_of_two_concurrent_acquirers_holds_the_lease(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     hub.ready().await;
     let (a, b) = (hub.bus().await, hub.bus().await);
     let (ra, rb) = tokio::join!(
@@ -954,9 +1071,10 @@ async fn one_of_two_concurrent_acquirers_holds_the_lease() {
     assert!(won.release().await.unwrap());
 }
 
-#[tokio::test]
-async fn a_released_lease_can_be_taken_again() {
-    let Some(hub) = Hub::start() else { return };
+async fn a_released_lease_can_be_taken_again(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     assert_eq!(bus.lock_get(LAND).await.unwrap(), None);
     let first = bus.lock_acquire(LAND, "first").await.unwrap();
@@ -1009,9 +1127,10 @@ async fn a_released_lease_can_be_taken_again() {
     ));
 }
 
-#[tokio::test]
-async fn ended_tasks_are_shared_and_a_later_end_stands() {
-    let Some(hub) = Hub::start() else { return };
+async fn ended_tasks_are_shared_and_a_later_end_stands(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let other = hub.bus().await;
     let t = TaskKey {
@@ -1059,16 +1178,19 @@ async fn within(secs: u64, what: &str, mut f: impl AsyncFnMut() -> bool) {
     }
 }
 
-#[tokio::test]
-async fn a_refreshed_lease_outlives_max_age_and_an_abandoned_one_expires() {
-    let Some(hub) = Hub::start() else { return };
-    let bus = hub.bus().await;
+async fn a_refreshed_lease_outlives_max_age_and_an_abandoned_one_expires(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let max_age = Duration::from_secs(1);
-    bus.provision_with(ProvisionOptions {
-        locks_max_age: max_age,
-    })
-    .await
-    .unwrap();
+    hub.as_role(HubRole::Admin)
+        .await
+        .provision_with(ProvisionOptions {
+            locks_max_age: max_age,
+        })
+        .await
+        .unwrap();
+    let bus = hub.bus().await;
     let other = hub.bus().await;
 
     // Refreshed well within max_age, it is kept for several times max_age.
@@ -1120,9 +1242,10 @@ async fn a_refreshed_lease_outlives_max_age_and_an_abandoned_one_expires() {
 /// `peek` reads what the inbox has not acknowledged without a delivery, so any number of
 /// peeks leave the note to the inbox (hgl-ai#5); naks never drop a note (max_deliver is
 /// unlimited; the bridge dead-letters, PROTO-8).
-#[tokio::test]
-async fn peeks_spend_no_delivery_and_naks_never_drop() {
-    let Some(hub) = Hub::start() else { return };
+async fn peeks_spend_no_delivery_and_naks_never_drop(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let claude = seat("claude");
     let mut inbox = bus.inbox(&claude).await.unwrap();
@@ -1192,9 +1315,10 @@ async fn peeks_spend_no_delivery_and_naks_never_drop() {
 
 /// A whole-history read goes on past a message it cannot read: each page names the last
 /// sequence read, a skipped one included.
-#[tokio::test]
-async fn pages_go_on_past_a_malformed_message() {
-    let Some(hub) = Hub::start() else { return };
+async fn pages_go_on_past_a_malformed_message(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let js = hub.raw().await;
     let bad = js
@@ -1237,10 +1361,11 @@ fn usage(host: &str, observed_at: &str) -> hgl_ai_proto::UsageRecord {
 
 /// PROTO-24: of hosts reporting one login, the newest observation stays, and only the
 /// records that won their key reach the history.
-#[tokio::test]
-async fn usage_keeps_the_newest_observation() {
+async fn usage_keeps_the_newest_observation(layout: Layout) {
     use hgl_ai_bus::UsagePut;
-    let Some(hub) = Hub::start() else { return };
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     assert!(bus.usage().await.unwrap().is_empty());
     assert!(matches!(
@@ -1278,10 +1403,8 @@ async fn usage_keeps_the_newest_observation() {
     // Racing writers: the newest wins, whatever the order.
     let mut set = tokio::task::JoinSet::new();
     for h in 12..20 {
-        let url = hub.url.clone();
-        let token = hub.token.clone();
+        let b = hub.bus().await;
         set.spawn(async move {
-            let b = Bus::connect_url(&url, Some(token)).await.unwrap();
             b.usage_put(&usage(&format!("host-{h}"), &format!("20261127T{h}0000Z")))
                 .await
                 .unwrap()
@@ -1327,10 +1450,11 @@ async fn usage_keeps_the_newest_observation() {
 /// A label removed after a record embedded it is gone from `usage` at once (r1 finding 2),
 /// and a record the KV holds but the history missed (a crash between the two writes) reaches
 /// the history when the same observation comes again, once (r1 minor 1).
-#[tokio::test]
-async fn usage_labels_come_off_and_history_catches_up() {
+async fn usage_labels_come_off_and_history_catches_up(layout: Layout) {
     use hgl_ai_bus::UsagePut;
-    let Some(hub) = Hub::start() else { return };
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let mut rec = usage("host-1", "20261127T100000Z");
     rec.label = Some("old".into());
@@ -1373,10 +1497,11 @@ async fn usage_labels_come_off_and_history_catches_up() {
 
 /// Bot round 2: an equal observation collected after the history's dedup window is not
 /// appended again; the history's last record for the key is checked, not the window.
-#[tokio::test]
-async fn usage_history_never_repeats_an_observation() {
+async fn usage_history_never_repeats_an_observation(layout: Layout) {
     use hgl_ai_bus::UsagePut;
-    let Some(hub) = Hub::start() else { return };
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let js = hub.raw().await;
     let mut cfg = js
@@ -1414,6 +1539,201 @@ async fn usage_history_never_repeats_an_observation() {
     assert_eq!(history.len(), 1);
 }
 
+async fn kv_snapshots(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
+    let seat = hub.ready().await;
+    assert!(seat.state_keys("").await.unwrap().is_empty());
+    let mut expected = Vec::new();
+    for n in 0..270 {
+        let key = format!("listed.{n:03}");
+        seat.state_put(&key, "present").await.unwrap();
+        expected.push(key);
+    }
+    seat.state_put("unlisted", "present").await.unwrap();
+    seat.state_put(&expected[0], "new revision").await.unwrap();
+    seat.state_del(&expected.remove(1)).await.unwrap();
+    assert_eq!(seat.state_keys("listed.").await.unwrap(), expected);
+
+    let builder = hub.as_role(HubRole::Builder).await;
+    let first = builder.build_put("run.a", b"first").await.unwrap();
+    builder.build_put("run.b", b"other key").await.unwrap();
+    let second = builder.build_put("run.a", b"second").await.unwrap();
+    let entries = seat.build_history("run.a").await.unwrap();
+    assert_eq!(
+        entries
+            .iter()
+            .map(|e| (e.revision, e.value.as_slice()))
+            .collect::<Vec<_>>(),
+        [(first, b"first".as_slice()), (second, b"second".as_slice())],
+    );
+    builder.build_del("run.a").await.unwrap();
+    assert!(seat.build_history("run.a").await.unwrap().is_empty());
+    assert_eq!(seat.build_keys("run.").await.unwrap(), ["run.b"]);
+
+    let console = hub.as_role(HubRole::Console).await;
+    console.console_put("session.z", &2).await.unwrap();
+    console.console_put("session.a", &1).await.unwrap();
+    console.console_put("other", &3).await.unwrap();
+    assert_eq!(
+        console.console_list::<i32>("session.").await.unwrap(),
+        [("session.a".into(), 1), ("session.z".into(), 2)],
+    );
+}
+
+#[tokio::test]
+async fn deployed_single_account_kv_grants_still_work() {
+    kv_snapshots(Layout::OldUsers).await;
+}
+
+async fn owner_history_and_durable_feeds(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
+    let seat = hub.ready().await;
+    let coord = hub.as_role(HubRole::Coord).await;
+    let console = hub.as_role(HubRole::Console).await;
+    let slack = hub.as_role(HubRole::Slack).await;
+    let client = hub.admin_client().await;
+    let admin = jetstream::new(client.clone());
+    let mut stream = admin.get_stream(STREAM_OWNER).await.unwrap();
+    let epoch = chrono::DateTime::UNIX_EPOCH;
+    let status = "hgl.console.status";
+    assert!(
+        seat.history(STREAM_OWNER, status, epoch, 10)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    let first = coord
+        .publish_event(status, b"first", "first")
+        .await
+        .unwrap()
+        .seq;
+    let deleted = console
+        .publish_event("hgl.owner.thread.other", b"other", "other")
+        .await
+        .unwrap()
+        .seq;
+    for n in 0..64 {
+        coord
+            .publish_event(
+                "hgl.console.thread.other",
+                b"unrelated",
+                &format!("other-{n}"),
+            )
+            .await
+            .unwrap();
+    }
+    let reply = slack
+        .publish_event("hgl.owner.thread.a.slack.b.c.d", b"reply", "reply")
+        .await
+        .unwrap()
+        .seq;
+    let last = coord
+        .publish_event(status, b"last", "last")
+        .await
+        .unwrap()
+        .seq;
+    stream.delete_message(deleted).await.unwrap();
+    let message = seat.owner_event_at(first).await.unwrap();
+    assert_eq!(
+        (
+            message.seq,
+            message.subject.as_str(),
+            message.payload.as_slice()
+        ),
+        (first, status, b"first".as_slice())
+    );
+    assert!(seat.owner_event_at(deleted).await.is_err());
+    assert_eq!(
+        seat.history(
+            STREAM_OWNER,
+            status,
+            message.time + chrono::Duration::nanoseconds(1),
+            10
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|m| m.seq)
+        .collect::<Vec<_>>(),
+        [last],
+    );
+    let filters = vec![
+        "hgl.*.status".into(),
+        "hgl.owner.thread.a.slack.>".into(),
+        status.into(),
+    ];
+    let mut requests = client
+        .subscribe(format!("$JS.API.STREAM.MSG.GET.{STREAM_OWNER}"))
+        .await
+        .unwrap();
+    client.flush().await.unwrap();
+    for reader in [&seat, &coord, &console, &slack] {
+        assert_eq!(
+            reader
+                .history_filtered(STREAM_OWNER, filters.clone(), epoch, 2)
+                .await
+                .unwrap()
+                .iter()
+                .map(|m| m.seq)
+                .collect::<Vec<_>>(),
+            [reply, last],
+        );
+    }
+    client.flush().await.unwrap();
+    requests.unsubscribe().await.unwrap();
+    let mut count = 0;
+    while let Some(request) = requests.next().await {
+        let fields: serde_json::Value = serde_json::from_slice(&request.payload).unwrap();
+        let filter = fields["next_by_subj"]
+            .as_str()
+            .expect("history request has a subject filter");
+        assert!(filters.iter().any(|f| f == filter), "{filter}");
+        count += 1;
+    }
+    assert_eq!(
+        count, 24,
+        "six matching reads per role, regardless of unrelated events"
+    );
+    assert_eq!(stream.info().await.unwrap().state.consumer_count, 0);
+
+    let mut owner_feed = console
+        .owner_feed("console", vec!["hgl.console.>".into()])
+        .await
+        .unwrap();
+    let m = owner_feed.next(LONG).await.unwrap().unwrap();
+    assert_eq!(m.seq, first);
+    m.ack().await.unwrap();
+    let mut slack_feed = slack
+        .owner_feed(SLACK_FEED, vec![SLACK_OWNER_FILTER.into()])
+        .await
+        .unwrap();
+    let m = slack_feed.next(LONG).await.unwrap().unwrap();
+    assert_eq!(m.seq, reply);
+    m.ack().await.unwrap();
+    assert_eq!(
+        stream
+            .consumer_info(SLACK_FEED)
+            .await
+            .unwrap()
+            .ack_floor
+            .stream_sequence,
+        reply
+    );
+
+    let link = "links.a.b";
+    assert!(console.slack_get::<String>(link).await.unwrap().is_none());
+    let revision = slack.slack_put(link, &"permalink", 0).await.unwrap();
+    assert_eq!(
+        console.slack_get::<String>(link).await.unwrap(),
+        Some(("permalink".into(), revision)),
+    );
+}
+
 /// A loopback proxy in front of the hub that holds back the hub's answer to the next
 /// publish on one subject, to stand for a slow PubAck.
 struct SlowAck {
@@ -1447,9 +1767,14 @@ impl SlowAck {
         SlowAck { url, state }
     }
 
-    /// Hold back the hub's answer to the next publish on `subject` for `delay`.
-    fn delay_next(&self, subject: &str, delay: Duration) {
-        self.state.lock().unwrap().armed = Some((subject.to_string(), delay));
+    /// Hold back the hub's answer to the next write to this lease.
+    fn delay_next_lease_write(&self, layout: Layout, name: &str, delay: Duration) {
+        let subject = format!("$KV.{KV_LOCKS}.{name}");
+        let subject = match layout {
+            Layout::Accounts => format!("{HUB_API_PREFIX}.{subject}"),
+            _ => subject,
+        };
+        self.state.lock().unwrap().armed = Some((subject, delay));
     }
 
     fn late(&self) -> usize {
@@ -1550,14 +1875,13 @@ async fn read_frame(
 /// A refresh whose PubAck comes after the caller's timeout dropped it, though the hub
 /// committed the write, keeps the lease: the next refresh takes the committed revision
 /// rather than reporting it lost (hgl-ai#132).
-#[tokio::test]
-async fn a_refresh_whose_answer_came_late_keeps_the_lease() {
-    let Some(hub) = Hub::start() else { return };
+async fn a_refresh_whose_answer_came_late_keeps_the_lease(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let direct = hub.ready().await;
     let proxy = SlowAck::start(&hub.url).await;
-    let bus = Bus::connect_url(&proxy.url, Some(hub.token.clone()))
-        .await
-        .expect("connect through the proxy");
+    let bus = hub.connect_at(&proxy.url, HubRole::Seat).await;
     let name = "builder.slow-ack";
     let mut lease = bus.lock_acquire(name, "builder-1 pid 1").await.unwrap();
     let kv = hub.raw().await.get_key_value("HGL_LOCKS").await.unwrap();
@@ -1565,10 +1889,7 @@ async fn a_refresh_whose_answer_came_late_keeps_the_lease() {
 
     // The caller gives up on the refresh; the hub commits it and answers late.
     let before = lease.revision();
-    proxy.delay_next(
-        &format!("$KV.HGL_LOCKS.{name}"),
-        Duration::from_millis(1500),
-    );
+    proxy.delay_next_lease_write(layout, name, Duration::from_millis(1500));
     assert!(
         tokio::time::timeout(Duration::from_millis(300), lease.refresh())
             .await
@@ -1616,21 +1937,17 @@ async fn a_refresh_whose_answer_came_late_keeps_the_lease() {
 /// A release whose lease was moved on by a refresh the caller dropped (the hub committed
 /// it; its answer came late) still deletes the lease, rather than leaving it to expire
 /// after `max_age` (hgl-ai#134).
-#[tokio::test]
-async fn a_release_after_a_refresh_whose_answer_came_late_deletes_the_lease() {
-    let Some(hub) = Hub::start() else { return };
+async fn a_release_after_a_refresh_whose_answer_came_late_deletes_the_lease(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let direct = hub.ready().await;
     let proxy = SlowAck::start(&hub.url).await;
-    let bus = Bus::connect_url(&proxy.url, Some(hub.token.clone()))
-        .await
-        .expect("connect through the proxy");
+    let bus = hub.connect_at(&proxy.url, HubRole::Seat).await;
     let name = "seat.slow-release";
     let mut lease = bus.lock_acquire(name, "bridge-1 pid 1").await.unwrap();
     let before = lease.revision();
-    proxy.delay_next(
-        &format!("$KV.HGL_LOCKS.{name}"),
-        Duration::from_millis(1500),
-    );
+    proxy.delay_next_lease_write(layout, name, Duration::from_millis(1500));
     assert!(
         tokio::time::timeout(Duration::from_millis(300), lease.refresh())
             .await
@@ -1670,9 +1987,10 @@ async fn a_release_after_a_refresh_whose_answer_came_late_deletes_the_lease() {
 /// one taken over by the same holder, nor one with the same holder and `acquired_at` (an
 /// expired lease re-acquired in the same second). Before the token the two ping-ponged,
 /// each refresh adopting the other's write (hgl-ai#134).
-#[tokio::test]
-async fn a_lease_with_the_same_holder_and_second_is_not_ours() {
-    let Some(hub) = Hub::start() else { return };
+async fn a_lease_with_the_same_holder_and_second_is_not_ours(layout: Layout) {
+    let Some(hub) = Hub::start(layout) else {
+        return;
+    };
     let bus = hub.ready().await;
     let name = "builder.same-second";
     let mut old = bus.lock_acquire(name, "builder-1 pid 1").await.unwrap();
@@ -1716,3 +2034,40 @@ async fn a_lease_with_the_same_holder_and_second_is_not_ours() {
     assert_eq!(entry.revision, at, "neither old lease wrote over it");
     assert_eq!(bus.lock_get(name).await.unwrap(), Some(twin));
 }
+
+live_cases! { shared_token: Token, single_account: Users, role_accounts: Accounts; {
+    provision_is_idempotent_and_corrects_settings,
+    send_fetch_ack,
+    connect_with_config_reads_the_token_file,
+    fetch_returns_at_the_first_note_and_respects_max,
+    duplicate_send_is_reported,
+    same_body_to_other_recipients_or_tasks_is_not_a_duplicate,
+    broadcasts_reach_only_inboxes_created_before_publish,
+    unread_broadcast_survives_hub_restart,
+    nak_redelivers_with_the_count_incremented,
+    in_progress_holds_a_note_past_ack_wait,
+    malformed_messages_are_terminated,
+    state_put_get_delete_with_revisions,
+    hosts_and_trees_round_trip,
+    refused_or_absent_hub_is_unreachable,
+    unprovisioned_hub_says_to_run_init,
+    compare_and_set,
+    concurrent_tree_merges_lose_nothing,
+    concurrent_appends_keep_every_line,
+    oversized_notes_are_refused_and_terminated,
+    bridge_host_names_the_serving_host,
+    one_of_two_concurrent_acquirers_holds_the_lease,
+    a_released_lease_can_be_taken_again,
+    ended_tasks_are_shared_and_a_later_end_stands,
+    a_refreshed_lease_outlives_max_age_and_an_abandoned_one_expires,
+    a_refresh_whose_answer_came_late_keeps_the_lease,
+    a_release_after_a_refresh_whose_answer_came_late_deletes_the_lease,
+    a_lease_with_the_same_holder_and_second_is_not_ours,
+    peeks_spend_no_delivery_and_naks_never_drop,
+    pages_go_on_past_a_malformed_message,
+    usage_keeps_the_newest_observation,
+    usage_labels_come_off_and_history_catches_up,
+    usage_history_never_repeats_an_observation,
+    kv_snapshots,
+    owner_history_and_durable_feeds,
+} }

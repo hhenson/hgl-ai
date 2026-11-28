@@ -1369,6 +1369,7 @@ dependencies = [
  "chrono",
  "futures",
  "hgl-ai-config",
+ "hgl-ai-install",
  "hgl-ai-proto",
  "nkeys",
  "serde",

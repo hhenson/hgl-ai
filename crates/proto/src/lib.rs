@@ -569,6 +569,9 @@ pub struct HostRecord {
     pub memcap_gb: u64,
     pub work_root_free_gb: u64,
     pub updated_at: String,
+    /// This bridge's client supports role accounts. Older heartbeats lack the field.
+    #[serde(default)]
+    pub accounts_capable: bool,
 }
 
 /// `HGL_TREES/<host>.<seat>.<repo>-<issue>` (PROTO-13).
